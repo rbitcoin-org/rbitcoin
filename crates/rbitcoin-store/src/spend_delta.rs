@@ -1585,14 +1585,18 @@ impl SpendPageLog {
     /// Open the committed snapshot. A `fold` file is copied onto `spent.body`
     /// again first. Then drop what a crash left past the commit, and cut
     /// every slot at or past the `spent.body` end.
+    ///
+    /// With `repair` false any of those writes, or a missing or unpublished
+    /// `spent.delta/`, refuses the open instead: an `--assumehot` source.
     pub fn load_with(
         store: &Path,
         body: &mut dyn SpentBody,
         policy: Policy,
+        repair: bool,
     ) -> Result<Self, StoreError> {
         let body_end = body.published_len();
-        let log = Self::open_committed(store, body, policy)?;
-        log.clip(body, body_end)?;
+        let log = Self::open_committed(store, body, policy, repair)?;
+        log.clip(body, body_end, repair)?;
         let s = log.stats();
         rbitcoin_log::info!(
             "store: spend delta open segments={} bytes={} live={} spent_body={} written={} records={} idx={} folded={} fold_records={} notes_ram={}",
@@ -1614,12 +1618,15 @@ impl SpendPageLog {
         store: &Path,
         body: &mut dyn SpentBody,
         policy: Policy,
+        repair: bool,
     ) -> Result<Self, StoreError> {
+        use crate::tx_table::may_repair;
         let dir = store.join(SPEND_DELTA_DIR);
         if dir.is_file() {
             return Err(StoreError::Corrupt(EARLIER_BUILD));
         }
         if !dir.exists() {
+            may_repair(repair, "source: spent.delta is missing")?;
             return Self::create_with(store, policy);
         }
         let commit =
@@ -1629,27 +1636,32 @@ impl SpendPageLog {
                     && ids_named(&dir, "idx.")?.is_empty()
                     && ids_named(&dir, "log.")?.is_empty() =>
                 {
+                    may_repair(repair, "source: spent.delta has no commit")?;
                     return Self::init(store, policy);
                 }
                 None => return Err(StoreError::Corrupt(
                     "spent.delta/commit is missing beside its segments; wipe datadir and redo IBD",
                 )),
             };
-        if commit.generation == 0 {
+        // A source opens an unpublished log as it is; missing files refuse.
+        if commit.generation == 0 && repair {
             // Nothing was ever published. A first open that stopped between
             // the commit and the files left this; build it again.
             for id in segment_ids(&dir)? {
                 remove_if_present(&dir, &segment_name(id))?;
             }
-            remove_unnamed_idx(&dir, None)?;
+            remove_unnamed_idx(&dir, None, true)?;
             return Self::init(store, policy);
+        }
+        if dir.join(SPEND_DELTA_FOLD_NAME).exists() {
+            may_repair(repair, "source: spent.delta holds an unfinished fold")?;
         }
         // Only a commit this build reads names the pages a `fold` holds.
         replay_fold_file(&dir, body)?;
-        remove_unnamed_idx(&dir, Some(commit.base))?;
+        remove_unnamed_idx(&dir, Some(commit.base), repair)?;
         let idx = Idx::open(&dir, commit.base)?;
         let scan = scan_directory(&idx.entries(&commit)?, &commit)?;
-        let segs = open_segments(&dir, &commit, &scan.segs)?;
+        let segs = open_segments(&dir, &commit, &scan.segs, repair)?;
         Ok(Self::with(dir, policy, idx, scan.directory, segs, commit))
     }
 
@@ -2328,6 +2340,7 @@ impl SpendPageLog {
         images: Vec<(u64, Vec<u8>)>,
         tip: u32,
         body: &dyn SpentBody,
+        repair: bool,
     ) -> Result<(), StoreError> {
         let mut w = self.writer();
         if self.lock().commit.generation != 0 {
@@ -2381,6 +2394,7 @@ impl SpendPageLog {
         if plan.pages.is_empty() && plan.folded.is_empty() {
             return Ok(());
         }
+        crate::tx_table::may_repair(repair, "source: spent.delta has not adopted spent.body")?;
         plan.dir_pages = u32::try_from(end.div_ceil(PAGE))
             .map_err(|_| StoreError::Corrupt("spent.delta idx past u32 pages"))?;
         rbitcoin_log::info!(
@@ -3230,7 +3244,7 @@ impl SpendPageLog {
     /// have written that page while it lay below a longer end, and its
     /// `spent.body` bytes past the cut are not slots of the creates that will
     /// take those offsets.
-    fn clip(&self, body: &dyn SpentBody, body_end: u64) -> Result<(), StoreError> {
+    fn clip(&self, body: &dyn SpentBody, body_end: u64, repair: bool) -> Result<(), StoreError> {
         let mut w = self.writer();
         let (dir_pages, tip) = {
             let g = self.lock();
@@ -3270,6 +3284,7 @@ impl SpendPageLog {
         if pages.is_empty() && !cut {
             return Ok(());
         }
+        crate::tx_table::may_repair(repair, "source: spent.delta names slots past spent.body")?;
         // `kept_pages` is at most `dir_pages`, a `u32`.
         let plan = Plan {
             pages,
@@ -3736,11 +3751,12 @@ fn scan_directory(entries: &[Entry], commit: &Commit) -> Result<DirScan, StoreEr
 /// Remove every `idx.<id>` and `log.<id>` but the pair `keep` names: what a
 /// fold of the log into a new base left when its commit was not renamed, or
 /// its old pair when the unlink after it did not finish.
-fn remove_unnamed_idx(dir: &Path, keep: Option<u32>) -> Result<(), StoreError> {
+fn remove_unnamed_idx(dir: &Path, keep: Option<u32>, repair: bool) -> Result<(), StoreError> {
     let mut removed = false;
     for (prefix, name) in [("idx.", idx_name as fn(u32) -> String), ("log.", log_name)] {
         for id in ids_named(dir, prefix)? {
             if Some(id) != keep {
+                crate::tx_table::may_repair(repair, "source: spent.delta holds an unnamed idx")?;
                 remove_if_present(dir, &name(id))?;
                 removed = true;
             }
@@ -3758,6 +3774,7 @@ fn open_segments(
     dir: &Path,
     commit: &Commit,
     named: &BTreeMap<u32, SegScan>,
+    repair: bool,
 ) -> Result<BTreeMap<u32, Seg>, StoreError> {
     let mut segs = BTreeMap::new();
     let mut ids: BTreeSet<u32> = named.keys().copied().collect();
@@ -3804,6 +3821,7 @@ fn open_segments(
     let mut removed = false;
     let present: HashSet<u32> = segment_ids(dir)?.into_iter().collect();
     for id in present.difference(&ids.iter().copied().collect()) {
+        crate::tx_table::may_repair(repair, "source: spent.delta holds an unnamed segment")?;
         let path = dir.join(segment_name(*id));
         std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
         removed = true;

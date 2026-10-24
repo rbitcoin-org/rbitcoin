@@ -20,6 +20,7 @@ mod confirm_stats;
 mod connect_facade;
 mod convert;
 mod header_store_tests;
+mod hot_digest;
 mod in_flight;
 mod index_writebehind;
 mod overlay_csv_tests;

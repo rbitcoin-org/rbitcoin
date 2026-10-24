@@ -109,7 +109,9 @@ impl Input {
         })
     }
 
-    pub fn open(dir: &Path) -> Result<Self, StoreError> {
+    /// With `repair` false, a locator, checkpoint or body that open would
+    /// trim refuses the open instead.
+    pub fn open(dir: &Path, repair: bool) -> Result<Self, StoreError> {
         let loc = TableFile::open(dir.join("input.loc"), TableKind::InputLoc)?;
         let off = TableFile::open(dir.join("input.off"), TableKind::ArrayLink)?;
         let body = TableFile::open(dir.join("input.body"), TableKind::Input)?;
@@ -148,10 +150,19 @@ impl Input {
         // A short body header is the prefix that landed. The locator can
         // still name later creates. Keep the largest count this header covers.
         let durable = opened.count_body_covers(count)?;
+        let need = FILE_HEADER_LEN as u64 + n_win * OFF_SLOT;
+        if durable < full
+            || opened.off.logical_len() > need
+            || opened.body_end_for_count(count)? < body_len
+        {
+            crate::tx_table::may_repair(
+                repair,
+                "source: input.loc, input.off and input.body differ in length",
+            )?;
+        }
         if durable < full {
             opened.truncate_to_count(durable)?;
         } else {
-            let need = FILE_HEADER_LEN as u64 + n_win * OFF_SLOT;
             if opened.off.logical_len() > need {
                 opened.off.set_logical_len(need)?;
             }

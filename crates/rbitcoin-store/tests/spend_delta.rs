@@ -88,7 +88,7 @@ fn reload(
     d: &std::path::Path,
     end: u64,
 ) -> Result<SpendPageLog, rbitcoin_store::error::StoreError> {
-    SpendPageLog::load_with(d, &mut MemBody::new(end as usize), Policy::DEFAULT)
+    SpendPageLog::load_with(d, &mut MemBody::new(end as usize), Policy::DEFAULT, true)
 }
 
 fn commit(
@@ -1169,7 +1169,7 @@ fn rewritten_pages_leave_dead_segments_that_are_unlinked() {
     assert!(!delta_dir(&d).join(segment_name(1)).exists());
     drop(log);
     let mut body = MemBody::new(4096);
-    let log = SpendPageLog::load_with(&d, &mut body, SMALL).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, SMALL, true).unwrap();
     assert_eq!(log.slot(16).unwrap(), Some([12u8; 8]));
 }
 
@@ -1197,7 +1197,7 @@ fn old_segments_fold_into_spent_body_under_budget() {
         );
     }
     drop(log);
-    let log = SpendPageLog::load_with(&d, &mut body, SMALL).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, SMALL, true).unwrap();
     for page in 0..PAGES {
         assert_eq!(
             read_through(&log, &body, page * 4096 + 16),
@@ -1251,7 +1251,7 @@ fn a_torn_fold_is_copied_again_at_open() {
     }
     body.fail_writes = true;
     let log = SpendPageLog::create_with(&d, SMALL).unwrap();
-    log.adopt_v29(Vec::new(), 0, &body).unwrap();
+    log.adopt_v29(Vec::new(), 0, &body, true).unwrap();
     let mut failed = false;
     for page in 0..PAGES {
         log.note_slots(&[(page * 4096 + 16, page_meta(page, 1))])
@@ -1277,7 +1277,7 @@ fn a_torn_fold_is_copied_again_at_open() {
         body.bytes[page_off as usize..(page_off + 4096) as usize].fill(0);
     }
     body.fail_writes = false;
-    let log = SpendPageLog::load_with(&d, &mut body, SMALL).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, SMALL, true).unwrap();
     for &page_off in &torn {
         let page = page_off / 4096;
         assert_eq!(read_through(&log, &body, page_off + 16), page_meta(page, 1));
@@ -1302,7 +1302,7 @@ fn an_unrenamed_fold_file_is_not_copied() {
     std::fs::write(rbitcoin_store::file::tmp_sidecar_path(&fold), b"RBT1 torn").unwrap();
     let mut body = MemBody::new(4096);
     body.fail_writes = true;
-    SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT).unwrap();
+    SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT, true).unwrap();
     assert!(body.bytes.iter().all(|&b| b == 0));
 }
 
@@ -1376,7 +1376,7 @@ fn a_note_on_a_folded_page_reads_over_the_body() {
     assert_eq!(log.slot(4096 + 16).unwrap(), None);
     std::fs::write(commit_path(&d), saved).unwrap();
     drop(log);
-    let log = SpendPageLog::load_with(&d, &mut body, SMALL).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, SMALL, true).unwrap();
     assert_eq!(log.slot(4096 + 24).unwrap(), None);
     assert_eq!(read_through(&log, &body, 4096 + 16), page_meta(1, 1));
 }
@@ -1472,7 +1472,7 @@ fn fold_waits_for_the_threshold_and_the_segment_floor() {
 /// room in a cap this small.
 fn fill_without_folding(d: &std::path::Path, policy: Policy, body: &mut MemBody) -> SpendPageLog {
     let log = SpendPageLog::create_with(d, policy).unwrap();
-    log.adopt_v29(Vec::new(), 0, body).unwrap();
+    log.adopt_v29(Vec::new(), 0, body, true).unwrap();
     let notes: Vec<(u64, [u8; 8])> = (0..PAGES)
         .map(|page| (page * 4096 + 16, page_meta(page, 1)))
         .collect();
@@ -1644,7 +1644,7 @@ fn a_record_folds_once_it_spends_half_its_page_s_unset_slots() {
         ..CARRY
     };
     let log = SpendPageLog::create_with(&d, policy).unwrap();
-    log.adopt_v29(Vec::new(), 0, &body).unwrap();
+    log.adopt_v29(Vec::new(), 0, &body, true).unwrap();
     log.note_slots(&[folds.clone(), carried.clone(), vec![dies]].concat())
         .unwrap();
     folding_commit(&log, 1, |_| Ok(true), &mut body, None).unwrap();
@@ -1656,7 +1656,7 @@ fn a_record_folds_once_it_spends_half_its_page_s_unset_slots() {
     assert_eq!(log.stats().fold_records, 2, "pages 6 and 2 fold");
     assert!(!delta_dir(&d).join(segment_name(1)).exists());
     drop(log);
-    let log = SpendPageLog::load_with(&d, &mut body, policy).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, policy, true).unwrap();
     for &(abs, meta) in &folds {
         assert_eq!(log.slot(abs).unwrap(), None, "{abs}");
         assert_eq!(body.slot(abs), meta);
@@ -1708,7 +1708,7 @@ fn a_fold_file_replays_onto_a_shorter_body() {
     }
     body.fail_writes = true;
     let log = SpendPageLog::create_with(&d, SMALL).unwrap();
-    log.adopt_v29(Vec::new(), 0, &body).unwrap();
+    log.adopt_v29(Vec::new(), 0, &body, true).unwrap();
     for page in 0..PAGES {
         log.note_slots(&[(page * 4096 + 16, page_meta(page, 1))])
             .unwrap();
@@ -1729,7 +1729,7 @@ fn a_fold_file_replays_onto_a_shorter_body() {
     let last = *folded.iter().max().unwrap();
     body.bytes.truncate((last + 2048) as usize);
     body.fail_writes = false;
-    SpendPageLog::load_with(&d, &mut body, SMALL).unwrap();
+    SpendPageLog::load_with(&d, &mut body, SMALL, true).unwrap();
     for &page_off in &folded {
         assert_eq!(body.slot(page_off + 16), page_meta(page_off / 4096, 1));
     }
@@ -1777,7 +1777,7 @@ fn a_failed_carry_leaves_no_slot_behind() {
         .unwrap();
     }
     drop(log);
-    let log = SpendPageLog::load_with(&d, &mut body, policy).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, policy, true).unwrap();
     for page in 0..last {
         assert_eq!(
             read_through(&log, &body, page * 4096 + 16),
@@ -1849,7 +1849,7 @@ fn reclaim_folds_in_rounds_and_carries_nothing_it_may_fold() {
     assert_eq!((r.folded, r.carried, r.fold_rounds), (1, 1, 1), "{r:?}");
     assert!(!delta_dir(&d).join(segment_name(1)).exists());
     drop(log);
-    let log = SpendPageLog::load_with(&d, &mut body, policy).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, policy, true).unwrap();
     for page in 0..last {
         assert_eq!(
             read_through(&log, &body, page * 4096 + 16),
@@ -1871,7 +1871,7 @@ fn many_fold_rounds_keep_each_pages_latest_note() {
         ..Policy::DEFAULT
     };
     let log = SpendPageLog::create_with(&d, policy).unwrap();
-    log.adopt_v29(Vec::new(), 0, &body).unwrap();
+    log.adopt_v29(Vec::new(), 0, &body, true).unwrap();
     let note = |round: u8| {
         let notes: Vec<(u64, [u8; 8])> = (0..FOLD_PAGES)
             .map(|page| (page * 4096 + 16, page_meta(page, round)))
@@ -1897,7 +1897,7 @@ fn many_fold_rounds_keep_each_pages_latest_note() {
         );
     }
     drop(log);
-    let log = SpendPageLog::load_with(&d, &mut body, policy).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, policy, true).unwrap();
     for page in 0..FOLD_PAGES {
         assert_eq!(
             read_through(&log, &body, page * 4096 + 16),
@@ -2042,7 +2042,7 @@ fn a_page_over_zeroes_folds_without_the_page_before_it() {
     }
     body.bytes[4096 + 16..4096 + 24].fill(0);
     let log = SpendPageLog::create_with(&d, Policy::DEFAULT).unwrap();
-    log.adopt_v29(Vec::new(), 0, &body).unwrap();
+    log.adopt_v29(Vec::new(), 0, &body, true).unwrap();
     // Page 2 spends 300 of its 512 slots: past half, so it folds when touched.
     let page2: Vec<(u64, [u8; 8])> = (0..300u64)
         .map(|i| (2 * 4096 + 8 * i, page_meta(2, 1)))
@@ -2307,7 +2307,7 @@ fn reclaim_reads_only_the_live_records() {
     assert_eq!(r.reclaim_read_bytes, 20, "{r:?}");
     assert_eq!(read_through(&log, &body, small), [2u8; 8]);
     drop(log);
-    let log = SpendPageLog::load_with(&d, &mut body, ROOMY).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, ROOMY, true).unwrap();
     assert_eq!(read_through(&log, &body, small), [2u8; 8]);
     assert_eq!(read_through(&log, &body, big + 500 * 8), [3u8; 8]);
 }
@@ -2499,7 +2499,7 @@ fn a_torn_fold_checkpoint_keeps_every_committed_slot() {
         assert!(r.is_err());
     });
     drop(log);
-    let log = SpendPageLog::load_with(&d, &mut body, SMALL).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, SMALL, true).unwrap();
     for page in 0..PAGES {
         assert_eq!(
             read_through(&log, &body, page * 4096 + 16),
@@ -2585,7 +2585,8 @@ fn a_torn_rebase_keeps_every_committed_slot() {
         commit(&log, page as u32 + 1, pub_len, |_| Ok(true));
     }
     drop(log);
-    let log = SpendPageLog::load_with(&d, &mut MemBody::new(pub_len as usize), REBASE).unwrap();
+    let log =
+        SpendPageLog::load_with(&d, &mut MemBody::new(pub_len as usize), REBASE, true).unwrap();
     crash_tearing_writes(&d, || {
         log.note_slots(&[(7 * 4096 + 16, [9u8; 8])]).unwrap();
         assert!(try_commit(&log, 7, |_| Ok(true)).is_err());
@@ -2619,7 +2620,7 @@ fn a_dense_page_folds_when_a_checkpoint_touches_it() {
     let d = dir();
     let mut body = MemBody::new(4 * 4096);
     let log = SpendPageLog::create_with(&d, Policy::DEFAULT).unwrap();
-    log.adopt_v29(Vec::new(), 0, &body).unwrap();
+    log.adopt_v29(Vec::new(), 0, &body, true).unwrap();
     log.note_slots(&dense_notes(1, 300, 1)).unwrap();
     reporting_commit(&log, 1, |_| Ok(true), &mut body, None).unwrap();
     log.note_slots(&[(4096 + 400 * 8, [9u8; 8])]).unwrap();
@@ -2633,7 +2634,7 @@ fn a_dense_page_folds_when_a_checkpoint_touches_it() {
     }
     assert_eq!(log.slot(4096 + 400 * 8).unwrap(), Some([9u8; 8]));
     drop(log);
-    let log = SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT, true).unwrap();
     assert_eq!(read_through(&log, &body, 4096 + 8), page_meta(1, 1));
     assert_eq!(read_through(&log, &body, 4096 + 400 * 8), [9u8; 8]);
 }
@@ -2693,7 +2694,7 @@ fn a_failed_publish_after_a_touch_fold_reads_the_same_on_retry() {
     let r = reporting_commit(&log, 2, |_| Ok(true), &mut body, None).unwrap();
     assert_eq!(r.hot_folds, 0);
     drop(log);
-    let log = SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT, true).unwrap();
     for (abs, meta) in dense_notes(1, 300, 1) {
         assert_eq!(read_through(&log, &body, abs), meta);
     }
@@ -2761,7 +2762,7 @@ fn written_counts_the_directory_bytes() {
     assert_eq!(s.idx_bytes, 16 + 2 * 16);
     assert_eq!(s.written(), s.record_bytes + s.idx_bytes);
     drop(log);
-    let log = SpendPageLog::load_with(&d, &mut MemBody::new(4 * 4096), REBASE).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut MemBody::new(4 * 4096), REBASE, true).unwrap();
     log.note_slots(&[(2 * 4096 + 16, [3u8; 8])]).unwrap();
     commit(&log, 2, 4 * 4096, |_| Ok(true));
     // The new base holds the 3 pages the directory reaches, 12 bytes each.
@@ -2792,7 +2793,7 @@ fn a_damaged_directory_refuses_open() {
     log.note_slots(&[(16, [1u8; 8])]).unwrap();
     commit(&log, 1, pub_len, |_| Ok(true));
     drop(log);
-    let log = SpendPageLog::load_with(&d, &mut MemBody::new(4096), SMALL).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut MemBody::new(4096), SMALL, true).unwrap();
     for page in 1..3u64 {
         log.note_slots(&[(page * 4096 + 16, page_meta(page, 1))])
             .unwrap();
@@ -2940,7 +2941,7 @@ fn an_earlier_build_refuses_before_copying_its_fold() {
     )
     .unwrap();
     let mut body = MemBody::new(2 * 4096);
-    let err = SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT)
+    let err = SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT, true)
         .err()
         .expect("layout 3 refuses");
     assert!(err.to_string().contains("wipe datadir"), "{err}");
@@ -3056,7 +3057,7 @@ fn a_torn_fold_over_zeroes_loses_nothing() {
     drop(log);
     assert_ne!(body.slot(2 * 4096), [0u8; 8], "the fold reached spent.body");
     body.bytes[2 * 4096..3 * 4096].fill(0);
-    let log = SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT, true).unwrap();
     for &(abs, meta) in &notes {
         assert_eq!(read_through(&log, &body, abs), meta, "slot {abs}");
     }
@@ -3086,7 +3087,7 @@ fn a_cut_through_a_folded_page_keeps_only_the_slots_below_it() {
     drop(log);
     let cut = 2 * 4096 + 100 * 8;
     body.bytes.truncate(cut as usize);
-    let log = SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT, true).unwrap();
     assert_eq!(
         log.slot(2 * 4096 + 16).unwrap(),
         Some([2, 1, 0, 0, 0, 0, 0, 1])
@@ -3095,7 +3096,7 @@ fn a_cut_through_a_folded_page_keeps_only_the_slots_below_it() {
     // Past the cut, the page reads zero again once creates take it.
     drop(log);
     body.bytes.resize(8 * 4096, 0);
-    let log = SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, Policy::DEFAULT, true).unwrap();
     assert_eq!(log.slot(2 * 4096 + 200 * 8).unwrap(), Some([0u8; 8]));
 }
 
@@ -3134,7 +3135,7 @@ fn a_fold_file_that_stays_fails_the_checkpoint() {
         body.bytes[at..at + 8].copy_from_slice(&[0xa5; 8]);
     }
     let log = SpendPageLog::create(&d).unwrap();
-    log.adopt_v29(Vec::new(), 0, &body).unwrap();
+    log.adopt_v29(Vec::new(), 0, &body, true).unwrap();
     log.note_slots(&half_page(2, 1)).unwrap();
     folding_commit(&log, 1, |_| Ok(true), &mut body, None).unwrap();
     log.note_slots(&[(2 * 4096 + 300 * 8, [9u8; 8])]).unwrap();
@@ -3214,7 +3215,7 @@ fn notes_a_failed_checkpoint_sealed_still_hold_the_edge_cap() {
     }
     body.fail_writes = true;
     let log = Arc::new(SpendPageLog::create_with(&d, SMALL).unwrap());
-    log.adopt_v29(Vec::new(), 0, &body).unwrap();
+    log.adopt_v29(Vec::new(), 0, &body, true).unwrap();
     let mut tip = 0;
     let mut failed = 0;
     while failed == 0 {
@@ -3417,7 +3418,7 @@ fn confirm_spend_meta_reads_delta_records_in_one_bulk() {
         len: published,
         path: body_path.clone(),
     };
-    let log = SpendPageLog::load_with(&d, &mut body, policy).unwrap();
+    let log = SpendPageLog::load_with(&d, &mut body, policy, true).unwrap();
     let dense = |page: u64| {
         let notes: Vec<(u64, [u8; 8])> = (0..DENSE)
             .map(|rel| (page + u64::from(rel) * 8, spent_meta(page + u64::from(rel))))

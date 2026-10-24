@@ -4532,8 +4532,14 @@ fn open_cut_past_a_roll_rebuilds_the_in_flight_segment() {
         );
         copy_tree(&dir, &copy);
     }
-    let t = TxTable::open_seqsigwit(&copy, &copy, rbitcoin_store::HeadOpenOpts::TINY, Some(204))
-        .expect("open with a cut just past the roll");
+    let t = TxTable::open_seqsigwit(
+        &copy,
+        &copy,
+        rbitcoin_store::HeadOpenOpts::TINY,
+        Some(204),
+        true,
+    )
+    .expect("open with a cut just past the roll");
     assert_eq!(t.count(), 204);
     for i in [1u64, 100, 204] {
         assert_eq!(

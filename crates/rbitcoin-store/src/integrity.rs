@@ -227,13 +227,20 @@ impl Store {
         let Ok(rec) = self.headers.get(fk) else {
             return Ok(());
         };
-        let prev_gen = TipSeal::load(self.path())?
-            .map(|s| s.generation)
-            .unwrap_or(0);
+        let prev = TipSeal::load(self.path())?;
+        let confirmed_len = u64::from(tip.0) + 1;
+        // Open republishes after its tip-window check. An unchanged tip writes
+        // nothing, so opening a clean store leaves its files as they were.
+        if let Some(p) = &prev {
+            if (p.tip_height, p.tip_hash, p.confirmed_len) == (tip.0, rec.hash, confirmed_len) {
+                return Ok(());
+            }
+        }
+        let prev_gen = prev.map(|s| s.generation).unwrap_or(0);
         let seal = TipSeal {
             tip_height: tip.0,
             tip_hash: rec.hash,
-            confirmed_len: u64::from(tip.0) + 1,
+            confirmed_len,
             generation: prev_gen.saturating_add(1),
         };
         seal.store(self.path())
@@ -674,26 +681,41 @@ impl Store {
     /// The fit never keeps fewer creates than a durable Class C row names:
     /// [`crate::tx_table::refuse_below_committed`] stops open first. What
     /// is left is trailing nulls, a header-only tip, and a Class C fixture.
-    pub(crate) fn drop_confirmed_past_creates(&self) -> Result<(), StoreError> {
-        let covered = self.txs.count();
-        let Some(tip) = self.confirmed.tip_height() else {
+    ///
+    /// With `repair` false such heights refuse the open instead of being
+    /// dropped: an `--assumehot` source.
+    pub(crate) fn drop_confirmed_past_creates(&self, repair: bool) -> Result<(), StoreError> {
+        let Some(kept) = self.confirmed_past_creates()? else {
             return Ok(());
         };
+        if !repair {
+            return Err(StoreError::Corrupt(
+                "source: the confirmed tip runs past its Class A creates",
+            ));
+        }
         let write = crate::array_table::ClassCWrite::new();
-        let mut report = TipRevalidateReport::default();
+        self.shrink_tip_to(&write, kept, &mut TipRevalidateReport::default())
+    }
+
+    /// The tip [`Self::drop_confirmed_past_creates`] shrinks to, if it
+    /// shrinks. `Some(None)` empties the chain.
+    fn confirmed_past_creates(&self) -> Result<Option<Option<u32>>, StoreError> {
+        let covered = self.txs.count();
+        let Some(tip) = self.confirmed.tip_height() else {
+            return Ok(None);
+        };
         if let Some(bad) = self.class_a_confirmed_cut(covered)? {
-            if self.header_tx_end(Height(bad))?.is_none() && self.strong_past_covered(covered)? {
-                self.shrink_tip_to(&write, bad.checked_sub(1), &mut report)?;
-            }
-            return Ok(());
+            let past =
+                self.header_tx_end(Height(bad))?.is_none() && self.strong_past_covered(covered)?;
+            return Ok(past.then(|| bad.checked_sub(1)));
         }
         if self.header_tx_end(tip)?.is_some() || !self.strong_past_covered(covered)? {
-            return Ok(());
+            return Ok(None);
         }
         if self.highest_height_with_tx_range(tip.0)?.is_some() {
-            return Ok(());
+            return Ok(None);
         }
-        self.shrink_tip_to(&write, None, &mut report)
+        Ok(Some(None))
     }
 
     fn strong_past_covered(&self, covered: u64) -> Result<bool, StoreError> {

@@ -829,7 +829,7 @@ fn pruned_short_input_skips_the_witness_locator() {
         txstat: &s.txs.txstat,
         input: &s.txs.input,
     };
-    rbitcoin_store::tx_table::repair_class_a_count_skew(stems, true, true, None).unwrap();
+    rbitcoin_store::tx_table::repair_class_a_count_skew(stems, true, true, None, true).unwrap();
     drop(disarm);
     assert_eq!(s.txs.count(), 1, "repair stops at the short input");
     assert_eq!(s.txs.input.count(), 1);
