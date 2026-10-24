@@ -112,7 +112,9 @@ impl Input {
         })
     }
 
-    pub fn open(dir: &Path) -> Result<Self, StoreError> {
+    /// With `repair` false, a locator, checkpoint or body that open would
+    /// trim refuses the open instead.
+    pub fn open(dir: &Path, repair: bool) -> Result<Self, StoreError> {
         let loc = TableFile::open(dir.join("input.loc"), TableKind::InputLoc)?;
         let off = TableFile::open(dir.join("input.off"), TableKind::ArrayLink)?;
         let body = TableFile::open(dir.join("input.body"), TableKind::Input)?;
@@ -150,10 +152,16 @@ impl Input {
         // Refuse a short body before any header write. A matching checkpoint
         // still has to be checked: the body can move on its own.
         let new_body = opened.body_end_if_durable(count)?;
+        let need = FILE_HEADER_LEN as u64 + n_win * OFF_SLOT;
+        if count < full || opened.off.logical_len() > need || new_body < body_len {
+            crate::tx_table::may_repair(
+                repair,
+                "source: input.loc, input.off and input.body differ in length",
+            )?;
+        }
         if count < full {
             opened.truncate_to_count(count)?;
         } else {
-            let need = FILE_HEADER_LEN as u64 + n_win * OFF_SLOT;
             if opened.off.logical_len() > need {
                 opened.off.set_logical_len(need)?;
             }
