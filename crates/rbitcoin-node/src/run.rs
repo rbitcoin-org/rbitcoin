@@ -1196,7 +1196,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         status.attach_sv2(Arc::clone(s));
     }
     let mut i2p_wallet = Vec::new();
-    if config.listen.i2p_accept_incoming && !shutdown.requested() {
+    if !shutdown.requested() {
         if let Some(addr) = config.listen.i2p_sam {
             if let Some(h) = electrum_handles.first() {
                 i2p_wallet.extend(
@@ -1323,21 +1323,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                             );
                         }
                     }
-                    if config.listen.i2p_accept_incoming {
-                        if let Some(addr) = config.listen.i2p_sam {
-                            if let Some(h) = handles.first() {
-                                i2p_wallet.extend(
-                                    shutdown.or_fail(
-                                        wallet_i2p_forward(
-                                            addr,
-                                            &config,
-                                            WalletListener::Electrum,
-                                            h.local_addr.port(),
-                                        )
-                                        .await,
-                                    ),
-                                );
-                            }
+                    if let Some(addr) = config.listen.i2p_sam {
+                        if let Some(h) = handles.first() {
+                            i2p_wallet.extend(
+                                shutdown.or_fail(
+                                    wallet_i2p_forward(
+                                        addr,
+                                        &config,
+                                        WalletListener::Electrum,
+                                        h.local_addr.port(),
+                                    )
+                                    .await,
+                                ),
+                            );
                         }
                     }
                     if let Some(h) = handles.first() {
@@ -1385,21 +1383,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                             );
                         }
                     }
-                    if config.listen.i2p_accept_incoming {
-                        if let Some(addr) = config.listen.i2p_sam {
-                            if let Some(h) = handles.first() {
-                                i2p_wallet.extend(
-                                    shutdown.or_fail(
-                                        wallet_i2p_forward(
-                                            addr,
-                                            &config,
-                                            WalletListener::Esplora,
-                                            h.local_addr.port(),
-                                        )
-                                        .await,
-                                    ),
-                                );
-                            }
+                    if let Some(addr) = config.listen.i2p_sam {
+                        if let Some(h) = handles.first() {
+                            i2p_wallet.extend(
+                                shutdown.or_fail(
+                                    wallet_i2p_forward(
+                                        addr,
+                                        &config,
+                                        WalletListener::Esplora,
+                                        h.local_addr.port(),
+                                    )
+                                    .await,
+                                ),
+                            );
                         }
                     }
                     if let Some(h) = handles.first() {

@@ -104,12 +104,14 @@ let
             enable = true;
             openFirewall = true;
             hiddenService = true;
+            i2p = true;
             maxSubs = 25000;
           };
           esplora = {
             enable = true;
             openFirewall = true;
             hiddenService = true;
+            i2p = true;
             maxInflight = 1024;
             blockTemplate = true;
           };
@@ -572,10 +574,12 @@ assert defaultCfg.onlyNet == [ ];
 assert defaultCfg.tor.control == null;
 assert defaultCfg.tor.controlCookie == null;
 assert defaultCfg.electrum.hiddenService == false;
+assert defaultCfg.electrum.i2p == false;
 assert defaultCfg.electrum.maxSubs == null;
 assert defaultCfg.heavyShCreates == null;
 assert defaultCfg.storeReadBudget == null;
 assert defaultCfg.esplora.hiddenService == false;
+assert defaultCfg.esplora.i2p == false;
 assert defaultCfg.esplora.maxInflight == null;
 assert defaultCfg.i2p.sam == null;
 assert defaultCfg.i2p.acceptIncoming == false;
@@ -691,6 +695,12 @@ assert builtins.match ".*--store-read-budget.*" (
 ) == null;
 assert builtins.match ".*--esplora-listen 127.0.0.1:3000.*" execStart != null;
 assert builtins.match ".*--esplora-onion.*" execStart != null;
+assert builtins.match ".*--electrum-onion.*" execStart != null;
+assert builtins.match ".*--electrum-i2p.*" execStart != null;
+assert builtins.match ".*--esplora-i2p.*" execStart != null;
+assert builtins.match ".*--(electrum|esplora)-(onion|i2p).*" (
+  defaultSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart
+) == null;
 assert builtins.match ".*--esplora-max-inflight 1024.*" execStart != null;
 assert builtins.match ".*--esplora-max-inflight.*" listenOffExec == null;
 assert builtins.match ".*--sh-index.*" execStart != null;
@@ -827,7 +837,7 @@ assert rbitcoinFailures (badSystem { apiLog = "/api.jsonl"; }) == rbitcoinFailur
 assert unixSystem.config.networking.firewall.allowedTCPPorts == [ ];
 assert unixSystem.config.systemd.tmpfiles.settings."10-rbitcoin"."/run/rbitcoin".d.mode == "0750";
 assert builtins.elem "/run/rbitcoin" unixSystem.config.systemd.services.rbitcoin.serviceConfig.ReadWritePaths;
-assert builtins.match ".*--esplora-onion=0.*" onionOffExec != null;
+assert builtins.match ".*--esplora-onion.*" onionOffExec == null;
 assert builtins.match ".*--network signet.*" signetExec != null;
 assert builtins.match ".*--signet-challenge 51.*" signetExec != null;
 assert builtins.match ".*--signet-block-time 120.*" signetExec != null;
