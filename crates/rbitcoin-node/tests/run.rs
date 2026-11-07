@@ -906,6 +906,157 @@ fn dns_seeds_not_resolved_locally_when_proxy() {
     );
 }
 
+/// `--only-net onion` has no IPv4 or IPv6 to reach. A DNS seed lookup, local
+/// or through `--proxy`, would tell a clearnet resolver or seed that this
+/// host runs a node. Only the fixed onion seeds apply.
+#[test]
+fn only_net_without_clearnet_asks_no_dns_seed() {
+    use rbitcoin_net::OnlyNet;
+    let mut cfg = NodeConfig::default();
+    cfg.listen.onion = Some("127.0.0.1:9050".parse().unwrap());
+    cfg.listen.only_net = vec![OnlyNet::Onion];
+    assert!(should_resolve_default_seeds(&cfg), "fixed onion seeds stay");
+    assert!(!should_resolve_dns_seeds(&cfg));
+    cfg.listen.only_net = vec![OnlyNet::Onion, OnlyNet::Ipv4];
+    assert!(should_resolve_dns_seeds(&cfg));
+    cfg.listen.only_net.clear();
+    assert!(should_resolve_dns_seeds(&cfg));
+
+    let mut proxied = NodeConfig::default();
+    proxied.listen.proxy = Some("127.0.0.1:9050".parse().unwrap());
+    assert!(should_queue_proxy_seeds(&proxied));
+    proxied.listen.only_net = vec![OnlyNet::Onion];
+    assert!(!should_queue_proxy_seeds(&proxied));
+}
+
+#[test]
+fn proxy_seeds_follow_the_local_seed_rules() {
+    use rbitcoin_primitives::Network;
+    let proxied = |network| {
+        let mut cfg = NodeConfig::default().with_network(network);
+        cfg.listen.proxy = Some("127.0.0.1:9050".parse().unwrap());
+        cfg
+    };
+    assert!(should_queue_proxy_seeds(&proxied(Network::Signet)));
+    assert!(!should_queue_proxy_seeds(&NodeConfig::default()));
+    assert!(
+        !should_queue_proxy_seeds(&proxied(Network::Regtest)),
+        "regtest has no seed to ask"
+    );
+
+    let mut connect = proxied(Network::Signet);
+    connect.listen.connect = vec![rbitcoin_net::NetAddr::from_socket(
+        "127.0.0.1:38333".parse().unwrap(),
+    )];
+    assert!(
+        !should_queue_proxy_seeds(&connect),
+        "--connect pins the peers"
+    );
+
+    let mut named = proxied(Network::Signet);
+    named.listen.connect_dns = vec!["node.example:38333".into()];
+    assert!(!should_queue_proxy_seeds(&named));
+
+    let mut custom = proxied(Network::Signet);
+    custom.signet_challenge = Some(bitcoin::ScriptBuf::from_bytes(vec![0x51]));
+    assert!(
+        !should_queue_proxy_seeds(&custom),
+        "default signet seeds serve another chain"
+    );
+
+    let mut no_seeds = proxied(Network::Signet);
+    no_seeds.listen.use_seeds = false;
+    assert!(!should_queue_proxy_seeds(&no_seeds));
+
+    let mut trusted = proxied(Network::Signet);
+    trusted.trust_peer = Some(rbitcoin_net::NetAddr::from_socket(
+        "127.0.0.1:38333".parse().unwrap(),
+    ));
+    assert!(
+        !should_queue_proxy_seeds(&trusted),
+        "--trust-peer pins one peer"
+    );
+}
+
+#[tokio::test]
+async fn regtest_proxy_start_does_not_wait_for_seeds() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-regtest-proxy-seeds-{nanos}"));
+    let proxy_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
+    cfg.listen.proxy = Some(proxy_l.local_addr().unwrap());
+    cfg.max_run_secs = Some(0);
+    let result = tokio::time::timeout(Duration::from_secs(5), run_p2p(cfg)).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+        .expect("regtest has no seed answer to wait for")
+        .unwrap();
+}
+
+/// `--proxy --only-net onion` reaches no clearnet seed, so the fixed onion
+/// seeds are the only way to a first peer. The node dials one through SOCKS.
+#[tokio::test]
+async fn proxy_only_net_onion_dials_a_fixed_onion_seed() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = rbitcoin_store::testutil::TempDir::new().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = NodeConfig::default()
+        .with_datadir(dir.path())
+        .with_network(rbitcoin_primitives::Network::Signet)
+        .with_tiny_heads();
+    cfg.apply_kv("milestone", "0").unwrap();
+    cfg.apply_kv("listen", "0").unwrap();
+    cfg.apply_kv("max_inbound", "0").unwrap();
+    cfg.apply_kv("only_net", "onion").unwrap();
+    cfg.apply_kv("proxy", &listener.local_addr().unwrap().to_string())
+        .unwrap();
+    cfg.max_run_secs = Some(0);
+    cfg.validate().unwrap();
+
+    let capture = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut greeting = [0; 2];
+        socket.read_exact(&mut greeting).await.unwrap();
+        let mut methods = vec![0; greeting[1] as usize];
+        socket.read_exact(&mut methods).await.unwrap();
+        if methods.contains(&2) {
+            socket.write_all(&[5, 2]).await.unwrap();
+            assert_eq!(socket.read_u8().await.unwrap(), 1);
+            for _ in 0..2 {
+                let len = socket.read_u8().await.unwrap();
+                let mut field = vec![0; len as usize];
+                socket.read_exact(&mut field).await.unwrap();
+            }
+            socket.write_all(&[1, 0]).await.unwrap();
+        } else {
+            socket.write_all(&[5, 0]).await.unwrap();
+        }
+        let mut header = [0; 5];
+        socket.read_exact(&mut header).await.unwrap();
+        assert_eq!(&header[..4], &[5, 1, 0, 3]);
+        let mut host = vec![0; header[4] as usize];
+        socket.read_exact(&mut host).await.unwrap();
+        socket
+            .write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        String::from_utf8(host).unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(45), run_p2p(cfg))
+        .await
+        .expect("run must stop")
+        .unwrap();
+    let host = tokio::time::timeout(Duration::from_secs(1), capture)
+        .await
+        .expect("a fixed onion seed must reach SOCKS CONNECT")
+        .unwrap();
+    assert!(host.ends_with(".onion"), "dialed {host}");
+}
+
 #[test]
 fn proxy_seed_bootstrap_queues_domain_addrfetch() {
     let peers = rbitcoin_net::PeerHub::new();

@@ -164,6 +164,17 @@ impl ListenOpts {
         !self.connect.is_empty() || !self.connect_dns.is_empty()
     }
 
+    /// `--only-net` leaves IPv4 or IPv6 reachable (an empty list leaves all).
+    pub fn clearnet_reachable(&self) -> bool {
+        self.only_net.is_empty()
+            || self.only_net.iter().any(|net| {
+                matches!(
+                    net,
+                    rbitcoin_net::OnlyNet::Ipv4 | rbitcoin_net::OnlyNet::Ipv6
+                )
+            })
+    }
+
     pub fn dialer(&self) -> rbitcoin_net::Dialer {
         rbitcoin_net::Dialer::with_proxies(self.proxy, self.onion, self.proxy_randomize)
     }
