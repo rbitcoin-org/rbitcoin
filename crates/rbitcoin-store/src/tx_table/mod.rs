@@ -1608,6 +1608,12 @@ impl TxTable {
         self.seqsigwit_loc.ovf.release_to_len(header)?;
         self.seqsigwit.truncate_body_to(0, header)?;
         self.seqsigwit.body.release_to_len(header)?;
+        // The short length is the durable end. A later open must not see
+        // the pre-cut allocation and treat it as witness payload.
+        self.seqsigwit_loc.loc.flush()?;
+        self.seqsigwit_loc.off.flush()?;
+        self.seqsigwit_loc.ovf.flush()?;
+        self.seqsigwit.body.flush()?;
         Ok(())
     }
 

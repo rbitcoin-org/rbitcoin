@@ -382,6 +382,61 @@ fn startup_refills_missing_window_then_cuts() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Locator count is already 0 and the body is still the archive. Open
+/// must serve the synced spills and finish the cut, not drop the chain.
+#[test]
+fn open_finishes_cut_when_locator_is_already_zero() {
+    let (dir, q) = temp_query("prune-loc-already-zero");
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 300, &[0x46], &mut hashes);
+    let n_tx = q.store().txs.count();
+    let tip = q.tip_height().unwrap().0;
+    let ph = tip - Query::SEQSIGWIT_KEEP_HEIGHTS;
+    for h in (ph + 1)..=tip {
+        let fks = q.block_tx_fks(Height(h)).unwrap();
+        let mut owned = Vec::new();
+        for fk in fks {
+            let tx = q.get_tx(fk).unwrap();
+            let mut ins = Vec::new();
+            for i in 0..tx.input_count {
+                ins.push(q.tx_input_at_fk(fk, &tx, i).unwrap());
+            }
+            owned.push((fk, ins));
+        }
+        let rows: Vec<(Fk, &[InputRecord])> = owned
+            .iter()
+            .map(|(fk, ins)| (*fk, ins.as_slice()))
+            .collect();
+        q.persist_seqsigwit_spill_height(Height(h), &rows).unwrap();
+    }
+    q.persist_pruneheight(ph).unwrap();
+    q.store()
+        .txs
+        .seqsigwit_loc
+        .truncate_to_count(0)
+        .unwrap();
+    let body_len = std::fs::metadata(q.store().path().join("seqsigwit.body"))
+        .unwrap()
+        .len();
+    assert!(body_len > rbitcoin_store::file::FILE_HEADER_LEN as u64);
+    q.store().sync_spend_durable(tip).unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_witness_stem_cut(&q);
+    assert_eq!(q.store().txs.count(), n_tx);
+    let block = q.reconstruct_block_at_height(Height(tip)).unwrap();
+    assert_eq!(
+        block.txdata[0].input[0].witness.to_vec(),
+        vec![vec![0x46]]
+    );
+    let err = q.reconstruct_block_at_height(Height(ph)).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Pruned { height } if height == ph),
+        "{err:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn pruned_seqsigwit_life() {
     let (dir, q) = temp_query("pruned-seqsigwit-life");

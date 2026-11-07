@@ -315,6 +315,7 @@ impl Query {
     /// not move it. Seqsigwit prune keeps its window below that tip.
     #[doc(hidden)]
     pub fn flush_tip(&self, before: Option<Height>) -> Result<Option<Height>, QueryError> {
+        self.require_pruned_keep_spills()?;
         if self.index_mode()?.is_tip() {
             let landed = self.store.flush_class_c_tip()?;
             return Ok(self.sealed_tip.for_prune(before, landed));
@@ -801,6 +802,11 @@ impl Query {
         }
         // Do not forget pending here: drain may still be inserting tx.head
         // (67438). Write forgets after drain.join() *and* this extend.
+        // Prune mode does not write seqsigwit.body. The spill is the witness,
+        // so it has to be durable before this flush commits the height.
+        // The fence is already extended, so a cache miss can still find
+        // the height of a spill written on an earlier connect.
+        self.seal_confirmed_seqsigwit_spills(items)?;
         let durable = self.flush_tip(durable_before)?;
         drop(commit);
         crate::note_confirm(
@@ -818,13 +824,21 @@ impl Query {
         Ok(out)
     }
 
+    /// Advance the prune watermark after the tip flush.
+    ///
+    /// [`Self::seal_confirmed_seqsigwit_spills`] wrote the keep-window
+    /// files before that flush. Heights that fell out of the window are
+    /// deleted here.
     #[doc(hidden)]
     pub fn record_confirmed_seqsigwit_window(
         &self,
-        items: &[ConfirmPrepared],
+        _items: &[ConfirmPrepared],
         durable: Option<Height>,
     ) -> Result<(), QueryError> {
-        self.prune_seqsigwit_below(durable)?;
+        self.prune_seqsigwit_below(durable)
+    }
+
+    fn seal_confirmed_seqsigwit_spills(&self, items: &[ConfirmPrepared]) -> Result<(), QueryError> {
         if !self.prune_seqsigwit() {
             return Ok(());
         }
