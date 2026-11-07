@@ -420,7 +420,7 @@ async fn i2p_accept_incoming_forwards_to_loopback() {
             c.contains("DESTINATION=TRANSIENT")
                 && c.contains("SIGNATURE_TYPE=7")
                 && c.contains("i2cp.leaseSetEncType=6,4")
-                && c.contains("inbound.length=1")
+                && !c.contains(".length")
         }),
         "{creates:?}"
     );

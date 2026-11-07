@@ -7,4 +7,9 @@ Fixed
 - **`--only-net onion` no longer asks clearnet seeds.** With no IPv4 or
   IPv6 reachable, the node sends no DNS seed query, local or through
   `--proxy`, and adds only the fixed onion seeds. Before, it looked up the
-  seed hostnames anyway and dropped the answers (#1348).
+  seed hostnames anyway and dropped the answers. With `--proxy` it added no
+  fixed seeds at all, so it had no first peer (#1348).
+- **The I2P session uses the router's tunnel length.** The node no longer
+  sets `inbound.length=1 outbound.length=1` in `SESSION CREATE`, which made
+  one-hop tunnels. The router default (three hops) applies, as in Core
+  (#1348).
