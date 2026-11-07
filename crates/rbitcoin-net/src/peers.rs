@@ -3235,9 +3235,11 @@ impl PeerHub {
     }
 
     /// `addnode` with the operator string. IP, onion, I2P, and CJDNS parse as
-    /// [`crate::NetAddr`]. Anything else is clearnet DNS, resolved at dial.
+    /// [`crate::NetAddr`]. Anything else is clearnet DNS, resolved at dial,
+    /// or by the proxy when `--proxy` is set.
     /// `add` keeps the string when DNS fails so a later redial can succeed.
-    /// `onetry` fails if the name does not resolve now.
+    /// `onetry` fails if the name does not resolve now, except under
+    /// `--proxy`, where it queues the name and returns `Ok`.
     pub fn addnode_host(&self, node: &str, cmd: &str, default_port: u16) -> Result<(), String> {
         let ready = self.dial_ready()?;
         ready.addnode_host(node, cmd, default_port)
@@ -3467,12 +3469,31 @@ impl PeerHub {
         if let Ok(net) = parse_peer_net(&with_port) {
             return Ok(DialTarget::from_net(net));
         }
+        if node.parse::<std::net::IpAddr>().is_err() {
+            if let Some(target) = self.proxied_domain_target(&with_port) {
+                return Ok(target);
+            }
+        }
         let addr =
             parse_peer_addr_with_port(node, self.default_port_opt()).map_err(|e| e.to_string())?;
         if self.trust_host_matches(node) {
             self.note_trust_resolved(addr);
         }
         Ok(DialTarget::Socket(addr))
+    }
+
+    /// `host:port` as a by-name target when `--proxy` is set, so the proxy
+    /// resolves it. An IP literal needs no lookup and stays a socket.
+    fn proxied_domain_target(&self, host_port: &str) -> Option<DialTarget> {
+        self.proxies().dialer.proxy_for(crate::OnlyNet::Ipv4)?;
+        if host_port.parse::<SocketAddr>().is_ok() {
+            return None;
+        }
+        let (host, port) = host_port.rsplit_once(':')?;
+        Some(DialTarget::Domain {
+            host: host.to_string(),
+            port: port.parse().ok()?,
+        })
     }
 
     fn trust_host_matches(&self, node: &str) -> bool {

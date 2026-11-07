@@ -1637,3 +1637,115 @@ fn concurrent_tx_relay_newcomers_keep_the_inbound_share() {
         );
     }
 }
+
+#[test]
+fn second_dial_of_the_same_target_stacks() {
+    let hub = PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+    let target = DialTarget::Socket(addr);
+    let first = hub.dial_in_flight(&target);
+    let second = hub.dial_in_flight(&target);
+    let n = first
+        .counts
+        .lock()
+        .unwrap()
+        .get(&first.key)
+        .expect("in flight")
+        .n;
+    assert_eq!(n, 2, "two guards on one target count two dials");
+    drop((first, second));
+}
+
+#[test]
+fn try_evict_inbound_disconnects_one_peer() {
+    let hub = PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    for i in 0..30u8 {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(i + 1, 1, 0, 1)), 8333);
+        hub.register_connecting(addr, bind, true, PeerConnType::Inbound);
+    }
+    let before = hub.snapshot().len();
+    assert!(hub.try_evict_inbound(), "an inbound peer is evicted");
+    assert_eq!(
+        hub.snapshot().len(),
+        before - 1,
+        "eviction disconnects that peer"
+    );
+}
+
+#[test]
+fn tx_relay_room_ignores_outbound_and_non_relay() {
+    let hub = PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let newcomer = hub.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)), 8333),
+        bind,
+        &ver("/new/"),
+        true,
+        PeerConnType::Inbound,
+    );
+    hub.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(2, 0, 0, 1)), 8333),
+        bind,
+        &ver("/out/"),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let mut quiet = ver("/quiet/");
+    quiet.relay = false;
+    hub.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(3, 0, 0, 1)), 8333),
+        bind,
+        &quiet,
+        true,
+        PeerConnType::Inbound,
+    );
+    assert!(
+        hub.make_room_for_tx_relay_inbound(&newcomer, 2),
+        "outbound relay and a non-relaying inbound are outside the tx-relay cap"
+    );
+}
+
+/// With `--proxy`, a `--connect` or `addnode` name goes to the proxy as a
+/// domain (SOCKS address type 3). The node never asks the OS resolver, so
+/// the unresolvable `.invalid` name still produces a dial.
+#[test]
+fn proxy_dials_connect_host_by_name() {
+    let hub = PeerHub::new();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    hub.set_dialer(tx);
+    hub.set_proxies(rbitcoin_net::NetProxies {
+        dialer: rbitcoin_net::Dialer::socks("127.0.0.1:9050".parse().unwrap(), true),
+        i2p_sam: None,
+    });
+    hub.set_connect_hosts(vec!["peer.invalid:8333".into()], 8333);
+    hub.redial_remembered();
+    hub.addnode_host("other.invalid", "onetry", 8333).unwrap();
+    let got = take_dials(&mut rx);
+    let names: Vec<_> = got
+        .iter()
+        .map(|d| match &d.target {
+            DialTarget::Domain { host, port } => format!("{host}:{port}"),
+            DialTarget::Socket(a) => panic!("resolved locally to {a}"),
+        })
+        .collect();
+    assert_eq!(names, ["peer.invalid:8333", "other.invalid:8333"]);
+}
+
+/// An IPv6 literal needs no lookup. Under `--proxy` it stays a socket target,
+/// not a domain cut at its last colon.
+#[test]
+fn proxy_keeps_ipv6_literals_as_sockets() {
+    let hub = PeerHub::new();
+    hub.set_proxies(rbitcoin_net::NetProxies {
+        dialer: rbitcoin_net::Dialer::socks("127.0.0.1:9050".parse().unwrap(), true),
+        i2p_sam: None,
+    });
+    hub.note_default_port(8333);
+    for literal in ["::1", "2001:db8::1"] {
+        match hub.host_dial_target(literal).unwrap() {
+            DialTarget::Socket(addr) => assert_eq!(addr.port(), 8333),
+            DialTarget::Domain { host, .. } => panic!("{literal} became domain {host}"),
+        }
+    }
+}
