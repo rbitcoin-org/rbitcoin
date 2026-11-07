@@ -297,6 +297,9 @@ let
   sv2KeyNotInStore = "services.rbitcoin.sv2.tp.authoritySecretFile must not be a store path (the store is world-readable)";
   failedAssertions =
     sys: map (a: a.message) (builtins.filter (a: !a.assertion) sys.config.assertions);
+  # A full NixOS also fails boot assertions this stub does not model.
+  rbitcoinFailures = sys:
+    builtins.filter (nixpkgs.lib.hasPrefix "services.rbitcoin.") (failedAssertions sys);
   execOf = opts: (moduleOnly opts).config.systemd.services.rbitcoin.serviceConfig.ExecStart;
   spExec = execOf {
     silentPaymentIndex = true;
@@ -305,7 +308,7 @@ let
   inboundExec = execOf {
     p2p.maxInbound = 125;
   };
-  unixExec = execOf {
+  unixOpts = {
     rpc.unixSocket = true;
     esplora = {
       enable = true;
@@ -313,7 +316,8 @@ let
       openFirewall = true;
     };
   };
-  unixSystem = nixpkgs.lib.nixosSystem {
+  unixExec = execOf unixOpts;
+  fullSystem = opts: nixpkgs.lib.nixosSystem {
     inherit (pkgs.stdenv.hostPlatform) system;
     modules = [
       module
@@ -321,16 +325,11 @@ let
         services.rbitcoin = {
           enable = true;
           package = fakePackage;
-          rpc.unixSocket = true;
-          esplora = {
-            enable = true;
-            socketPath = "/run/rbitcoin/esplora.sock";
-            openFirewall = true;
-          };
-        };
+        } // opts;
       }
     ];
   };
+  unixSystem = fullSystem unixOpts;
   onionOffExec = execOf {
     tor.control = "127.0.0.1:9051";
     esplora = {
@@ -465,9 +464,7 @@ let
       }
     ];
   };
-  # Options this module writes. Assertion and argv cases do not need the
-  # rest of NixOS; one nixosSystem per case re-merged the whole distribution
-  # and ran past the CI eval cap.
+  # Assertion and argv cases do not merge the rest of NixOS.
   hostOptions =
     { lib, ... }:
     {
@@ -482,11 +479,14 @@ let
         };
         ids.gids.tor = lib.mkOption {
           type = lib.types.int;
-          default = 0;
+          # nixos/modules/misc/ids.nix on nixos-26.05. The ids module is not
+          # in this eval, so the default has to be the same number.
+          default = 35;
         };
         networking.firewall.allowedTCPPorts = lib.mkOption {
-          type = lib.types.listOf lib.types.int;
+          type = lib.types.listOf lib.types.port;
           default = [ ];
+          apply = ports: lib.unique (builtins.sort builtins.lessThan ports);
         };
         services.prometheus.enable = lib.mkOption {
           type = lib.types.bool;
@@ -819,6 +819,11 @@ assert builtins.match ".*--rpc .*" unixExec != null;
 assert builtins.match ".*--rpc-listen.*" unixExec == null;
 assert builtins.match ".*--esplora-listen /run/rbitcoin/esplora.sock.*" unixExec != null;
 assert builtins.match ".*--esplora-listen 127.0.0.1:3000.*" unixExec == null;
+assert unixExec == unixSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart;
+assert rbitcoinFailures (moduleOnly unixOpts) == rbitcoinFailures unixSystem;
+assert rbitcoinFailures (badSystem { apiLog = "/api.jsonl"; }) == rbitcoinFailures (
+  fullSystem { apiLog = "/api.jsonl"; }
+);
 assert unixSystem.config.networking.firewall.allowedTCPPorts == [ ];
 assert unixSystem.config.systemd.tmpfiles.settings."10-rbitcoin"."/run/rbitcoin".d.mode == "0750";
 assert builtins.elem "/run/rbitcoin" unixSystem.config.systemd.services.rbitcoin.serviceConfig.ReadWritePaths;
