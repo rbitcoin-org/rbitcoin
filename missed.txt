@@ -1001,3 +1001,34 @@ MISSED   crates/rbitcoin-net/src/asmap.rs:426:26: replace == with != in sanity_c
 MISSED   crates/rbitcoin-net/src/asmap.rs:427:27: replace == with != in sanity_check_bits in 4s build + 36s test
 MISSED   crates/rbitcoin-net/src/asmap.rs:431:20: replace == with != in sanity_check_bits in 4s build + 36s test
 MISSED   crates/rbitcoin-net/src/asmap.rs:463:29: replace >> with << in encode_bits in 4s build + 36s test
+# 42392716098 2 69048dac0e6c4129e8c81989590fc1ed1b3c45e7
+MISSED   crates/rbitcoin-net/src/chain.rs:56:5: replace header_store_counts -> (u64, u64, u64) with (0, 0, 0) in 8s build + 42s test
+MISSED   crates/rbitcoin-net/src/chain.rs:163:9: replace HeldBodies::is_empty -> bool with true in 9s build + 41s test
+MISSED   crates/rbitcoin-net/src/chain.rs:163:9: replace HeldBodies::is_empty -> bool with false in 6s build + 41s test
+MISSED   crates/rbitcoin-net/src/chain.rs:309:29: replace || with && in parse_invalid_file in 6s build + 41s test
+MISSED   crates/rbitcoin-net/src/chain.rs:401:24: delete ! in Invalidated::prune_failed in 6s build + 41s test
+MISSED   crates/rbitcoin-net/src/chain.rs:442:9: replace HeaderTips::is_empty -> bool with true in 7s build + 41s test
+MISSED   crates/rbitcoin-net/src/chain.rs:442:9: replace HeaderTips::is_empty -> bool with false in 5s build + 42s test
+MISSED   crates/rbitcoin-net/src/chain.rs:610:9: delete match arm NetError::Consensus(s) | NetError::ConnectFailed{msg:s, ..} in accept_err_is_temporary_time in 8s build + 43s test
+MISSED   crates/rbitcoin-net/src/chain.rs:615:17: replace || with && in accept_err_is_temporary_time in 8s build + 41s test
+MISSED   crates/rbitcoin-net/src/chain.rs:614:17: replace || with && in accept_err_is_temporary_time in 6s build + 41s test
+MISSED   crates/rbitcoin-net/src/chain.rs:613:17: replace || with && in accept_err_is_temporary_time in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/chain.rs:628:9: delete match arm NetError::Consensus(s) | NetError::Mutated(s) | NetError::ConnectFailed{msg:s, ..} in accept_err_is_warn_and_apply in 7s build + 42s test
+MISSED   crates/rbitcoin-net/src/chain.rs:758:80: replace < with <= in held_branch_beats in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/chain.rs:892:20: replace >= with < in ChainHub::claim_block_ask in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/chain.rs:1144:21: replace > with >= in ChainHub::anti_dos_work_threshold in 7s build + 41s test
+MISSED   crates/rbitcoin-net/src/chain.rs:1229:9: replace ChainHub::clear_header_inv_challenge with () in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/chain.rs:1410:21: delete match arm "invalid" in ChainHub::chaintips in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/chain.rs:1589:50: replace || with && in ChainHub::header_ancestry_invalid in 6s build + 67s test
+MISSED   crates/rbitcoin-net/src/chain.rs:1729:16: delete ! in ChainHub::remember_failed_accept in 15s build + 42s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2283:17: replace < with <= in ChainHub::header_along_off_tip in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2800:30: replace == with != in ChainHub::generate_paying in 4s build + 33s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2820:49: delete ! in ChainHub::generate_paying in 4s build + 33s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3157:27: replace match guard e.is_local_fault() with false in ChainHub::activate_best_side_branch in 4s build + 31s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3193:21: replace || with && in ChainHub::park_restored_leaves in 3s build + 31s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3220:63: replace && with || in ChainHub::side_branches in 3s build + 30s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3220:43: replace && with || in ChainHub::side_branches in 3s build + 31s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3242:43: replace && with || in ChainHub::most_work_branch in 3s build + 32s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3249:34: replace == with != in ChainHub::most_work_branch in 3s build + 33s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3437:42: replace && with || in ChainHub::accept_incoming in 4s build + 32s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3444:28: delete ! in ChainHub::accept_incoming in 4s build + 32s test
