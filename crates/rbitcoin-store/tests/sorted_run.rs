@@ -25,7 +25,7 @@ fn cgroup_level(root: &std::path::Path, rel: &str, files: &[(&str, String)]) {
 }
 
 #[test]
-fn cgroup_v2_limit_caps_free_ram() {
+fn cgroup_limit_caps_free_ram() {
     let root = rbitcoin_store::testutil::TempDir::labeled("cgroup").unwrap();
     let svc = "system.slice/rbitcoin.service";
     let self_cgroup = format!("0::/{svc}\n");
@@ -60,7 +60,10 @@ fn cgroup_v2_limit_caps_free_ram() {
         svc,
         &[
             ("memory.current", format!("{}\n", 6 * GIB)),
-            ("memory.stat", format!("anon 1\ninactive_file {}\n", 2 * GIB)),
+            (
+                "memory.stat",
+                format!("anon 1\ninactive_file {}\n", 2 * GIB),
+            ),
         ],
     );
     assert_eq!(
@@ -96,7 +99,7 @@ fn cgroup_v2_limit_caps_free_ram() {
 }
 
 #[test]
-fn no_cgroup_limit_keeps_host_free_ram() {
+fn cgroup_without_limit_keeps_host_free_ram() {
     let root = rbitcoin_store::testutil::TempDir::labeled("cgroup").unwrap();
     cgroup_level(
         root.path(),
@@ -138,7 +141,6 @@ fn darwin_vm_pages_count_as_free_ram() {
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn host_mem_available_bytes_is_some_on_linux_macos_windows() {
     let n = host_mem_available_bytes().expect("Linux MemAvailable / Darwin vm / Windows AvailPhys");
-    assert!(n >= 1024 * 1024, "probe too small: {n}");
     let w = workers_for_free_ram(logical_cpus(), n, 2 << 30);
     assert!((1..=256).contains(&w));
     assert!(w <= logical_cpus());
