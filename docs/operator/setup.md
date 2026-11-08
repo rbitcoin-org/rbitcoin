@@ -297,6 +297,9 @@ bandwidth caps. On an otherwise idle host, these settings still allow rbitcoin
 to use the available CPU and storage. They do not limit process memory or
 network traffic. Add memory limits only from a separate, host-specific capacity
 plan; an undersized limit can terminate the node or make IBD impractically slow.
+The scripthash build and `tx.head` rebuild size their worker pools from the
+smaller of `MemAvailable` and the cgroup v2 memory headroom, so they shrink
+under `MemoryMax=` or `MemoryHigh=`. Other allocations do not follow the limit.
 
 I/O priority is also storage-stack dependent. Linux currently implements
 per-process I/O priorities in the `bfq` and `mq-deadline` schedulers; `none`

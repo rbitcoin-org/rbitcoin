@@ -13,10 +13,68 @@ pub fn workers_for_free_ram(cpus: usize, free_bytes: u64, per_worker: u64) -> us
     cpus.min(ram_cap.clamp(1, 256))
 }
 
-/// `MemAvailable` from `/proc/meminfo` text (kB → bytes).
+/// `MemAvailable` from `/proc/meminfo`, capped by this process's cgroup v2
+/// headroom. `/proc/meminfo` reports the whole host even under `MemoryMax=`
+/// or a container limit.
+///
+/// Headroom is `min(memory.max, memory.high)` minus the working set
+/// (`memory.current` less reclaimable `inactive_file`), at the cgroup named
+/// in `/proc/self/cgroup` and at each ancestor up to `cgroup_root`. The
+/// smallest wins. A level with neither limit set is skipped.
 #[cfg(any(debug_assertions, target_os = "linux"))]
 #[doc(hidden)]
-pub fn mem_available_from_meminfo(text: &str) -> Option<u64> {
+pub fn mem_available_under_cgroup(
+    meminfo: &str,
+    proc_self_cgroup: &str,
+    cgroup_root: &std::path::Path,
+) -> Option<u64> {
+    let host = mem_available_from_meminfo(meminfo)?;
+    let Some(leaf) = proc_self_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::/"))
+    else {
+        return Some(host);
+    };
+    let leaf_dir = cgroup_root.join(leaf);
+    Some(
+        leaf_dir
+            .ancestors()
+            .take_while(|dir| dir.starts_with(cgroup_root))
+            .filter_map(cgroup_headroom)
+            .fold(host, u64::min),
+    )
+}
+
+#[cfg(any(debug_assertions, target_os = "linux"))]
+fn cgroup_headroom(dir: &std::path::Path) -> Option<u64> {
+    let read_u64 = |name: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    };
+    let limit = ["memory.max", "memory.high"]
+        .into_iter()
+        .filter_map(read_u64)
+        .min()?;
+    let inactive_file = std::fs::read_to_string(dir.join("memory.stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.lines()
+                .find_map(|line| line.strip_prefix("inactive_file "))
+                .and_then(|n| n.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    let working_set = read_u64("memory.current")
+        .unwrap_or(0)
+        .saturating_sub(inactive_file);
+    Some(limit.saturating_sub(working_set))
+}
+
+/// `MemAvailable` from `/proc/meminfo` text (kB → bytes).
+#[cfg(any(debug_assertions, target_os = "linux"))]
+fn mem_available_from_meminfo(text: &str) -> Option<u64> {
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("MemAvailable:") else {
             continue;
@@ -126,13 +184,19 @@ pub fn mem_available_from_windows_host() -> Option<u64> {
 
 /// Host memory available for new allocations.
 ///
-/// Linux: `MemAvailable`. Darwin: free+inactive pages. Windows: `ullAvailPhys`.
-/// Other OS: `None` (worker cap falls back to 1).
+/// Linux: `MemAvailable`, capped by the cgroup v2 memory headroom
+/// ([`mem_available_under_cgroup`]). Darwin: free+inactive pages. Windows:
+/// `ullAvailPhys`. Other OS: `None` (worker cap falls back to 1).
 pub fn host_mem_available_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        mem_available_from_meminfo(&text)
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let self_cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        mem_available_under_cgroup(
+            &meminfo,
+            &self_cgroup,
+            std::path::Path::new("/sys/fs/cgroup"),
+        )
     }
     #[cfg(target_os = "macos")]
     {
@@ -148,7 +212,7 @@ pub fn host_mem_available_bytes() -> Option<u64> {
     }
 }
 
-/// `MemAvailable` as a log label (`"12.3"` GiB, or `"?"` when unknown).
+/// [`host_mem_available_bytes`] as a log label (`"12.3"` GiB, or `"?"` when unknown).
 pub fn free_gib_label() -> String {
     host_mem_available_bytes()
         .map(|b| format!("{:.1}", b as f64 / (1u64 << 30) as f64))
