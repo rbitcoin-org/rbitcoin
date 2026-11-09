@@ -236,6 +236,20 @@ impl DialTarget {
     }
 }
 
+impl DialTarget {
+    /// [`Self::net_addr`] without interning: `None` for a name nobody added,
+    /// which can be neither live nor removable.
+    fn known_net_addr(&self) -> Option<crate::NetAddr> {
+        match self {
+            Self::Socket(addr) => Some(crate::NetAddr::from_socket(*addr)),
+            Self::Domain { host, port } => format!("{host}:{port}")
+                .parse()
+                .ok()
+                .or_else(|| crate::NetAddr::known_name(host, *port)),
+        }
+    }
+}
+
 impl std::fmt::Display for DialTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3561,7 +3575,9 @@ impl PeerHub {
                 self.disconnect_addr(*addr)
             }
             DialTarget::Domain { .. } => {
-                let net = target.net_addr();
+                let Some(net) = target.known_net_addr() else {
+                    return false;
+                };
                 self.added
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -3657,10 +3673,9 @@ impl PeerHub {
         let peers = self.snapshot();
         match target {
             DialTarget::Socket(addr) => peers.iter().any(|p| p.addr == *addr),
-            DialTarget::Domain { .. } => {
-                let net = target.net_addr();
-                peers.iter().any(|p| p.net == net)
-            }
+            DialTarget::Domain { .. } => target
+                .known_net_addr()
+                .is_some_and(|net| peers.iter().any(|p| p.net == net)),
         }
     }
 

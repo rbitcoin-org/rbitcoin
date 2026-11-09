@@ -278,6 +278,19 @@ impl NameId {
         Some(Self(names.len() as u32 - 1))
     }
 
+    /// The id of a name already interned; never takes a slot.
+    pub fn get(host: &str) -> Option<Self> {
+        let host = host.to_ascii_lowercase();
+        let names = NAMES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        names
+            .iter()
+            .position(|n| *n == host)
+            .map(|at| Self(at as u32))
+    }
+
     pub fn host(self) -> String {
         NAMES
             .get_or_init(Default::default)
@@ -353,6 +366,12 @@ impl NetAddr {
 
     pub fn name(host: &str, port: u16) -> Option<Self> {
         NameId::intern(host).map(|id| NetAddr::Name { id, port })
+    }
+
+    /// [`Self::name`] for a name that must already be known: a question about
+    /// it does not take an interner slot.
+    pub fn known_name(host: &str, port: u16) -> Option<Self> {
+        NameId::get(host).map(|id| NetAddr::Name { id, port })
     }
 
     pub fn from_socket(s: SocketAddr) -> Self {

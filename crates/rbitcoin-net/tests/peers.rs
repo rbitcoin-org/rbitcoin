@@ -1706,6 +1706,22 @@ fn tx_relay_room_ignores_outbound_and_non_relay() {
     );
 }
 
+/// Asking about a name nobody added (a live check, `addnode remove`) must not
+/// spend one of the interner's slots, or a flood of removes fills it for good.
+#[test]
+fn asking_about_unknown_names_leaves_the_interner_alone() {
+    let hub = PeerHub::new();
+    for i in 0..2000 {
+        let target = DialTarget::Domain {
+            host: format!("never-added-{i}.example"),
+            port: 8333,
+        };
+        assert!(!hub.is_target_live(&target));
+        assert!(!hub.disconnect_target(&target));
+    }
+    assert!(rbitcoin_net::NetAddr::name("added-after.example", 8333).is_some());
+}
+
 /// With `--proxy`, a `--connect` or `addnode` name goes to the proxy as a
 /// domain (SOCKS address type 3). The node never asks the OS resolver, so
 /// the unresolvable `.invalid` name still produces a dial.
