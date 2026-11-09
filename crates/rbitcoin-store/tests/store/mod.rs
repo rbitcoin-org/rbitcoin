@@ -136,6 +136,373 @@ fn open_tiny_reopen_still_works() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Every file under `dir`, by path, with its bytes.
+fn tree_bytes(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.insert(p.clone(), std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    out
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let p = e.unwrap().path();
+        let dst = to.join(p.file_name().unwrap());
+        if p.is_dir() {
+            copy_tree(&p, &dst);
+        } else {
+            std::fs::copy(&p, &dst).unwrap();
+        }
+    }
+}
+
+/// Copies of one closed store after 0, 3 and 4 confirmed blocks of one
+/// coinbase each.
+fn source_moments() -> [rbitcoin_store::testutil::TempDir; 3] {
+    let live = tmp();
+    Store::create_tiny(&live).unwrap().flush().unwrap();
+    let snap = |live: &Path| {
+        let dir = tmp();
+        copy_tree(live, &dir);
+        dir
+    };
+    let empty = snap(&live);
+    let mut three = None;
+    let (mut prev, mut parent_hash) = (Fk::NULL, [0u8; 32]);
+    for b in 1..=4u8 {
+        let s = Store::open_tiny(&live).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        let txid = [0x25 + b; 32];
+        let item = coinbase_item(txid, vec![OutputRecord::unspent(50, vec![0x51])]);
+        let tx = s.put_tx_full_batch_indexed(&[item], true).unwrap()[0];
+        let (timestamp, bits, nonce) = (u32::from(b), 0x207fffff, u32::from(b));
+        let hash = rbitcoin_store::header_table::block_header_hash(
+            1,
+            &parent_hash,
+            &txid,
+            timestamp,
+            bits,
+            nonce,
+        );
+        let header = s
+            .put_header(&HeaderRecord {
+                prev_fk: prev,
+                version: 1,
+                timestamp,
+                bits,
+                nonce,
+                merkle_root: txid,
+                hash,
+                size: 0,
+                weight: 0,
+            })
+            .unwrap();
+        s.header_txs.put_range(&write, header, tx, 1).unwrap();
+        s.strong_tx.set_strong(&write, tx, header).unwrap();
+        s.confirmed
+            .set(&write, Height(u32::from(b - 1)), header)
+            .unwrap();
+        s.flush_class_c_tip().unwrap();
+        s.flush().unwrap();
+        drop(s);
+        (prev, parent_hash) = (header, hash);
+        if b == 3 {
+            three = Some(snap(&live));
+        }
+    }
+    [empty, three.unwrap(), live]
+}
+
+/// Replace `name` under `to` with the copy under `from`, or remove it when
+/// `from` has none.
+fn take_entry(from: &Path, to: &Path, name: &std::ffi::OsStr) {
+    let (from, to) = (from.join(name), to.join(name));
+    if to.is_dir() {
+        std::fs::remove_dir_all(&to).unwrap();
+    } else if to.exists() {
+        std::fs::remove_file(&to).unwrap();
+    }
+    if from.is_dir() {
+        copy_tree(&from, &to);
+    } else if from.exists() {
+        std::fs::copy(&from, &to).unwrap();
+    }
+}
+
+/// A Class A stem: the transaction bodies, their locators and `tx.head`.
+fn is_class_a(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    [
+        "create.",
+        "seqsigwit.",
+        "txout.",
+        "spent.",
+        "txid.",
+        "txstat.",
+        "input.",
+        "tx.",
+    ]
+    .iter()
+    .any(|p| name.starts_with(p))
+}
+
+/// Open `dir` as a source; whether or not it opens, nothing in it changes.
+/// True when the open was refused.
+fn open_source_refused_untouched(dir: &Path, what: &str) -> bool {
+    let left = tree_bytes(dir);
+    let refused = Store::open_source(dir).is_err();
+    assert!(tree_bytes(dir) == left, "{what}: the open wrote");
+    refused
+}
+
+/// Copies of `closed` with one file cut to its header, or by one byte, each
+/// open as a source without a write.
+fn cut_each_file_writes_nothing(closed: &Path) {
+    let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
+    for (file, bytes) in tree_bytes(closed) {
+        let len = bytes.len() as u64;
+        for cut in [header.min(len), len.saturating_sub(1)] {
+            if cut == len {
+                continue;
+            }
+            let dir = tmp();
+            copy_tree(closed, &dir);
+            let short = dir.join(file.strip_prefix(closed).unwrap());
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&short)
+                .unwrap()
+                .set_len(cut)
+                .unwrap();
+            open_source_refused_untouched(
+                &dir,
+                &format!("{} cut to {cut} of {len} bytes", short.display()),
+            );
+        }
+    }
+}
+
+/// An `--assumehot` source opens only as it is. Another schema is refused,
+/// and so is a copy missing a file. A copy with a file cut short (to its
+/// header, or by one byte), with an entry taken at another moment, or with
+/// its Class A taken at another moment than its confirmed chain, is left as
+/// it was: the open trims, aligns, drops and rebuilds nothing, so a refused
+/// import cannot shrink the source it read.
+#[test]
+fn open_source_refuses_another_schema_and_never_writes() {
+    let [empty, three, closed] = source_moments();
+    let before = tree_bytes(&closed);
+    Store::open_source(&closed).unwrap();
+    assert!(
+        tree_bytes(&closed) == before,
+        "a whole source is not written"
+    );
+
+    let mut names: Vec<_> = std::fs::read_dir(&closed)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    for name in &names {
+        let dir = tmp();
+        copy_tree(&closed, &dir);
+        let gone = dir.join(name);
+        if gone.is_dir() {
+            std::fs::remove_dir_all(&gone).unwrap();
+        } else {
+            std::fs::remove_file(&gone).unwrap();
+        }
+        let refused = open_source_refused_untouched(&dir, &format!("{name:?} missing"));
+        // The import, not the open, refuses a source without its tip seal.
+        assert!(refused || name == "tip_seal", "{name:?} missing");
+    }
+
+    cut_each_file_writes_nothing(&closed);
+
+    for (base, other) in [(&three, &closed), (&closed, &three), (&closed, &empty)] {
+        for name in &names {
+            let dir = tmp();
+            copy_tree(base, &dir);
+            take_entry(other, &dir, name);
+            open_source_refused_untouched(&dir, &format!("{name:?} from {}", other.display()));
+        }
+    }
+
+    // Class A copied at another moment than the confirmed chain: the tip
+    // runs past the creates, or stops short of them.
+    let class_a: Vec<_> = names.iter().filter(|n| is_class_a(n)).collect();
+    assert!(class_a.iter().any(|n| *n == "create.loc"), "{class_a:?}");
+    for (base, other) in [(&closed, &three), (&three, &closed), (&closed, &empty)] {
+        let dir = tmp();
+        copy_tree(base, &dir);
+        for name in &class_a {
+            take_entry(other, &dir, name);
+        }
+        open_source_refused_untouched(&dir, &format!("Class A from {}", other.display()));
+    }
+
+    let mut meta = std::fs::read(closed.join("meta")).unwrap();
+    meta[4..6].copy_from_slice(&(SCHEMA_VERSION - 1).to_le_bytes());
+    std::fs::write(closed.join("meta"), meta).unwrap();
+    assert!(matches!(
+        Store::open_source(&closed),
+        Err(StoreError::BadSchema(v)) if v == SCHEMA_VERSION - 1
+    ));
+}
+
+/// A closed store with one confirmed block of 1025 coinbases: one window in
+/// `create.off` and `seqsigwit.off`. The last create overflows both
+/// locators (256 outputs, a 600 kB script sig).
+fn source_past_one_window() -> rbitcoin_store::testutil::TempDir {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let mut items: Vec<_> = (0..1025u32)
+        .map(|i| {
+            let mut txid = [0x61; 32];
+            txid[..4].copy_from_slice(&i.to_le_bytes());
+            coinbase_item(txid, vec![OutputRecord::unspent(50, vec![0x51])])
+        })
+        .collect();
+    let last = items.last_mut().unwrap();
+    last.0.output_count = 256;
+    last.1[0].script_sig = vec![0x01; 600_000];
+    last.2 = vec![OutputRecord::unspent(1, vec![0x51]); 256];
+    let txs = s.put_tx_full_batch_indexed(&items, true).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let txid = items[0].0.txid;
+    let hash =
+        rbitcoin_store::header_table::block_header_hash(1, &[0; 32], &txid, 1, 0x207fffff, 1);
+    let header = s
+        .put_header(&HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 1,
+            merkle_root: txid,
+            hash,
+            size: 0,
+            weight: 0,
+        })
+        .unwrap();
+    s.header_txs
+        .put_range(&write, header, txs[0], txs.len() as u32)
+        .unwrap();
+    for &tx in &txs {
+        s.strong_tx.set_strong(&write, tx, header).unwrap();
+    }
+    s.confirmed.set(&write, Height(0), header).unwrap();
+    s.flush_class_c_tip().unwrap();
+    s.flush().unwrap();
+    drop(s);
+    dir
+}
+
+/// Move the length recorded in `p`'s header by `delta` bytes.
+fn shift_logical_len(p: &Path, delta: i64) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(p)
+        .unwrap();
+    let mut hdr = [0u8; 16];
+    f.read_exact(&mut hdr).unwrap();
+    let logical = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+    let moved = logical.checked_add_signed(delta).unwrap();
+    let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
+    assert!(moved >= header, "{} {logical}{delta:+}", p.display());
+    f.seek(SeekFrom::Start(8)).unwrap();
+    f.write_all(&moved.to_le_bytes()).unwrap();
+}
+
+/// A locator that open would fit to its checkpoint, overflow or input body
+/// is refused as a source and left as it was; a node's open trims it. Past
+/// one window, a copy with any file cut short also opens without a write.
+#[test]
+fn open_source_never_trims_a_locator() {
+    let closed = source_past_one_window();
+    let before = tree_bytes(&closed);
+    Store::open_source(&closed).unwrap();
+    assert!(
+        tree_bytes(&closed) == before,
+        "a whole source is not written"
+    );
+
+    // Each damage moves recorded lengths, in bytes. The 1024th create
+    // closes the window; the 1025th is the overflow row.
+    let damages: [(&str, &[(&str, i64)]); 13] = [
+        ("create.off lost its window", &[("create.off", -16)]),
+        (
+            "create.loc past create.off and create.loc.ovf",
+            &[("create.off", -16), ("create.loc.ovf", -16)],
+        ),
+        (
+            "create.loc.ovf row past its header",
+            &[("create.loc.ovf", -16)],
+        ),
+        ("create.loc.ovf row past create.loc", &[("create.loc", -2)]),
+        (
+            "create.off window past create.loc",
+            &[("create.loc", -4), ("create.loc.ovf", -16)],
+        ),
+        ("seqsigwit.off lost its window", &[("seqsigwit.off", -8)]),
+        (
+            "seqsigwit.loc past seqsigwit.off and seqsigwit.loc.ovf",
+            &[("seqsigwit.off", -8), ("seqsigwit.loc.ovf", -12)],
+        ),
+        (
+            "seqsigwit.loc.ovf row past its header",
+            &[("seqsigwit.loc.ovf", -12)],
+        ),
+        (
+            "seqsigwit.loc.ovf row past seqsigwit.loc",
+            &[("seqsigwit.loc", -2)],
+        ),
+        (
+            "seqsigwit.off window past seqsigwit.loc",
+            &[("seqsigwit.loc", -4), ("seqsigwit.loc.ovf", -12)],
+        ),
+        (
+            "input.loc past input.off and input.body",
+            &[("input.off", -8), ("input.body", -16)],
+        ),
+        (
+            "input.off window past input.loc",
+            &[("input.loc", -4), ("input.body", -16)],
+        ),
+        ("input.body past input.loc", &[("input.loc", -2)]),
+    ];
+    let damaged = |moves: &[(&str, i64)]| {
+        let dir = tmp();
+        copy_tree(&closed, &dir);
+        for &(name, delta) in moves {
+            shift_logical_len(&dir.join(name), delta);
+        }
+        dir
+    };
+    for (what, moves) in damages {
+        let node = damaged(moves);
+        let left = tree_bytes(&node);
+        drop(Store::open_tiny(&node));
+        assert!(tree_bytes(&node) != left, "{what}: a node's open trims it");
+
+        let dir = damaged(moves);
+        assert!(open_source_refused_untouched(&dir, what), "{what}: refused");
+    }
+    cut_each_file_writes_nothing(&closed);
+}
+
 #[test]
 fn occupied_schema23_header_body_opens_as_24() {
     use rbitcoin_store::file::{TableFile, FILE_HEADER_LEN};

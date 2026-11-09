@@ -103,7 +103,7 @@ fn delta_loc_checkpoint_enospc_drops_the_ovf_row() {
     assert_eq!(loc.count(), 1024);
     let path = dir.path().to_path_buf();
     drop(loc);
-    let loc = DeltaLoc::open(&path, "seqsigwit").unwrap();
+    let loc = DeltaLoc::open(&path, "seqsigwit", true).unwrap();
     assert_eq!(
         loc.range_batch(&[Fk(1024)]).unwrap()[0],
         Some((FILE_HEADER_LEN as u64 + 1023 * 8, fat))
@@ -141,7 +141,7 @@ fn delta_loc_truncate_across_window_reopens_at_the_short_prefix() {
     f.seek(SeekFrom::Start(8)).unwrap();
     f.write_all(&short.to_le_bytes()).unwrap();
     drop(f);
-    let loc = DeltaLoc::open(&path, "seqsigwit").expect("short prefix opens");
+    let loc = DeltaLoc::open(&path, "seqsigwit", true).expect("short prefix opens");
     assert_eq!(loc.count(), 1023);
     let rows = loc
         .ovf_rows
@@ -184,7 +184,7 @@ fn delta_loc_short_prefix_inside_a_window_drops_later_ovf_rows() {
     f.seek(SeekFrom::Start(8)).unwrap();
     f.write_all(&short.to_le_bytes()).unwrap();
     drop(f);
-    let loc = DeltaLoc::open(&path, "seqsigwit").expect("short prefix opens");
+    let loc = DeltaLoc::open(&path, "seqsigwit", true).expect("short prefix opens");
     assert_eq!(loc.count(), 7);
     let rows = loc
         .ovf_rows
@@ -235,7 +235,7 @@ fn delta_loc_unreadable_slot_for_a_row_past_the_header_does_not_open() {
         .unwrap();
     f.set_len(FILE_HEADER_LEN as u64).unwrap();
     drop(f);
-    let loc = DeltaLoc::open(&path, "seqsigwit").expect("a short overflow read is no row");
+    let loc = DeltaLoc::open(&path, "seqsigwit", true).expect("a short overflow read is no row");
     assert_eq!(loc.count(), 2);
     drop(loc);
 
@@ -253,7 +253,7 @@ fn delta_loc_unreadable_slot_for_a_row_past_the_header_does_not_open() {
     }
     rbitcoin_store::io_handle::arm_fail_pread_len(2, 1);
     let disarm = Disarm;
-    match DeltaLoc::open(&path, "seqsigwit") {
+    match DeltaLoc::open(&path, "seqsigwit", true) {
         Err(StoreError::Io { .. }) => {}
         Ok(_) => panic!("an unreadable locator slot opened"),
         Err(other) => panic!("{other}"),
@@ -266,7 +266,7 @@ fn delta_loc_unreadable_slot_for_a_row_past_the_header_does_not_open() {
     );
     assert_eq!(logical, FILE_HEADER_LEN as u64 + 4);
 
-    let loc = DeltaLoc::open(&path, "seqsigwit").expect("a readable slot cuts the create");
+    let loc = DeltaLoc::open(&path, "seqsigwit", true).expect("a readable slot cuts the create");
     assert_eq!(loc.count(), 1);
     let rows = loc
         .ovf_rows
@@ -302,7 +302,7 @@ fn delta_loc_u16_overflow_and_missing() {
     assert_eq!(got[0], Some((FILE_HEADER_LEN as u64, fat)));
     drop(loc);
     std::fs::remove_file(dir.path().join("seqsigwit.loc.ovf")).unwrap();
-    let loc = DeltaLoc::open(dir.path(), "seqsigwit").unwrap();
+    let loc = DeltaLoc::open(dir.path(), "seqsigwit", true).unwrap();
     match loc.range_batch(&[Fk(1)]) {
         Err(StoreError::Corrupt(m)) => assert!(m.contains("overflow missing"), "{m}"),
         other => panic!("{other:?}"),

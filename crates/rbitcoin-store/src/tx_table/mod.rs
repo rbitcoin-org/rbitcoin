@@ -711,9 +711,12 @@ pub fn class_a_body_occupied(dir: &Path, stem: &str) -> bool {
 }
 
 #[doc(hidden)]
-pub fn open_or_create_create_loc(dir: &Path) -> Result<crate::create_loc::CreateLoc, StoreError> {
+pub fn open_or_create_create_loc(
+    dir: &Path,
+    repair: bool,
+) -> Result<crate::create_loc::CreateLoc, StoreError> {
     if dir.join("create.loc").exists() {
-        crate::create_loc::CreateLoc::open(dir)
+        crate::create_loc::CreateLoc::open(dir, repair)
     } else if class_a_body_occupied(dir, "txout") {
         Err(StoreError::Corrupt("invariant: create.loc missing"))
     } else {
@@ -724,9 +727,10 @@ pub fn open_or_create_create_loc(dir: &Path) -> Result<crate::create_loc::Create
 #[doc(hidden)]
 pub fn open_or_create_seqsigwit_loc(
     seqsigwit_dir: &Path,
+    repair: bool,
 ) -> Result<crate::delta_loc::DeltaLoc, StoreError> {
     if seqsigwit_dir.join("seqsigwit.loc").exists() {
-        crate::delta_loc::DeltaLoc::open(seqsigwit_dir, "seqsigwit")
+        crate::delta_loc::DeltaLoc::open(seqsigwit_dir, "seqsigwit", repair)
     } else if class_a_body_occupied(seqsigwit_dir, "seqsigwit") {
         Err(StoreError::Corrupt("invariant: seqsigwit.loc missing"))
     } else {
@@ -924,11 +928,22 @@ pub fn class_a_skew_assert_aligned(
     Ok(())
 }
 
+/// `Ok` when the open may repair; otherwise `what` refuses the store, which
+/// is an `--assumehot` source opened as it is.
+pub(crate) fn may_repair(repair: bool, what: &'static str) -> Result<(), StoreError> {
+    if repair {
+        Ok(())
+    } else {
+        Err(StoreError::Corrupt(what))
+    }
+}
+
 #[doc(hidden)]
 pub fn repair_class_a_count_skew(
     stems: ClassASkewStems<'_>,
     prune_seqsigwit_mode: bool,
     input_existed: bool,
+    repair: bool,
 ) -> Result<bool, StoreError> {
     let n_loc = stems.create_loc.count();
     let n_txids = stems.txids.count();
@@ -963,6 +978,10 @@ pub fn repair_class_a_count_skew(
     if skewed.is_none() && !ahead {
         return Ok(false);
     }
+    may_repair(
+        repair,
+        "source: Class A stems differ in length (a copy cut short)",
+    )?;
     let n_input = stems.input.count();
     rbitcoin_log::warn!(
         "store: Class A count skew loc={n_loc} seqsigwit.loc={n_seqsigwit_loc} \
@@ -1183,14 +1202,21 @@ impl TxTable {
     }
 
     pub fn open_with_opts(dir: &Path, opts: HeadOpenOpts) -> Result<Self, StoreError> {
-        Self::open_seqsigwit(dir, dir, opts)
+        Self::open_seqsigwit(dir, dir, opts, true)
     }
 
     /// Open Class A stems; `seqsigwit` may live in a different directory.
+    ///
+    /// With `repair` false, Class A counts that differ, a locator longer than
+    /// its checkpoint, overflow or input body names, a `txstat` of another
+    /// length, or a `tx.head` that is unreadable, empty, ahead of or behind
+    /// the bodies refuse the open instead of being trimmed, aligned,
+    /// backfilled or rebuilt: an `--assumehot` source.
     pub fn open_seqsigwit(
         dir: &Path,
         seqsigwit_dir: &Path,
         opts: HeadOpenOpts,
+        repair: bool,
     ) -> Result<Self, StoreError> {
         let prune_seqsigwit_mode = false;
         crate::store::rename_legacy_inwit_files(dir)?;
@@ -1206,8 +1232,8 @@ impl TxTable {
         let had_txout = dir.join("txout.body").exists();
         let had_seqsigwit = seqsigwit_dir.join("seqsigwit.body").exists();
         let had_spent = dir.join("spent.body").exists();
-        let create_loc = open_or_create_create_loc(dir)?;
-        let seqsigwit_loc = open_or_create_seqsigwit_loc(seqsigwit_dir)?;
+        let create_loc = open_or_create_create_loc(dir, repair)?;
+        let seqsigwit_loc = open_or_create_seqsigwit_loc(seqsigwit_dir, repair)?;
         let loc_count = create_loc.count();
         let body = if had_txout {
             VarTable::open_body_only(dir, "txout", TableKind::TxOut, loc_count)?
@@ -1261,7 +1287,7 @@ impl TxTable {
         let txstat = crate::txstat::TxStat::open(seqsigwit_dir)?;
         let input_existed = seqsigwit_dir.join("input.loc").exists();
         let input = if input_existed {
-            crate::input::Input::open(seqsigwit_dir)?
+            crate::input::Input::open(seqsigwit_dir, repair)?
         } else if seqsigwit_dir.join("input.body").exists()
             || seqsigwit_dir.join("input.off").exists()
         {
@@ -1282,9 +1308,11 @@ impl TxTable {
             },
             prune_seqsigwit_mode,
             input_existed,
+            repair,
         )?;
         let n_bodies = create_loc.count();
         if txstat.count() != n_bodies {
+            may_repair(repair, "source: txstat count differs from Class A")?;
             rbitcoin_log::warn!(
                 "store: txstat.body count={} loc={} — aligning to loc",
                 txstat.count(),
@@ -1313,6 +1341,7 @@ impl TxTable {
                     if covered > n_bodies {
                         // Torn Class A truncate: stale head entries past the
                         // bodies would fail a later seal — rebuild instead.
+                        may_repair(repair, "source: tx.head leads Class A")?;
                         rbitcoin_log::warn!(
                             "store: tx.head leads Class A covered={covered} n={n_bodies} \
                              — wipe + rebuild"
@@ -1326,13 +1355,14 @@ impl TxTable {
                         )?
                     } else {
                         if n_bodies > 0 && h.occupied() == 0 {
+                            may_repair(repair, "source: tx.head is empty")?;
                             need_rebuild = true;
                         }
                         h
                     }
                 }
                 Err(e) => {
-                    if crate::segmented_head::is_index_open_refuse(&e) {
+                    if crate::segmented_head::is_index_open_refuse(&e) || !repair {
                         return Err(e);
                     }
                     if n_bodies > 0 {
@@ -1426,6 +1456,7 @@ impl TxTable {
             let n = t.count();
             let covered = t.head.last_inserted_fk();
             if covered < n {
+                may_repair(repair, "source: tx.head lags Class A")?;
                 rbitcoin_log::info!(
                     "store: tx.head lags Class A covered={covered} n={n} — backfill tail"
                 );

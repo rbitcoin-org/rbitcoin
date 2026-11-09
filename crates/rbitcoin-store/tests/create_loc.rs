@@ -96,7 +96,7 @@ fn create_loc_checkpoint_enospc_drops_the_ovf_row() {
     assert_eq!(loc.count(), 1024);
     let path = dir.path().to_path_buf();
     drop(loc);
-    let loc = CreateLoc::open(&path).unwrap();
+    let loc = CreateLoc::open(&path, true).unwrap();
     assert_eq!(loc.range_batch(&[Fk(1024)]).unwrap()[0].unwrap().n_out, 256);
 }
 
@@ -133,7 +133,7 @@ fn create_loc_truncate_keeps_count_with_loc_when_ovf_rewrite_is_full() {
     assert_eq!(rows, vec![(1024, 1, 256)]);
     let path = dir.path().to_path_buf();
     drop(loc);
-    let loc = CreateLoc::open(&path).unwrap();
+    let loc = CreateLoc::open(&path, true).unwrap();
     assert_eq!(loc.count(), 1024);
     assert_eq!(loc.range_batch(&[Fk(1024)]).unwrap()[0].unwrap().n_out, 256);
 }
@@ -169,7 +169,7 @@ fn create_loc_truncate_across_window_reopens_at_the_short_prefix() {
         &path.join("create.loc"),
         FILE_HEADER_LEN as u64 + 1023 * SLOT,
     );
-    let loc = CreateLoc::open(&path).expect("short prefix opens");
+    let loc = CreateLoc::open(&path, true).expect("short prefix opens");
     assert_eq!(loc.count(), 1023);
     let rows = loc
         .ovf_rows
@@ -196,7 +196,7 @@ fn create_loc_short_prefix_inside_a_window_drops_later_ovf_rows() {
     let path = dir.path().to_path_buf();
     drop(loc);
     write_loc_hwm(&path.join("create.loc"), FILE_HEADER_LEN as u64 + 7 * SLOT);
-    let loc = CreateLoc::open(&path).expect("short prefix inside a window opens");
+    let loc = CreateLoc::open(&path, true).expect("short prefix inside a window opens");
     assert_eq!(loc.count(), 7);
     let rows = loc
         .ovf_rows
@@ -233,7 +233,7 @@ fn create_loc_unreadable_slot_for_a_row_past_the_header_does_not_open() {
     let f = std::fs::OpenOptions::new().write(true).open(&ovf).unwrap();
     f.set_len(FILE_HEADER_LEN as u64).unwrap();
     drop(f);
-    let loc = CreateLoc::open(&path).expect("a short overflow read is no row");
+    let loc = CreateLoc::open(&path, true).expect("a short overflow read is no row");
     assert_eq!(loc.count(), 2);
     drop(loc);
 
@@ -247,7 +247,7 @@ fn create_loc_unreadable_slot_for_a_row_past_the_header_does_not_open() {
     }
     rbitcoin_store::io_handle::arm_fail_pread_len(2, 1);
     let disarm = Disarm;
-    match CreateLoc::open(&path) {
+    match CreateLoc::open(&path, true) {
         Err(StoreError::Io { .. }) => {}
         Ok(_) => panic!("an unreadable locator slot opened"),
         Err(other) => panic!("{other}"),
@@ -260,7 +260,7 @@ fn create_loc_unreadable_slot_for_a_row_past_the_header_does_not_open() {
     );
     assert_eq!(logical, FILE_HEADER_LEN as u64 + 2 * SLOT);
 
-    let loc = CreateLoc::open(&path).expect("a readable slot cuts the create");
+    let loc = CreateLoc::open(&path, true).expect("a readable slot cuts the create");
     assert_eq!(loc.count(), 1);
     let rows = loc
         .ovf_rows
@@ -373,7 +373,7 @@ fn create_loc_window_1024_and_1025() {
         (FILE_HEADER_LEN as u64 + 1024 * 8, 8)
     );
     drop(loc);
-    let loc = CreateLoc::open(dir.path()).unwrap();
+    let loc = CreateLoc::open(dir.path(), true).unwrap();
     let got = loc.range_batch(&[Fk(1024), Fk(1025)]).unwrap();
     assert_eq!(
         got[0].unwrap().txout,
@@ -405,7 +405,7 @@ fn create_loc_n_out_256_overflow() {
     assert_eq!(got[0].unwrap().spent.1, 256 * 8);
     assert!(dir.path().join("create.loc.ovf").exists());
     drop(loc);
-    let loc = CreateLoc::open(dir.path()).unwrap();
+    let loc = CreateLoc::open(dir.path(), true).unwrap();
     assert_eq!(loc.range_batch(&[Fk(1)]).unwrap()[0].unwrap().n_out, 256);
 }
 
@@ -429,7 +429,7 @@ fn create_loc_txout_past_u16_strides() {
     assert_eq!(got[0].unwrap().txout.1, len);
     assert_eq!(got[0].unwrap().n_out, 1);
     drop(loc);
-    let loc = CreateLoc::open(dir.path()).unwrap();
+    let loc = CreateLoc::open(dir.path(), true).unwrap();
     let got = loc.range_batch(&[Fk(1)]).unwrap();
     assert_eq!(got[0].unwrap().txout.1, len);
     assert_eq!(got[0].unwrap().n_out, 1);
@@ -445,7 +445,7 @@ fn create_loc_n_out_past_u16() {
     assert_eq!(got[0].unwrap().n_out, 65536);
     assert_eq!(got[0].unwrap().spent.1, 65536 * IDX_STRIDE);
     drop(loc);
-    let loc = CreateLoc::open(dir.path()).unwrap();
+    let loc = CreateLoc::open(dir.path(), true).unwrap();
     assert_eq!(loc.range_batch(&[Fk(1)]).unwrap()[0].unwrap().n_out, 65536);
     assert_eq!(ovf_data_len(dir.path()), 16);
 }
@@ -462,7 +462,7 @@ fn create_loc_opens_legacy_12b_ovf() {
         &[(1, 1, 256), (2, 1, 256), (3, 1, 256), (4, 1, 256)],
     );
     assert_eq!(ovf_data_len(dir.path()), 48);
-    let loc = CreateLoc::open(dir.path()).unwrap();
+    let loc = CreateLoc::open(dir.path(), true).unwrap();
     let got = loc.range_batch(&[Fk(1), Fk(2), Fk(3), Fk(4)]).unwrap();
     for g in &got {
         assert_eq!(g.unwrap().n_out, 256);
@@ -526,7 +526,7 @@ fn create_loc_missing_ovf_is_corrupt() {
     loc.append(&chain(&[256], &[8])).unwrap();
     drop(loc);
     std::fs::remove_file(dir.path().join("create.loc.ovf")).unwrap();
-    let loc = CreateLoc::open(dir.path()).unwrap();
+    let loc = CreateLoc::open(dir.path(), true).unwrap();
     match loc.range_batch(&[Fk(1)]) {
         Err(StoreError::Corrupt(m)) => {
             assert!(m.contains("overflow missing"), "{m}");
