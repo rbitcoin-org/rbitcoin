@@ -920,10 +920,22 @@ fn pin_disconnect_logs_and_rewinds_ibd_marks(q: &Query, top: u32, top_hash: &[u8
         "DisconnectTip: hash={} height={top} tx=1",
         BlockHash::from_byte_array(*top_hash)
     );
-    assert!(
+    assert_eq!(
         logs.iter()
-            .any(|(l, m)| *l == rbitcoin_log::Level::Warn && m.contains(&line)),
-        "{logs:?}"
+            .filter(|(_, m)| m.contains("DisconnectTip:"))
+            .count(),
+        1,
+        "one disconnected block is one DisconnectTip line: {logs:?}"
+    );
+    let start = line.replacen("DisconnectTip:", "DisconnectTip start:", 1);
+    let at = |want: &str, level| {
+        logs.iter()
+            .position(|(l, m)| *l == level && m.contains(want))
+            .unwrap_or_else(|| panic!("no {level} line {want:?}: {logs:?}"))
+    };
+    assert!(
+        at(&start, rbitcoin_log::Level::Debug) < at(&line, rbitcoin_log::Level::Warn),
+        "the debug start marker comes before the warn line: {logs:?}"
     );
     assert_eq!(q.lookup_taken_hi(), Some(top - 1));
     assert_eq!(q.lookup_started_hi(), Some(top - 1));

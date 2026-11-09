@@ -1334,8 +1334,9 @@ impl Query {
     /// tip is still high (permanent if kill). Mid-kill after tip shrink leaves
     /// strong **not on the new fence** → `repair_class_c_above_tip` heals.
     ///
-    /// Logs [`format_disconnect_tip_line`] at **warn** before the scripthash
-    /// unlink and again after the tip shrink commits.
+    /// Logs `DisconnectTip start:` at **debug** before the scripthash unlink,
+    /// then [`format_disconnect_tip_line`] at **warn** once the tip shrink
+    /// commits: one warn line per disconnected block.
     pub fn disconnect_tip(&self) -> Result<(), QueryError> {
         let _commit = self.lock_tip_commit()?;
         self.disconnect_tip_body(true)
@@ -1382,7 +1383,7 @@ impl Query {
             .unwrap_or([0u8; 32]);
         let tx_fks = self.block_tx_fks(height)?;
 
-        log_disconnect_tip(height.0, &hash, tx_fks.len());
+        log_disconnect_tip_start(height.0, &hash, tx_fks.len());
         let mut by_sh: HashMap<[u8; 32], Vec<Fk>> = HashMap::new();
         for &tx_fk in &tx_fks {
             let outputs = self.tx_output_run_class_a(tx_fk)?;
@@ -1468,6 +1469,11 @@ pub fn format_disconnect_tip_line(height: u32, hash: &[u8; 32], tx_count: usize)
 #[doc(hidden)]
 pub fn log_disconnect_tip(height: u32, hash: &[u8; 32], tx_count: usize) {
     rbitcoin_log::warn!("{}", format_disconnect_tip_line(height, hash, tx_count));
+}
+
+fn log_disconnect_tip_start(height: u32, hash: &[u8; 32], tx_count: usize) {
+    let hash = BlockHash::from_byte_array(*hash);
+    rbitcoin_log::debug!("DisconnectTip start: hash={hash} height={height} tx={tx_count}");
 }
 
 pub fn request_sh_writebehind_halt(
