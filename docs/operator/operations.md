@@ -164,7 +164,9 @@ mempool_size_mb=100
 
 `--proxy 127.0.0.1:9050` sends every P2P outbound through SOCKS5 CONNECT
 (system `tor`, not Arti). DNS seeds are not resolved locally on that path —
-pass `--connect ADDR` (or reuse a `peers` file). `--proxy-randomize` (default
+pass `--connect ADDR` (or reuse a `peers` file). A `--connect` or `addnode`
+hostname goes to the proxy by name (SOCKS5 address type 3), so the proxy, not
+the OS resolver, looks it up. `--proxy-randomize` (default
 on) uses a fresh SOCKS username per peer so Tor isolates circuits.
 `--proxy` or `--onion` also turns on **isolated local-tx broadcast**, unless `--trust-peer` is set (that session is the only announcement path):
 `sendrawtransaction`, Electrum `transaction.broadcast`, and Esplora
@@ -675,7 +677,10 @@ Do **not** wipe `store/` for mempool slot/full/schema errors.
   warm `peers` file or a DNS answer for IPv4 and IPv6 leaves only the empty
   overlays to fill. `--onion` alone keeps IPv4 and IPv6 reachable and
   dialed direct, as in Core; `--only-net onion` adds only onion seeds.
-  `--proxy` takes the SOCKS addr-fetch path above and adds no fixed seeds.
+  `--proxy` takes the SOCKS addr-fetch path above and adds no fixed seeds,
+  unless `--only-net` leaves no IPv4 or IPv6: then it asks no seed hostname
+  and adds the fixed seeds of the overlays it can reach.
+  As in Core, it asks no seed with `--connect` or on a custom signet.
 - **Outbound diversity:** live IBD and tip-follow peers prefer unused
   **netgroups**. With a Core `ip_asn.dat` (DecodeAsmap format) the group is
   **ASN**; without a file it is IPv4 `/16` or IPv6 `/32`. Place Core’s map at
