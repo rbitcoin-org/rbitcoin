@@ -516,6 +516,85 @@ fn confirm_batch_syncs_the_window_directory_once() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn already_committed_batch(
+    q: &Query,
+    header_fk: Fk,
+) -> rbitcoin_query::confirm_run::ScriptOkBatch {
+    use rbitcoin_query::confirm_run::Prepared;
+    let hash = q.get_header(header_fk).unwrap().hash;
+    rbitcoin_query::confirm_run::ScriptOkBatch {
+        prepared: vec![Prepared {
+            height: Height(0),
+            header_fk,
+            tx_fks: q.block_tx_fks(Height(0)).unwrap(),
+            jobs: vec![],
+            spends: vec![],
+            fees: 0,
+            check_scripts: false,
+            time: 0,
+            bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+            hash,
+            txids: Vec::new(),
+            prev_mtp: 0,
+        }],
+        wire_blocks: vec![],
+        batch_parents: BatchParents::new(),
+        archive_plan: None,
+        index_seal: rbitcoin_query::confirm_run::index::IndexSeal::default(),
+        trust_script_warns: Vec::new(),
+    }
+}
+
+fn retry_committed_write(q: &Query, header_fk: Fk) {
+    rbitcoin_query::confirm_run::confirm_write_phase(
+        q,
+        &rbitcoin_consensus::ChainParams::regtest(),
+        rbitcoin_consensus::Milestone::NONE,
+        already_committed_batch(q, header_fk),
+    )
+    .unwrap();
+}
+
+/// The tip is already this height. A second confirm leaves the keep file
+/// alone. After that file is removed, the same retry writes it again from
+/// the block being connected. The write stage does the same when its batch
+/// is already committed.
+#[test]
+fn pruned_retry_seals_a_missing_keep_file() {
+    let (dir, q) = temp_query("prune-retry-keep");
+    q.set_prune_seqsigwit(true).unwrap();
+    let (header, mut tx) = coinbase_block(0, Fk::NULL, None);
+    tx.inputs[0].witness = vec![vec![0x42; 8]];
+    let fk = q.connect_block(Height(0), &header, &[tx.clone()]).unwrap();
+    let tx_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    let spill = q.store().path().join("seqsigwit.window/0.bin");
+    let first = std::fs::read(&spill).unwrap();
+    assert_eq!(witness_of(&q, tx_fk), vec![vec![0x42; 8]]);
+
+    q.confirm_blocks_run(std::slice::from_ref(&prepared_at(&q, Height(0), fk)))
+        .unwrap();
+    retry_committed_write(&q, fk);
+    assert_eq!(std::fs::read(&spill).unwrap(), first, "a present keep file stays");
+    assert_eq!(q.tip_height(), Some(Height(0)));
+
+    std::fs::remove_file(&spill).unwrap();
+    q.clear_seqsigwit_ram_window();
+    q.commit_class_a_only(&header, &[tx.clone()]).unwrap();
+    q.confirm_blocks_run(std::slice::from_ref(&prepared_at(&q, Height(0), fk)))
+        .unwrap();
+    q.clear_seqsigwit_ram_window();
+    assert_eq!(witness_of(&q, tx_fk), vec![vec![0x42; 8]]);
+
+    std::fs::remove_file(&spill).unwrap();
+    q.clear_seqsigwit_ram_window();
+    q.commit_class_a_only(&header, &[tx]).unwrap();
+    retry_committed_write(&q, fk);
+    q.clear_seqsigwit_ram_window();
+    assert_eq!(witness_of(&q, tx_fk), vec![vec![0x42; 8]]);
+    assert_eq!(q.tip_height(), Some(Height(0)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn pruned_seqsigwit_life() {
     let (dir, q) = temp_query("pruned-seqsigwit-life");
