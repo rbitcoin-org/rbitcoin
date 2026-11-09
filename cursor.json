@@ -1,14 +1,14 @@
 {
   "new_base": "8e62e4ce4d60c30abc851cb0893e4b80149ac9e4",
   "new_skip": 2709,
-  "old_index": 9701,
+  "old_index": 10178,
   "new_cap_used": true,
   "run_id": "42578171911",
-  "old_name": "crates/rbitcoin-net/src/i2p_sam.rs:192:32: replace == with != in I2pSam::connect_persistent",
+  "old_name": "crates/rbitcoin-net/src/netaddr.rs:401:13: replace > with == in encode_i2p_name",
   "new_len": 5121,
   "new_remaining": 2412,
-  "completed_new": 220,
-  "completed_old": 148,
+  "completed_new": 0,
+  "completed_old": 477,
   "old_len": 29166,
-  "old_remaining": 29018
+  "old_remaining": 28689
 }

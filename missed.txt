@@ -1146,3 +1146,36 @@ MISSED   crates/rbitcoin-net/src/header_report.rs:390:55: replace >= with < in C
 MISSED   crates/rbitcoin-net/src/header_report.rs:421:25: replace == with != in ChainHub::check_ibd_header_proof in 6s build + 43s test
 MISSED   crates/rbitcoin-net/src/header_report.rs:464:13: delete field safe_until from struct IbdValidation expression in ChainHub::check_ibd_header_proof in 6s build + 44s test
 MISSED   crates/rbitcoin-net/src/i2p_sam.rs:167:5: replace clear_installed with () in 4s build + 34s test
+# 42578171911 2 1ec1f626da3dd0f9d17f38881023d4bbdb2bf9da
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:225:27: replace match guard sam_retry(&e) with true in I2pSam::connect_session_dest in 72s build + 37s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:225:27: replace match guard sam_retry(&e) with false in I2pSam::connect_session_dest in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:314:27: replace match guard stream_retry(&e) with true in I2pSam::stream_forward in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:352:27: replace match guard stream_retry(&e) with true in I2pDialer::stream_connect in 6s build + 38s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:430:33: replace + with - in i2p_public_destination in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:491:40: replace | with ^ in i2p_b64_encode in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:492:18: replace < with <= in i2p_b64_encode in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:492:14: replace + with * in i2p_b64_encode in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:493:45: replace | with ^ in i2p_b64_encode in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:72:21: replace | with ^ in <impl std::ops::BitOr for NetPermissionFlags>::bitor in 72s build + 37s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:108:22: replace >= with < in ipv4_mask in 5s build + 38s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:111:35: replace - with + in ipv4_mask in 5s build + 38s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:111:35: replace - with / in ipv4_mask in 5s build + 38s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:111:17: replace << with >> in ipv4_mask in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:111:24: replace - with + in ipv4_mask in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:111:24: replace - with / in ipv4_mask in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:122:26: replace - with / in ipv6_mask in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:356:35: replace || with && in NetPermTable::flags_for in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:356:51: replace == with != in NetPermTable::flags_for in 6s build + 37s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:73:53: replace && with || in ipv6_special_unroutable in 72s build + 38s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:77:21: replace && with || in ipv6_special_unroutable in 5s build + 38s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:125:53: replace && with || in ipv6_embedded_bogon in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:125:37: replace && with || in ipv6_embedded_bogon in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:131:55: replace && with || in ipv6_embedded_bogon in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:131:39: replace && with || in ipv6_embedded_bogon in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:174:9: replace || with && in ipv4_unroutable in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:173:9: replace || with && in ipv4_unroutable in 5s build + 39s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:197:17: replace || with && in clearnet_unroutable in 5s build + 38s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:196:17: replace || with && in clearnet_unroutable in 5s build + 39s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:195:17: replace || with && in clearnet_unroutable in 5s build + 39s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:194:17: replace || with && in clearnet_unroutable in 5s build + 39s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:394:26: replace | with ^ in encode_i2p_name in 5s build + 38s test
