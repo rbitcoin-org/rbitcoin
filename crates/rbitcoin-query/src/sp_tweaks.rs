@@ -176,8 +176,8 @@ impl Query {
     /// Enable persist + serve-from-index + backfill. Creates empty files if needed.
     ///
     /// Does **not** gate Electrum: naive walk remains when off / hole.
-    /// Under `--prune-seqsigwit` the index has to be on before `origin`
-    /// (taproot), or already sealed through every dropped height.
+    /// Under `--prune-seqsigwit` the index can start while nothing has been
+    /// dropped, or when it is already sealed through every dropped height.
     pub fn set_sptweaks_enabled(&self, on: bool, origin: Height) -> Result<(), QueryError> {
         if on {
             self.require_sp_tweaks_start(origin)?;
@@ -204,9 +204,9 @@ impl Query {
     }
 
     /// Prune drops scriptSig and witness at or below [`Self::pruneheight`].
-    /// A new index can start only while the tip is still below `origin`.
-    /// A restart is allowed when the watermark is already past that line
-    /// (or past the tip, before any height has been dropped).
+    /// A new index can start while the tip is still below `origin`, while
+    /// nothing has been dropped, or when the watermark is already past
+    /// every dropped height.
     pub(crate) fn require_sp_tweaks_start(&self, origin: Height) -> Result<(), QueryError> {
         if !self.prune_seqsigwit() {
             return Ok(());
@@ -215,8 +215,7 @@ impl Query {
         if tip.is_none_or(|t| t < origin.0) {
             return Ok(());
         }
-        let tip = tip.expect("tip checked above");
-        if self.tweak_watermark_covers(origin, self.pruneheight().map(|h| h.0), tip)? {
+        if self.tweak_watermark_covers(origin, self.pruneheight().map(|h| h.0))? {
             return Ok(());
         }
         Err(StoreError::Layout(SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into()))
@@ -235,14 +234,14 @@ impl Query {
         if tip < origin.0 {
             return Ok(());
         }
-        // Same line `prune_seqsigwit_below` will persist: nothing is dropped
-        // until the tip is past the keep window.
-        let ph = if tip > Self::SEQSIGWIT_KEEP_HEIGHTS {
+        // Same line `prune_seqsigwit_below` will persist. Tip 288 drops
+        // height 0. A shorter chain drops nothing.
+        let ph = if tip >= Self::SEQSIGWIT_KEEP_HEIGHTS {
             Some(tip - Self::SEQSIGWIT_KEEP_HEIGHTS)
         } else {
             None
         };
-        if self.tweak_watermark_covers(origin, ph, tip)? {
+        if self.tweak_watermark_covers(origin, ph)? {
             return Ok(());
         }
         Err(StoreError::Layout(SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into()))
@@ -252,12 +251,13 @@ impl Query {
         &self,
         origin: Height,
         pruneheight: Option<u32>,
-        tip: u32,
     ) -> Result<bool, QueryError> {
         let next = self.tweak_watermark(origin)?;
         Ok(match pruneheight {
             Some(ph) => next > ph,
-            None => next > tip,
+            // Nothing dropped. The keep window still has every witness,
+            // including a gap `class_c_commit` published before the seal.
+            None => true,
         })
     }
 }

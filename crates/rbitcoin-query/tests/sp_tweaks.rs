@@ -201,6 +201,73 @@ fn prune_seqsigwit_and_sp_tweaks_follow_taproot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Nothing is dropped until the tip reaches the keep window. A restart whose
+/// tweak watermark is still behind that tip has the witnesses in
+/// `seqsigwit.window` and must get through the startup gate.
+#[test]
+fn pruned_restart_allows_a_tweak_gap_before_anything_is_dropped() {
+    let (dir, q) = tmp_q();
+    let mut prev = Fk::NULL;
+    let mut prev_hash = None;
+    for h in 0..3 {
+        let (fk, hash) = connect_one(&q, h, prev, prev_hash, false);
+        prev = fk;
+        prev_hash = Some(hash);
+    }
+    assert_eq!(q.tip_height(), Some(Height(2)));
+    q.set_prune_seqsigwit(true).unwrap();
+    q.apply_prune_seqsigwit_tip().unwrap();
+    assert_eq!(q.pruneheight(), None);
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    q.sp_tweaks
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .truncate_keep_slots(0)
+        .unwrap();
+    assert!(q.sptweaks_next_height().unwrap().0 <= 2);
+    q.set_sptweaks_enabled(false, Height(0)).unwrap();
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Tip 287 drops nothing, so adding prune beside a not-yet-enabled index is
+/// safe. Tip 288 drops genesis. An index that does not already cover height 0
+/// is refused before that cut.
+#[test]
+fn adding_prune_matches_the_height_that_will_be_dropped() {
+    let (dir, q) = tmp_q();
+    let mut prev = Fk::NULL;
+    let mut prev_hash = None;
+    let keep = Query::SEQSIGWIT_KEEP_HEIGHTS;
+    for h in 0..keep {
+        let (fk, hash) = connect_one(&q, h, prev, prev_hash, false);
+        prev = fk;
+        prev_hash = Some(hash);
+    }
+    assert_eq!(q.tip_height(), Some(Height(keep - 1)));
+    q.refuse_adding_prune_with_tweaks(Height(0)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (dir, q) = tmp_q();
+    let mut prev = Fk::NULL;
+    let mut prev_hash = None;
+    for h in 0..=keep {
+        let (fk, hash) = connect_one(&q, h, prev, prev_hash, false);
+        prev = fk;
+        prev_hash = Some(hash);
+    }
+    assert_eq!(q.tip_height(), Some(Height(keep)));
+    let before = q.store().txs.seqsigwit_loc.count();
+    assert!(before > 0);
+    let err = q.refuse_adding_prune_with_tweaks(Height(0)).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("taproot"), "{msg}");
+    assert_eq!(q.store().txs.seqsigwit_loc.count(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn header(h: u32, prev_fk: Fk, prev_hash: Option<[u8; 32]>) -> HeaderRecord {
     rbitcoin_query::testutil::header_with_merkle_marker(h, prev_fk, prev_hash, 0xec)
 }

@@ -112,10 +112,11 @@ balances and history.
 | BDK wallets on Esplora (Alby Hub's chain source, and the same client shape Mutiny used) | `http://127.0.0.1:3000`, or TLS in front of that port. |
 
 `--sp-tweaks` can run with `--prune-seqsigwit` when the index is enabled
-before the node reaches taproot. From then on, confirm seals tweaks from
-the wire block. A pruned chain that never sealed those heights cannot
-build the index later. Cake, Dana, and Sparrow still need the index, so a
-pruned wallet node has to have had the flag on before activation.
+before taproot, or later while nothing has been dropped. From then on,
+confirm seals tweaks from the wire block. Once a taproot height has been
+dropped and was never sealed, the index cannot be built. Cake, Dana, and
+Sparrow still need the index, so a pruned wallet node has to cover those
+heights before they are dropped.
 
 ## Wasabi
 

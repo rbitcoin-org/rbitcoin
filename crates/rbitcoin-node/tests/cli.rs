@@ -818,10 +818,11 @@ fn smoke_allows_sp_tweaks_with_prune_before_taproot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Regtest taproot is genesis. A pruned chain already there, with no tweak
-/// watermark above the prune height, refuses the index at startup.
+/// Regtest taproot is genesis. Nothing has been dropped yet, so startup
+/// still turns the index on. A watermark that does not cover a dropped
+/// height is refused.
 #[test]
-fn pruned_datadir_past_taproot_refuses_sp_tweaks() {
+fn pruned_datadir_at_taproot_allows_tweaks_until_a_height_is_dropped() {
     let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-late-tweaks");
     q.set_prune_seqsigwit(true).unwrap();
@@ -835,6 +836,7 @@ fn pruned_datadir_past_taproot_refuses_sp_tweaks() {
         rbitcoin_consensus::Milestone::height(u32::MAX),
     )
     .unwrap();
+    assert_eq!(q.pruneheight(), None);
     let cfg = ready_config([
         "rbitcoin-node",
         "--network",
@@ -842,6 +844,23 @@ fn pruned_datadir_past_taproot_refuses_sp_tweaks() {
         "--sp-tweaks",
         "--prune-seqsigwit",
     ]);
+    rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height()).unwrap();
+    assert!(q.sptweaks_enabled());
+    drop(q);
+    let _ = std::fs::remove_dir_all(dir.path());
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-late-tweaks-dropped");
+    q.set_prune_seqsigwit(true).unwrap();
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        rbitcoin_consensus::Milestone::height(u32::MAX),
+    )
+    .unwrap();
+    q.set_pruneheight(Some(rbitcoin_primitives::Height(0)))
+        .unwrap();
     let err = rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height())
         .unwrap_err();
     let msg = err.to_string();
@@ -851,10 +870,11 @@ fn pruned_datadir_past_taproot_refuses_sp_tweaks() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
-/// An unpruned chain already at taproot must refuse both flags before the
-/// stem cut. Prune cannot be turned back off.
+/// Regtest is already at taproot at genesis, and nothing is dropped on a
+/// one-block chain. Both flags start, and the genesis witness stays in the
+/// keep window.
 #[test]
-fn both_flags_on_unpruned_past_taproot_keep_the_stem() {
+fn both_flags_on_a_short_unpruned_chain_start() {
     let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-late-both");
     let params = rbitcoin_consensus::ChainParams::regtest();
@@ -867,7 +887,6 @@ fn both_flags_on_unpruned_past_taproot_keep_the_stem() {
         rbitcoin_consensus::Milestone::height(u32::MAX),
     )
     .unwrap();
-    let before = q.store().txs.seqsigwit.body_logical_len();
     let cfg = ready_config([
         "rbitcoin-node",
         "--network",
@@ -875,16 +894,11 @@ fn both_flags_on_unpruned_past_taproot_keep_the_stem() {
         "--sp-tweaks",
         "--prune-seqsigwit",
     ]);
-    let err = rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height())
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("prune-seqsigwit"), "{msg}");
-    assert!(msg.contains("taproot"), "{msg}");
-    assert!(
-        !q.prune_seqsigwit(),
-        "prune stuck after a refused tweak start"
-    );
-    assert_eq!(q.store().txs.seqsigwit.body_logical_len(), before);
+    rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height()).unwrap();
+    assert!(q.prune_seqsigwit());
+    assert!(q.sptweaks_enabled());
+    assert_eq!(q.pruneheight(), None);
+    assert!(q.store().path().join("seqsigwit.window/0.bin").is_file());
     drop(q);
     let _ = std::fs::remove_dir_all(dir.path());
 }
