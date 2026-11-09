@@ -445,3 +445,57 @@ fn pruned_seqsigwit_life() {
     prune_life_thresholds(&q, &dir, &mut hashes);
     prune_life_watermark(q, &dir, &mut hashes);
 }
+
+/// Tip 287 is the whole keep window. Genesis stays, and no watermark is written.
+#[test]
+fn enabling_prune_at_keep_window_keeps_genesis() {
+    let (dir, q) = temp_query("prune-at-287");
+    let mut hashes = Vec::new();
+    let n = Query::SEQSIGWIT_KEEP_HEIGHTS;
+    connect_range(&q, Fk::NULL, None, n, &[0x47], &mut hashes);
+    assert_eq!(q.tip_height(), Some(Height(n - 1)));
+    q.set_prune_seqsigwit(true).unwrap();
+    q.apply_prune_seqsigwit_tip().unwrap();
+    assert_eq!(q.pruneheight(), None);
+    assert_witness_stem_cut(&q);
+    q.clear_seqsigwit_ram_window();
+    // Genesis uses the fixture header hash. Witness is the served fact.
+    let genesis = q.block_tx_fks(Height(0)).unwrap()[0];
+    assert_eq!(witness_of(&q, genesis), vec![vec![0x47]]);
+    assert!(q.store().path().join("seqsigwit.window/0.bin").is_file());
+    q.require_seqsigwit_at(Height(0)).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Tip 288 is one past the keep window. The stem cut drops genesis, so the
+/// watermark has to say so. A missing watermark lets reconstruct fail as
+/// pruned for a height the node still claims to have.
+#[test]
+fn enabling_prune_at_288_marks_genesis_pruned() {
+    let (dir, q) = temp_query("prune-at-288");
+    let mut hashes = Vec::new();
+    let n = Query::SEQSIGWIT_KEEP_HEIGHTS + 1;
+    connect_range(&q, Fk::NULL, None, n, &[0x48], &mut hashes);
+    let tip = q.tip_height().unwrap().0;
+    assert_eq!(tip, Query::SEQSIGWIT_KEEP_HEIGHTS);
+    q.set_prune_seqsigwit(true).unwrap();
+    q.apply_prune_seqsigwit_tip().unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(0)));
+    assert_witness_stem_cut(&q);
+    q.clear_seqsigwit_ram_window();
+    let err = q.require_seqsigwit_at(Height(0)).unwrap_err();
+    assert!(matches!(err, StoreError::Pruned { height: 0 }), "{err:?}");
+    let err = q.reconstruct_block_at_height(Height(0)).unwrap_err();
+    assert!(matches!(err, StoreError::Pruned { height: 0 }), "{err:?}");
+    q.require_seqsigwit_at(Height(1)).unwrap();
+    let kept = q.reconstruct_block_at_height(Height(1)).unwrap();
+    assert_eq!(kept.txdata[0].input[0].witness.to_vec(), vec![vec![0x48]]);
+    assert!(!q.store().path().join("seqsigwit.window/0.bin").exists());
+    assert!(q.store().path().join("seqsigwit.window/1.bin").is_file());
+    assert!(q
+        .store()
+        .path()
+        .join(format!("seqsigwit.window/{tip}.bin"))
+        .is_file());
+    let _ = std::fs::remove_dir_all(dir);
+}

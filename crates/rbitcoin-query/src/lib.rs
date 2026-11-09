@@ -1149,7 +1149,9 @@ impl Query {
         let Some(tip) = tip else {
             return Ok(());
         };
-        if tip.0 <= Self::SEQSIGWIT_KEEP_HEIGHTS {
+        // Tip 287 is heights 0..=287: the whole keep window, nothing dropped.
+        // Tip 288 is one past that, so height 0 is gone and the watermark is 0.
+        if tip.0 < Self::SEQSIGWIT_KEEP_HEIGHTS {
             return Ok(());
         }
         self.set_pruneheight(Some(Height(tip.0 - Self::SEQSIGWIT_KEEP_HEIGHTS)))
@@ -1438,9 +1440,7 @@ impl Query {
         let Some(tip) = self.tip_height() else {
             return Ok(());
         };
-        let from = tip
-            .0
-            .saturating_sub(Self::SEQSIGWIT_KEEP_HEIGHTS.saturating_sub(1));
+        let from = self.seqsigwit_keep_lo(tip.0);
         for h in from..=tip.0 {
             let tx_fks = self.block_tx_fks(Height(h))?;
             if tx_fks.is_empty() {
