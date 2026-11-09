@@ -160,7 +160,9 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-#[cfg(debug_assertions)]
+// Only Unix calls this. Windows `fsync_parent_dir` is a no-op, and a
+// private helper with no caller fails `-D warnings` there.
+#[cfg(all(debug_assertions, unix))]
 fn note_fsynced_dir(dir: &Path) {
     if FSYNC_TRACE.with(|on| on.get()) {
         FSYNC_DIRS.with(|dirs| dirs.borrow_mut().push(dir.to_path_buf()));
