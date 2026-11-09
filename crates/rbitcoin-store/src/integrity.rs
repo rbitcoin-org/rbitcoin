@@ -553,9 +553,18 @@ impl Store {
                 return Err(TipFault::Bad("input unstamped"));
             };
             if !prune {
-                let n = self.seqsigwit_input_count(Fk(first + i as u64))?;
-                if n != edges.len() {
-                    return Err(TipFault::Bad("input edge count"));
+                // No witness row is not a torn read. The locator does not
+                // name this create, so there is no scriptSig count to match.
+                let fk = Fk(first + i as u64);
+                match self.txs.seqsigwit_range(fk) {
+                    Err(StoreError::NotFound) => {}
+                    Err(e) => return Err(TipFault::read("seqsigwit range")(e)),
+                    Ok(_) => {
+                        let n = self.seqsigwit_input_count(fk)?;
+                        if n != edges.len() {
+                            return Err(TipFault::Bad("input edge count"));
+                        }
+                    }
                 }
             }
             if i == 0 {

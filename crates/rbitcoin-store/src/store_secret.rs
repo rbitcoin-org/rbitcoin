@@ -17,8 +17,7 @@
 
 use crate::error::StoreError;
 use bitcoin_hashes::{sha256, Hash};
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// On-disk filename under the store directory.
@@ -62,17 +61,19 @@ impl StoreSecret {
     /// Persist under `store_dir/store.secret`.
     pub fn write_to_store_dir(&self, store_dir: &Path) -> Result<(), StoreError> {
         let path = secret_path(store_dir);
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
+        if path.exists() {
+            return Err(StoreError::io(
+                &path,
+                std::io::Error::new(std::io::ErrorKind::AlreadyExists, "store.secret exists"),
+            ));
+        }
+        crate::file::write_synced_tmp_rename(&path, &self.bytes)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| StoreError::io(&path, e))?;
         }
-        let mut f = opts.open(&path).map_err(|e| StoreError::io(&path, e))?;
-        f.write_all(&self.bytes)
-            .map_err(|e| StoreError::io(&path, e))?;
-        f.sync_all().map_err(|e| StoreError::io(&path, e))?;
         Ok(())
     }
 

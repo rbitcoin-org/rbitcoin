@@ -8,3 +8,9 @@ Fixed
 - **A `tx.head/` directory with segment files and no `meta` rebuilds.** That
   directory used to refuse as a legacy shard. Open wipes it and rebuilds from
   Class A. A monolithic `tx.head` and a flat `tx.head.meta` still refuse.
+- **Small durable files publish through a synced rename.** Store `meta`,
+  `store.secret`, `seqsigwit.prune`, mempool `meta`, and `unbroadcast` no
+  longer truncate the live name. A short prune file is not a height. Open
+  keeps creates the witness locator no longer names, and those creates have
+  no scriptSig or witness. A short mempool `meta` is quarantined and the
+  pool starts empty.

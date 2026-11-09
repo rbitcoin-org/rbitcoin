@@ -1225,10 +1225,11 @@ impl Query {
         let path = store_path.join("seqsigwit.prune");
         match std::fs::read(&path) {
             Ok(bytes) => {
-                let arr: [u8; 4] = bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| StoreError::Corrupt("invariant: seqsigwit.prune size"))?;
+                // A torn write is not a height. The flag and the witness stem
+                // decide prune; this file does not.
+                let Ok(arr) = <[u8; 4]>::try_from(bytes.as_slice()) else {
+                    return Ok((u32::MAX, false));
+                };
                 Ok((u32::from_le_bytes(arr), true))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((u32::MAX, false)),
@@ -1469,8 +1470,14 @@ impl Query {
         self.set_pruneheight(Some(Height(next)))
     }
 
-    /// `false` when this create's connected height is at/below [`Self::pruneheight`].
+    /// `false` when this create's connected height is at/below [`Self::pruneheight`],
+    /// or the witness locator does not name the create.
     pub fn seqsigwit_available(&self, fk: Fk) -> Result<bool, QueryError> {
+        let id = fk.get().unwrap_or(0);
+        let named = self.store.txs.seqsigwit_loc.count();
+        if id > 0 && id <= self.store.txs.count() && id > named {
+            return Ok(false);
+        }
         let Some(ph) = self.pruneheight() else {
             return Ok(true);
         };
@@ -1815,6 +1822,10 @@ impl Query {
         let built = (|| -> Result<(), QueryError> {
             let mut appended = self.seqsigwit_append_cache.lock().unwrap();
             for &fk in tx_fks {
+                let id = fk.get().unwrap_or(0);
+                if id > self.store.txs.seqsigwit_loc.count() {
+                    continue;
+                }
                 let ins = if let Some(id) = fk.get() {
                     if let Some(v) = appended.remove(&id) {
                         from_cache.push(id);
@@ -1829,6 +1840,9 @@ impl Query {
                 staged.push((fk, ins, bytes));
             }
             drop(appended);
+            if staged.is_empty() {
+                return Ok(());
+            }
             self.drop_seqsigwit_ram_height(height.0);
             let spill_rows: Vec<(Fk, &[InputRecord])> = staged
                 .iter()

@@ -794,6 +794,52 @@ fn pruned_retry_seals_a_missing_keep_file() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// One coinbase whose merkle and header hash survive tip revalidate.
+fn connect_checked(q: &Query, h: u32, prev: Fk, parent_hash: [u8; 32]) -> (Fk, [u8; 32]) {
+    let (mut header, ta) = coinbase_block(h, prev, Some(parent_hash));
+    header.merkle_root = ta.tx.txid;
+    header.hash = rbitcoin_store::block_header_hash(
+        header.version,
+        &parent_hash,
+        &header.merkle_root,
+        header.timestamp,
+        header.bits,
+        header.nonce,
+    );
+    let fk = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    (fk, header.hash)
+}
+
+/// A 0-byte prune file is not a height. Open keeps the creates the short
+/// witness locator no longer names, and those creates have no witness.
+#[test]
+fn torn_prune_file_reports_the_height_the_witness_stem_covers() {
+    let (dir, q) = temp_query("torn-prune-height");
+    let (prev, parent) = connect_checked(&q, 0, Fk::NULL, [0u8; 32]);
+    connect_checked(&q, 1, prev, parent);
+    q.store().flush_class_c_tip().unwrap();
+    q.store().txs.seqsigwit_loc.truncate_to_count(1).unwrap();
+    drop(q);
+    std::fs::write(dir.path().join("seqsigwit.prune"), []).unwrap();
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.store().txs.count(), 2);
+    assert_eq!(q.store().txs.seqsigwit_loc.count(), 1);
+    assert_eq!(q.tip_height(), Some(Height(1)));
+    let kept = q.block_tx_fks(Height(0)).unwrap()[0];
+    let cut = q.block_tx_fks(Height(1)).unwrap()[0];
+    assert!(q.seqsigwit_available(kept).unwrap());
+    assert!(!q.seqsigwit_available(cut).unwrap());
+    q.set_prune_seqsigwit(true).unwrap();
+    assert_eq!(q.pruneheight(), None, "a short locator is not a dropped prefix");
+    assert!(q.seqsigwit_available(kept).unwrap());
+    assert!(!q.seqsigwit_available(cut).unwrap());
+    assert_eq!(
+        std::fs::read(dir.path().join("seqsigwit.prune")).unwrap(),
+        u32::MAX.to_le_bytes()
+    );
+    let _ = dir;
+}
+
 #[test]
 fn pruned_seqsigwit_life() {
     let (dir, q) = temp_query("pruned-seqsigwit-life");

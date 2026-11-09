@@ -266,7 +266,8 @@ pub fn persist_unbroadcast_file(dir: &Path, set: &HashSet<Txid>) {
     for t in set {
         buf.extend_from_slice(&t.to_byte_array());
     }
-    let _ = std::fs::write(dir.join("unbroadcast"), buf);
+    let path = dir.join("unbroadcast");
+    let _ = rbitcoin_store::file::write_synced_tmp_rename(&path, &buf);
 }
 
 /// Depths the refresh evaluates. Every other confirm target is

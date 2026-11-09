@@ -181,6 +181,27 @@ fn seqsigwit_loc_behind_create_loc_reopens_at_the_shorter_count() {
     assert_eq!(outs(&t, 1)[0].script, vec![1]);
 }
 
+/// A torn `seqsigwit.prune` means the witness cut already happened.
+/// Open keeps the creates the short witness locator no longer names.
+#[test]
+fn torn_prune_file_keeps_creates_past_the_witness_stem() {
+    let dir = super::tempfile_dir("torn-prune-stem");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let seq_end = on_disk_hwm(&t.seqsigwit_loc.loc);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    assert!(on_disk_hwm(&t.seqsigwit_loc.loc) > seq_end);
+    set_disk_hwm(&t.seqsigwit_loc.loc, seq_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.create_loc.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 1);
+    assert_eq!(outs(&t, 1)[0].script, vec![1]);
+    assert_eq!(outs(&t, 2)[0].script, vec![2]);
+}
+
 /// A 1024-create window whose `create.off` checkpoint did not land opens at
 /// the last create that does not need that checkpoint.
 #[test]
