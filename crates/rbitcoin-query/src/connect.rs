@@ -569,7 +569,11 @@ impl Query {
         if let Some(h) = self.height_of_hash(header_hash)? {
             if h == height {
                 if let Some((fk, _)) = self.get_header_by_hash(header_hash)? {
-                    return Ok(fk);
+                    // Same header at this height, but the witness file was
+                    // never written. Fall through and seal it.
+                    if self.pruned_spill_covers(fk)? {
+                        return Ok(fk);
+                    }
                 }
             }
         }
@@ -740,8 +744,15 @@ impl Query {
         let commit = self.lock_tip_commit()?;
         let durable_before = self.tip_height();
         if let Some(fk) = self.check_run_extends_tip(items)? {
+            // Already confirmed. Do not apply Class C again. A missing spill
+            // is still a failed confirm, not a successful retry.
+            self.seal_missing_pruned_spills(items)?;
             return Ok(vec![fk]);
         }
+
+        // The spill is the witness. Write it before any tip publish, so a
+        // failed write leaves the old tip in place and the append cache intact.
+        self.seal_confirmed_seqsigwit_spills(items)?;
 
         let write = rbitcoin_store::ClassCWrite::new();
         if !header_ranges.is_empty() {
@@ -802,11 +813,7 @@ impl Query {
         }
         // Do not forget pending here: drain may still be inserting tx.head
         // (67438). Write forgets after drain.join() *and* this extend.
-        // Prune mode does not write seqsigwit.body. The spill is the witness,
-        // so it has to be durable before this flush commits the height.
-        // The fence is already extended, so a cache miss can still find
-        // the height of a spill written on an earlier connect.
-        self.seal_confirmed_seqsigwit_spills(items)?;
+        // The spill was sealed before the tip moved. This flush commits it.
         let durable = self.flush_tip(durable_before)?;
         drop(commit);
         crate::note_confirm(
@@ -844,6 +851,20 @@ impl Query {
         }
         for item in items {
             self.note_seqsigwit_ram_for_confirmed(item.height, &item.tx_fks)?;
+        }
+        Ok(())
+    }
+
+    /// Retry of a block that is already the tip. Seal only a height whose
+    /// file does not already hold that block.
+    fn seal_missing_pruned_spills(&self, items: &[ConfirmPrepared]) -> Result<(), QueryError> {
+        if !self.prune_seqsigwit() {
+            return Ok(());
+        }
+        for item in items {
+            if !self.pruned_spill_covers(item.header_fk)? {
+                self.note_seqsigwit_ram_for_confirmed(item.height, &item.tx_fks)?;
+            }
         }
         Ok(())
     }

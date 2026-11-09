@@ -133,6 +133,18 @@ pub fn finish_already_committed_write(
         .iter()
         .map(|p| (p.height.0, p.hash))
         .collect();
+    if query.prune_seqsigwit() {
+        for p in &batch.prepared {
+            if !query
+                .pruned_spill_covers(p.header_fk)
+                .map_err(ConfirmError::from)?
+            {
+                query
+                    .note_seqsigwit_ram_for_confirmed(p.height, &p.tx_fks)
+                    .map_err(ConfirmError::from)?;
+            }
+        }
+    }
     finish_post_commit_hashes(query, &items)?;
     if let Some(h) = items.iter().map(|(h, _)| *h).max() {
         query.prune_write_create_loc(h);

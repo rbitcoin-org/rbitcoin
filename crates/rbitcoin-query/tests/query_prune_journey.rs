@@ -582,3 +582,75 @@ fn shorter_fork_does_not_lower_pruneheight() {
     assert_eq!(witness_of(&q, tip), vec![vec![0x55; 8]]);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+fn next_block(q: &Query, parent_hash: [u8; 32], witness: u8) -> (HeaderRecord, TxApply) {
+    let h = q.tip_height().unwrap().0.saturating_add(1);
+    let (mut header, mut ta) =
+        coinbase_block(h, q.tip_header_fk().unwrap().unwrap(), Some(parent_hash));
+    ta.inputs[0].witness = vec![vec![witness]];
+    header.merkle_root = ta.tx.txid;
+    header.hash = rbitcoin_store::block_header_hash(
+        header.version,
+        &parent_hash,
+        &header.merkle_root,
+        header.timestamp,
+        header.bits,
+        header.nonce,
+    );
+    (header, ta)
+}
+
+/// A spill write that fails must not leave the new tip in RAM. The same
+/// block connects once the file can be written.
+#[test]
+fn spill_failure_does_not_publish_the_tip() {
+    let (dir, q) = temp_query("prune-spill-fail");
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 1, &[0x11], &mut hashes);
+    assert_eq!(q.tip_height(), Some(Height(0)));
+    let window = q.store().path().join("seqsigwit.window");
+    std::fs::create_dir_all(&window).unwrap();
+    let blocker = window.join("1.bin.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    let (header, ta) = next_block(&q, hashes[0], 0x22);
+    let err = q.connect_block(Height(1), &header, &[ta.clone()]).unwrap_err();
+    assert_eq!(
+        q.tip_height(),
+        Some(Height(0)),
+        "a failed spill must not publish the tip ({err})"
+    );
+    std::fs::remove_dir(&blocker).unwrap();
+    q.connect_block(Height(1), &header, &[ta]).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(1)));
+    q.clear_seqsigwit_ram_window();
+    let fk = q.block_tx_fks(Height(1)).unwrap()[0];
+    assert_eq!(witness_of(&q, fk), vec![vec![0x22]]);
+    assert!(window.join("1.bin").is_file());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Shutdown must not persist a tip whose keep-window file is missing.
+#[test]
+fn spill_failure_shutdown_keeps_the_old_tip() {
+    let (dir, q) = temp_query("prune-spill-shutdown");
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut hashes = Vec::new();
+    // Tall enough that reopen checks the real headers, not the fixture genesis.
+    connect_range(&q, Fk::NULL, None, 8, &[0x11], &mut hashes);
+    assert_eq!(q.tip_height(), Some(Height(7)));
+    let window = q.store().path().join("seqsigwit.window");
+    std::fs::create_dir_all(&window).unwrap();
+    std::fs::create_dir(window.join("8.bin.tmp")).unwrap();
+    let (header, ta) = next_block(&q, hashes[7], 0x22);
+    let _ = q.connect_block(Height(8), &header, &[ta]).unwrap_err();
+    assert_eq!(q.tip_height(), Some(Height(7)));
+    q.store().sync_spend_durable(7).unwrap();
+    q.flush_for_shutdown().unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(7)));
+    assert!(q.prune_seqsigwit());
+    assert!(!q.store().path().join("seqsigwit.window/8.bin").is_file());
+    let _ = std::fs::remove_dir_all(dir);
+}

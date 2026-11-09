@@ -1311,6 +1311,17 @@ impl Query {
         if self.pruneheight().is_some_and(|ph| height <= ph.0) {
             return Ok(None);
         }
+        self.read_spill_row(height, fk, input_count)
+    }
+
+    /// One tx inside `{height}.bin`. The confirm height is known before the
+    /// fence publishes it, so a reconnect can read the file without `tx_height`.
+    fn read_spill_row(
+        &self,
+        height: u32,
+        fk: Fk,
+        input_count: u32,
+    ) -> Result<Option<Vec<InputRecord>>, QueryError> {
         let path = self.seqsigwit_spill_file(height)?;
         let canon = match path.canonicalize() {
             Ok(p) => p,
@@ -1372,6 +1383,30 @@ impl Query {
         }
     }
 
+    /// The height file holds every tx in this header. RAM does not count:
+    /// shutdown can drop it, and the tip must not outlive the file.
+    pub(crate) fn pruned_spill_covers(&self, header_fk: Fk) -> Result<bool, QueryError> {
+        if !self.prune_seqsigwit() {
+            return Ok(true);
+        }
+        let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
+            return Ok(false);
+        };
+        if tx_fks.is_empty() {
+            return Ok(false);
+        }
+        for fk in tx_fks {
+            let tx = self.get_tx(fk)?;
+            if self
+                .seqsigwit_spill_inputs_with_count(fk, tx.input_count)?
+                .is_none()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn note_seqsigwit_ram_for_confirmed(
         &self,
         height: Height,
@@ -1382,27 +1417,48 @@ impl Query {
         }
         let threshold = self.seqsigwit_ram_threshold_bytes();
         let mut staged: Vec<(Fk, Vec<InputRecord>, u64)> = Vec::with_capacity(tx_fks.len());
-        let mut appended = self.seqsigwit_append_cache.lock().unwrap();
-        for &fk in tx_fks {
-            let ins = if let Some(id) = fk.get() {
-                if let Some(v) = appended.remove(&id) {
-                    v
+        // Ids taken from the append cache. A failed spill puts these rows back
+        // so the retry still has the witness. Rows loaded from the store stay out.
+        let mut from_cache: Vec<u64> = Vec::new();
+        let built = (|| -> Result<(), QueryError> {
+            let mut appended = self.seqsigwit_append_cache.lock().unwrap();
+            for &fk in tx_fks {
+                let ins = if let Some(id) = fk.get() {
+                    if let Some(v) = appended.remove(&id) {
+                        from_cache.push(id);
+                        v
+                    } else {
+                        self.inputs_for_seal(height, fk)?
+                    }
                 } else {
-                    self.inputs_for_confirmed_window(fk)?
+                    self.inputs_for_seal(height, fk)?
+                };
+                let bytes = ins.iter().map(|i| i.encoded_len() as u64).sum();
+                staged.push((fk, ins, bytes));
+            }
+            drop(appended);
+            self.drop_seqsigwit_ram_height(height.0);
+            let spill_rows: Vec<(Fk, &[InputRecord])> = staged
+                .iter()
+                .map(|(fk, ins, _)| (*fk, ins.as_slice()))
+                .collect();
+            self.persist_seqsigwit_spill_height(height, &spill_rows)?;
+            Ok(())
+        })();
+        if let Err(e) = built {
+            if !from_cache.is_empty() {
+                let mut cache = self.seqsigwit_append_cache.lock().unwrap();
+                for (fk, ins, _) in staged {
+                    let Some(id) = fk.get() else {
+                        continue;
+                    };
+                    if from_cache.contains(&id) {
+                        cache.entry(id).or_insert(ins);
+                    }
                 }
-            } else {
-                self.inputs_for_confirmed_window(fk)?
-            };
-            let bytes = ins.iter().map(|i| i.encoded_len() as u64).sum();
-            staged.push((fk, ins, bytes));
+            }
+            return Err(e);
         }
-        drop(appended);
-        self.drop_seqsigwit_ram_height(height.0);
-        let spill_rows: Vec<(Fk, &[InputRecord])> = staged
-            .iter()
-            .map(|(fk, ins, _)| (*fk, ins.as_slice()))
-            .collect();
-        self.persist_seqsigwit_spill_height(height, &spill_rows)?;
         if threshold == 0 {
             return Ok(());
         }
@@ -1440,12 +1496,14 @@ impl Query {
         Ok(())
     }
 
-    /// Witness for a confirmed height already in the window, or the archive stem
-    /// when prune mode is off. A prune-mode miss fails the confirm.
-    fn inputs_for_confirmed_window(&self, fk: Fk) -> Result<Vec<InputRecord>, QueryError> {
+    /// Witness for a height being sealed. The spill file is keyed by that
+    /// height, which may not be on the fence yet.
+    fn inputs_for_seal(&self, height: Height, fk: Fk) -> Result<Vec<InputRecord>, QueryError> {
         let tx = self.get_tx(fk)?;
-        if let Some(ins) = self.seqsigwit_spill_inputs_with_count(fk, tx.input_count)? {
-            return Ok(ins);
+        if !self.pruneheight().is_some_and(|ph| height.0 <= ph.0) {
+            if let Some(ins) = self.read_spill_row(height.0, fk, tx.input_count)? {
+                return Ok(ins);
+            }
         }
         if self.store.prune_seqsigwit_mode() {
             return Err(StoreError::Corrupt("seqsigwit window miss"));
@@ -1755,6 +1813,8 @@ impl Query {
     /// See [`rbitcoin_store::Store::flush_for_shutdown`].
     pub fn flush_for_shutdown(&self) -> Result<(), QueryError> {
         let _commit = self.lock_tip_commit()?;
+        // A tip whose keep-window file is missing must not become the disk tip.
+        self.require_pruned_keep_spills()?;
         self.store.flush_for_shutdown()
     }
 }

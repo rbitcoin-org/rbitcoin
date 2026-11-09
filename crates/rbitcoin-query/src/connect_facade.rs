@@ -77,8 +77,10 @@ pub fn accept_and_connect_block_preverified(
                 .get_header_by_hash(&hash)
                 .map_err(ConfirmError::from)?
             {
-                confirm_run::finish_post_commit(query, height.0, &hash)?;
-                return Ok(fk);
+                if query.pruned_spill_covers(fk).map_err(ConfirmError::from)? {
+                    confirm_run::finish_post_commit(query, height.0, &hash)?;
+                    return Ok(fk);
+                }
             }
         }
     }
