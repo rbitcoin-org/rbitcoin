@@ -325,6 +325,38 @@ fn adding_prune_after_the_tweak_index_is_built_keeps_serving() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Prune is already on, so this call is a later start. A tweak index that
+/// no longer covers the persisted prune height must not make it fail, and
+/// it must not cut the stem again. Turning tweaks back on still refuses.
+#[test]
+fn already_pruned_restart_ignores_a_tweak_hole() {
+    let keep = Query::SEQSIGWIT_KEEP_HEIGHTS;
+    let (dir, q) = tmp_q();
+    let (fk, hash) = connect_one(&q, 0, Fk::NULL, None, false);
+    q.set_prune_seqsigwit(true).unwrap();
+    q.apply_prune_seqsigwit_tip().unwrap();
+    assert_eq!(q.pruneheight(), None);
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    // No rows. Next stays at the origin. The files remain after the flag drops.
+    q.set_sptweaks_enabled(false, Height(0)).unwrap();
+    let mut prev = fk;
+    let mut prev_hash = Some(hash);
+    for h in 1..=keep {
+        let (next_fk, next_hash) = connect_one(&q, h, prev, prev_hash, false);
+        prev = next_fk;
+        prev_hash = Some(next_hash);
+    }
+    assert_eq!(q.tip_height(), Some(Height(keep)));
+    q.apply_prune_seqsigwit_tip().unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(0)));
+    assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
+    let before = q.store().txs.seqsigwit_loc.count();
+    q.set_prune_seqsigwit(true).unwrap();
+    assert_eq!(q.store().txs.seqsigwit_loc.count(), before);
+    assert_eq!(q.pruneheight(), Some(Height(0)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn header(h: u32, prev_fk: Fk, prev_hash: Option<[u8; 32]>) -> HeaderRecord {
     rbitcoin_query::testutil::header_with_merkle_marker(h, prev_fk, prev_hash, 0xec)
 }
