@@ -366,6 +366,58 @@ fn already_pruned_restart_ignores_a_tweak_hole() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A caught-up index still has 288 blocks of slack. Omitting `--sp-tweaks`
+/// on a pruned datadir reports that slack, and reports when the index is
+/// already past the prune height.
+#[test]
+fn omitting_sp_tweaks_reports_blocks_left_before_the_index_is_stranded() {
+    let caught_up = sp_tweaks_omit_warning(1001, Some(1000), Some(712));
+    assert_eq!(caught_up, SpTweaksOmitWarning::BlocksLeft(288));
+    assert!(
+        caught_up.log_line().contains("288 more blocks"),
+        "{}",
+        caught_up.log_line()
+    );
+    assert_eq!(
+        sp_tweaks_omit_warning(6, Some(10), Some(5)),
+        SpTweaksOmitWarning::BlocksLeft(0)
+    );
+    assert_eq!(
+        sp_tweaks_omit_warning(5, Some(300), Some(5)),
+        SpTweaksOmitWarning::Stranded
+    );
+    assert_eq!(
+        sp_tweaks_omit_warning(0, None, None),
+        SpTweaksOmitWarning::BlocksLeft(288)
+    );
+
+    let (dir, q) = tmp_q();
+    let _ = connect_one(&q, 0, Fk::NULL, None, false);
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    q.set_sptweaks_enabled(false, Height(0)).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    q.apply_prune_seqsigwit_tip().unwrap();
+    assert_eq!(q.pruneheight(), None);
+    assert_eq!(
+        q.sp_tweaks_prune_omit_warning(),
+        Some(SpTweaksOmitWarning::BlocksLeft(287))
+    );
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    assert_eq!(q.sp_tweaks_prune_omit_warning(), None);
+    q.set_sptweaks_enabled(false, Height(0)).unwrap();
+    q.set_pruneheight(Some(Height(0))).unwrap();
+    assert_eq!(
+        q.sp_tweaks_prune_omit_warning(),
+        Some(SpTweaksOmitWarning::Stranded)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (dir, q) = tmp_q();
+    q.set_prune_seqsigwit(true).unwrap();
+    assert_eq!(q.sp_tweaks_prune_omit_warning(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn header(h: u32, prev_fk: Fk, prev_hash: Option<[u8; 32]>) -> HeaderRecord {
     rbitcoin_query::testutil::header_with_merkle_marker(h, prev_fk, prev_hash, 0xec)
 }

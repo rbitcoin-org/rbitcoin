@@ -415,6 +415,8 @@ Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak 
   when the index does not already cover every height that has been dropped\n\
   or will be dropped. Turning prune on after that index is already built\n\
   is allowed, and those sealed rows keep being served.\n\
+  Omitting --sp-tweaks while those files exist and prune is on logs how many\n\
+  blocks remain before the index cannot be enabled again.\n\
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
 Health: --health-listen [ADDR] serves GET /healthz, GET /readyz, and GET /progress (JSON:\n\
   the running index build, rebuild, or backfill stage, at any log level) from the first\n\

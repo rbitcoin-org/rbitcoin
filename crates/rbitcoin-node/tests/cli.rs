@@ -943,6 +943,47 @@ fn adding_prune_beside_existing_tweaks_on_a_short_chain_starts() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
+/// Prune is on, tweak files exist, and this start left `--sp-tweaks` off.
+/// Startup says how many blocks remain before that index cannot be enabled.
+#[test]
+fn prune_without_sp_tweaks_warns_how_many_blocks_remain() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-omit-tweaks");
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        rbitcoin_consensus::Milestone::height(u32::MAX),
+    )
+    .unwrap();
+    q.set_sptweaks_enabled(true, rbitcoin_primitives::Height(0))
+        .unwrap();
+    let path = dir.path().to_path_buf();
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&path).unwrap();
+    let cfg = ready_config(["rbitcoin-node", "--network", "regtest", "--prune-seqsigwit"]);
+    rbitcoin_log::capture_logs(true);
+    rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height()).unwrap();
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(!q.sptweaks_enabled());
+    assert!(q.prune_seqsigwit());
+    let joined = lines
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("287 more blocks"),
+        "startup should say how many blocks remain:\n{joined}"
+    );
+    drop(q);
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
 /// RPC binds only after catch-up, so a bad `--rpc-cookie-file` must fail
 /// the launch rather than surface as a warning after IBD.
 #[test]

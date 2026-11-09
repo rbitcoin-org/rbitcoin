@@ -221,6 +221,21 @@ impl Query {
         Err(self.tweak_prune_miss())
     }
 
+    /// Prune is on, this process is not sealing tweaks, and an index is loaded.
+    /// Startup warns with [`SpTweaksOmitWarning::log_line`].
+    #[doc(hidden)]
+    pub fn sp_tweaks_prune_omit_warning(&self) -> Option<SpTweaksOmitWarning> {
+        if !self.prune_seqsigwit() || self.sptweaks_enabled() {
+            return None;
+        }
+        let next = self.sptweaks_next_height()?.0.max(self.sptweaks_origin().0);
+        Some(sp_tweaks_omit_warning(
+            next,
+            self.tip_height().map(|h| h.0),
+            self.pruneheight().map(|h| h.0),
+        ))
+    }
+
     /// Height `prune_seqsigwit_below` will record for the current tip.
     /// Tip 288 drops height 0. A shorter chain drops nothing.
     fn predicted_pruneheight(&self) -> Option<u32> {
@@ -300,6 +315,52 @@ pub(crate) const SP_TWEAKS_PRUNE_BEFORE_TAPROOT: &str =
 /// Callers match `does not cover`. This text does not say `taproot`.
 pub(crate) const SP_TWEAKS_PRUNE_INDEX_SHORT: &str =
     "silent payment tweak index does not cover every height --prune-seqsigwit would drop";
+
+/// What startup logs when prune is on, tweak files exist, and this start
+/// left `--sp-tweaks` off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpTweaksOmitWarning {
+    /// Further confirms that still leave a later enable possible.
+    /// Zero means the next block strands the index.
+    BlocksLeft(u32),
+    /// The watermark is already at or below the prune height.
+    Stranded,
+}
+
+impl SpTweaksOmitWarning {
+    pub fn log_line(self) -> String {
+        match self {
+            Self::Stranded => "sp_tweaks: index files are on disk and do not cover the prune height; --sp-tweaks cannot be turned back on".to_string(),
+            Self::BlocksLeft(0) => "sp_tweaks: index files are on disk and --sp-tweaks is off; the next block drops witnesses --sp-tweaks would need".to_string(),
+            Self::BlocksLeft(1) => "sp_tweaks: index files are on disk and --sp-tweaks is off; 1 more block can be confirmed before --sp-tweaks cannot be turned back on".to_string(),
+            Self::BlocksLeft(n) => format!(
+                "sp_tweaks: index files are on disk and --sp-tweaks is off; {n} more blocks can be confirmed before --sp-tweaks cannot be turned back on"
+            ),
+        }
+    }
+}
+
+/// Blocks that can still be confirmed with `--sp-tweaks` off.
+///
+/// A caught-up index (`next = tip + 1`, prune height `tip - 288`) has 288.
+/// The next block after that makes `next <= pruneheight`. Nothing dropped
+/// (`pruneheight` none) stays resumable through tip `next + 287`.
+pub fn sp_tweaks_omit_warning(
+    next: u32,
+    tip: Option<u32>,
+    pruneheight: Option<u32>,
+) -> SpTweaksOmitWarning {
+    if let Some(ph) = pruneheight {
+        if next <= ph {
+            return SpTweaksOmitWarning::Stranded;
+        }
+        return SpTweaksOmitWarning::BlocksLeft(next - ph - 1);
+    }
+    let Some(tip) = tip else {
+        return SpTweaksOmitWarning::BlocksLeft(next.saturating_add(288));
+    };
+    SpTweaksOmitWarning::BlocksLeft(next.saturating_add(287).saturating_sub(tip))
+}
 
 impl Query {
     #[doc(hidden)]

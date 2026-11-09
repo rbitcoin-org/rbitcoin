@@ -2136,6 +2136,8 @@ pub fn apply_startup_index_mode(
         .map_err(|e| NodeError::Config(e.to_string()))?;
     if config.sptweaks {
         info!("sp_tweaks: enabled origin={taproot_height}");
+    } else if let Some(warning) = query.sp_tweaks_prune_omit_warning() {
+        warn!("{}", warning.log_line());
     }
     // Before write-behind starts. An unproven head must not catch up by
     // appending from height 0; delete it and stay Direct until materialize.
