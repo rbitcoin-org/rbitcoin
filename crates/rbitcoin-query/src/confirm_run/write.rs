@@ -134,6 +134,7 @@ pub fn finish_already_committed_write(
         .map(|p| (p.height.0, p.hash))
         .collect();
     if query.prune_seqsigwit() {
+        let mut wrote = false;
         for p in &batch.prepared {
             if !query
                 .pruned_spill_covers(p.header_fk)
@@ -142,7 +143,11 @@ pub fn finish_already_committed_write(
                 query
                     .note_seqsigwit_ram_for_confirmed(p.height, &p.tx_fks)
                     .map_err(ConfirmError::from)?;
+                wrote = true;
             }
+        }
+        if wrote {
+            query.sync_spill_dir().map_err(ConfirmError::from)?;
         }
     }
     finish_post_commit_hashes(query, &items)?;

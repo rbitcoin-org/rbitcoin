@@ -806,14 +806,14 @@ impl Query {
                 .iter()
                 .map(|(fk, ins)| (*fk, ins.as_slice()))
                 .collect();
-            self.persist_seqsigwit_spill_height(Height(h), &rows)?;
+            self.write_synced_seqsigwit_spill(Height(h), &rows)?;
         }
         Ok(())
     }
 
     /// `sync_all` every keep-window file and its directory.
     ///
-    /// [`Self::persist_seqsigwit_spill_height`] already syncs a file it just
+    /// [`Self::write_synced_seqsigwit_spill`] already syncs a file it just
     /// wrote. Files copied by an earlier process are still only a rename until
     /// this runs, and the stem cut throws away the other copy.
     fn sync_keep_window_files(&self) -> Result<(), QueryError> {
@@ -1273,6 +1273,19 @@ impl Query {
         height: Height,
         rows: &[(Fk, &[InputRecord])],
     ) -> Result<(), QueryError> {
+        self.write_synced_seqsigwit_spill(height, rows)?;
+        // One height, one directory sync. A confirm batch syncs once after
+        // every file instead of calling this.
+        self.sync_spill_dir()
+    }
+
+    /// Sync the spill file only. The caller fsyncs `seqsigwit.window` and
+    /// `store/` after the batch, before the tip flush.
+    fn write_synced_seqsigwit_spill(
+        &self,
+        height: Height,
+        rows: &[(Fk, &[InputRecord])],
+    ) -> Result<(), QueryError> {
         let dir = self.seqsigwit_spill_dir();
         std::fs::create_dir_all(&dir).map_err(|e| StoreError::io(&dir, e))?;
         let path = self.seqsigwit_spill_file(height.0)?;
@@ -1291,12 +1304,9 @@ impl Query {
             out.extend_from_slice(&(enc.len() as u32).to_le_bytes());
             out.extend_from_slice(&enc);
         }
-        // Rename without a sync is not a copy. This file is the only witness
-        // once the stem is cut or the tip flush commits the height.
-        rbitcoin_store::file::write_synced_tmp_rename(&path, &out)?;
-        // A fresh pruned chain never cuts a fat stem and never rewrites the
-        // sidecar, so this write is what makes the new directory durable.
-        self.sync_spill_dir()?;
+        // Rename without a file sync is not a copy. This file is the only
+        // witness once the stem is cut or the tip flush commits the height.
+        rbitcoin_store::file::write_file_synced_tmp_rename(&path, &out)?;
         Ok(())
     }
 
@@ -1449,7 +1459,7 @@ impl Query {
                 .iter()
                 .map(|(fk, ins, _)| (*fk, ins.as_slice()))
                 .collect();
-            self.persist_seqsigwit_spill_height(height, &spill_rows)?;
+            self.write_synced_seqsigwit_spill(height, &spill_rows)?;
             Ok(())
         })();
         if let Err(e) = built {
@@ -1532,7 +1542,9 @@ impl Query {
             }
             self.note_seqsigwit_ram_for_confirmed(Height(h), &tx_fks)?;
         }
-        Ok(())
+        // Enable writes every keep file, then one directory sync, before the
+        // stem cut. `release_pruned_seqsigwit_stem` syncs again when it runs.
+        self.sync_spill_dir()
     }
 
     /// After `head_insert_many` returned these fks (inclusive max).

@@ -11,7 +11,8 @@ Fixed
   backward onto a height whose witness file is already gone. Connecting an
   already archived block again writes that block's scriptSig and witness
   into the height file. A failed spill write does not publish the new tip.
-  `store/` is synced after `seqsigwit.window` is created, including on each
-  spill write, so a crash cannot drop that directory while the sidecar and
-  a cut locator remain. `txout`, `input`, `txstat`, and block filters stay.
+  `store/` is synced after `seqsigwit.window` is created. A confirm batch
+  syncs that directory once, after each height file, and before the tip
+  moves, so a crash cannot drop the directory while the sidecar and a cut
+  locator remain. `txout`, `input`, `txstat`, and block filters stay.
   Unpruned nodes still read `seqsigwit.body`.

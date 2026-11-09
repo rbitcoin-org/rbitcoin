@@ -852,7 +852,9 @@ impl Query {
         for item in items {
             self.note_seqsigwit_ram_for_confirmed(item.height, &item.tx_fks)?;
         }
-        Ok(())
+        // One directory sync for the batch, after every file is synced and
+        // before the tip flush. `store/` is synced here too.
+        self.sync_spill_dir()
     }
 
     /// Retry of a block that is already the tip. Seal only a height whose
@@ -861,10 +863,15 @@ impl Query {
         if !self.prune_seqsigwit() {
             return Ok(());
         }
+        let mut wrote = false;
         for item in items {
             if !self.pruned_spill_covers(item.header_fk)? {
                 self.note_seqsigwit_ram_for_confirmed(item.height, &item.tx_fks)?;
+                wrote = true;
             }
+        }
+        if wrote {
+            self.sync_spill_dir()?;
         }
         Ok(())
     }

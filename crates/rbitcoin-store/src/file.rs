@@ -60,16 +60,34 @@ pub fn tmp_sidecar_path(path: &Path) -> PathBuf {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TmpSync {
+    None,
+    /// File `sync_all` only. The caller syncs the parent directory.
+    File,
+    /// File `sync_all`, then `fsync` the parent directory.
+    FileAndDir,
+}
+
 /// Write `bytes` to a sibling tmp, then rename over `path`. No `sync_all`.
 pub fn write_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    write_tmp_file(path, false, |f| {
+    write_tmp_synced(path, TmpSync::None, |f| {
         f.write_all(bytes).map_err(|e| StoreError::io(path, e))
     })
 }
 
 /// Write `bytes` to a sibling tmp, `sync_all`, then rename over `path`.
 pub fn write_synced_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    write_tmp_file(path, true, |f| {
+    write_tmp_synced(path, TmpSync::FileAndDir, |f| {
+        f.write_all(bytes).map_err(|e| StoreError::io(path, e))
+    })
+}
+
+/// Write `bytes` to a sibling tmp and `sync_all` the file before rename.
+///
+/// The parent directory is left unsynced so a batch can fsync it once.
+pub fn write_file_synced_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    write_tmp_synced(path, TmpSync::File, |f| {
         f.write_all(bytes).map_err(|e| StoreError::io(path, e))
     })
 }
@@ -81,11 +99,26 @@ pub fn write_synced_tmp_file<F>(path: &Path, write: F) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
 {
-    write_tmp_file(path, true, write)
+    write_tmp_synced(path, TmpSync::FileAndDir, write)
 }
 
 #[doc(hidden)]
 pub fn write_tmp_file<F>(path: &Path, sync: bool, write: F) -> Result<(), StoreError>
+where
+    F: FnOnce(&mut File) -> Result<(), StoreError>,
+{
+    write_tmp_synced(
+        path,
+        if sync {
+            TmpSync::FileAndDir
+        } else {
+            TmpSync::None
+        },
+        write,
+    )
+}
+
+fn write_tmp_synced<F>(path: &Path, sync: TmpSync, write: F) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
 {
@@ -98,12 +131,12 @@ where
     {
         let mut f = File::create(&tmp).map_err(|e| StoreError::io(&tmp, e))?;
         write(&mut f)?;
-        if sync {
+        if sync != TmpSync::None {
             f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
         }
     }
     std::fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))?;
-    if sync {
+    if sync == TmpSync::FileAndDir {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;

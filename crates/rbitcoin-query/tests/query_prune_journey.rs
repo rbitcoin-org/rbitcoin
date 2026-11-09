@@ -476,6 +476,43 @@ fn spill_write_syncs_the_window_dirent() {
     let synced = rbitcoin_store::file::take_fsynced_dirs();
     assert!(q.store().path().join("seqsigwit.window/0.bin").is_file());
     assert_store_synced_after_window(q.store().path(), &synced);
+    let window = q.store().path().join("seqsigwit.window");
+    let n = synced.iter().filter(|p| p.as_path() == window).count();
+    assert_eq!(
+        n, 1,
+        "one spill write syncs the window directory once; synced {synced:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A confirm of several heights writes each file, then syncs the window
+/// directory once. The parent `store/` sync still follows that directory.
+#[test]
+#[cfg(unix)]
+fn confirm_batch_syncs_the_window_directory_once() {
+    let (dir, q) = temp_query("prune-fsync-batch");
+    q.set_prune_seqsigwit(true).unwrap();
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let fk0 = q.commit_class_a_only(&h0, std::slice::from_ref(&t0)).unwrap();
+    let (h1, t1) = coinbase_block(1, fk0, Some(h0.hash));
+    let fk1 = q.commit_class_a_only(&h1, std::slice::from_ref(&t1)).unwrap();
+    let run = vec![
+        prepared_at(&q, Height(0), fk0),
+        prepared_at(&q, Height(1), fk1),
+    ];
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    q.confirm_blocks_run(&run).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert_eq!(q.tip_height(), Some(Height(1)));
+    assert!(q.store().path().join("seqsigwit.window/0.bin").is_file());
+    assert!(q.store().path().join("seqsigwit.window/1.bin").is_file());
+    let window = q.store().path().join("seqsigwit.window");
+    let n = synced.iter().filter(|p| p.as_path() == window).count();
+    assert_eq!(
+        n, 1,
+        "a confirm batch syncs the window directory once; synced {synced:?}"
+    );
+    assert_store_synced_after_window(q.store().path(), &synced);
     let _ = std::fs::remove_dir_all(dir);
 }
 
