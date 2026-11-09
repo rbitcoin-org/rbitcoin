@@ -994,3 +994,43 @@ fn master_plaintext_window_is_rewritten_before_the_cut() {
     assert_eq!(witness_of(&q, fk), vec![witness.to_vec()]);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A height at or below the prune height has no witness file on purpose.
+/// Confirming it again is a no-op.
+#[test]
+fn confirm_of_a_pruned_height_stays_ok() {
+    let (dir, q) = temp_query("prune-reconfirm-old");
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 2, &[0x61], &mut hashes);
+    q.set_pruneheight(Some(Height(0))).unwrap();
+    assert!(!q.store().path().join("seqsigwit.window/0.bin").is_file());
+    let fk = q.confirm_block(Height(0), &hashes[0]).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(1)));
+    assert_eq!(q.header_at_height(Height(0)).unwrap().unwrap().0, fk);
+    assert!(!q.store().path().join("seqsigwit.window/0.bin").is_file());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The wire facade used to reject a block that is already the tip once its
+/// keep file was gone. Resubmitting that block writes the file again.
+#[test]
+fn resubmit_rewrites_a_missing_keep_file() {
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::accept_and_connect_block;
+
+    let (dir, q) = temp_query("prune-resubmit-keep");
+    q.set_prune_seqsigwit(true).unwrap();
+    let params = ChainParams::regtest();
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    accept_and_connect_block(&q, &params, Height(0), &genesis, Milestone::NONE).unwrap();
+    let spill = q.store().path().join("seqsigwit.window/0.bin");
+    let before = std::fs::read(&spill).unwrap();
+    std::fs::remove_file(&spill).unwrap();
+    q.clear_seqsigwit_ram_window();
+    accept_and_connect_block(&q, &params, Height(0), &genesis, Milestone::NONE).unwrap();
+    q.clear_seqsigwit_ram_window();
+    assert_eq!(std::fs::read(&spill).unwrap(), before);
+    assert_eq!(q.tip_height(), Some(Height(0)));
+    let _ = std::fs::remove_dir_all(dir);
+}

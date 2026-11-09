@@ -859,7 +859,10 @@ impl Query {
 
     /// Retry of a block that is already the tip. Seal only a height whose
     /// file does not already hold that block.
-    fn seal_missing_pruned_spills(&self, items: &[ConfirmPrepared]) -> Result<(), QueryError> {
+    pub(crate) fn seal_missing_pruned_spills(
+        &self,
+        items: &[ConfirmPrepared],
+    ) -> Result<(), QueryError> {
         if !self.prune_seqsigwit() {
             return Ok(());
         }

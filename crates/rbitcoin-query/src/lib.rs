@@ -1402,6 +1402,8 @@ impl Query {
 
     /// The height file holds every tx in this header. RAM does not count:
     /// shutdown can drop it, and the tip must not outlive the file.
+    /// A height at or below the prune height is covered: its witness was
+    /// dropped on purpose, and confirming it again must stay a no-op.
     pub(crate) fn pruned_spill_covers(&self, header_fk: Fk) -> Result<bool, QueryError> {
         if !self.prune_seqsigwit() {
             return Ok(true);
@@ -1411,6 +1413,15 @@ impl Query {
         };
         if tx_fks.is_empty() {
             return Ok(false);
+        }
+        if let Some(ph) = self.pruneheight() {
+            if self
+                .store
+                .tx_height_get(tx_fks[0])?
+                .is_some_and(|h| h <= ph.0)
+            {
+                return Ok(true);
+            }
         }
         for fk in tx_fks {
             let tx = self.get_tx(fk)?;
