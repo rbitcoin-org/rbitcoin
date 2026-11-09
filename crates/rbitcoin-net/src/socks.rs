@@ -129,7 +129,7 @@ impl Dialer {
                     connect_floor,
                     ..
                 },
-                crate::NetAddr::Ip(_),
+                crate::NetAddr::Ip(_) | crate::NetAddr::Name { .. },
             ) => {
                 if *connect_floor < SOCKS_CONNECT_TIMEOUT {
                     *connect_floor
