@@ -1761,7 +1761,13 @@ pub fn proxied_connect_names(hosts: &[String], network: Network) -> Vec<rbitcoin
                 return Some(net);
             }
             let (host, port) = with_port.rsplit_once(':')?;
-            rbitcoin_net::NetAddr::name(host, port.parse().ok()?)
+            let name = rbitcoin_net::NetAddr::name(host, port.parse().ok()?);
+            if name.is_none() {
+                rbitcoin_log::warn!(
+                    "not pinning {with_port}: too many distinct proxied host names"
+                );
+            }
+            name
         })
         .collect()
 }

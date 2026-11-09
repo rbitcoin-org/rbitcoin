@@ -221,9 +221,23 @@ impl DialTarget {
         self.version_socket()
     }
 
+    /// Whether the target has a key of its own. False for a name once the
+    /// interner is full: such a dial is refused, never keyed `0.0.0.0:port`,
+    /// where it would share a key with every other overflow name.
+    pub fn has_key(&self) -> bool {
+        match self {
+            Self::Socket(_) => true,
+            Self::Domain { host, port } => {
+                format!("{host}:{port}").parse::<crate::NetAddr>().is_ok()
+                    || crate::NetAddr::name(host, *port).is_some()
+            }
+        }
+    }
+
     /// An overlay host is its own `NetAddr`. A DNS name has no address until
-    /// the proxy resolves it, so the name is its key. Past the interner cap
-    /// the key falls back to [`Self::version_socket`] `0.0.0.0:port`.
+    /// the proxy resolves it, so the name is its key. Callers refuse a target
+    /// without [`Self::has_key`] first; the `0.0.0.0:port` fallback only keeps
+    /// this total.
     pub fn net_addr(&self) -> crate::NetAddr {
         match self {
             Self::Socket(addr) => crate::NetAddr::from_socket(*addr),
@@ -235,6 +249,11 @@ impl DialTarget {
         }
     }
 }
+
+/// The refusal for a name past the interner cap.
+#[doc(hidden)]
+pub const NO_NAME_KEY: &str =
+    "too many distinct proxied host names this run; restart the node to dial a new one";
 
 impl DialTarget {
     /// [`Self::net_addr`] without interning: `None` for a name nobody added,
@@ -725,7 +744,18 @@ impl LivePeer {
             crate::NetAddr::Onion { .. } => return SelfAnnounceLink::Tor,
             crate::NetAddr::I2p { .. } => return SelfAnnounceLink::I2p,
             crate::NetAddr::Cjdns { .. } => return SelfAnnounceLink::Cjdns,
-            crate::NetAddr::Name { .. } => return SelfAnnounceLink::Unknown,
+            crate::NetAddr::Name { .. } => {
+                // Only a `--proxy` dials a name: the link is the proxy's, like a proxied IP.
+                let proxied = hub
+                    .proxies()
+                    .proxy_for(crate::OnlyNet::of(self.net))
+                    .is_some();
+                return if proxied {
+                    SelfAnnounceLink::Tor
+                } else {
+                    SelfAnnounceLink::Unknown
+                };
+            }
             crate::NetAddr::Ip(sock) => sock,
         };
         if !self.inbound {
@@ -3220,6 +3250,9 @@ impl PeerHub {
         tx: &mpsc::UnboundedSender<DialRequest>,
         target: DialTarget,
     ) -> Result<(), String> {
+        if !target.has_key() {
+            return Err(NO_NAME_KEY.to_string());
+        }
         self.trust_allows_target(&target)?;
         // Claim before the live check: a dial registers its session before
         // it drops its claim, so no window shows the endpoint as neither.
