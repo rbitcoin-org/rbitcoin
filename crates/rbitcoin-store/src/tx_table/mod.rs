@@ -959,22 +959,24 @@ pub fn repair_class_a_count_skew(
     let n_loc = stems.create_loc.count();
     let n_txids = stems.txids.count();
     let n_seqsigwit_loc = stems.seqsigwit_loc.count();
-    let short_input = pruned_uncovered_input_floor(
+    let short_input = match pruned_uncovered_input_floor(
         &stems,
         n_loc,
         n_txids,
         n_seqsigwit_loc,
         prune_seqsigwit_mode,
         input_existed,
-    )
-    .or(short_new_layout_input(
-        &stems,
-        n_loc,
-        n_txids,
-        n_seqsigwit_loc,
-        prune_seqsigwit_mode,
-        input_existed,
-    )?);
+    ) {
+        Some(n) => Some(n),
+        None => short_new_layout_input(
+            &stems,
+            n_loc,
+            n_txids,
+            n_seqsigwit_loc,
+            prune_seqsigwit_mode,
+            input_existed,
+        )?,
+    };
     let skewed = class_a_skew_target_count(
         n_loc,
         n_txids,

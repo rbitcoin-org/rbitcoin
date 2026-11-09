@@ -836,6 +836,41 @@ fn connect_wide_coinbase(
     (header_fk, hash)
 }
 
+/// Prune mode already knows the short input is the crash tail. Repair must
+/// not also read the witness locator: that read can fail, and open would
+/// refuse a store it can already truncate.
+#[test]
+fn pruned_short_input_skips_the_witness_locator() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (prev, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let (prev, parent) = connect_coinbase(&s, &write, 1, prev, parent);
+    connect_coinbase(&s, &write, 2, prev, parent);
+    s.txs.flush().unwrap();
+    assert_eq!(s.txs.count(), 3);
+    s.txs.input.truncate_to_count(1).unwrap();
+    s.txs.seqsigwit_loc.truncate_to_count(2).unwrap();
+    let fd = s.txs.seqsigwit_loc.loc.read_fd();
+    rbitcoin_store::io_handle::arm_fail_preads(fd, 8);
+    let disarm = Disarm(fd);
+    let stems = rbitcoin_store::tx_table::ClassASkewStems {
+        create_loc: &s.txs.create_loc,
+        seqsigwit_loc: &s.txs.seqsigwit_loc,
+        body: &s.txs.body,
+        spent: &s.txs.spent,
+        seqsigwit: &s.txs.seqsigwit,
+        txids: &s.txs.txids,
+        txstat: &s.txs.txstat,
+        input: &s.txs.input,
+    };
+    rbitcoin_store::tx_table::repair_class_a_count_skew(stems, true, true).unwrap();
+    drop(disarm);
+    assert_eq!(s.txs.count(), 1, "repair stops at the short input");
+    assert_eq!(s.txs.input.count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn write_hwm(path: &std::path::Path, logical: u64) {
     use std::io::{Seek, SeekFrom, Write};
     let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();

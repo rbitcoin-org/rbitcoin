@@ -14,5 +14,7 @@ Fixed
   `store/` is synced after `seqsigwit.window` is created. A confirm batch
   syncs that directory once, after each height file, and before the tip
   moves, so a crash cannot drop the directory while the sidecar and a cut
-  locator remain. `txout`, `input`, `txstat`, and block filters stay.
+  locator remain. Opening a pruned store that already found a short input
+  does not also read the witness locator. `txout`, `input`, `txstat`, and
+  block filters stay.
   Unpruned nodes still read `seqsigwit.body`.
