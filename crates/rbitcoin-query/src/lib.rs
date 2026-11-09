@@ -740,15 +740,20 @@ impl Query {
     }
 
     /// Rewrite the keep window from the witness stem, then cut that stem
-    /// down to its header. A file already in the window is replaced. Master
-    /// wrote those files in the clear, and skipping one would keep the wrong
-    /// bytes after the stem is gone. A stem that is already only a header is
-    /// left alone, including the create slack.
+    /// down to its header. A file already in the window is replaced when
+    /// the locator still names the rows. Master wrote those files in the
+    /// clear, and skipping one would keep the wrong bytes after the stem
+    /// is gone. A locator that is already empty cannot be read. The window
+    /// files from the earlier sync stay, and the leftover body is cut. A
+    /// stem that is already only a header is left alone, including the
+    /// create slack.
     pub fn release_pruned_seqsigwit_stem(&self) -> Result<(), QueryError> {
         if !self.prune_seqsigwit() || !self.store.txs.seqsigwit_stem_needs_release() {
             return Ok(());
         }
-        self.rewrite_keep_window_from_stem()?;
+        if self.store.txs.seqsigwit_loc.count() > 0 {
+            self.rewrite_keep_window_from_stem()?;
+        }
         // A crash that keeps a truncated locator cannot read the stem.
         // The spill files have to be durable before that truncate.
         self.sync_keep_window_files()?;
@@ -787,7 +792,7 @@ impl Query {
     }
 
     /// Every keep height is written from the stem, including one that already
-    /// has a file. This runs only while the stem still holds the witness.
+    /// has a file. This runs only while the locator still names those rows.
     fn rewrite_keep_window_from_stem(&self) -> Result<(), QueryError> {
         let Some(tip) = self.tip_height() else {
             return Ok(());
