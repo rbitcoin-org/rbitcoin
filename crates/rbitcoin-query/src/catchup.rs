@@ -328,11 +328,10 @@ impl Query {
             || self.store.scripthash.shard_offset_past_file()?;
         if !rebuild
             && Self::sh_lost_tail(self.store.scripthash.include_hwm(), self.store.txs.count())
+            && !self.unlink_sh_tail(self.store.txs.count())?
         {
-            if !self.unlink_sh_tail(self.store.txs.count())? {
-                rbitcoin_store::scripthash::mark_sh_rebuild(self.store.path())?;
-                rebuild = true;
-            }
+            rbitcoin_store::scripthash::mark_sh_rebuild(self.store.path())?;
+            rebuild = true;
         }
         if rebuild && !self.sh_force_rebuild() {
             rbitcoin_store::scripthash::mark_sh_rebuild(self.store.path())?;
