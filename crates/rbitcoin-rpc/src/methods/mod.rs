@@ -1049,7 +1049,9 @@ pub const NAMED_HELP: &[(&str, &str)] = &[
         "estimaterawfee",
         "estimaterawfee conf_target (threshold)\n\
          Regtest/harness surface matching Core's RPC name. Returns this node's \
-         10-minute inclusion frontier (same product as estimatesmartfee).",
+         10-minute inclusion frontier, as estimatesmartfee does, except that \
+         target 1 keeps the 1-block quote and `blocks` 1 (estimatesmartfee \
+         answers target 1 as 2).",
     ),
     (
         "getblockchaininfo",

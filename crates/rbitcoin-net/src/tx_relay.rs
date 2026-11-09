@@ -4399,11 +4399,16 @@ impl MempoolHub {
     }
 
     /// Core `estimateSmartFee` treats target 1 as 2 ("not possible to get
-    /// reasonable estimates for confTarget of 1") and reports `blocks` 2.
-    /// `estimatesmartfee` and Electrum `blockchain.estimatefee` quote this
-    /// target. `estimaterawfee` and Esplora keep target 1.
+    /// reasonable estimates for confTarget of 1"). Only 1 moves: Electrum
+    /// target 0 stays the 1-block horizon. `estimatesmartfee` and Electrum
+    /// `blockchain.estimatefee` quote this target. `estimaterawfee` and
+    /// Esplora keep target 1.
     pub fn smart_fee_target(conf_target: u32) -> u32 {
-        conf_target.max(2)
+        if conf_target == 1 {
+            2
+        } else {
+            conf_target
+        }
     }
 
     /// Lazy singleflight refresh when dirty or older than [`FEE_SNAPSHOT_MAX_AGE`].
