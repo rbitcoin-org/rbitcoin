@@ -4798,6 +4798,19 @@ impl MempoolHub {
         }
     }
 
+    /// The target Core's `estimateSmartFee` answers for `target_blocks`: a
+    /// 1-block target is answered as 2 ("It's not possible to get reasonable
+    /// estimates for confTarget of 1", `block_policy_estimator.cpp`).
+    /// `estimatesmartfee` and Electrum `blockchain.estimatefee` follow Core;
+    /// Esplora `/fee-estimates` and `estimaterawfee` keep the 1-block quote.
+    pub const fn core_smart_fee_target(target_blocks: u32) -> u32 {
+        if target_blocks == 1 {
+            2
+        } else {
+            target_blocks
+        }
+    }
+
     /// Lazy singleflight refresh when dirty or older than [`FEE_SNAPSHOT_MAX_AGE`].
     #[doc(hidden)]
     pub fn maybe_refresh_fee_snapshot(&self) {

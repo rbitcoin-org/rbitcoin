@@ -2583,6 +2583,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         "esplora target 1 below the paid decade: {estimates}"
     );
     let expect = |target: u32| if target == 1 { one } else { floor };
+    let core = |target: u32| target.max(2);
     for target in [1u32, 2, 6, 144, 504, 1008] {
         let sat_vb = estimates[target.to_string()]
             .as_f64()
@@ -2601,7 +2602,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
             .unwrap_or_else(|| panic!("electrum estimatefee: {est}"));
         assert_eq!(
             btc_per_kb_to_sat_kvb(btc),
-            expect(target),
+            expect(core(target)),
             "electrum target {target}: {est}"
         );
     }
@@ -2619,12 +2620,20 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         let btc = fee["result"]["feerate"]
             .as_f64()
             .unwrap_or_else(|| panic!("{method} {target}: {fee}"));
+        let answered = if method == "estimatesmartfee" {
+            core(target)
+        } else {
+            target
+        };
         assert_eq!(
             btc_per_kb_to_sat_kvb(btc),
-            expect(target),
+            expect(answered),
             "{method} target {target}: {fee}"
         );
-        assert_eq!(fee["result"]["blocks"], target, "{method} {target}: {fee}");
+        assert_eq!(
+            fee["result"]["blocks"], answered,
+            "{method} {target}: {fee}"
+        );
         let errs = fee["result"].get("errors");
         assert!(
             errs.is_none() || errs.is_some_and(Value::is_null),
