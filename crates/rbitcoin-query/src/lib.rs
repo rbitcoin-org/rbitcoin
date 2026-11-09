@@ -736,14 +736,16 @@ impl Query {
         Ok(q)
     }
 
-    /// Copy any missing keep-window spill from the witness stem, then cut that
-    /// stem down to its header. A stem that is already only a header is left
-    /// alone, including the create slack.
+    /// Rewrite the keep window from the witness stem, then cut that stem
+    /// down to its header. A file already in the window is replaced. Master
+    /// wrote those files in the clear, and skipping one would keep the wrong
+    /// bytes after the stem is gone. A stem that is already only a header is
+    /// left alone, including the create slack.
     pub fn release_pruned_seqsigwit_stem(&self) -> Result<(), QueryError> {
         if !self.prune_seqsigwit() || !self.store.txs.seqsigwit_stem_needs_release() {
             return Ok(());
         }
-        self.fill_missing_seqsigwit_window()?;
+        self.rewrite_keep_window_from_stem()?;
         // A crash that keeps a truncated locator cannot read the stem.
         // The spill files have to be durable before that truncate.
         self.sync_keep_window_files()?;
@@ -781,7 +783,9 @@ impl Query {
         Ok(())
     }
 
-    fn fill_missing_seqsigwit_window(&self) -> Result<(), QueryError> {
+    /// Every keep height is written from the stem, including one that already
+    /// has a file. This runs only while the stem still holds the witness.
+    fn rewrite_keep_window_from_stem(&self) -> Result<(), QueryError> {
         let Some(tip) = self.tip_height() else {
             return Ok(());
         };
@@ -790,10 +794,6 @@ impl Query {
             return Ok(());
         }
         for h in from..=tip.0 {
-            let path = self.seqsigwit_spill_file(h)?;
-            if path.is_file() {
-                continue;
-            }
             let fks = self.block_tx_fks(Height(h))?;
             if fks.is_empty() {
                 return Err(StoreError::Corrupt("seqsigwit window miss"));

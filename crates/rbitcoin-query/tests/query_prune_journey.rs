@@ -957,3 +957,40 @@ fn wire_reorg_restores_the_archived_witness() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Master wrote `seqsigwit.window` in the clear. Open must copy the keep
+/// window from the stem again before it cuts that stem.
+#[test]
+fn master_plaintext_window_is_rewritten_before_the_cut() {
+    let (dir, q) = temp_query("prune-master-plaintext");
+    let witness: &[u8] = b"spar-witness-marker";
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 8, witness, &mut hashes);
+    let tip = q.tip_height().unwrap().0;
+    for h in 0..=tip {
+        let fks = q.block_tx_fks(Height(h)).unwrap();
+        let mut raw = Vec::new();
+        for fk in fks {
+            let (_tx, ins, _outs) = q.store().get_tx_full(fk).unwrap();
+            let id = fk.get().unwrap();
+            raw.extend_from_slice(&id.to_le_bytes());
+            let mut enc = Vec::new();
+            rbitcoin_store::encode_seqsigwit_with_secret(&ins, &mut enc, None);
+            raw.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+            raw.extend_from_slice(&enc);
+        }
+        let path = q.store().path().join(format!("seqsigwit.window/{h}.bin"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, raw).unwrap();
+    }
+    q.persist_pruneheight(u32::MAX).unwrap();
+    q.store().sync_spend_durable(tip).unwrap();
+    q.flush_for_shutdown().unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_witness_stem_cut(&q);
+    q.clear_seqsigwit_ram_window();
+    let fk = q.block_tx_fks(Height(4)).unwrap()[0];
+    assert_eq!(witness_of(&q, fk), vec![witness.to_vec()]);
+    let _ = std::fs::remove_dir_all(dir);
+}
