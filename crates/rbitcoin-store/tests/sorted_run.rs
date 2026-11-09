@@ -31,8 +31,8 @@ fn darwin_vm_pages_count_as_free_ram() {
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn mem_available_bytes_is_some_on_linux_macos_windows() {
+    // A cgroup at its limit reports 0 (`cgroup_usage_over_limit_leaves_zero_headroom`).
     let n = mem_available_bytes().expect("Linux MemAvailable / Darwin vm / Windows AvailPhys");
-    assert!(n >= 1024 * 1024, "probe too small: {n}");
     let w = workers_for_free_ram(logical_cpus(), n, 2 << 30);
     assert!((1..=256).contains(&w));
     assert!(w <= logical_cpus());
@@ -112,6 +112,28 @@ fn cgroup_usage_over_limit_leaves_zero_headroom() {
         3 * GIB,
     );
     assert_eq!(cgroup_headroom_bytes(&tmp.path, SERVICE), Some(0));
+}
+
+/// After IBD the page cache fills a `MemoryMax=` cgroup. The kernel reclaims
+/// it before the OOM killer runs, so it is headroom.
+#[test]
+fn cgroup_file_cache_counts_as_headroom() {
+    let tmp = rbitcoin_store::testutil::TempDir::labeled("cg-cache").expect("tmp");
+    let max = (7 * GIB).to_string();
+    let leaf = "system.slice/rbitcoin.service";
+    cgroup_level(&tmp.path, leaf, &max, "max", 7 * GIB - (64 << 20));
+    let stat = format!(
+        "anon {}\nfile {}\nactive_file {}\ninactive_file {}\nshmem 0\n",
+        2 * GIB,
+        5 * GIB,
+        GIB,
+        4 * GIB
+    );
+    std::fs::write(tmp.path.join(leaf).join("memory.stat"), stat).expect("memory.stat");
+    assert_eq!(
+        cgroup_headroom_bytes(&tmp.path, SERVICE),
+        Some(5 * GIB + (64 << 20))
+    );
 }
 
 #[test]

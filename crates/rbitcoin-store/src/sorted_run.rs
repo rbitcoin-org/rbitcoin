@@ -128,7 +128,8 @@ pub fn mem_available_from_windows_host() -> Option<u64> {
 ///
 /// `proc_self_cgroup` is `/proc/self/cgroup` text; its `0::<path>` line is
 /// resolved under `cgroup_root` (the v2 mount). Each level from that cgroup up
-/// to `cgroup_root` caps at `min(memory.max, memory.high) - memory.current`.
+/// to `cgroup_root` caps at `min(memory.max, memory.high)` less
+/// `memory.current` without its reclaimable file pages (`memory.stat`).
 /// `None` when no level sets a limit or the v2 files are absent (v1, hybrid).
 #[cfg(any(debug_assertions, target_os = "linux"))]
 #[doc(hidden)]
@@ -160,7 +161,17 @@ fn cgroup_level_headroom(dir: &std::path::Path) -> Option<u64> {
         .filter_map(|name| read(name)?.trim().parse::<u64>().ok())
         .min()?;
     let current: u64 = read("memory.current")?.trim().parse().ok()?;
-    Some(limit.saturating_sub(current))
+    // `memory.current` counts the page cache, which the kernel reclaims
+    // before the OOM killer runs. `file` would also count shmem. No
+    // `memory.stat` counts as nothing to reclaim.
+    let reclaimable: u64 = read("memory.stat").map_or(0, |stat| {
+        stat.lines()
+            .filter_map(|line| line.split_once(' '))
+            .filter(|(key, _)| matches!(*key, "active_file" | "inactive_file"))
+            .filter_map(|(_, v)| v.trim().parse::<u64>().ok())
+            .sum()
+    });
+    Some(limit.saturating_sub(current.saturating_sub(reclaimable)))
 }
 
 /// Memory this process can still allocate.
