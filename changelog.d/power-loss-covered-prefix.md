@@ -14,3 +14,7 @@ Fixed
   keeps creates the witness locator no longer names, and those creates have
   no scriptSig or witness. A short mempool `meta` is quarantined and the
   pool starts empty.
+- **Scripthash inclusion stays inside the covered create count.** A watermark
+  just above that count unlinks the tail, or rebuilds the head when those
+  outputs are gone. A shard offset past its file rebuilds once. A floor that
+  already matches the count does not.

@@ -46,6 +46,26 @@ pub const COLD_PROGRESS_MAGIC: &[u8; 8] = b"SHCOLDP1";
 /// Max create_fk fully present in durable SH (inclusion HWM; crash catch-up).
 pub const INCLUDE_HWM_NAME: &str = "scripthash.include_hwm";
 
+/// Present while a framing fault still has to be rebuilt from Class A.
+pub const SH_REBUILD_NAME: &str = "scripthash.rebuild";
+
+pub fn sh_rebuild_marked(store_dir: &Path) -> bool {
+    store_dir.join(SH_REBUILD_NAME).is_file()
+}
+
+pub fn mark_sh_rebuild(store_dir: &Path) -> Result<(), StoreError> {
+    crate::file::write_synced_tmp_rename(&store_dir.join(SH_REBUILD_NAME), b"1")
+}
+
+pub fn clear_sh_rebuild(store_dir: &Path) -> Result<(), StoreError> {
+    let path = store_dir.join(SH_REBUILD_NAME);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StoreError::io(path, e)),
+    }
+}
+
 /// Progress after each fully installed prefix shard (SIGINT resume).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColdProgress {
@@ -681,6 +701,20 @@ pub fn paged_first_from_last(body: &TableFile, last_page: u64) -> Result<u64, St
     sh_page_first_off(page)
 }
 
+fn note_sh_framing_near(body: &TableFile) {
+    let path = body.path();
+    let store = if path.file_name().and_then(|s| s.to_str()) == Some("scripthash.body") {
+        path.parent().map(|p| p.to_path_buf())
+    } else {
+        path.parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+    };
+    if let Some(store) = store {
+        let _ = mark_sh_rebuild(&store);
+    }
+}
+
 /// Cap on a contiguous megakey span pread (64 MiB ≈ 16k pages).
 #[doc(hidden)]
 pub const SH_PAGE_SPAN_MAX: u64 = 64 * 1024 * 1024;
@@ -695,6 +729,7 @@ pub fn read_sh_page_bytes(body: &TableFile, off: u64, buf: &mut [u8]) -> Result<
         ReadIoBackend::Uring => {
             let end = off.saturating_add(buf.len() as u64);
             if end > body.logical_len() {
+                note_sh_framing_near(body);
                 return Err(StoreError::Corrupt("pread past logical end"));
             }
             use crate::bulk_io::{self, ReadOp};
@@ -2019,6 +2054,7 @@ impl ScriptHashTable {
             ShHeadValue::Slab { class, off, used } => {
                 let got = self.read_slab(body, *class, *off)?;
                 if got.len() != *used as usize {
+                    let _ = mark_sh_rebuild(&self.store_dir);
                     return Err(StoreError::Corrupt(
                         "invariant: scripthash slab used != decoded fk count",
                     ));
@@ -2541,6 +2577,24 @@ impl ScriptHashTable {
     /// Number of SH head shards (1 on Tiny, 64 on mainnet).
     pub fn head_shard_count(&self) -> usize {
         self.n_shards
+    }
+
+    /// One alloc-header bump compared with that shard file's length.
+    ///
+    /// A bump past the file is a torn body. This does not read slab records.
+    pub fn shard_offset_past_file(&self) -> Result<bool, StoreError> {
+        for body in &self.bodies {
+            if body.logical_len() < FILE_HEADER_LEN as u64 + 24 {
+                continue;
+            }
+            match read_alloc_header(body) {
+                Ok((state, _)) if state.bump > body.logical_len() => return Ok(true),
+                Ok(_) => {}
+                Err(StoreError::Corrupt(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(false)
     }
 
     /// Current body bump (complete-shard HWM). Shared file: the one bump.

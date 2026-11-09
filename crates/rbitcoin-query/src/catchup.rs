@@ -171,7 +171,63 @@ impl Query {
         let seal = self.sh_run.sealed_max_create_fk();
         let include_hwm = self.store.scripthash.include_hwm();
         let floor = durable_sh_inclusion_floor(include_hwm, seal);
+        // A watermark just above the stem still names creates this open
+        // dropped. A seal copied far above the stem is not that tail.
+        if Self::sh_lost_tail(include_hwm, tip_max) {
+            return false;
+        }
         floor >= tip_max
+    }
+
+    /// `include_hwm` names creates that are no longer in Class A.
+    ///
+    /// A gap of more than a million creates is the legacy missing-file
+    /// SEAL, not a power-loss tail. That watermark stays put.
+    fn sh_lost_tail(include_hwm: u64, create_count: u64) -> bool {
+        const MAX_TAIL: u64 = 1_000_000;
+        include_hwm > create_count && include_hwm - create_count <= MAX_TAIL
+    }
+
+    /// Drop index rows for creates past the stem, using the same unlink
+    /// disconnect uses. Missing outputs mean the body was cut: the caller
+    /// rebuilds from Class A instead.
+    fn unlink_sh_tail(&self, covered: u64) -> Result<bool, QueryError> {
+        use std::collections::HashMap;
+        let hwm = self.store.scripthash.include_hwm();
+        let mut by_sh: HashMap<[u8; 32], Vec<Fk>> = HashMap::new();
+        for id in covered.saturating_add(1)..=hwm {
+            let outputs = match self.tx_output_run_class_a(Fk(id)) {
+                Ok(v) => v,
+                Err(StoreError::NotFound) => return Ok(false),
+                Err(e) => return Err(e),
+            };
+            for o in &outputs {
+                by_sh
+                    .entry(script_hash(&o.script))
+                    .or_default()
+                    .push(Fk(id));
+            }
+        }
+        if !by_sh.is_empty() {
+            let groups: Vec<([u8; 32], Vec<Fk>)> = by_sh.into_iter().collect();
+            self.store.scripthash.unlink_creates_batch(&groups)?;
+            self.store.scripthash.commit_deferred_empty_heads()?;
+        }
+        let path = self.store.path().join(rbitcoin_store::INCLUDE_HWM_NAME);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StoreError::io(&path, e)),
+        }
+        if covered > 0 {
+            self.store.scripthash.note_include_hwm(covered)?;
+        }
+        self.sh_run.refresh_seal();
+        if self.sh_run.sealed_max_create_fk() > covered {
+            crate::sh_builder::store_seal(&self.sh_run.runs_dir, covered)?;
+            self.sh_run.refresh_seal();
+        }
+        Ok(true)
     }
 
     /// Sync SEAL up to durable `include_hwm` when the head is ahead of the run
@@ -267,7 +323,22 @@ impl Query {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<u64, QueryError> {
         self.discard_unproven_scripthash_head()?;
-        if !self.sh_force_rebuild() && self.sh_use_writebehind() {
+        let mut rebuild = self.sh_force_rebuild()
+            || rbitcoin_store::scripthash::sh_rebuild_marked(self.store.path())
+            || self.store.scripthash.shard_offset_past_file()?;
+        if !rebuild
+            && Self::sh_lost_tail(self.store.scripthash.include_hwm(), self.store.txs.count())
+        {
+            if !self.unlink_sh_tail(self.store.txs.count())? {
+                rbitcoin_store::scripthash::mark_sh_rebuild(self.store.path())?;
+                rebuild = true;
+            }
+        }
+        if rebuild && !self.sh_force_rebuild() {
+            rbitcoin_store::scripthash::mark_sh_rebuild(self.store.path())?;
+            self.sh_run.prepare_force_full_rebuild(&self.store)?;
+        }
+        if !rebuild && !self.sh_force_rebuild() && self.sh_use_writebehind() {
             if self.store.scripthash.unsealed_main_shards().is_empty() {
                 let residual = self.sh_run.on_disk_run_count();
                 self.sh_run.discard_residual_runs();
@@ -313,7 +384,9 @@ impl Query {
             );
         }
 
-        self.finalize_sh_unsorted_cancellable(cancel)
+        let n = self.finalize_sh_unsorted_cancellable(cancel)?;
+        rbitcoin_store::scripthash::clear_sh_rebuild(self.store.path())?;
+        Ok(n)
     }
 
     #[doc(hidden)]

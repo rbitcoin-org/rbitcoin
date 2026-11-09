@@ -151,6 +151,65 @@ fn finalize_sh_runs_durable_head_missing_hwm_keeps_seal() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `include_hwm` above the create count is not tip-ready. Open drops that
+/// tail with the disconnect unlink. A second open does not rebuild.
+#[test]
+fn sh_floor_above_the_create_count_drops_the_tail() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-lost-tail");
+    q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    assert!(q.sh_is_tip_ready());
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(1, end).unwrap();
+    assert_eq!(q.store.txs.count(), 1);
+    assert!(!q.sh_is_tip_ready());
+    let cut = rbitcoin_store::script_hash(&[0x51, 1]);
+    let before = q.store.scripthash.entries(&cut).unwrap();
+    assert!(
+        before.iter().any(|(fk, _)| fk.0 > 1),
+        "tail create must be indexed before repair: {before:?}"
+    );
+    q.finalize_sh_runs().unwrap();
+    let after = q.store.scripthash.entries(&cut).unwrap();
+    assert!(
+        after.iter().all(|(fk, _)| fk.0 <= 1),
+        "history must not keep a create past the stem: {after:?}"
+    );
+    assert!(q.sh_is_tip_ready());
+    assert!(!rbitcoin_store::scripthash::sh_rebuild_marked(&dir));
+    let n = q.store.scripthash.entry_count();
+    q.finalize_sh_runs().unwrap();
+    assert_eq!(q.store.scripthash.entry_count(), n);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A shard alloc bump past the file rebuilds from Class A once.
+#[test]
+fn sh_shard_offset_past_the_file_rebuilds_once() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-shard-off");
+    q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    assert!(q.sh_is_tip_ready());
+    {
+        let body = &q.store.scripthash.bodies[0];
+        let mut state = q.store.scripthash.allocs[0].lock().unwrap();
+        state.bump = body.logical_len() + 64;
+        rbitcoin_store::scripthash::write_alloc_header(body, &state).unwrap();
+    }
+    assert!(q.store.scripthash.shard_offset_past_file().unwrap());
+    q.finalize_sh_runs().unwrap();
+    assert!(!q.store.scripthash.shard_offset_past_file().unwrap());
+    assert!(!rbitcoin_store::scripthash::sh_rebuild_marked(&dir));
+    assert!(q.sh_is_tip_ready());
+    let n = q.store.scripthash.entry_count();
+    q.finalize_sh_runs().unwrap();
+    assert_eq!(q.store.scripthash.entry_count(), n);
+    assert!(!q.store.scripthash.shard_offset_past_file().unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn finalize_sh_runs_empty_head_leftover_seal_is_wiped() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-stale");
