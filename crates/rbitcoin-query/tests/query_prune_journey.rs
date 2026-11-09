@@ -652,7 +652,9 @@ fn spill_failure_does_not_publish_the_tip() {
     let blocker = window.join("1.bin.tmp");
     std::fs::create_dir(&blocker).unwrap();
     let (header, ta) = next_block(&q, hashes[0], 0x22);
-    let err = q.connect_block(Height(1), &header, &[ta.clone()]).unwrap_err();
+    let err = q
+        .connect_block(Height(1), &header, std::slice::from_ref(&ta))
+        .unwrap_err();
     assert_eq!(
         q.tip_height(),
         Some(Height(0)),
@@ -724,7 +726,8 @@ fn reorg_restores_the_archived_witness() {
     connect_range(&q, Fk::NULL, None, 1, &[0x11], &mut hashes);
     let parent = hashes[0];
     let (header_a, ta_a) = tagged_block(&q, parent, 0x11, 1);
-    q.connect_block(Height(1), &header_a, &[ta_a.clone()]).unwrap();
+    q.connect_block(Height(1), &header_a, std::slice::from_ref(&ta_a))
+        .unwrap();
     q.disconnect_tip().unwrap();
     let (header_b, ta_b) = tagged_block(&q, parent, 0x22, 2);
     q.connect_block(Height(1), &header_b, &[ta_b]).unwrap();

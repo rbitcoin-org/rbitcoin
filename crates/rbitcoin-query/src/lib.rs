@@ -1517,7 +1517,7 @@ impl Query {
     /// height, which may not be on the fence yet.
     fn inputs_for_seal(&self, height: Height, fk: Fk) -> Result<Vec<InputRecord>, QueryError> {
         let tx = self.get_tx(fk)?;
-        if !self.pruneheight().is_some_and(|ph| height.0 <= ph.0) {
+        if self.pruneheight().is_none_or(|ph| height.0 > ph.0) {
             if let Some(ins) = self.read_spill_row(height.0, fk, tx.input_count)? {
                 return Ok(ins);
             }
