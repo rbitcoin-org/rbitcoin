@@ -437,6 +437,34 @@ fn open_finishes_cut_when_locator_is_already_zero() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The create locator landed and the witness locator stopped short. Open
+/// drops that tail, then copies the keep window from the rows that remain.
+#[test]
+fn open_truncates_a_short_witness_locator_before_the_cut() {
+    let (dir, q) = temp_query("prune-loc-prefix");
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 20, &[0x47], &mut hashes);
+    let kept = 12u64;
+    q.store()
+        .txs
+        .seqsigwit_loc
+        .truncate_to_count(kept)
+        .unwrap();
+    q.persist_pruneheight(u32::MAX).unwrap();
+    q.store().sync_spend_durable(19).unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.store().txs.count(), kept);
+    assert_eq!(q.tip_height(), Some(Height(11)));
+    assert_witness_stem_cut(&q);
+    let block = q.reconstruct_block_at_height(Height(11)).unwrap();
+    assert_eq!(
+        block.txdata[0].input[0].witness.to_vec(),
+        vec![vec![0x47]]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// `store/` has to be synced after `seqsigwit.window` exists. The sidecar
 /// rename syncs `store/` before that directory is created, and the spill
 /// rename only syncs the window directory.

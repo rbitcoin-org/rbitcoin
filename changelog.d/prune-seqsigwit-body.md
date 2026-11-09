@@ -8,7 +8,9 @@ Fixed
   A datadir already pruned by an older build has plaintext window files.
   The first open rewrites the keep window from the stem before that cut,
   so those heights still serve. If the witness locator is already empty,
-  that open keeps the window files and finishes the cut. Confirming a height that was already
+  that open keeps the window files and finishes the cut. A locator that
+  stopped short of the creates drops that unpublished tail before the copy.
+  Confirming a height that was already
   dropped is a no-op. Resubmitting the tip writes a missing keep file again.
   The height file is synced before the tip commit and before that cut.
   A tip of 288 drops genesis and records pruneheight 0. A shorter chain

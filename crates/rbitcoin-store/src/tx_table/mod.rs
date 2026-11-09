@@ -775,10 +775,14 @@ pub fn class_a_skew_target_count(
     if let Some(n) = short_new_layout_input {
         return Some(n);
     }
-    if n_txids == n_loc && (prune_seqsigwit_mode || n_seqsigwit_loc == n_loc) {
+    // Count 0 is the finished cut. Min-ing it would drop the chain.
+    // A positive locator that is short of the creates is an unfinished
+    // commit, and the chain truncates to the rows it still names.
+    let witness_cut = prune_seqsigwit_mode && n_seqsigwit_loc == 0;
+    if n_txids == n_loc && (witness_cut || n_seqsigwit_loc == n_loc) {
         return None;
     }
-    Some(if prune_seqsigwit_mode {
+    Some(if witness_cut {
         n_loc.min(n_txids)
     } else {
         n_loc.min(n_txids).min(n_seqsigwit_loc)
