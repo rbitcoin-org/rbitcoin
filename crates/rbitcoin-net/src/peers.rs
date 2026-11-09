@@ -3478,10 +3478,8 @@ impl PeerHub {
         if let Ok(net) = parse_peer_net(&with_port) {
             return Ok(DialTarget::from_net(net));
         }
-        if node.parse::<std::net::IpAddr>().is_err() {
-            if let Some(target) = self.proxied_domain_target(&with_port) {
-                return Ok(target);
-            }
+        if let Some(target) = self.proxied_domain_target(&with_port) {
+            return Ok(target);
         }
         let addr =
             parse_peer_addr_with_port(node, self.default_port_opt()).map_err(|e| e.to_string())?;
@@ -4043,6 +4041,10 @@ pub fn parse_peer_net(s: &str) -> Result<crate::NetAddr, NetError> {
 pub fn ensure_host_port(node: &str, default_port: Option<u16>) -> Result<String, String> {
     if node.parse::<SocketAddr>().is_ok() {
         return Ok(node.to_string());
+    }
+    if let Ok(ip) = node.parse::<IpAddr>() {
+        let port = default_port.ok_or_else(|| format!("bad peer address {node}"))?;
+        return Ok(SocketAddr::new(ip, port).to_string());
     }
     if let Some((host, port_s)) = node.rsplit_once(':') {
         if !host.is_empty() && !host.starts_with('[') && port_s.parse::<u16>().is_ok() {

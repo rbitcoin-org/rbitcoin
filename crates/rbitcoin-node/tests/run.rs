@@ -1058,11 +1058,16 @@ async fn proxy_only_net_onion_dials_a_fixed_onion_seed() {
 }
 
 /// Under `--proxy` a `--connect` hostname is pinned by name: catch-up and the
-/// follow dial hand that name to SOCKS, and `--trust-peer` sees a pin.
+/// follow dial hand that name to SOCKS, and `--trust-peer` sees a pin. A bare
+/// IPv6 literal needs no lookup and stays a socket at the default port.
 #[test]
 fn proxy_pins_the_connect_hostname_for_the_follow_dial() {
     let pinned = proxied_connect_names(
-        &["peer.example:8444".to_string(), "bare.example".to_string()],
+        &[
+            "peer.example:8444".to_string(),
+            "bare.example".to_string(),
+            "2001:db8::1".to_string(),
+        ],
         rbitcoin_primitives::Network::Regtest,
     );
     let dialed: Vec<_> = outbound_dial_targets(true, &pinned, &AddrMan::default(), 8, &[])
@@ -1080,7 +1085,11 @@ fn proxy_pins_the_connect_hostname_for_the_follow_dial() {
             want(
                 "bare.example",
                 rbitcoin_primitives::Network::Regtest.default_p2p_port()
-            )
+            ),
+            rbitcoin_net::DialTarget::Socket(std::net::SocketAddr::new(
+                "2001:db8::1".parse().unwrap(),
+                rbitcoin_primitives::Network::Regtest.default_p2p_port()
+            ))
         ]
     );
 }
