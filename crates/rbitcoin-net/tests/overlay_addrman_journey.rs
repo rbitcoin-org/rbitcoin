@@ -365,7 +365,7 @@ fn overlay_config() {
             rbitcoin_net::NetAddr::Onion { .. } => one.set_onion_reachable(true),
             rbitcoin_net::NetAddr::I2p { .. } => one.set_i2p_reachable(true),
             rbitcoin_net::NetAddr::Cjdns { .. } => one.set_cjdns_reachable(true),
-            rbitcoin_net::NetAddr::Ip(_) => {}
+            rbitcoin_net::NetAddr::Ip(_) | rbitcoin_net::NetAddr::Name { .. } => {}
         }
         one.add_addr(addr);
         hub.set_addrman(Arc::new(Mutex::new(one)));

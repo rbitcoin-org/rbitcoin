@@ -1749,3 +1749,79 @@ fn proxy_keeps_ipv6_literals_as_sockets() {
         }
     }
 }
+
+fn proxied_hub() -> (
+    std::sync::Arc<PeerHub>,
+    mpsc::UnboundedReceiver<DialRequest>,
+) {
+    let hub = PeerHub::new();
+    let (tx, rx) = mpsc::unbounded_channel();
+    hub.set_dialer(tx);
+    hub.set_proxies(rbitcoin_net::NetProxies {
+        dialer: rbitcoin_net::Dialer::socks("127.0.0.1:9050".parse().unwrap(), true),
+        i2p_sam: None,
+    });
+    (hub, rx)
+}
+
+/// A `--proxy` name is the live key of its session. A redial pass while the
+/// session is up opens no second one, and two names on one port stay apart.
+#[test]
+fn proxy_names_are_the_live_key_of_their_sessions() {
+    let (hub, mut rx) = proxied_hub();
+    hub.set_connect_hosts(vec!["a.invalid:8333".into(), "b.invalid:8333".into()], 8333);
+    hub.redial_remembered();
+    let first = take_dials(&mut rx);
+    assert_eq!(first.len(), 2);
+    let a = first
+        .iter()
+        .find(|d| matches!(&d.target, DialTarget::Domain { host, .. } if host == "a.invalid"))
+        .unwrap();
+    let _session = hub.register_connecting_net(
+        a.target.version_socket(),
+        a.target.net_addr(),
+        a.target.version_socket(),
+        false,
+        PeerConnType::Manual,
+    );
+    drop(first);
+    hub.redial_remembered();
+    let again: Vec<_> = take_dials(&mut rx)
+        .into_iter()
+        .map(|d| match d.target {
+            DialTarget::Domain { host, .. } => host,
+            DialTarget::Socket(a) => panic!("resolved locally to {a}"),
+        })
+        .collect();
+    assert_eq!(
+        again,
+        ["b.invalid"],
+        "a.invalid is live; only b.invalid is dialed"
+    );
+}
+
+/// The session of the `--trust-peer` hostname is the trusted session, so the
+/// block and tx waiver applies to it.
+#[test]
+fn proxied_trust_peer_hostname_is_the_trusted_session() {
+    let (hub, _rx) = proxied_hub();
+    hub.set_trust_peer(None, Some("trusted.invalid".into()));
+    let target = hub.host_dial_target("trusted.invalid:8333").unwrap();
+    let trusted = hub.register_connecting_net(
+        target.version_socket(),
+        target.net_addr(),
+        target.version_socket(),
+        false,
+        PeerConnType::Manual,
+    );
+    assert!(hub.session_is_trusted_peer(&trusted));
+    let other = hub.host_dial_target("other.invalid:8333").unwrap();
+    let stranger = hub.register_connecting_net(
+        other.version_socket(),
+        other.net_addr(),
+        other.version_socket(),
+        false,
+        PeerConnType::Manual,
+    );
+    assert!(!hub.session_is_trusted_peer(&stranger));
+}

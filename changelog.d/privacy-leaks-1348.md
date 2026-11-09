@@ -3,7 +3,11 @@ Fixed
 - **`--proxy` now resolves `--connect` and `addnode` names.** The node
   hands the name to the SOCKS proxy (address type 3). Before, the OS resolver
   looked it up first, so clear-text DNS queries for the peer left the host
-  outside the proxy, again every two seconds while the dial failed (#1348).
+  outside the proxy, again every two seconds while the dial failed. The
+  name is also the key of its session now: a redial pass no longer opens a
+  second session to a name that is up, two names on one port stay apart, a
+  `--trust-peer` hostname's session is the trusted one, and a `--connect`
+  name is dialed by catch-up and tip-follow (#1348).
 - **`--only-net onion` no longer asks clearnet seeds.** With no IPv4 or
   IPv6 reachable, the node sends no DNS seed query, local or through
   `--proxy`, and adds only the fixed onion seeds. Before, it looked up the

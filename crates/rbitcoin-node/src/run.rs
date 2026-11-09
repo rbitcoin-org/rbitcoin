@@ -748,9 +748,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         config.listen.connect_dns.clone(),
         config.network.default_p2p_port(),
     );
-    // A `--proxy` resolves connect names itself; a local lookup would leak them.
-    let dns_resolved = if shutdown.requested() || config.listen.proxy.is_some() {
+    let dns_resolved = if shutdown.requested() {
         Vec::new()
+    } else if config.listen.proxy.is_some() {
+        proxied_connect_names(&config.listen.connect_dns, config.network)
     } else {
         resolve_connect_dns(&config.listen.connect_dns, config.network).await
     };
@@ -1747,6 +1748,22 @@ pub fn catch_up_with_connect(
 /// Tip-follow may run below `--min-chain-work`. Relay stays off until the floor.
 pub fn relay_while_following(meets_min_work: bool, blocks_only: bool, in_ibd: bool) -> bool {
     meets_min_work && !blocks_only && !in_ibd
+}
+
+/// `--connect` names under `--proxy`: pinned by name, so the proxy resolves them.
+pub fn proxied_connect_names(hosts: &[String], network: Network) -> Vec<rbitcoin_net::NetAddr> {
+    let port = network.default_p2p_port();
+    hosts
+        .iter()
+        .filter_map(|h| {
+            let with_port = rbitcoin_net::ensure_host_port(h, Some(port)).ok()?;
+            if let Ok(net) = rbitcoin_net::parse_peer_net(&with_port) {
+                return Some(net);
+            }
+            let (host, port) = with_port.rsplit_once(':')?;
+            rbitcoin_net::NetAddr::name(host, port.parse().ok()?)
+        })
+        .collect()
 }
 
 pub async fn resolve_connect_dns(hosts: &[String], network: Network) -> Vec<rbitcoin_net::NetAddr> {

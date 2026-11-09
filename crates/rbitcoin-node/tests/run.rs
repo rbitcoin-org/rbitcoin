@@ -1057,6 +1057,34 @@ async fn proxy_only_net_onion_dials_a_fixed_onion_seed() {
     assert!(host.ends_with(".onion"), "dialed {host}");
 }
 
+/// Under `--proxy` a `--connect` hostname is pinned by name: catch-up and the
+/// follow dial hand that name to SOCKS, and `--trust-peer` sees a pin.
+#[test]
+fn proxy_pins_the_connect_hostname_for_the_follow_dial() {
+    let pinned = proxied_connect_names(
+        &["peer.example:8444".to_string(), "bare.example".to_string()],
+        rbitcoin_primitives::Network::Regtest,
+    );
+    let dialed: Vec<_> = outbound_dial_targets(true, &pinned, &AddrMan::default(), 8, &[])
+        .into_iter()
+        .map(rbitcoin_net::DialTarget::from_net)
+        .collect();
+    let want = |host: &str, port| rbitcoin_net::DialTarget::Domain {
+        host: host.into(),
+        port,
+    };
+    assert_eq!(
+        dialed,
+        [
+            want("peer.example", 8444),
+            want(
+                "bare.example",
+                rbitcoin_primitives::Network::Regtest.default_p2p_port()
+            )
+        ]
+    );
+}
+
 #[test]
 fn proxy_seed_bootstrap_queues_domain_addrfetch() {
     let peers = rbitcoin_net::PeerHub::new();

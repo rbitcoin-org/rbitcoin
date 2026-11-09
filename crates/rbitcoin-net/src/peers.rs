@@ -198,6 +198,10 @@ impl DialTarget {
         match addr {
             crate::NetAddr::Ip(s) => Self::Socket(s),
             crate::NetAddr::Cjdns { ip, port } => Self::Socket(SocketAddr::from((ip, port))),
+            crate::NetAddr::Name { id, port } => Self::Domain {
+                host: id.host(),
+                port,
+            },
             other => Self::Domain {
                 host: other.host_str(),
                 port: other.port(),
@@ -217,15 +221,17 @@ impl DialTarget {
         self.version_socket()
     }
 
-    /// An overlay host is its own `NetAddr`. A DNS name (a `--proxy` seed
-    /// addr-fetch) has no address until the proxy resolves it, so it is the
-    /// [`Self::version_socket`] `0.0.0.0:port`.
+    /// An overlay host is its own `NetAddr`. A DNS name has no address until
+    /// the proxy resolves it, so the name is its key. Past the interner cap
+    /// the key falls back to [`Self::version_socket`] `0.0.0.0:port`.
     pub fn net_addr(&self) -> crate::NetAddr {
         match self {
             Self::Socket(addr) => crate::NetAddr::from_socket(*addr),
             Self::Domain { host, port } => format!("{host}:{port}")
                 .parse()
-                .unwrap_or_else(|_| crate::NetAddr::from_socket(self.version_socket())),
+                .ok()
+                .or_else(|| crate::NetAddr::name(host, *port))
+                .unwrap_or_else(|| crate::NetAddr::from_socket(self.version_socket())),
         }
     }
 }
@@ -705,6 +711,7 @@ impl LivePeer {
             crate::NetAddr::Onion { .. } => return SelfAnnounceLink::Tor,
             crate::NetAddr::I2p { .. } => return SelfAnnounceLink::I2p,
             crate::NetAddr::Cjdns { .. } => return SelfAnnounceLink::Cjdns,
+            crate::NetAddr::Name { .. } => return SelfAnnounceLink::Unknown,
             crate::NetAddr::Ip(sock) => sock,
         };
         if !self.inbound {
@@ -1693,6 +1700,7 @@ impl DiscourageKey {
             crate::NetAddr::Onion { pk, .. } => Some(Self::Onion(pk)),
             crate::NetAddr::I2p { dest, .. } => Some(Self::I2p(dest)),
             crate::NetAddr::Cjdns { ip, .. } => Some(Self::Ip(IpAddr::V6(ip))),
+            crate::NetAddr::Name { .. } => None,
             crate::NetAddr::Ip(sock) => {
                 let ip = sock.ip();
                 if ip_skips_discourage(ip) {
@@ -1905,6 +1913,7 @@ impl OwnAddrs {
             }
             crate::NetAddr::Ip(sock) => self.has_ip(sock.ip()),
             crate::NetAddr::Cjdns { ip, .. } => self.has_ip(IpAddr::V6(ip)),
+            crate::NetAddr::Name { .. } => false,
         }
     }
 
@@ -3650,9 +3659,10 @@ impl PeerHub {
         let peers = self.snapshot();
         match target {
             DialTarget::Socket(addr) => peers.iter().any(|p| p.addr == *addr),
-            DialTarget::Domain { host, port } => peers
-                .iter()
-                .any(|p| p.net.host_str() == *host && p.net.port() == *port),
+            DialTarget::Domain { .. } => {
+                let net = target.net_addr();
+                peers.iter().any(|p| p.net == net)
+            }
         }
     }
 
