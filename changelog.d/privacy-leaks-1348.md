@@ -6,8 +6,9 @@ Fixed
   outside the proxy, again every two seconds while the dial failed. The
   name is also the key of its session now: a redial pass no longer opens a
   second session to a name that is up, two names on one port stay apart, a
-  `--trust-peer` hostname's session is the trusted one, and a `--connect`
-  name is dialed by catch-up and tip-follow (#1348).
+  `--trust-peer` hostname's session is the trusted one, a `--connect`
+  name is dialed by catch-up and tip-follow, and `disconnectnode` takes the
+  name `getpeerinfo` lists as `addr` (#1348).
 - **`--only-net onion` no longer asks clearnet seeds.** With no IPv4 or
   IPv6 reachable, the node sends no DNS seed query, local or through
   `--proxy`, and adds only the fixed onion seeds. Before, it looked up the
