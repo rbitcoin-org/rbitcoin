@@ -1167,7 +1167,7 @@ impl TxTable {
                 } else {
                     tx_head_rebuild_workers_for_free_ram(
                         crate::sorted_run::logical_cpus(),
-                        crate::host_mem_available_bytes().unwrap_or(0),
+                        crate::sorted_run::mem_available_bytes().unwrap_or(0),
                     )
                 }
             });

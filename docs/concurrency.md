@@ -73,7 +73,7 @@ walk at the tip that no connected peer can extend. Competing
 `hash_height` and leftover explore getdata are not remainder. Tip entry
 bulk-materializes SH (two Class A `txout` scans → identity-map key spills
 then fuse-hit postings → BDZ `scripthash.head/NN`; extract workers capped at
-one per 1.5 GiB host free RAM). Shared file `scripthash.body`
+one per 1.5 GiB free RAM, cgroup limit included). Shared file `scripthash.body`
 is one writer. Overflow body
 is one writer (ingest / compact). It does **not** rebuild `tx.head` or
 spend annotations.

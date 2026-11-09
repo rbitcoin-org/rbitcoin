@@ -212,7 +212,7 @@ pub fn sh_extract_workers() -> usize {
     }
     crate::sorted_run::workers_for_free_ram(
         crate::sorted_run::logical_cpus(),
-        crate::sorted_run::host_mem_available_bytes().unwrap_or(0),
+        crate::sorted_run::mem_available_bytes().unwrap_or(0),
         SH_EXTRACT_WORKER_RAM_BYTES,
     )
 }
