@@ -221,12 +221,27 @@ impl Query {
         Err(StoreError::Layout(SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into()))
     }
 
+    /// Height `prune_seqsigwit_below` will record for the current tip.
+    /// Tip 288 drops height 0. A shorter chain drops nothing.
+    fn predicted_pruneheight(&self) -> Option<u32> {
+        let tip = self.tip_height().map(|h| h.0)?;
+        if tip >= Self::SEQSIGWIT_KEEP_HEIGHTS {
+            Some(tip - Self::SEQSIGWIT_KEEP_HEIGHTS)
+        } else {
+            None
+        }
+    }
+
     /// Startup calls this before the first prune cut when this start also
     /// wants tweaks. The enabled bit is still false on a fresh process, and
-    /// the stem cut cannot be undone.
+    /// the stem cut cannot be undone. An index that already covers every
+    /// height the cut will drop keeps serving from `sp_tweaks` and `txout`.
     pub fn refuse_adding_prune_with_tweaks(&self, origin: Height) -> Result<(), QueryError> {
-        if self.sptweaks_enabled() || SpTweaksTable::files_present(self.store.cold_files_dir()) {
-            return Err(StoreError::Layout(SP_TWEAKS_PRUNE_WHILE_ENABLED.into()));
+        let ph = self.predicted_pruneheight();
+        let present =
+            self.sptweaks_enabled() || SpTweaksTable::files_present(self.store.cold_files_dir());
+        if present {
+            return self.allow_prune_when_tweaks_cover(origin, ph);
         }
         let Some(tip) = self.tip_height().map(|h| h.0) else {
             return Ok(());
@@ -234,17 +249,19 @@ impl Query {
         if tip < origin.0 {
             return Ok(());
         }
-        // Same line `prune_seqsigwit_below` will persist. Tip 288 drops
-        // height 0. A shorter chain drops nothing.
-        let ph = if tip >= Self::SEQSIGWIT_KEEP_HEIGHTS {
-            Some(tip - Self::SEQSIGWIT_KEEP_HEIGHTS)
+        self.allow_prune_when_tweaks_cover(origin, ph)
+    }
+
+    fn allow_prune_when_tweaks_cover(
+        &self,
+        origin: Height,
+        pruneheight: Option<u32>,
+    ) -> Result<(), QueryError> {
+        if self.tweak_watermark_covers(origin, pruneheight)? {
+            Ok(())
         } else {
-            None
-        };
-        if self.tweak_watermark_covers(origin, ph)? {
-            return Ok(());
+            Err(StoreError::Layout(SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into()))
         }
-        Err(StoreError::Layout(SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into()))
     }
 
     fn tweak_watermark_covers(
@@ -265,10 +282,6 @@ impl Query {
 /// Startup and enable share this text. Callers match `prune-seqsigwit` and `taproot`.
 pub(crate) const SP_TWEAKS_PRUNE_BEFORE_TAPROOT: &str =
     "silent payment tweaks on --prune-seqsigwit must be enabled before taproot activation";
-
-/// `set_prune_seqsigwit` and startup share this text.
-pub(crate) const SP_TWEAKS_PRUNE_WHILE_ENABLED: &str =
-    "refusing --prune-seqsigwit while silent payment tweaks are enabled";
 
 impl Query {
     #[doc(hidden)]

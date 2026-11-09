@@ -413,8 +413,8 @@ Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak 
   With --prune-seqsigwit, a later enable is allowed while nothing has been\n\
   dropped, because the keep window still has those witnesses. It is refused\n\
   when the index does not already cover every height that has been dropped\n\
-  or will be dropped. Turning prune on while tweaks are already enabled\n\
-  stays refused.\n\
+  or will be dropped. Turning prune on after that index is already built\n\
+  is allowed, and those sealed rows keep being served.\n\
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
 Health: --health-listen [ADDR] serves GET /healthz, GET /readyz, and GET /progress (JSON:\n\
   the running index build, rebuild, or backfill stage, at any log level) from the first\n\

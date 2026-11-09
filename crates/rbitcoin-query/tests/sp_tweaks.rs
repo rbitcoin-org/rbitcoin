@@ -160,13 +160,7 @@ fn connect_one(
 fn prune_seqsigwit_and_sp_tweaks_follow_taproot() {
     let (dir, q) = tmp_q();
     q.set_sptweaks_enabled(true, Height(4)).unwrap();
-    assert!(
-        q.set_prune_seqsigwit(true).is_err(),
-        "prune under tweaks stays refused"
-    );
-    q.set_sptweaks_enabled(false, Height(4)).unwrap();
     q.set_prune_seqsigwit(true).unwrap();
-    q.set_sptweaks_enabled(true, Height(4)).unwrap();
 
     let mut prev = Fk::NULL;
     let mut prev_hash = None;
@@ -261,6 +255,69 @@ fn adding_prune_matches_the_height_that_will_be_dropped() {
     assert_eq!(q.tip_height(), Some(Height(keep)));
     let before = q.store().txs.seqsigwit_loc.count();
     assert!(before > 0);
+    let err = q.refuse_adding_prune_with_tweaks(Height(0)).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("taproot"), "{msg}");
+    assert_eq!(q.store().txs.seqsigwit_loc.count(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The tweak index already covers the chain. Turning prune on drops
+/// historical witnesses and still serves the sealed row from `sp_tweaks`
+/// and `txout`. An index that does not cover the height about to be dropped
+/// is refused before the stem cut.
+#[test]
+fn adding_prune_after_the_tweak_index_is_built_keeps_serving() {
+    let keep = Query::SEQSIGWIT_KEEP_HEIGHTS;
+    let (dir, q) = tmp_q();
+    let mut prev = Fk::NULL;
+    let mut prev_hash = None;
+    let mut headers = Vec::with_capacity((keep + 1) as usize);
+    for h in 0..=keep {
+        let (fk, hash) = connect_one(&q, h, prev, prev_hash, h == 0);
+        prev = fk;
+        prev_hash = Some(hash);
+        headers.push(fk);
+    }
+    assert_eq!(q.tip_height(), Some(Height(keep)));
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    let tweak = [0x02; 33];
+    for (h, fk) in headers.iter().copied().enumerate() {
+        let row = if h == 0 {
+            vec![Some(tweak)]
+        } else {
+            vec![None]
+        };
+        q.put_sp_tweaks_block(Height(h as u32), fk, &row).unwrap();
+    }
+    assert_eq!(q.sptweaks_next_height(), Some(Height(keep + 1)));
+    // A restart has not loaded the flag yet. The files are the index.
+    q.set_sptweaks_enabled(false, Height(0)).unwrap();
+    let before = q.store().txs.seqsigwit_loc.count();
+    q.refuse_adding_prune_with_tweaks(Height(0)).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    q.apply_prune_seqsigwit_tip().unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(0)));
+    assert!(q.store().txs.seqsigwit_loc.count() < before);
+    assert!(!q.store().path().join("seqsigwit.window/0.bin").exists());
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    let rows = q.load_thin_tweaks(Height(0)).unwrap().expect("sealed row");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].tweak, tweak);
+    assert!(!rows[0].p2tr.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (dir, q) = tmp_q();
+    let mut prev = Fk::NULL;
+    let mut prev_hash = None;
+    for h in 0..=keep {
+        let (fk, hash) = connect_one(&q, h, prev, prev_hash, false);
+        prev = fk;
+        prev_hash = Some(hash);
+    }
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    q.set_sptweaks_enabled(false, Height(0)).unwrap();
+    let before = q.store().txs.seqsigwit_loc.count();
     let err = q.refuse_adding_prune_with_tweaks(Height(0)).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("taproot"), "{msg}");

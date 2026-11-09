@@ -903,10 +903,11 @@ fn both_flags_on_a_short_unpruned_chain_start() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
-/// A fresh process loads the tweak flag as off. Files on disk still count as
-/// the index being enabled, so adding prune must not cut the stem.
+/// A fresh process loads the tweak flag as off. Files on disk are still the
+/// index. Nothing has been dropped on a one-block chain, so prune starts and
+/// the genesis witness stays in the keep window.
 #[test]
-fn adding_prune_beside_existing_tweaks_keeps_the_stem() {
+fn adding_prune_beside_existing_tweaks_on_a_short_chain_starts() {
     let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-tweaks-then-prune");
     let params = rbitcoin_consensus::ChainParams::regtest();
@@ -933,17 +934,11 @@ fn adding_prune_beside_existing_tweaks_keeps_the_stem() {
         "--sp-tweaks",
         "--prune-seqsigwit",
     ]);
-    let err = rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height())
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("refusing"), "{msg}");
-    assert!(msg.contains("prune-seqsigwit"), "{msg}");
-    assert!(msg.contains("silent payment tweaks are enabled"), "{msg}");
-    assert!(
-        !q.prune_seqsigwit(),
-        "prune stuck beside an existing tweak index"
-    );
-    assert_eq!(q.store().txs.seqsigwit.body_logical_len(), before);
+    rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height()).unwrap();
+    assert!(q.prune_seqsigwit());
+    assert!(q.sptweaks_enabled());
+    assert!(path.join("seqsigwit.window/0.bin").is_file());
+    assert!(q.store().txs.seqsigwit.body_logical_len() < before);
     drop(q);
     let _ = std::fs::remove_dir_all(dir.path());
 }

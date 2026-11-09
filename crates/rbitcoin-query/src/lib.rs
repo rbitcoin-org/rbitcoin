@@ -1037,10 +1037,14 @@ impl Query {
 
     pub fn set_prune_seqsigwit(&self, on: bool) -> Result<(), QueryError> {
         let was_on = self.prune_seqsigwit();
-        if on && self.sptweaks_enabled() {
-            return Err(StoreError::Layout(
-                crate::sp_tweaks::SP_TWEAKS_PRUNE_WHILE_ENABLED.into(),
-            ));
+        if on
+            && (self.sptweaks_enabled()
+                || rbitcoin_store::SpTweaksTable::files_present(self.store.cold_files_dir()))
+        {
+            // Same gate as startup. A built index covers the drop and keeps
+            // serving. A hole at or below that height still refuses, before
+            // this writes the mode bit.
+            self.refuse_adding_prune_with_tweaks(self.sptweaks_origin())?;
         }
         if !on && self.prune_seqsigwit() {
             return Err(StoreError::Layout(
