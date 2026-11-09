@@ -654,3 +654,133 @@ fn spill_failure_shutdown_keeps_the_old_tip() {
     assert!(!q.store().path().join("seqsigwit.window/8.bin").is_file());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+fn tagged_block(
+    q: &Query,
+    parent_hash: [u8; 32],
+    witness: u8,
+    tag: u8,
+) -> (HeaderRecord, TxApply) {
+    let (mut header, mut ta) = next_block(q, parent_hash, witness);
+    ta.tx.txid[30] = tag;
+    header.merkle_root = ta.tx.txid;
+    header.hash = rbitcoin_store::block_header_hash(
+        header.version,
+        &parent_hash,
+        &header.merkle_root,
+        header.timestamp,
+        header.bits,
+        header.nonce,
+    );
+    (header, ta)
+}
+
+/// Connect A, replace it with B, then connect A again. A is already archived,
+/// so the second connect has to take A's witness from the wire. The spill
+/// still holds B.
+#[test]
+fn reorg_restores_the_archived_witness() {
+    let (dir, q) = temp_query("prune-reorg-witness");
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 1, &[0x11], &mut hashes);
+    let parent = hashes[0];
+    let (header_a, ta_a) = tagged_block(&q, parent, 0x11, 1);
+    q.connect_block(Height(1), &header_a, &[ta_a.clone()]).unwrap();
+    q.disconnect_tip().unwrap();
+    let (header_b, ta_b) = tagged_block(&q, parent, 0x22, 2);
+    q.connect_block(Height(1), &header_b, &[ta_b]).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let b_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+    assert_eq!(witness_of(&q, b_fk), vec![vec![0x22]]);
+    q.disconnect_tip().unwrap();
+    q.connect_block(Height(1), &header_a, &[ta_a]).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let a_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+    assert_eq!(witness_of(&q, a_fk), vec![vec![0x11]]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Same reorg through the wire confirm path. Lookup skips Class A once the
+/// body exists, and the spill still has to be rewritten from that block.
+#[test]
+fn wire_reorg_restores_the_archived_witness() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::{
+        Amount, Block, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode,
+        TxOut, Witness,
+    };
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::accept_and_connect_block;
+
+    fn coinbase(height: u32, tag: u8) -> Transaction {
+        let mut ss = rbitcoin_consensus::bip34_height_script(height);
+        ss.push(tag);
+        Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(ss),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+    fn mine(prev: bitcoin::BlockHash, time: u32, height: u32, tag: u8) -> Block {
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let mut block = Block {
+            header: Header {
+                version: Version::from_consensus(4),
+                prev_blockhash: prev,
+                merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+                time,
+                bits,
+                nonce: 0,
+            },
+            txdata: vec![coinbase(height, tag)],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let target = bitcoin::Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            block.header.nonce = nonce;
+            if block.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        block
+    }
+
+    let (dir, q) = temp_query("prune-wire-reorg");
+    q.set_prune_seqsigwit(true).unwrap();
+    let params = ChainParams::regtest();
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    accept_and_connect_block(&q, &params, Height(0), &genesis, Milestone::NONE).unwrap();
+    let a = mine(genesis.block_hash(), 1_700_000_001, 1, 0x11);
+    accept_and_connect_block(&q, &params, Height(1), &a, Milestone::NONE).unwrap();
+    q.disconnect_tip().unwrap();
+    let b = mine(genesis.block_hash(), 1_700_000_002, 1, 0x22);
+    accept_and_connect_block(&q, &params, Height(1), &b, Milestone::NONE).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let b_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+    let b_tx = q.get_tx(b_fk).unwrap();
+    assert!(q.tx_input_at_fk(b_fk, &b_tx, 0).unwrap().script_sig.ends_with(&[0x22]));
+    q.disconnect_tip().unwrap();
+    accept_and_connect_block(&q, &params, Height(1), &a, Milestone::NONE).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let a_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+    let a_tx = q.get_tx(a_fk).unwrap();
+    assert!(
+        q.tx_input_at_fk(a_fk, &a_tx, 0)
+            .unwrap()
+            .script_sig
+            .ends_with(&[0x11]),
+        "reconnecting A must serve A's script, not B's"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

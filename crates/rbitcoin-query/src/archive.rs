@@ -1449,6 +1449,52 @@ pub fn seqsigwit_rows_for_prune(
 pub type ArchiveHeadParents = (bool, Vec<rbitcoin_store::CreateLocPair>, Vec<(Fk, Fk, u32)>);
 
 impl Query {
+    /// The body is already archived, so commit will not note scriptSig and
+    /// witness again. Prune mode has no stem to fall back on. Take them from
+    /// the block being connected and the input edges already stored.
+    pub fn note_pruned_archived_seqsigwit(
+        &self,
+        header_fk: Fk,
+        block: &bitcoin::Block,
+    ) -> Result<(), QueryError> {
+        if !self.prune_seqsigwit() || !self.store.header_txs.has_body(header_fk)? {
+            return Ok(());
+        }
+        let Some(fks) = self.store.header_txs.get_list(header_fk)? else {
+            return Err(StoreError::Corrupt("seqsigwit window miss"));
+        };
+        if fks.len() != block.txdata.len() {
+            return Err(StoreError::Corrupt(
+                "invariant: archived seqsigwit tx count",
+            ));
+        }
+        let mut rows = Vec::with_capacity(fks.len());
+        for (fk, tx) in fks.iter().copied().zip(block.txdata.iter()) {
+            let stored = self.store.input_edges(fk)?.ok_or(StoreError::Corrupt(
+                "invariant: archived seqsigwit missing input edges",
+            ))?;
+            if stored.len() != tx.input.len() {
+                return Err(StoreError::Corrupt(
+                    "invariant: archived seqsigwit input count",
+                ));
+            }
+            let edges: Vec<crate::SpendEdge> = stored
+                .iter()
+                .enumerate()
+                .map(|(vin, edge)| crate::SpendEdge {
+                    prev_txid: tx.input[vin].previous_output.txid.to_byte_array(),
+                    vout: edge.vout,
+                    spend_fk: fk,
+                    create_fk: edge.parent,
+                    vin: vin as u32,
+                })
+                .collect();
+            rows.push(input_records_from_wire(tx, fk, &edges)?);
+        }
+        self.note_appended_seqsigwit_inputs(&fks, rows);
+        Ok(())
+    }
+
     /// Class A plan + commit from wire blocks. Does not set tip.
     pub fn archive_class_a_from_wire(&self, items: &[WirePlanNeed<'_>]) -> Result<(), QueryError> {
         if items.is_empty() {
