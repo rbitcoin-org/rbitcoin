@@ -931,6 +931,9 @@ fn chain_ops_estimate_fee_edges(ctx: &RpcContext) {
     assert!(r.get("feerate").is_none(), "no estimate has no feerate: {r}");
     assert_eq!(r["errors"][0], "Insufficient data or no feerate found", "{r}");
     assert_eq!(r["blocks"], 2, "{r}");
+    // Core treats target 1 as 2.
+    let one = dispatch(ctx, "estimatesmartfee", vec![json!(1)]).unwrap();
+    assert_eq!(one["blocks"], 2, "{one}");
     for target in [2_u64, 6, 12, 100] {
         let fee = dispatch(ctx, "estimatesmartfee", vec![json!(target)]).unwrap();
         assert!(

@@ -2827,7 +2827,7 @@ pub fn dispatch_pinned(
         }
         "blockchain.transaction.id_from_pos" => id_from_pos(query, params),
         "blockchain.estimatefee" => {
-            let target = param_u32(params, 0).unwrap_or(2);
+            let target = MempoolHub::smart_fee_target(param_u32(params, 0).unwrap_or(2));
             let fee = mempool
                 .map(|m| m.estimate_fee_btc_per_kb(target))
                 .unwrap_or(-1.0);

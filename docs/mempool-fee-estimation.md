@@ -13,6 +13,10 @@ The **default** fee estimate this node advertises answers:
 | Esplora fee endpoints (primary) | Same |
 | Optional target-depth knobs | **Near:** flow invert. **Far:** block history. Blended. |
 
+`estimatesmartfee` and Electrum `blockchain.estimatefee` treat target 1 as 2
+and report `blocks` 2, like Core's `estimateSmartFee`. `estimaterawfee` and
+Esplora `/fee-estimates` key `1` keep the 1-block quote below.
+
 The published rate blends a cold quote and a warm quote by flow fullness α.
 α = 0 is history, raised by the live frontier when the pool reaches that
 depth. α = 1 is the warm quote: the 1-block target is live stock and capped
