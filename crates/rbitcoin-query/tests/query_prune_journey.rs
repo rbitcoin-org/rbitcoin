@@ -614,9 +614,10 @@ fn shorter_fork_does_not_lower_pruneheight() {
     q.clear_seqsigwit_ram_window();
     let kept = q.block_tx_fks(Height(12)).unwrap()[0];
     assert_eq!(witness_of(&q, kept), vec![vec![0x55; 8]]);
-    // The fixture txid ignores witness, so this tip is the same block.
+    // The fixture txid ignores witness, so this tip is the same header.
+    // The spill stores the witness from the block just connected.
     let tip = q.block_tx_fks(Height(299)).unwrap()[0];
-    assert_eq!(witness_of(&q, tip), vec![vec![0x55; 8]]);
+    assert_eq!(witness_of(&q, tip), vec![vec![0x77; 8]]);
     let _ = std::fs::remove_dir_all(dir);
 }
 
