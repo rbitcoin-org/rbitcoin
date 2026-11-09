@@ -1,14 +1,14 @@
 {
   "new_base": "8e62e4ce4d60c30abc851cb0893e4b80149ac9e4",
-  "new_skip": 2489,
-  "old_index": 9553,
+  "new_skip": 2709,
+  "old_index": 9701,
   "new_cap_used": true,
-  "run_id": "42455961975",
-  "old_name": "crates/rbitcoin-net/src/fee_history.rs:108:42: replace && with || in FeeHistory::truncate_above",
-  "new_len": 5117,
-  "new_remaining": 2628,
-  "completed_new": 0,
-  "completed_old": 371,
-  "old_len": 29168,
-  "old_remaining": 28797
+  "run_id": "42578171911",
+  "old_name": "crates/rbitcoin-net/src/i2p_sam.rs:192:32: replace == with != in I2pSam::connect_persistent",
+  "new_len": 5121,
+  "new_remaining": 2412,
+  "completed_new": 220,
+  "completed_old": 148,
+  "old_len": 29166,
+  "old_remaining": 29018
 }
