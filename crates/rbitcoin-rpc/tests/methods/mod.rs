@@ -5014,6 +5014,69 @@ fn testmempoolaccept_package_applies_truc_to_an_untested_parent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A tx with the txid of a pool entry but another witness is
+/// `txn-same-nonwitness-data-in-mempool`, alone and as a package member. The
+/// pooled witness itself is `txn-already-in-mempool`. Core gives each the
+/// same `reject-details`. `sendrawtransaction` of
+/// the other witness returns the txid and keeps the pooled one (Core
+/// `mempool_accept_wtxid.py`).
+#[test]
+fn testmempoolaccept_tells_a_witness_swap_from_a_duplicate() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let value = 50_0000_0000 - 10_000;
+    let proto = p2wsh_with_lens(OutPoint::null(), value, 1_000, 1, &[1]);
+    let (_, funding) = spend_generated_coinbase(&ctx, 1, value, p2wsh_spk(&proto));
+    let prev = OutPoint::new(funding.compute_txid(), 0);
+    let pooled = p2wsh_with_lens(prev, value, 1_000, 1, &[1]);
+    let swapped = p2wsh_with_lens(prev, value, 1_000, 1, &[2]);
+    assert_eq!(pooled.compute_txid(), swapped.compute_txid());
+    assert_ne!(pooled.compute_wtxid(), swapped.compute_wtxid());
+    let child = Transaction {
+        version: TxVersion::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(pooled.compute_txid(), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value - 2_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    for tx in [&funding, &pooled] {
+        dispatch(&ctx, "sendrawtransaction", vec![json!(hex(tx))]).unwrap();
+    }
+    let test = |txs: &[&Transaction]| {
+        let hexes: Vec<String> = txs.iter().map(|tx| hex(tx)).collect();
+        dispatch(&ctx, "testmempoolaccept", vec![json!(hexes)]).unwrap()
+    };
+    let same_nonwitness = "txn-same-nonwitness-data-in-mempool";
+    let alone = test(&[&swapped]);
+    assert_eq!(alone[0]["reject-reason"], same_nonwitness, "{alone}");
+    assert_eq!(alone[0]["reject-details"], same_nonwitness, "{alone}");
+    let member = test(&[&swapped, &child]);
+    assert_eq!(member[0]["reject-reason"], same_nonwitness, "{member}");
+    assert_eq!(member[0]["reject-details"], same_nonwitness, "{member}");
+    let duplicate = test(&[&pooled, &child]);
+    for key in ["reject-reason", "reject-details"] {
+        assert_eq!(duplicate[0][key], "txn-already-in-mempool", "{duplicate}");
+    }
+    let sent = dispatch(&ctx, "sendrawtransaction", vec![json!(hex(&swapped))]).unwrap();
+    assert_eq!(sent, json!(pooled.compute_txid().to_string()));
+    let mp = ctx.mempool.as_ref().unwrap();
+    assert_eq!(
+        mp.wtxid_of(&pooled.compute_txid()),
+        Some(pooled.compute_wtxid())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A package dry run may not replace a pool tx, and says so with Core's
 /// `reject-details`. The refusal comes before any input resolves, so an
 /// input already spent on chain does not win.
