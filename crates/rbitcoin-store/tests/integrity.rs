@@ -1113,6 +1113,83 @@ fn cleared_tail_range_still_drops_the_sealed_tip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Body headers name height 0. Locators and a side header still name the
+/// next create. Open shrinks to height 0, drops both ranges past that
+/// create, and the next append does not keep a second copy of height 0.
+#[test]
+fn short_body_header_shrinks_to_the_landed_prefix() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    s.txs.flush().unwrap();
+    let tx_end = on_disk_hwm(&dir.join("txout.body"));
+    let sp_end = on_disk_hwm(&dir.join("spent.body"));
+    let in_end = on_disk_hwm(&dir.join("seqsigwit.body"));
+    let (tail, _) = connect_coinbase(&s, &write, 1, genesis, parent);
+    let side = s.put_header(&hdr(genesis, parent, 9)).unwrap();
+    s.header_txs.put_range(&write, side, Fk(2), 1).unwrap();
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    s.header_txs.flush().unwrap();
+    assert!(on_disk_hwm(&dir.join("txout.body")) > tx_end);
+    write_hwm(&dir.join("txout.body"), tx_end);
+    write_hwm(&dir.join("spent.body"), sp_end);
+    write_hwm(&dir.join("seqsigwit.body"), in_end);
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+    assert!(s.header_txs.has_body(genesis).unwrap());
+    assert!(!s.header_txs.has_body(tail).unwrap());
+    assert!(!s.header_txs.has_body(side).unwrap());
+    let again = s
+        .put_tx_full_batch_indexed(
+            &[(
+                rbitcoin_store::tx_table::TxRecord {
+                    txid: [2u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![rbitcoin_store::tx_table::InputRecord::coinbase(
+                    u32::MAX,
+                    vec![],
+                    vec![],
+                )],
+                vec![rbitcoin_store::tx_table::OutputRecord::unspent(1, vec![2])],
+            )],
+            false,
+        )
+        .unwrap();
+    assert_eq!(again, vec![Fk(2)]);
+    assert_eq!(s.txs.count(), 2);
+    assert_eq!(s.txs.body_txid(Fk(1)).unwrap(), [0u8; 32]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Headers that already match the logical lengths are the commit.
+/// Open does not drop a create.
+#[test]
+fn aligned_class_a_headers_do_not_truncate() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let (tail, _) = connect_coinbase(&s, &write, 1, genesis, parent);
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    drop(s);
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 2);
+    assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
+    assert!(s.header_txs.has_body(genesis).unwrap());
+    assert!(s.header_txs.has_body(tail).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Every header range was cleared, including genesis, and the empty-tip
 /// shrink did not land. Reopen drops the tip and leaves no body association.
 #[test]

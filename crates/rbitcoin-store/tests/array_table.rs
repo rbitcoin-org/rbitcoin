@@ -424,10 +424,8 @@ fn array_set_get_grow_set_many_truncate_flush() {
         raw[8..16].copy_from_slice(&bad);
         std::fs::write(&path, &raw).unwrap();
     }
-    assert!(matches!(
-        ArrayTable::open(&path, TableKind::Confirmed),
-        Err(StoreError::Corrupt(_))
-    ));
+    let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
+    assert_eq!(t.len(), 0, "a partial trailing record is not a row");
     let _ = std::fs::remove_file(&path);
 }
 

@@ -868,6 +868,51 @@ pub fn pruned_uncovered_input_floor(
     Some(n_in)
 }
 
+fn body_headers_cover(
+    stems: &ClassASkewStems<'_>,
+    tx_end: u64,
+    sp_end: u64,
+    in_end: u64,
+    prune_seqsigwit_mode: bool,
+) -> bool {
+    stems.body.body.header_persist_len() >= tx_end
+        && stems.spent.body.header_persist_len() >= sp_end
+        && (prune_seqsigwit_mode || stems.seqsigwit.body.header_persist_len() >= in_end)
+}
+
+/// Largest create `<= n` whose stem ends fit the durable body headers.
+///
+/// Stem ends grow with the create index. Create `0` is the file header.
+/// A failed locator read returns before any truncate.
+#[doc(hidden)]
+pub fn fit_covered_to_body_headers(
+    stems: &ClassASkewStems<'_>,
+    n: u64,
+    prune_seqsigwit_mode: bool,
+) -> Result<(u64, u64, u64, u64), StoreError> {
+    let (tx_end, sp_end, in_end) = class_a_skew_stem_ends(stems, n, prune_seqsigwit_mode)?;
+    if n == 0 || body_headers_cover(stems, tx_end, sp_end, in_end, prune_seqsigwit_mode) {
+        return Ok((n, tx_end, sp_end, in_end));
+    }
+    let zero = class_a_skew_stem_ends(stems, 0, prune_seqsigwit_mode)?;
+    let mut best = (0, zero.0, zero.1, zero.2);
+    let mut lo = 0u64;
+    let mut hi = n - 1;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let (tx_end, sp_end, in_end) = class_a_skew_stem_ends(stems, mid, prune_seqsigwit_mode)?;
+        if body_headers_cover(stems, tx_end, sp_end, in_end, prune_seqsigwit_mode) {
+            best = (mid, tx_end, sp_end, in_end);
+            lo = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(best)
+}
+
 #[doc(hidden)]
 pub fn class_a_skew_stem_ends(
     stems: &ClassASkewStems<'_>,
@@ -990,19 +1035,13 @@ pub fn repair_class_a_count_skew(
         prune_seqsigwit_mode,
         short_input,
     );
-    let n = skewed.unwrap_or(n_loc);
-    let (tx_end, sp_end, in_end) = class_a_skew_stem_ends(&stems, n, prune_seqsigwit_mode)?;
-    // The locator count is the commit. A body header ahead of it is the crash
-    // before the locator pwrite. A body header short of it was not published.
-    require_body_header(stems.body.body_logical_len(), tx_end)?;
-    require_body_header(stems.spent.body_logical_len(), sp_end)?;
-    if !prune_seqsigwit_mode {
-        require_body_header(stems.seqsigwit.body_logical_len(), in_end)?;
-    }
+    let n_target = skewed.unwrap_or(n_loc);
+    let (n, tx_end, sp_end, in_end) =
+        fit_covered_to_body_headers(&stems, n_target, prune_seqsigwit_mode)?;
     let ahead = stems.body.body_logical_len() > tx_end
         || stems.spent.body_logical_len() > sp_end
         || (!prune_seqsigwit_mode && stems.seqsigwit.body_logical_len() > in_end);
-    if skewed.is_none() && !ahead {
+    if skewed.is_none() && !ahead && n == n_loc {
         return Ok(false);
     }
     let n_input = stems.input.count();
@@ -1021,16 +1060,6 @@ pub fn repair_class_a_count_skew(
     )?;
     class_a_skew_assert_aligned(&stems, prune_seqsigwit_mode)?;
     Ok(true)
-}
-
-fn require_body_header(header: u64, end: u64) -> Result<(), StoreError> {
-    if header < end {
-        Err(StoreError::Corrupt(
-            "invariant: body header short of locator",
-        ))
-    } else {
-        Ok(())
-    }
 }
 
 fn file_header_behind(file: &crate::file::TableFile) -> bool {
@@ -1793,20 +1822,30 @@ impl TxTable {
         past(&self.body.body) || past(&self.spent.body) || past(&self.seqsigwit.body)
     }
 
-    /// Creates whose locator headers have landed.
+    /// Creates whose durable headers have landed.
     ///
     /// No header is behind: two loads per file and the RAM count. A withheld
-    /// header is the length those headers still name.
+    /// header is the length the locator headers and the body headers still name.
     pub(crate) fn durable_create_count(&self) -> Result<u64, StoreError> {
         if !self.class_a_header_behind() {
             return Ok(self.count());
         }
-        self.locator_header_count()
+        let n = self.locator_header_count()?;
+        let stems = ClassASkewStems {
+            create_loc: &self.create_loc,
+            seqsigwit_loc: &self.seqsigwit_loc,
+            body: &self.body,
+            spent: &self.spent,
+            seqsigwit: &self.seqsigwit,
+            txids: &self.txids,
+            txstat: &self.txstat,
+            input: &self.input,
+        };
+        Ok(fit_covered_to_body_headers(&stems, n, self.prune_seqsigwit_mode())?.0)
     }
 
     /// Create count named by the locator headers, including a withheld
-    /// overflow header. A body header is not part of this count: open
-    /// truncates a body that ran ahead and refuses one that fell short.
+    /// overflow header. Callers min this with the body-header prefix.
     fn locator_header_count(&self) -> Result<u64, StoreError> {
         let prune = self.seqsigwit_stem_retired();
         let mut hi = durable_loc_count(

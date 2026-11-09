@@ -633,9 +633,14 @@ impl ArrayTable {
 
     pub fn open(path: impl AsRef<Path>, kind: TableKind) -> Result<Self, StoreError> {
         let file = TableFile::open(path.as_ref(), kind)?;
-        let body = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
-        if body % ELEM != 0 {
-            return Err(StoreError::Corrupt("array table size"));
+        let mut logical = file.logical_len();
+        let mut body = logical.saturating_sub(FILE_HEADER_LEN as u64);
+        if !body.is_multiple_of(ELEM) {
+            // A torn trailing record is not a row. The header pwrite is not
+            // synced: the next open floors again if this write did not land.
+            logical -= body % ELEM;
+            file.set_logical_len(logical)?;
+            body = logical.saturating_sub(FILE_HEADER_LEN as u64);
         }
         let n = body / ELEM;
         let data = if body <= class_c_inram_max_bytes() {

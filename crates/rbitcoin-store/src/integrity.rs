@@ -679,13 +679,15 @@ impl Store {
         Ok(self.class_a_confirmed_cut(covered)?.is_none())
     }
 
-    /// After open truncates Class A, drop confirmed heights whose tx range
-    /// ends past that count. The header clear is flushed before the tip
-    /// shrink. A crash after that clear still shrinks: the strong bit past
-    /// the count is set and the range is already gone. Trailing nulls, a
-    /// header-only tip, and a Class C fixture are not this drop.
+    /// After open truncates Class A, clear every `header_txs` range that
+    /// ends past that count, then drop confirmed heights that no longer fit.
+    /// The header clear is flushed before the tip shrink. A crash after that
+    /// clear still shrinks: the strong bit past the count is set and the
+    /// range is already gone. Trailing nulls, a header-only tip, and a Class
+    /// C fixture are not this drop.
     pub(crate) fn drop_confirmed_past_creates(&self) -> Result<(), StoreError> {
         let covered = self.txs.count();
+        self.clear_header_ranges_past_covered(covered)?;
         let Some(tip) = self.confirmed.tip_height() else {
             return Ok(());
         };
@@ -721,6 +723,39 @@ impl Store {
             return Ok(());
         }
         self.shrink_tip_to(&write, None, &mut report)
+    }
+
+    /// In-RAM `header_txs` only. A clean chain walks slots that are already
+    /// resident. A header-only store and a Class C fixture name no archive.
+    fn clear_header_ranges_past_covered(&self, covered: u64) -> Result<(), StoreError> {
+        if covered == 0 && !self.txs.bodies_allocated_past_header() {
+            return Ok(());
+        }
+        let write = crate::array_table::ClassCWrite::new();
+        let n = self.header_txs.first.len().min(self.header_txs.count.len());
+        let mut cleared = false;
+        for i in 0..n {
+            let count = self.header_txs.count.get(i)?;
+            if count == 0 {
+                continue;
+            }
+            let first = self.header_txs.first.get(i)?;
+            if first == 0 {
+                continue;
+            }
+            let end = first.saturating_add(count).saturating_sub(1);
+            if end <= covered {
+                continue;
+            }
+            let Some(fk) = Fk::new(i.saturating_add(1)) else {
+                continue;
+            };
+            cleared |= self.header_txs.clear_body(&write, fk)?;
+        }
+        if cleared {
+            self.header_txs.flush()?;
+        }
+        Ok(())
     }
 
     fn strong_past_covered(&self, covered: u64) -> Result<bool, StoreError> {

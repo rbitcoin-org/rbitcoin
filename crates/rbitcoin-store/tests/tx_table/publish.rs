@@ -58,9 +58,10 @@ fn numbered(n: u16) -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
     )
 }
 
-/// A body header short of the locator count is not a prefix to recover.
+/// A body header short of the locator count is the covered prefix.
+/// Open keeps that create and drops the locator tail.
 #[test]
-fn body_header_short_of_the_locator_is_corrupt() {
+fn body_header_short_of_the_locator_reopens_at_that_prefix() {
     let dir = super::tempfile_dir("body-behind-loc");
     let t = TxTable::create_tiny(&dir).unwrap();
     t.put_full_batch_indexed(&[one(1)], false).unwrap();
@@ -73,12 +74,11 @@ fn body_header_short_of_the_locator_is_corrupt() {
     set_disk_hwm(&t.seqsigwit.body, in_end);
     set_disk_hwm(&t.spent.body, sp_end);
     drop(t);
-    match TxTable::open_tiny(&dir) {
-        Err(rbitcoin_store::StoreError::Corrupt(m))
-            if m.contains("body header short of locator") => {}
-        Err(e) => panic!("open returned {e}"),
-        Ok(_) => panic!("open kept a body header short of the locator"),
-    }
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.create_loc.count(), 1);
+    assert_eq!(outs(&t, 1)[0].script, vec![1]);
+    assert!(t.get_meta_and_outputs(rbitcoin_primitives::Fk(2)).is_err());
 }
 
 /// `create.loc` landed and `seqsigwit.loc` did not. Open cuts back to the
