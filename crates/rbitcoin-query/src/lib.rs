@@ -542,6 +542,8 @@ pub struct Query {
     pub spill_unlinked_through: AtomicU32,
     /// Operator `--prune-seqsigwit` (advertise NETWORK_LIMITED even before a drop).
     pub prune_seqsigwit: AtomicBool,
+    /// This process created `seqsigwit.window` and has not synced `store/` since.
+    seqsigwit_window_dir_fresh: AtomicBool,
     /// True while the net IBD engine is active.
     pub ibd_mode: AtomicBool,
     /// In prune+IBD mode, cap for recent witness kept in RAM.
@@ -710,6 +712,7 @@ impl Query {
             sealed_tip,
             spill_unlinked_through: AtomicU32::new(u32::MAX),
             prune_seqsigwit: AtomicBool::new(prune_on),
+            seqsigwit_window_dir_fresh: AtomicBool::new(false),
             ibd_mode: AtomicBool::new(false),
             seqsigwit_ram_threshold_bytes: AtomicU64::new(
                 Self::DEFAULT_SEQSIGWIT_RAM_THRESHOLD_BYTES,
@@ -838,14 +841,19 @@ impl Query {
             return Ok(());
         }
         rbitcoin_store::file::fsync_parent_dir(&dir).map_err(|e| StoreError::io(&dir, e))?;
-        // The window directory's own dirent lives in `store/`. The sidecar
-        // rename syncs that parent before `create_dir_all`, so a crash can
-        // drop the directory after the stem cut unless this parent is synced
-        // once the directory exists.
-        if let Some(parent) = dir.parent() {
-            if !parent.as_os_str().is_empty() {
-                rbitcoin_store::file::fsync_parent_dir(parent)
-                    .map_err(|e| StoreError::io(parent, e))?;
+        // The window directory's dirent lives in `store/`. The sidecar rename
+        // syncs that parent before `create_dir_all`, so the parent has to be
+        // synced once, when this process created the directory. Later calls
+        // only sync the window directory itself.
+        if self
+            .seqsigwit_window_dir_fresh
+            .swap(false, AtomicOrdering::AcqRel)
+        {
+            if let Some(parent) = dir.parent() {
+                if !parent.as_os_str().is_empty() {
+                    rbitcoin_store::file::fsync_parent_dir(parent)
+                        .map_err(|e| StoreError::io(parent, e))?;
+                }
             }
         }
         Ok(())
@@ -1287,7 +1295,12 @@ impl Query {
         rows: &[(Fk, &[InputRecord])],
     ) -> Result<(), QueryError> {
         let dir = self.seqsigwit_spill_dir();
+        let created = !dir.is_dir();
         std::fs::create_dir_all(&dir).map_err(|e| StoreError::io(&dir, e))?;
+        if created {
+            self.seqsigwit_window_dir_fresh
+                .store(true, AtomicOrdering::Release);
+        }
         let path = self.seqsigwit_spill_file(height.0)?;
         let mut out = Vec::new();
         for (fk, ins) in rows {

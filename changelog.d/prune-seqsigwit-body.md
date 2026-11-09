@@ -5,16 +5,21 @@ Fixed
   (`store/seqsigwit.window/{height}.bin`, plus the RAM cache). Each height
   file is encrypted with the store secret. Enabling it
   on an archive copies that window out and cuts the stem back to its header.
+  A datadir already pruned by an older build has plaintext window files.
+  The first open rewrites the keep window from the stem before that cut,
+  so those heights still serve. Confirming a height that was already
+  dropped is a no-op. Resubmitting the tip writes a missing keep file again.
   The height file is synced before the tip commit and before that cut.
   A tip of 288 drops genesis and records pruneheight 0. A shorter chain
   drops nothing. A reorg to a shorter fork does not move that watermark
   backward onto a height whose witness file is already gone. Connecting an
   already archived block again writes that block's scriptSig and witness
   into the height file. A failed spill write does not publish the new tip.
-  `store/` is synced after `seqsigwit.window` is created. A confirm batch
-  syncs that directory once, after each height file, and before the tip
-  moves, so a crash cannot drop the directory while the sidecar and a cut
-  locator remain. Opening a pruned store that already found a short input
+  `store/` is synced once, when `seqsigwit.window` is created. A later
+  confirm syncs that window directory and does not sync `store/` again.
+  A confirm batch syncs the window directory once, after each height file,
+  and before the tip moves, so a crash cannot drop the directory while the
+  sidecar and a cut locator remain. Opening a pruned store that already found a short input
   does not also read the witness locator. `txout`, `input`, `txstat`, and
   block filters stay.
   Unpruned nodes still read `seqsigwit.body`.

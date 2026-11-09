@@ -485,6 +485,28 @@ fn spill_write_syncs_the_window_dirent() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `store/` is synced when `seqsigwit.window` is created. A later spill
+/// syncs that window directory and leaves `store/` alone.
+#[test]
+#[cfg(unix)]
+fn later_spill_sync_skips_the_store_directory() {
+    let (dir, q) = temp_query("prune-fsync-later");
+    q.persist_seqsigwit_spill_height(Height(0), &[]).unwrap();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    q.persist_seqsigwit_spill_height(Height(1), &[]).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    let window = q.store().path().join("seqsigwit.window");
+    assert!(
+        synced.iter().any(|p| p.as_path() == window),
+        "the window directory is still synced; synced {synced:?}"
+    );
+    assert!(
+        synced.iter().all(|p| p != q.store().path()),
+        "a later spill must not fsync store/; synced {synced:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A confirm of several heights writes each file, then syncs the window
 /// directory once. The parent `store/` sync still follows that directory.
 #[test]

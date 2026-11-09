@@ -853,7 +853,8 @@ impl Query {
             self.note_seqsigwit_ram_for_confirmed(item.height, &item.tx_fks)?;
         }
         // One directory sync for the batch, after every file is synced and
-        // before the tip flush. `store/` is synced here too.
+        // before the tip flush. `store/` is synced when this batch created
+        // the window directory.
         self.sync_spill_dir()
     }
 
