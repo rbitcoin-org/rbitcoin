@@ -3,8 +3,10 @@
 Hard kills (`kill -9`) and tip disconnects are normal. **Corrupt Class A / Class C
 payloads are not repaired in-process** — reindex / redo IBD. Derived `tx.head` in
 the **current** layout that is unreadable (truncated sealed MPHF, empty/short
-`meta`, other open errors) **rebuilds from Class A** when bodies exist. Leftover
-**prior layouts** (fuse8 v1, flat `tx.head.meta`) still **refuse**.
+`meta`, segment files with no `meta`, other open errors) **rebuilds from Class A**
+when bodies exist. A crash during that rebuild leaves no `meta`, so the next open
+wipes the directory and rebuilds again. Leftover **prior layouts** (monolithic
+`tx.head`, fuse8 v1, flat `tx.head.meta`) still **refuse**.
 
 ## Tip as commit point
 

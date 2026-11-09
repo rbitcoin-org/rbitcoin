@@ -1415,12 +1415,21 @@ impl TxTable {
                     "store: tx.head meta missing with {n_bodies} Class A bodies — rebuild segmented head"
                 );
             }
-            // Wipe legacy mono head if present so create does not refuse after wipe intent.
-            let mono = dir.join("tx.head");
-            if mono.is_file() {
-                let _ = std::fs::remove_file(&mono);
+            // A torn segment directory has no meta to keep. A mono file still
+            // refuses in `create`. Meta is removed until the rebuild flushes,
+            // so a crash mid-rebuild wipes and starts again.
+            if dir.join("tx.head").is_dir() {
+                crate::segmented_head::wipe_segmented_head_files(dir);
             }
-            SegmentedTxHead::create(dir, crate::address_head::default_layout(opts.scale))?
+            let head =
+                SegmentedTxHead::create(dir, crate::address_head::default_layout(opts.scale))?;
+            if need_rebuild {
+                let meta = crate::segmented_head::meta_path(dir);
+                if meta.is_file() {
+                    std::fs::remove_file(&meta).map_err(|e| StoreError::io(&meta, e))?;
+                }
+            }
+            head
         } else {
             match SegmentedTxHead::open(dir) {
                 Ok(h) => {

@@ -81,6 +81,88 @@ fn body_header_short_of_the_locator_reopens_at_that_prefix() {
     assert!(t.get_meta_and_outputs(rbitcoin_primitives::Fk(2)).is_err());
 }
 
+/// Segment files and no `tx.head/meta` are a torn rebuild. Open wipes that
+/// directory, serves the txid from Class A, and the next open keeps the head.
+#[test]
+fn tx_head_without_meta_rebuilds_from_class_a() {
+    let dir = super::tempfile_dir("head-no-meta");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    let batch = [one(7)];
+    let txid = batch[0].0.txid;
+    t.put_full_batch_indexed(&batch, false).unwrap();
+    t.head.flush().unwrap();
+    drop(t);
+    let root = dir.join("tx.head");
+    std::fs::write(root.join("000000"), b"torn-segment").unwrap();
+    std::fs::remove_file(root.join("meta")).unwrap();
+
+    rbitcoin_log::capture_logs(true);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    let first = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let text = first
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("tx.head rebuild begin"), "{text}");
+    assert_eq!(
+        t.get_by_txid(&txid).unwrap().unwrap().0,
+        rbitcoin_primitives::Fk(1)
+    );
+    drop(t);
+
+    rbitcoin_log::capture_logs(true);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    let second = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let text = second
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !text.contains("tx.head rebuild begin"),
+        "a finished head rebuilds again: {text}"
+    );
+    assert_eq!(
+        t.get_by_txid(&txid).unwrap().unwrap().0,
+        rbitcoin_primitives::Fk(1)
+    );
+}
+
+/// A monolithic `tx.head` file is not a torn segment directory.
+#[test]
+fn legacy_mono_tx_head_still_refuses_open() {
+    let dir = super::tempfile_dir("head-mono");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    drop(t);
+    let root = dir.join("tx.head");
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::write(&root, b"mono").unwrap();
+    let msg = match TxTable::open_tiny(&dir) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("legacy mono head opened"),
+    };
+    assert!(msg.contains("legacy monolithic"), "{msg}");
+}
+
+/// Flat `tx.head.meta` is the pre-directory layout and still refuses.
+#[test]
+fn flat_tx_head_meta_still_refuses_open() {
+    let dir = super::tempfile_dir("head-flat-meta");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    drop(t);
+    std::fs::rename(dir.join("tx.head").join("meta"), dir.join("tx.head.meta")).unwrap();
+    let msg = match TxTable::open_tiny(&dir) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("flat tx.head.meta opened"),
+    };
+    assert!(msg.contains("index refuses flat tx.head.meta"), "{msg}");
+}
+
 /// `create.loc` landed and `seqsigwit.loc` did not. Open cuts back to the
 /// shorter locator instead of refusing the datadir.
 #[test]

@@ -5,3 +5,6 @@ Fixed
   to the last create those headers still name, clears `header_txs` ranges
   past that prefix, and shrinks the tip to match. A Class C array torn
   mid-record opens at the last whole row.
+- **A `tx.head/` directory with segment files and no `meta` rebuilds.** That
+  directory used to refuse as a legacy shard. Open wipes it and rebuilds from
+  Class A. A monolithic `tx.head` and a flat `tx.head.meta` still refuse.
