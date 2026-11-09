@@ -1283,7 +1283,11 @@ impl Query {
             };
             out.extend_from_slice(&id.to_le_bytes());
             let mut enc = Vec::new();
-            rbitcoin_store::encode_seqsigwit_with_secret(ins, &mut enc, None);
+            rbitcoin_store::encode_seqsigwit_with_secret(
+                ins,
+                &mut enc,
+                Some(self.store.txs.store_secret()),
+            );
             out.extend_from_slice(&(enc.len() as u32).to_le_bytes());
             out.extend_from_slice(&enc);
         }
@@ -1353,8 +1357,11 @@ impl Query {
                 return Err(StoreError::Corrupt("seqsigwit spill short row"));
             }
             if id == want {
-                let mut ins =
-                    rbitcoin_store::decode_seqsigwit_secret(&raw[i..i + n], input_count, None)?;
+                let mut ins = rbitcoin_store::decode_seqsigwit_secret(
+                    &raw[i..i + n],
+                    input_count,
+                    Some(self.store.txs.store_secret()),
+                )?;
                 self.store.stamp_input_prevouts(fk, &mut ins)?;
                 return Ok(Some(ins));
             }

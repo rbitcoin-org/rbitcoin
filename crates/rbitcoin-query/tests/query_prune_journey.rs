@@ -734,6 +734,26 @@ fn pruned_keep_serves_input_prevouts() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A reader of `seqsigwit.window/{height}.bin` must not see the scripts.
+/// The node still serves them with the store secret.
+#[test]
+fn seqsigwit_window_file_is_not_plaintext() {
+    let (dir, q) = temp_query("prune-window-secret");
+    q.set_prune_seqsigwit(true).unwrap();
+    let witness = b"window-secret-marker";
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 1, witness, &mut hashes);
+    let raw = std::fs::read(q.store().path().join("seqsigwit.window/0.bin")).unwrap();
+    assert!(
+        !raw.windows(witness.len()).any(|w| w == witness.as_slice()),
+        "keep-window file must not store the witness in the clear"
+    );
+    q.clear_seqsigwit_ram_window();
+    let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    assert_eq!(witness_of(&q, fk), vec![witness.to_vec()]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Same reorg through the wire confirm path. Lookup skips Class A once the
 /// body exists, and the spill still has to be rewritten from that block.
 #[test]
