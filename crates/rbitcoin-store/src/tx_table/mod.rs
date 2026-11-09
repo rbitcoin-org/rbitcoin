@@ -1937,9 +1937,8 @@ impl TxTable {
     /// Stamped rows read `n_in` and the parent edge from `input`. Leftover
     /// unstamped rows still take the inline prevout out of legacy `seqsigwit`.
     pub fn get_meta_and_prevouts(&self, fk: Fk) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
-        if self.prune_seqsigwit_mode() {
-            return Err(StoreError::NotFound);
-        }
+        // Stamped rows read `input`. Prune drops script and witness, not edges.
+        // An unstamped row still needs the witness stem, which prune has cut.
         let mut tx = if let Some(n_in) = self.input.n_in(fk)? {
             TxRecord {
                 txid: [0u8; 32],
@@ -1948,11 +1947,15 @@ impl TxTable {
                 input_count: n_in,
                 output_count: 0,
             }
+        } else if self.prune_seqsigwit_mode() {
+            return Err(StoreError::NotFound);
         } else {
             self.get(fk)?
         };
         let prevs = if let Some(edges) = self.input.edges(fk)? {
             prevouts_from_edges(&edges)
+        } else if self.prune_seqsigwit_mode() {
+            return Err(StoreError::NotFound);
         } else {
             let ir = self
                 .seqsigwit_loc

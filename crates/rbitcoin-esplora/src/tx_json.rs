@@ -180,6 +180,50 @@ fn status_for(query: &Query, tx_fk: Fk, view: Option<&ChainView>) -> Result<Valu
     }
 }
 
+/// Inputs for `tx_json_from_wire`. Prune mode has no `seqsigwit.body`.
+/// Parent edges still live in `input`, and the wire tx has the scripts.
+fn stored_inputs_for_json(
+    query: &Query,
+    tx_fk: Fk,
+    wire: &Transaction,
+) -> Result<Vec<InputRecord>, QueryError> {
+    match query.store().get_tx_full(tx_fk) {
+        Ok((_, ins, _)) => return Ok(ins),
+        Err(rbitcoin_store::StoreError::NotFound) if query.prune_seqsigwit() => {}
+        Err(e) => return Err(e),
+    }
+    let Some(edges) = query.store().input_edges(tx_fk)? else {
+        return Err(rbitcoin_store::StoreError::NotFound);
+    };
+    if edges.len() != wire.input.len() {
+        return Err(rbitcoin_store::StoreError::Corrupt(
+            "invariant: esplora pruned input count",
+        ));
+    }
+    let mut out = Vec::with_capacity(edges.len());
+    for (edge, inp) in edges.iter().zip(wire.input.iter()) {
+        if edge.parent.is_null() {
+            out.push(InputRecord::coinbase(
+                inp.sequence.to_consensus_u32(),
+                inp.script_sig.to_bytes(),
+                inp.witness.to_vec(),
+            ));
+            continue;
+        }
+        out.push(InputRecord {
+            prev_txid: inp.previous_output.txid.to_byte_array(),
+            parent: rbitcoin_store::InputParent::Prevout {
+                create_fk: edge.parent,
+                vout: edge.vout,
+            },
+            sequence: inp.sequence.to_consensus_u32(),
+            script_sig: inp.script_sig.to_bytes(),
+            witness: inp.witness.to_vec(),
+        });
+    }
+    Ok(out)
+}
+
 /// Full `GET /tx/:txid` body (Esplora API.md transaction format).
 ///
 /// `view` is the status pin. `None` uses the live tip. The wire body is the
@@ -198,7 +242,7 @@ pub fn build_tx_json(
         Err(e) => return Err(e),
     };
     let status = status_for(query, tx_fk, view)?;
-    let (_meta, stored_inputs, _outs) = query.store().get_tx_full(tx_fk)?;
+    let stored_inputs = stored_inputs_for_json(query, tx_fk, &wire)?;
     let stored_txid = query
         .store()
         .txs

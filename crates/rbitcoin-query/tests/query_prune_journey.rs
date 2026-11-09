@@ -719,6 +719,21 @@ fn pruned_reopen_replays_spends_without_the_witness() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Verbosity 2 reads prevouts from `input`. Prune mode must not hide a
+/// height the node still serves.
+#[test]
+fn pruned_keep_serves_input_prevouts() {
+    let (dir, q) = temp_query("prune-prevouts");
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 2, &[0x11], &mut hashes);
+    let fk = q.block_tx_fks(Height(1)).unwrap()[0];
+    let (tx, prevs) = q.store().get_tx_meta_and_prevouts(fk).unwrap();
+    assert_eq!(tx.input_count, 1);
+    assert_eq!(prevs.len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Same reorg through the wire confirm path. Lookup skips Class A once the
 /// body exists, and the spill still has to be rewritten from that block.
 #[test]
