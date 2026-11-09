@@ -6052,6 +6052,34 @@ fn getpeerinfo_and_disconnectnode_support_onion_addr() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `--proxy` name session lists its name as `addr`, and `disconnectnode`
+/// takes that `addr` back, as Core matches the name a peer was added by.
+#[test]
+fn disconnectnode_takes_the_addr_of_a_proxied_name() {
+    use rbitcoin_net::{PeerConnType, PeerHub};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    let hint = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8333);
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+    hub.register_net(
+        hint,
+        rbitcoin_net::NetAddr::name("peer.example", 8333).unwrap(),
+        bind,
+        &test_version(0, 0),
+        false,
+        PeerConnType::Manual,
+    );
+    ctx.peers = Some(hub);
+
+    let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+    assert_eq!(r[0]["addr"], json!("peer.example:8333"));
+    dispatch(&ctx, "disconnectnode", vec![json!("peer.example:8333")]).unwrap();
+    assert_eq!(dispatch(&ctx, "getpeerinfo", vec![]).unwrap(), json!([]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn addpeeraddress_updates_addrman_without_rewriting_peers_file() {
     use rbitcoin_net::AddrMan;

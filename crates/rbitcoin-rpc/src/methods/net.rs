@@ -201,23 +201,32 @@ pub fn addnode(
 pub fn disconnectnode(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["address", "nodeid"])?;
     let hub = require_peers(ctx)?;
+    // getpeerinfo lists a proxied name as its addr. Match that string when
+    // the address does not parse as a socket or onion.
+    let listed = hub.snapshot();
+    let not_found = || {
+        rpc_error(
+            ERR_CLIENT_NODE_NOT_CONNECTED,
+            "Node not found in connected nodes",
+        )
+    };
     if let Some(id) = params.opt_u64(1, "nodeid")? {
-        if !hub.disconnect_id(id) {
-            return Err(rpc_error(
-                ERR_CLIENT_NODE_NOT_CONNECTED,
-                "Node not found in connected nodes",
-            ));
+        if !listed.iter().any(|p| p.id == id) || !hub.disconnect_id(id) {
+            return Err(not_found());
         }
         return Ok(Value::Null);
     }
     if let Some(a) = params.get(0, "address").and_then(|v| v.as_str()) {
-        let addr = rbitcoin_net::parse_peer_net(a)
-            .map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
-        if !hub.disconnect_net(addr) {
-            return Err(rpc_error(
-                ERR_CLIENT_NODE_NOT_CONNECTED,
-                "Node not found in connected nodes",
-            ));
+        let addr = match rbitcoin_net::parse_peer_net(a) {
+            Ok(addr) => addr,
+            Err(e) => listed
+                .iter()
+                .map(|p| p.net)
+                .find(|net| net.to_string().eq_ignore_ascii_case(a))
+                .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?,
+        };
+        if !listed.iter().any(|p| p.net == addr) || !hub.disconnect_net(addr) {
+            return Err(not_found());
         }
         return Ok(Value::Null);
     }
