@@ -541,3 +541,44 @@ fn enabling_prune_at_288_marks_genesis_pruned() {
         .is_file());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Tip 299 with pruneheight 11 has already deleted `11.bin`. Disconnecting
+/// two blocks and connecting a fork at 298 must not lower the watermark to
+/// 10. The next block still has to connect, and height 12 stays readable.
+#[test]
+fn shorter_fork_does_not_lower_pruneheight() {
+    let (dir, q) = temp_query("prune-reorg-watermark");
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 300, &[0x55; 8], &mut hashes);
+    assert_eq!(q.tip_height(), Some(Height(299)));
+    q.set_prune_seqsigwit(true).unwrap();
+    q.apply_prune_seqsigwit_tip().unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(11)));
+    let window = q.store().path().join("seqsigwit.window");
+    assert!(!window.join("11.bin").exists());
+    assert!(window.join("12.bin").is_file());
+    q.disconnect_tip().unwrap();
+    q.disconnect_tip().unwrap();
+    assert_eq!(q.tip_height(), Some(Height(297)));
+    let (prev, parent) = resume(&q, &mut hashes);
+    connect_range(&q, prev, Some(parent), 1, &[0x66; 8], &mut hashes);
+    assert_eq!(q.tip_height(), Some(Height(298)));
+    assert_eq!(
+        q.pruneheight(),
+        Some(Height(11)),
+        "a shorter fork must not lower pruneheight onto a deleted spill"
+    );
+    assert!(!window.join("11.bin").exists());
+    assert!(window.join("12.bin").is_file());
+    let (prev, parent) = resume(&q, &mut hashes);
+    connect_range(&q, prev, Some(parent), 1, &[0x77; 8], &mut hashes);
+    assert_eq!(q.tip_height(), Some(Height(299)));
+    assert_eq!(q.pruneheight(), Some(Height(11)));
+    q.clear_seqsigwit_ram_window();
+    let kept = q.block_tx_fks(Height(12)).unwrap()[0];
+    assert_eq!(witness_of(&q, kept), vec![vec![0x55; 8]]);
+    // The fixture txid ignores witness, so this tip is the same block.
+    let tip = q.block_tx_fks(Height(299)).unwrap()[0];
+    assert_eq!(witness_of(&q, tip), vec![vec![0x55; 8]]);
+    let _ = std::fs::remove_dir_all(dir);
+}

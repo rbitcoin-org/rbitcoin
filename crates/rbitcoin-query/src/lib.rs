@@ -1164,7 +1164,13 @@ impl Query {
         if tip.0 < Self::SEQSIGWIT_KEEP_HEIGHTS {
             return Ok(());
         }
-        self.set_pruneheight(Some(Height(tip.0 - Self::SEQSIGWIT_KEEP_HEIGHTS)))
+        let next = tip.0 - Self::SEQSIGWIT_KEEP_HEIGHTS;
+        // A shorter fork must not ask for a spill that was already deleted.
+        // Once a height is dropped it stays dropped.
+        if self.pruneheight().is_some_and(|ph| next < ph.0) {
+            return Ok(());
+        }
+        self.set_pruneheight(Some(Height(next)))
     }
 
     /// `false` when this create's connected height is at/below [`Self::pruneheight`].
