@@ -701,6 +701,24 @@ fn reorg_restores_the_archived_witness() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Spend replay runs before the node serves. It only needs parent edges.
+/// Those live in `input`, which this prune does not drop.
+#[test]
+fn pruned_reopen_replays_spends_without_the_witness() {
+    let (dir, q) = temp_query("prune-spend-replay");
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 8, &[0x11], &mut hashes);
+    assert_eq!(q.tip_height(), Some(Height(7)));
+    q.store().sync_spend_durable(0).unwrap();
+    q.flush_for_shutdown().unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(7)));
+    rbitcoin_query::confirm_run::replay_spend_annotations(&q).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Same reorg through the wire confirm path. Lookup skips Class A once the
 /// body exists, and the spill still has to be rewritten from that block.
 #[test]

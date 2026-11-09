@@ -736,12 +736,16 @@ pub fn annotate_slots_from_connected_hash(
         return Ok(());
     };
     for (tx_i, &spend_fk) in tx_fks.iter().enumerate() {
-        let (_meta, ins, _outs) = query
+        // Parent edges live in `input`. Script and witness may be pruned.
+        let edges = query
             .store()
-            .get_tx_full(spend_fk)
-            .map_err(ConfirmError::from)?;
+            .input_edges(spend_fk)
+            .map_err(ConfirmError::from)?
+            .ok_or(ConfirmError::Store(StoreError::Corrupt(
+                "invariant: spend replay missing input edges",
+            )))?;
         if tx_i == 0 {
-            let coinbase = ins.len() == 1 && ins[0].is_coinbase();
+            let coinbase = edges.len() == 1 && edges[0].parent.is_null();
             if !coinbase {
                 return Err(ConfirmError::Store(StoreError::Corrupt(
                     "invariant: coinbase input edge",
@@ -749,12 +753,14 @@ pub fn annotate_slots_from_connected_hash(
             }
             continue;
         }
-        for (inp_i, inp) in ins.into_iter().enumerate() {
-            let rbitcoin_store::InputParent::Prevout { create_fk, vout } = inp.parent else {
+        for (inp_i, edge) in edges.iter().enumerate() {
+            if edge.parent.is_null() {
                 return Err(ConfirmError::Store(StoreError::Corrupt(
                     "invariant: non-coinbase input edge",
                 )));
-            };
+            }
+            let create_fk = edge.parent;
+            let vout = edge.vout;
             let (off, len) = query
                 .store()
                 .tx_spent_range(create_fk)
