@@ -1,6 +1,7 @@
 //! Tor control-port AUTH (cookie or password) for hidden-service setup.
 
 use crate::error::NodeError;
+use base64::Engine;
 use bitcoin_hashes::{hmac, sha256, Hash, HashEngine};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -15,6 +16,9 @@ pub const SAFECOOKIE_SERVER_KEY: &[u8] =
 #[doc(hidden)]
 pub const SAFECOOKIE_CLIENT_KEY: &[u8] =
     b"Tor safe cookie authentication controller-to-server hash";
+
+/// ADD_ONION key spec that asks Tor for a fresh v3 key.
+const ONION_KEY_NEW: &str = "NEW:ED25519-V3";
 
 pub const DEFAULT_CONTROL_PORT: u16 = 9051;
 pub const DEFAULT_COOKIE_PATH: &str = "/run/tor/control.authcookie";
@@ -171,10 +175,13 @@ impl TorControl {
                 )));
             }
         };
-        let spec = match stored.as_deref() {
-            Some(k) => k.to_string(),
-            None => "NEW:ED25519-V3".to_string(),
-        };
+        if stored.as_deref().is_some_and(|k| !onion_key_well_formed(k)) {
+            return Err(NodeError::Init(format!(
+                "tor control key {}: malformed; remove the file to generate a new key",
+                key_path.display()
+            )));
+        }
+        let spec = stored.as_deref().unwrap_or(ONION_KEY_NEW);
         let cmd = format!("ADD_ONION {spec} Port={virt},{target}");
         let reply = self.command(&cmd).await?;
         let hs = parse_add_onion_reply(&reply)?;
@@ -313,7 +320,13 @@ pub fn parse_add_onion_reply(body: &str) -> Result<HiddenService, NodeError> {
         if let Some(id) = line.strip_prefix("ServiceID=") {
             service_id = Some(id.trim().to_string());
         } else if let Some(pk) = line.strip_prefix("PrivateKey=") {
-            private_key = Some(pk.trim().to_string());
+            let pk = pk.trim();
+            if !onion_key_well_formed(pk) {
+                return Err(NodeError::Init(
+                    "tor control ADD_ONION returned a malformed PrivateKey".into(),
+                ));
+            }
+            private_key = Some(pk.to_string());
         }
     }
     let Some(service_id) = service_id else {
@@ -321,10 +334,23 @@ pub fn parse_add_onion_reply(body: &str) -> Result<HiddenService, NodeError> {
             "tor control ADD_ONION missing ServiceID".into(),
         ));
     };
+    if rbitcoin_net::netaddr::decode_onion_name(&service_id).is_none() {
+        return Err(NodeError::Init(
+            "tor control ADD_ONION returned an invalid ServiceID".into(),
+        ));
+    }
     Ok(HiddenService {
         service_id,
         private_key,
     })
+}
+
+/// `ED25519-V3:` and Base64 of a 64-byte expanded secret key: the only key
+/// Tor returns for a v3 service, and the only one sent back in ADD_ONION.
+fn onion_key_well_formed(key: &str) -> bool {
+    key.strip_prefix("ED25519-V3:")
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .is_some_and(|raw| raw.len() == 64)
 }
 
 #[doc(hidden)]

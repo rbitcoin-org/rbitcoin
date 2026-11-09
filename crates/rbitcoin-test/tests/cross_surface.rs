@@ -2903,11 +2903,13 @@ async fn node_listen_and_exit() {
 }
 
 /// Tor control port stand-in: PROTOCOLINFO advertises `methods`, SAFECOOKIE
-/// answers from `cookie`, and ADD_ONION NEW mints `key{n}` for service `n`.
+/// answers from `cookie`, and ADD_ONION NEW mints `fake_onion_key(n)` for
+/// service `n`, unless `add_onion` holds a reply to send instead.
 /// Every command line lands in `log`. Live Tor is overlay-functional.
 struct FakeTor {
     addr: SocketAddr,
     methods: Arc<Mutex<&'static str>>,
+    add_onion: Arc<Mutex<Option<String>>>,
     log: Arc<Mutex<Vec<String>>>,
     /// Lines written back to the controller, including `250-ServiceID=`.
     replies: Arc<Mutex<Vec<String>>>,
@@ -2930,18 +2932,30 @@ fn fake_onion_service_id(n: usize) -> String {
     name.trim_end_matches(".onion:0").to_string()
 }
 
+/// A well-formed onion key: `ED25519-V3:` and Base64 of 64 bytes.
+fn fake_onion_key(n: usize) -> String {
+    use base64::Engine;
+    let raw = [u8::try_from(n + 1).unwrap(); 64];
+    format!(
+        "ED25519-V3:{}",
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    )
+}
+
 impl FakeTor {
     async fn start() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tor = Self {
             addr: listener.local_addr().unwrap(),
             methods: Arc::new(Mutex::new("SAFECOOKIE")),
+            add_onion: Arc::default(),
             log: Arc::default(),
             replies: Arc::default(),
             minted: Arc::default(),
         };
-        let (methods, log, replies, minted) = (
+        let (methods, add_onion, log, replies, minted) = (
             Arc::clone(&tor.methods),
+            Arc::clone(&tor.add_onion),
             Arc::clone(&tor.log),
             Arc::clone(&tor.replies),
             Arc::clone(&tor.minted),
@@ -2951,6 +2965,7 @@ impl FakeTor {
                 tokio::spawn(fake_tor_session(
                     s,
                     Arc::clone(&methods),
+                    Arc::clone(&add_onion),
                     Arc::clone(&log),
                     Arc::clone(&replies),
                     Arc::clone(&minted),
@@ -2972,6 +2987,7 @@ impl FakeTor {
 async fn fake_tor_session(
     s: TcpStream,
     methods: Arc<Mutex<&'static str>>,
+    add_onion: Arc<Mutex<Option<String>>>,
     log: Arc<Mutex<Vec<String>>>,
     replies: Arc<Mutex<Vec<String>>>,
     minted: Arc<Mutex<Vec<String>>>,
@@ -3013,12 +3029,18 @@ async fn fake_tor_session(
             .to_string()
         } else if line == "GETINFO version" {
             "250-version=0.4.8.10\r\n250 OK\r\n".to_string()
+        } else if let Some(forged) = line
+            .starts_with("ADD_ONION ")
+            .then(|| add_onion.lock().unwrap().clone())
+            .flatten()
+        {
+            forged
         } else if let Some(rest) = line.strip_prefix("ADD_ONION ") {
             let spec = rest.split_once(" Port=").map_or(rest, |(s, _)| s);
             let mut minted = minted.lock().unwrap();
             if spec == "NEW:ED25519-V3" {
                 let n = minted.len();
-                minted.push(format!("ED25519-V3:key{n}"));
+                minted.push(fake_onion_key(n));
                 format!(
                     "250-ServiceID={}\r\n250-PrivateKey={}\r\n250 OK\r\n",
                     fake_onion_service_id(n),
@@ -3195,13 +3217,81 @@ async fn tor_control_onion_lifecycle() {
         starts_with_any(&refused, "ADD_ONION ").is_empty(),
         "{refused:?}"
     );
+
+    // A control port that answers ADD_ONION with a service ID that is not a
+    // v3 onion address, with no service ID, or with a key that would split
+    // the next ADD_ONION, stops the start. Nothing is saved or advertised.
+    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
+    let onion_cfg = || {
+        let mut cfg = listen_and_exit_cfg(&dir);
+        cfg.tor.control = Some(tor.addr);
+        cfg.tor.password = Some(TOR_PASSWORD.into());
+        cfg.listen.listen_onion = true;
+        cfg
+    };
+    let p2p_key = dir.join("onion").join("p2p.priv");
+    let mut bad_id = fake_onion_service_id(0);
+    bad_id.replace_range(..1, if bad_id.starts_with('a') { "b" } else { "a" });
+    let (id, key) = (fake_onion_service_id(0), fake_onion_key(0));
+    for (reply, want) in [
+        (
+            format!("250-ServiceID={bad_id}\r\n250-PrivateKey={key}\r\n250 OK\r\n"),
+            "invalid ServiceID",
+        ),
+        (
+            format!("250-PrivateKey={key}\r\n250 OK\r\n"),
+            "missing ServiceID",
+        ),
+        (
+            format!("250-ServiceID={id}\r\n250-PrivateKey={key} Flags=Detach\r\n250 OK\r\n"),
+            "malformed PrivateKey",
+        ),
+        (
+            format!("250-ServiceID={id}\r\n250-PrivateKey=ED25519-V3:AAAA\r\n250 OK\r\n"),
+            "malformed PrivateKey",
+        ),
+    ] {
+        *tor.add_onion.lock().unwrap() = Some(reply);
+        let err = start_and_exit(onion_cfg())
+            .await
+            .expect_err(want)
+            .to_string();
+        assert!(err.contains(want), "{err}");
+        assert!(!p2p_key.exists(), "{want}: key saved");
+    }
+    *tor.add_onion.lock().unwrap() = None;
+
+    // A saved key that would add arguments to ADD_ONION, or frame a second
+    // control command, is refused before it reaches the control port. The
+    // error names the file to remove.
+    std::fs::create_dir_all(p2p_key.parent().unwrap()).unwrap();
+    let _ = tor.take_log();
+    for poisoned in [
+        format!("{key} Flags=Detach"),
+        format!("{key}\r\nSETCONF ControlPort=0"),
+    ] {
+        std::fs::write(&p2p_key, &poisoned).unwrap();
+        let err = start_and_exit(onion_cfg())
+            .await
+            .expect_err("poisoned onion key")
+            .to_string();
+        assert!(
+            err.contains("malformed") && err.contains(&p2p_key.display().to_string()),
+            "{err}"
+        );
+        let sent = tor.take_log();
+        assert!(starts_with_any(&sent, "ADD_ONION ").is_empty(), "{sent:?}");
+        assert!(starts_with_any(&sent, "SETCONF ").is_empty(), "{sent:?}");
+    }
+    std::fs::remove_file(&p2p_key).unwrap();
+
     // Those boots also wrote control replies. The password boot's replies
     // are the ones the datadir and getnetworkinfo must match.
     let _ = tor.take_replies();
+    let _ = tor.take_log();
 
     // Password auth. Each service gets a fresh onion key, saved 0600 under
     // the datadir, and an I2P destination; getnetworkinfo lists them all.
-    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
     std::fs::write(dir.join("rpc.token"), "pass").unwrap();
     #[cfg(unix)]
     {
@@ -3335,7 +3425,7 @@ async fn tor_control_onion_lifecycle() {
     // The run still tears down, so that port is closed once run_p2p returns.
     let onion_key = dir.join("onion").join("electrum.priv");
     let saved_key = std::fs::read(&onion_key).unwrap();
-    std::fs::write(&onion_key, "ED25519-V3:revoked").unwrap();
+    std::fs::write(&onion_key, fake_onion_key(99)).unwrap();
     let mut cfg = services_cfg();
     cfg.tor.cookie = Some(cookie.clone());
     let err = start_and_exit(cfg)
