@@ -218,7 +218,7 @@ impl Query {
         if self.tweak_watermark_covers(origin, self.pruneheight().map(|h| h.0))? {
             return Ok(());
         }
-        Err(StoreError::Layout(SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into()))
+        Err(self.tweak_prune_miss())
     }
 
     /// Height `prune_seqsigwit_below` will record for the current tip.
@@ -260,8 +260,21 @@ impl Query {
         if self.tweak_watermark_covers(origin, pruneheight)? {
             Ok(())
         } else {
-            Err(StoreError::Layout(SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into()))
+            Err(self.tweak_prune_miss())
         }
+    }
+
+    /// A missing index still has to start before taproot. An index that is
+    /// already on disk, and does not cover the drop, is a hole.
+    fn tweak_prune_miss(&self) -> QueryError {
+        let present =
+            self.sptweaks_enabled() || SpTweaksTable::files_present(self.store.cold_files_dir());
+        let msg = if present {
+            SP_TWEAKS_PRUNE_INDEX_SHORT
+        } else {
+            SP_TWEAKS_PRUNE_BEFORE_TAPROOT
+        };
+        StoreError::Layout(msg.into())
     }
 
     fn tweak_watermark_covers(
@@ -279,9 +292,14 @@ impl Query {
     }
 }
 
-/// Startup and enable share this text. Callers match `prune-seqsigwit` and `taproot`.
+/// No tweak index on disk. Callers match `prune-seqsigwit` and `taproot`.
 pub(crate) const SP_TWEAKS_PRUNE_BEFORE_TAPROOT: &str =
     "silent payment tweaks on --prune-seqsigwit must be enabled before taproot activation";
+
+/// Index files exist, and the next height is not past the prune height.
+/// Callers match `does not cover`. This text does not say `taproot`.
+pub(crate) const SP_TWEAKS_PRUNE_INDEX_SHORT: &str =
+    "silent payment tweak index does not cover every height --prune-seqsigwit would drop";
 
 impl Query {
     #[doc(hidden)]

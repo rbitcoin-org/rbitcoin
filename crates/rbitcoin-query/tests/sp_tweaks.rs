@@ -320,7 +320,12 @@ fn adding_prune_after_the_tweak_index_is_built_keeps_serving() {
     let before = q.store().txs.seqsigwit_loc.count();
     let err = q.refuse_adding_prune_with_tweaks(Height(0)).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("taproot"), "{msg}");
+    assert!(msg.contains("does not cover"), "{msg}");
+    assert!(!msg.contains("taproot"), "{msg}");
+    assert_eq!(q.store().txs.seqsigwit_loc.count(), before);
+    let err = q.set_prune_seqsigwit(true).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("does not cover"), "{msg}");
     assert_eq!(q.store().txs.seqsigwit_loc.count(), before);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -354,6 +359,10 @@ fn already_pruned_restart_ignores_a_tweak_hole() {
     q.set_prune_seqsigwit(true).unwrap();
     assert_eq!(q.store().txs.seqsigwit_loc.count(), before);
     assert_eq!(q.pruneheight(), Some(Height(0)));
+    let err = q.set_sptweaks_enabled(true, Height(0)).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("does not cover"), "{msg}");
+    assert!(!msg.contains("taproot"), "{msg}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
