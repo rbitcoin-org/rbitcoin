@@ -120,12 +120,50 @@ where
 pub fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        std::fs::File::open(dir)?.sync_all()
+        let result = std::fs::File::open(dir)?.sync_all();
+        #[cfg(debug_assertions)]
+        if result.is_ok() {
+            note_fsynced_dir(dir);
+        }
+        result
     }
     #[cfg(not(unix))]
     {
         let _ = dir;
         Ok(())
+    }
+}
+
+/// Record directories passed to [`fsync_parent_dir`] on this thread.
+///
+/// Debug tests use this to check that `store/` is synced after
+/// `seqsigwit.window` exists. A release build does not record.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fsync_dir_trace() {
+    FSYNC_TRACE.with(|on| on.set(true));
+    FSYNC_DIRS.with(|dirs| dirs.borrow_mut().clear());
+}
+
+/// Stop recording and return the directories synced since [`arm_fsync_dir_trace`].
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_fsynced_dirs() -> Vec<PathBuf> {
+    FSYNC_TRACE.with(|on| on.set(false));
+    FSYNC_DIRS.with(|dirs| std::mem::take(&mut *dirs.borrow_mut()))
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static FSYNC_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FSYNC_DIRS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(debug_assertions)]
+fn note_fsynced_dir(dir: &Path) {
+    if FSYNC_TRACE.with(|on| on.get()) {
+        FSYNC_DIRS.with(|dirs| dirs.borrow_mut().push(dir.to_path_buf()));
     }
 }
 

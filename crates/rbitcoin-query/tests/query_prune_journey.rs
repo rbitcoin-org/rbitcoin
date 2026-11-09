@@ -437,6 +437,48 @@ fn open_finishes_cut_when_locator_is_already_zero() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `store/` has to be synced after `seqsigwit.window` exists. The sidecar
+/// rename syncs `store/` before that directory is created, and the spill
+/// rename only syncs the window directory.
+#[cfg(unix)]
+fn assert_store_synced_after_window(store: &std::path::Path, dirs: &[std::path::PathBuf]) {
+    let window = store.join("seqsigwit.window");
+    let win_at = dirs.iter().position(|p| p == &window);
+    let store_after = dirs.iter().rposition(|p| p == store);
+    assert!(
+        win_at.is_some() && store_after.is_some() && store_after.unwrap() > win_at.unwrap(),
+        "store fsync must follow the window dirent; synced {dirs:?}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn enabling_prune_syncs_the_window_dirent_before_the_cut() {
+    let (dir, q) = temp_query("prune-fsync-parent");
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 2, &[0x49], &mut hashes);
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    q.set_prune_seqsigwit(true).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert_witness_stem_cut(&q);
+    assert_store_synced_after_window(q.store().path(), &synced);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The spill write creates `seqsigwit.window`. Syncing that directory does
+/// not sync its dirent in `store/`. A later confirm flush is not this write.
+#[test]
+#[cfg(unix)]
+fn spill_write_syncs_the_window_dirent() {
+    let (dir, q) = temp_query("prune-fsync-spill");
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    q.persist_seqsigwit_spill_height(Height(0), &[]).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(q.store().path().join("seqsigwit.window/0.bin").is_file());
+    assert_store_synced_after_window(q.store().path(), &synced);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn pruned_seqsigwit_life() {
     let (dir, q) = temp_query("pruned-seqsigwit-life");

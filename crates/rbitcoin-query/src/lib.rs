@@ -837,7 +837,17 @@ impl Query {
         if !dir.is_dir() {
             return Ok(());
         }
-        rbitcoin_store::file::fsync_parent_dir(&dir).map_err(|e| StoreError::io(dir, e))?;
+        rbitcoin_store::file::fsync_parent_dir(&dir).map_err(|e| StoreError::io(&dir, e))?;
+        // The window directory's own dirent lives in `store/`. The sidecar
+        // rename syncs that parent before `create_dir_all`, so a crash can
+        // drop the directory after the stem cut unless this parent is synced
+        // once the directory exists.
+        if let Some(parent) = dir.parent() {
+            if !parent.as_os_str().is_empty() {
+                rbitcoin_store::file::fsync_parent_dir(parent)
+                    .map_err(|e| StoreError::io(parent, e))?;
+            }
+        }
         Ok(())
     }
 
@@ -1274,6 +1284,9 @@ impl Query {
         // Rename without a sync is not a copy. This file is the only witness
         // once the stem is cut or the tip flush commits the height.
         rbitcoin_store::file::write_synced_tmp_rename(&path, &out)?;
+        // A fresh pruned chain never cuts a fat stem and never rewrites the
+        // sidecar, so this write is what makes the new directory durable.
+        self.sync_spill_dir()?;
         Ok(())
     }
 
