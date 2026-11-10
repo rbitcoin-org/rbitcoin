@@ -68,14 +68,14 @@ impl StoreSecret {
             ));
         }
         crate::file::write_synced_tmp_file(&path, |f| {
-            f.write_all(&self.bytes)
-                .map_err(|e| StoreError::io(&path, e))?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 f.set_permissions(std::fs::Permissions::from_mode(0o600))
                     .map_err(|e| StoreError::io(&path, e))?;
             }
+            f.write_all(&self.bytes)
+                .map_err(|e| StoreError::io(&path, e))?;
             Ok(())
         })
     }

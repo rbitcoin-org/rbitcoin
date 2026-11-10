@@ -691,20 +691,25 @@ impl Store {
         Ok(self.class_a_confirmed_cut(covered)?.is_none())
     }
 
-    /// After open truncates Class A, clear every `header_txs` range that
-    /// ends past that count, then drop confirmed heights that no longer fit.
-    /// The header clear is flushed before the tip shrink. A crash after that
-    /// clear still shrinks: the strong bit past the count is set and the
-    /// range is already gone. Trailing nulls, a header-only tip, and a Class
-    /// C fixture are not this drop.
+    /// After open truncates Class A, drop confirmed heights that no longer
+    /// fit, then clear every `header_txs` range that ends past that count.
+    ///
+    /// The shrink reads those ranges first. Clearing them first drops a
+    /// confirmed height whose next create is an unstrong orphan: the range
+    /// is gone and the strong bit does not save the tip. A crash that
+    /// already cleared the tail still shrinks when that next create is
+    /// strong. Trailing nulls, a header-only tip, and a Class C fixture
+    /// are not this drop.
     pub(crate) fn drop_confirmed_past_creates(&self) -> Result<(), StoreError> {
         let covered = self.txs.count();
-        self.clear_header_ranges_past_covered(covered)?;
         let Some(tip) = self.confirmed.tip_height() else {
+            self.clear_header_ranges_past_covered(covered)?;
             return Ok(());
         };
         let write = crate::array_table::ClassCWrite::new();
-        let Some(kept) = self.covered_tip_shrink(&write, covered, tip.0)? else {
+        let kept = self.covered_tip_shrink(&write, covered, tip.0)?;
+        self.clear_header_ranges_past_covered(covered)?;
+        let Some(kept) = kept else {
             return Ok(());
         };
         let mut report = TipRevalidateReport::default();

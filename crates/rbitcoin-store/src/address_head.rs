@@ -402,8 +402,10 @@ pub struct InsertPageOutcome {
 /// Insert `new_fk` into a **loaded** probe page buffer; the new slot carries
 /// the key's fingerprint.
 ///
-/// Idempotent if `new_fk` is already present. Does not touch the file or
-/// occupied count — caller applies the buffer via pwrite.
+/// Idempotent when `new_fk` is already present with this key's fingerprint,
+/// or with an untagged slot. A different fingerprint is the previous txid
+/// at a create the body reused, and that slot is rewritten. Does not touch
+/// the file or occupied count — caller applies the buffer via pwrite.
 pub fn insert_fk_into_page_buf(
     page_buf: &mut [u8],
     bits: u32,
@@ -422,11 +424,23 @@ pub fn insert_fk_into_page_buf(
     let h1 = h1_in_page(txid, bits);
     let h2 = h2_in_page(txid, bits);
     let scan = hop_scan_page(page_buf, h1, h2, nslots, MAX_PROBE);
-    for &(_d, e) in scan.cands.iter() {
+    let new_fp = fingerprint(txid, bits);
+    for &(d, e) in scan.cands.iter() {
         if e & rel_mask == new_u {
+            let stored_fp = (e >> bits) as u32;
+            // Untagged slots match every key. A different fingerprint is the
+            // previous txid at a create fk the body has reused.
+            if stored_fp == 0 || stored_fp == new_fp {
+                return Ok(InsertPageOutcome {
+                    wrote_new: false,
+                    depth: 0,
+                });
+            }
+            let local = h1.wrapping_add(u64::from(d).wrapping_mul(h2)) & (nslots - 1);
+            store_entry_in_page_buf(page_buf, local, tagged)?;
             return Ok(InsertPageOutcome {
-                wrote_new: false,
-                depth: 0,
+                wrote_new: true,
+                depth: d,
             });
         }
     }

@@ -2035,7 +2035,14 @@ impl ScriptHashTable {
         live_through: u64,
     ) -> Result<Option<(ShHeadValue, usize, i64)>, StoreError> {
         let body = self.body_for(key, kh);
-        let old = self.collect_entries_from(body, cur)?;
+        let old = match self.collect_entries_from(body, cur) {
+            Ok(old) => old,
+            Err(StoreError::Corrupt(Self::SLAB_USED_MISMATCH)) => {
+                let _ = mark_sh_rebuild(&self.store_dir);
+                return Err(StoreError::Corrupt(Self::SLAB_USED_MISMATCH));
+            }
+            Err(e) => return Err(e),
+        };
         let old_len = old.len();
         let mut live = Vec::with_capacity(old_len.saturating_add(fk_vals.len()));
         for fk in &old {
@@ -2377,6 +2384,8 @@ impl ScriptHashTable {
     /// ≈1M create rows: materialize flushes each head shard after its bucket.
     pub const LARGE_BATCH_ROWS: u64 = 1_000_000;
 
+    const SLAB_USED_MISMATCH: &str = "invariant: scripthash slab used != decoded fk count";
+
     #[doc(hidden)]
     pub fn collect_entries_from(
         &self,
@@ -2389,10 +2398,11 @@ impl ScriptHashTable {
             ShHeadValue::Slab { class, off, used } => {
                 let got = self.read_slab(body, *class, *off)?;
                 if got.len() != *used as usize {
-                    let _ = mark_sh_rebuild(&self.store_dir);
-                    return Err(StoreError::Corrupt(
-                        "invariant: scripthash slab used != decoded fk count",
-                    ));
+                    // A history read can hold the head from before an in-place
+                    // append. That mismatch is transient. Scheduling a rebuild
+                    // here would rescan Class A on the next start. Repair marks
+                    // the file when it sees this error.
+                    return Err(StoreError::Corrupt(Self::SLAB_USED_MISMATCH));
                 }
                 Ok(got)
             }

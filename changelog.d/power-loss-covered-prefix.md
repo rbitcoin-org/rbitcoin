@@ -3,7 +3,8 @@ Fixed
 - **Open keeps the covered Class A prefix after power loss.** A body header
   shorter than the locator count used to refuse startup. Open now truncates
   to the last create those headers still name, clears `header_txs` ranges
-  past that prefix, and shrinks the tip to match. A Class C array torn
+  past that prefix, and shrinks the tip to match. An unstrong orphan at
+  that cut does not keep later confirmed blocks. A Class C array torn
   mid-record opens at the last whole row.
 - **A `tx.head/` directory with segment files and no `meta` rebuilds.** That
   directory used to refuse as a legacy shard. Open wipes it and rebuilds from
@@ -45,7 +46,8 @@ Fixed
   below the prune height, and a missing keep file, fail the seal.
   Turning prune on skips an empty pad instead of decoding it as an input. A `tx.head` that still has
   `meta` is shortened to that count. Its slots stay, and open does not
-  rebuild it from Class A.
+  rebuild it from Class A. A later create that reuses one of those fks
+  replaces a slot that still carries the old txid's fingerprint.
 - **Scripthash inclusion stays inside the covered create count.** A watermark
   just above that count unlinks the tail when the outputs are still there.
   When those outputs are already gone, the seal falls first and the watermark

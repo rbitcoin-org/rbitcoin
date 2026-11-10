@@ -192,7 +192,7 @@ impl Query {
     /// disconnect uses. A packed head stores a mix of the key, not the key,
     /// so a missing output cannot name the row. The watermark and SEAL still
     /// move to `covered`, and the head stays.
-    fn unlink_sh_tail(&self, covered: u64) -> Result<bool, QueryError> {
+    fn unlink_sh_tail(&self, covered: u64) -> Result<(), QueryError> {
         use std::collections::HashMap;
         let hwm = self.store.scripthash.include_hwm();
         let mut by_sh: HashMap<[u8; 32], Vec<Fk>> = HashMap::new();
@@ -244,7 +244,7 @@ impl Query {
                 Err(e) => return Err(StoreError::io(&path, e)),
             }
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Sync SEAL up to durable `include_hwm` when the head is ahead of the run
@@ -340,15 +340,13 @@ impl Query {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<u64, QueryError> {
         self.discard_unproven_scripthash_head()?;
-        let mut rebuild = self.sh_force_rebuild()
+        let rebuild = self.sh_force_rebuild()
             || rbitcoin_store::scripthash::sh_rebuild_marked(self.store.path())
             || self.store.scripthash.shard_offset_past_file()?;
         if !rebuild
             && Self::sh_lost_tail(self.store.scripthash.include_hwm(), self.store.txs.count())
-            && !self.unlink_sh_tail(self.store.txs.count())?
         {
-            rbitcoin_store::scripthash::mark_sh_rebuild(self.store.path())?;
-            rebuild = true;
+            self.unlink_sh_tail(self.store.txs.count())?;
         }
         if rebuild && !self.sh_force_rebuild() {
             rbitcoin_store::scripthash::mark_sh_rebuild(self.store.path())?;

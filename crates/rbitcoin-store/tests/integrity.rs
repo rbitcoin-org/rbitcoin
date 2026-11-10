@@ -1170,6 +1170,107 @@ fn short_body_header_shrinks_to_the_landed_prefix() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An unstrong orphan owns the create just past the covered prefix.
+/// Confirmed blocks after it still name those dropped creates. Open has
+/// to shrink to the prefix. Clearing their ranges first leaves the tip
+/// in place, and the strong bit of the orphan does not save it.
+#[test]
+fn unstrong_orphan_at_the_cut_still_shrinks_the_tip() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let side_fk = put_coinbase(&s, 9);
+    assert_eq!(side_fk, Fk(2), "the orphan is the create just past genesis");
+    let side = s.put_header(&hdr(genesis, parent, 9)).unwrap();
+    s.header_txs.put_range(&write, side, side_fk, 1).unwrap();
+    let (tail, tail_hash) = connect_coinbase(&s, &write, 1, genesis, parent);
+    let (tip, _) = connect_coinbase(&s, &write, 2, tail, tail_hash);
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    s.header_txs.flush().unwrap();
+    shorten_creates(&s, 1);
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    assert_eq!(
+        s.confirmed.tip_height(),
+        Some(Height(0)),
+        "confirmed blocks past the orphan must not stay"
+    );
+    assert!(s.header_txs.has_body(genesis).unwrap());
+    assert!(!s.header_txs.has_body(tail).unwrap());
+    assert!(!s.header_txs.has_body(tip).unwrap());
+    assert!(!s.header_txs.has_body(side).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cut leaves the old tx.head slot. The next create reuses that fk.
+/// When the new txid lands on the same probe slot, the old fingerprint
+/// must not make get_by_txid miss the body.
+#[test]
+fn reused_cut_fk_replaces_the_old_tx_head_fingerprint() {
+    use rbitcoin_store::address_head::{bits_for_scale, fingerprint, h1_in_page, page_index};
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let put = |s: &Store, txid: [u8; 32]| {
+        s.put_tx_full_batch_indexed(
+            &[(
+                TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![InputRecord::coinbase(u32::MAX, vec![1], vec![])],
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            )],
+            true,
+        )
+        .unwrap()[0]
+    };
+    let old = [2u8; 32];
+    assert_eq!(put(&s, [1u8; 32]), Fk(1));
+    assert_eq!(put(&s, old), Fk(2));
+    s.txs.flush().unwrap();
+    assert_eq!(s.txs.get_by_txid(&old).unwrap().map(|p| p.0), Some(Fk(2)));
+    shorten_creates(&s, 1);
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    let bits = bits_for_scale(s.head_scale());
+    let old_mixed = s.txs.mix_txid_for_head(&old);
+    let page = page_index(&old_mixed, bits);
+    let h1 = h1_in_page(&old_mixed, bits);
+    let old_fp = fingerprint(&old_mixed, bits);
+    let mut neu = [3u8; 32];
+    let mut found = None;
+    for n in 0u32..2_000_000 {
+        neu[0..4].copy_from_slice(&n.to_le_bytes());
+        let mixed = s.txs.mix_txid_for_head(&neu);
+        if page_index(&mixed, bits) == page
+            && h1_in_page(&mixed, bits) == h1
+            && fingerprint(&mixed, bits) != old_fp
+        {
+            found = Some(neu);
+            break;
+        }
+    }
+    let neu = found.expect("a txid that shares the old primary slot");
+    let fk = put(&s, neu);
+    assert_eq!(fk, Fk(2));
+    assert_eq!(
+        s.txs.get_by_txid(&neu).unwrap().map(|p| p.0),
+        Some(Fk(2)),
+        "the replacement body is in the head"
+    );
+    assert!(s.txs.get_by_txid(&old).unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Headers that already match the logical lengths are the commit.
 /// Open does not drop a create.
 #[test]
