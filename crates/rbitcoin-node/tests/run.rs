@@ -1470,6 +1470,65 @@ fn startup_resumes_tip_mode_when_the_scripthash_head_is_durable() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The tweak watermark is behind the tip and the keep file is gone.
+/// Startup has to say the repair failed. It must not advance prune height.
+#[test]
+fn startup_reports_a_tweak_repair_that_cannot_read_the_keep_file() {
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::testutil::FixtureChain;
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let dir = scratch_dir("tweak-repair-miss");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut script = rbitcoin_primitives::P2TR_PREFIX.to_vec();
+    script.extend_from_slice(&[0x11; 32]);
+    let mut txid = [0u8; 32];
+    txid[31] = 0xcb;
+    let ta = TxApply {
+        tx: TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord::coinbase(
+            u32::MAX,
+            vec![0x04, 1],
+            vec![vec![0x22]],
+        )],
+        outputs: vec![OutputRecord::unspent(50_0000_0000, script)],
+    };
+    let header = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207f_ffff,
+        nonce: 0,
+        merkle_root: txid,
+        hash: txid,
+        size: 0,
+        weight: 0,
+    };
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let spill = q.store().path().join("seqsigwit.window/0.bin");
+    assert!(spill.is_file());
+    std::fs::remove_file(&spill).unwrap();
+    let mut cfg = NodeConfig::default();
+    cfg.prune_seqsigwit = true;
+    cfg.sptweaks = true;
+    let err = apply_startup_index_mode(&q, &cfg, 0).unwrap_err();
+    assert!(
+        err.to_string().contains("index startup repair failed"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A pack-marked head whose inclusion floor is behind the tip must not open
 /// Electrum. Tip follow still starts so write-behind can catch up.
 #[test]
