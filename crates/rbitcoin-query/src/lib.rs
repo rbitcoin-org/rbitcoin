@@ -757,6 +757,9 @@ impl Query {
         // A crash that keeps a truncated locator cannot read the stem.
         // The spill files have to be durable before that truncate.
         self.sync_keep_window_files()?;
+        // Schema 27 is on disk before the locator goes to zero. A crash
+        // that leaves schema 26 and an empty locator is what a 26 binary wipes.
+        rbitcoin_store::store::rewrite_meta_current(self.store.path())?;
         self.store.set_prune_seqsigwit_mode(true);
         self.store.txs.cut_seqsigwit_stem_to_header()
     }
