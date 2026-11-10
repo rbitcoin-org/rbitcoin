@@ -168,8 +168,16 @@ impl Query {
     fn fill_pruned_tweak_inputs(&self, window: &mut IndexWindow) -> Result<(), QueryError> {
         for block in &mut window.blocks {
             let mut file_wants = Vec::new();
+            // Keep this lookup. Confirm can evict the RAM row before the
+            // second pass, and the spill file is still the right copy.
+            let mut ram_hits = std::collections::HashMap::new();
             for tx in &block.txs {
-                if tx.need_seqsigwit && self.seqsigwit_ram_inputs(tx.fk).is_none() {
+                if !tx.need_seqsigwit {
+                    continue;
+                }
+                if let Some(ram) = self.seqsigwit_ram_inputs(tx.fk) {
+                    ram_hits.insert(tx.fk, ram);
+                } else {
                     file_wants.push((tx.fk, tx.rec.input_count));
                 }
             }
@@ -178,13 +186,12 @@ impl Query {
                 if !tx.need_seqsigwit {
                     continue;
                 }
-                let inputs = if let Some(ram) = self.seqsigwit_ram_inputs(tx.fk) {
+                let inputs = if let Some(ram) = ram_hits.remove(&tx.fk) {
                     ram
-                } else {
-                    let Some(row) = from_file.get(&tx.fk) else {
-                        return Err(self.pruned_tweak_witness_miss(block.height));
-                    };
+                } else if let Some(row) = from_file.get(&tx.fk) {
                     row.clone()
+                } else {
+                    return Err(self.pruned_tweak_witness_miss(block.height));
                 };
                 tx.inputs = Some(inputs);
             }
