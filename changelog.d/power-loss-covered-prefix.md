@@ -14,7 +14,12 @@ Fixed
   keeps creates the witness locator no longer names, and those creates have
   no scriptSig or witness. Without the prune file, that missing locator
   still drops the block. A short mempool `meta` is quarantined and the
-  pool starts empty.
+  pool starts empty. `store.secret` is mode 0600 on the temporary
+  inode, before the name is published.
+- **The next block after a torn witness locator keeps its own witness.**
+  Open appends an empty witness row for each create the short locator did
+  not name. The following append files its scriptSig on the new create.
+  The empty rows are still not a witness, and the tip stays.
 - **Scripthash inclusion stays inside the covered create count.** A watermark
   just above that count unlinks the tail, or rebuilds the head when those
   outputs are gone. A shard offset past its file rebuilds once. A floor that

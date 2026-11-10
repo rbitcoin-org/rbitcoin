@@ -1474,6 +1474,9 @@ impl Query {
     /// or the witness locator does not name the create.
     pub fn seqsigwit_available(&self, fk: Fk) -> Result<bool, QueryError> {
         let id = fk.get().unwrap_or(0);
+        if self.store.txs.witness_row_is_gap(id) {
+            return Ok(false);
+        }
         let named = self.store.txs.seqsigwit_loc.count();
         if id > 0 && id <= self.store.txs.count() && id > named {
             return Ok(false);
@@ -1823,7 +1826,8 @@ impl Query {
             let mut appended = self.seqsigwit_append_cache.lock().unwrap();
             for &fk in tx_fks {
                 let id = fk.get().unwrap_or(0);
-                if id > self.store.txs.seqsigwit_loc.count() {
+                if id > self.store.txs.seqsigwit_loc.count() || self.store.txs.witness_row_is_gap(id)
+                {
                     continue;
                 }
                 let ins = if let Some(id) = fk.get() {

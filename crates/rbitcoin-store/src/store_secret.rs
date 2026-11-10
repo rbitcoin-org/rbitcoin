@@ -17,7 +17,7 @@
 
 use crate::error::StoreError;
 use bitcoin_hashes::{sha256, Hash};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// On-disk filename under the store directory.
@@ -67,14 +67,17 @@ impl StoreSecret {
                 std::io::Error::new(std::io::ErrorKind::AlreadyExists, "store.secret exists"),
             ));
         }
-        crate::file::write_synced_tmp_rename(&path, &self.bytes)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        crate::file::write_synced_tmp_file(&path, |f| {
+            f.write_all(&self.bytes)
                 .map_err(|e| StoreError::io(&path, e))?;
-        }
-        Ok(())
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| StoreError::io(&path, e))?;
+            }
+            Ok(())
+        })
     }
 
     /// Load existing secret; `Err` if missing or wrong length.

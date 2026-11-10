@@ -810,25 +810,62 @@ fn connect_checked(q: &Query, h: u32, prev: Fk, parent_hash: [u8; 32]) -> (Fk, [
     (fk, header.hash)
 }
 
+fn connect_witness(
+    q: &Query,
+    h: u32,
+    prev: Fk,
+    parent_hash: [u8; 32],
+    witness: &[u8],
+) -> Fk {
+    let (mut header, mut ta) = coinbase_block(h, prev, Some(parent_hash));
+    ta.inputs[0].witness = vec![witness.to_vec()];
+    header.merkle_root = ta.tx.txid;
+    header.hash = rbitcoin_store::block_header_hash(
+        header.version,
+        &parent_hash,
+        &header.merkle_root,
+        header.timestamp,
+        header.bits,
+        header.nonce,
+    );
+    q.connect_block(Height(h), &header, &[ta]).unwrap();
+    q.block_tx_fks(Height(h)).unwrap()[0]
+}
+
 /// A 0-byte prune file is not a height. Open keeps the creates the short
 /// witness locator no longer names, and those creates have no witness.
+/// The next block's witness lands on the new create.
 #[test]
 fn torn_prune_file_reports_the_height_the_witness_stem_covers() {
     let (dir, q) = temp_query("torn-prune-height");
     let (prev, parent) = connect_checked(&q, 0, Fk::NULL, [0u8; 32]);
-    connect_checked(&q, 1, prev, parent);
+    let (prev, parent) = connect_checked(&q, 1, prev, parent);
     q.store().flush_class_c_tip().unwrap();
     q.store().txs.seqsigwit_loc.truncate_to_count(1).unwrap();
     drop(q);
     std::fs::write(dir.path().join("seqsigwit.prune"), []).unwrap();
     let q = Query::open_or_create_tiny(dir.path()).unwrap();
     assert_eq!(q.store().txs.count(), 2);
-    assert_eq!(q.store().txs.seqsigwit_loc.count(), 1);
+    assert_eq!(q.store().txs.seqsigwit_loc.count(), 2);
     assert_eq!(q.tip_height(), Some(Height(1)));
     let kept = q.block_tx_fks(Height(0)).unwrap()[0];
     let cut = q.block_tx_fks(Height(1)).unwrap()[0];
     assert!(q.seqsigwit_available(kept).unwrap());
     assert!(!q.seqsigwit_available(cut).unwrap());
+    let added = connect_witness(&q, 2, prev, parent, &[0xab; 8]);
+    assert_eq!(q.tip_height(), Some(Height(2)));
+    assert_eq!(q.store().txs.seqsigwit_loc.count(), 3);
+    assert!(!q.seqsigwit_available(cut).unwrap());
+    assert!(q.seqsigwit_available(added).unwrap());
+    assert_eq!(witness_of(&q, added), vec![vec![0xab; 8]]);
+    let (off, len) = q.store().txs.seqsigwit_range(cut).unwrap();
+    let gap = q
+        .store()
+        .txs
+        .seqsigwit
+        .with_bytes_at(off, len, |b| Ok(b.to_vec()))
+        .unwrap();
+    assert!(gap.iter().all(|&b| b == 0), "gap row is not the new witness");
     q.set_prune_seqsigwit(true).unwrap();
     assert_eq!(q.pruneheight(), None, "a short locator is not a dropped prefix");
     assert!(q.seqsigwit_available(kept).unwrap());

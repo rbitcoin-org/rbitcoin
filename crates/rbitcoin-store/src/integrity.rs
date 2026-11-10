@@ -561,6 +561,7 @@ impl Store {
                 match self.txs.seqsigwit_range(fk) {
                     Err(StoreError::NotFound) if lag => {}
                     Err(e) => return Err(TipFault::read("seqsigwit range")(e)),
+                    Ok(_) if self.txs.witness_row_is_gap(fk.0) => {}
                     Ok(_) => {
                         let n = self.seqsigwit_input_count(fk)?;
                         if n != edges.len() {
@@ -703,37 +704,76 @@ impl Store {
             return Ok(());
         };
         let write = crate::array_table::ClassCWrite::new();
+        let Some(kept) = self.covered_tip_shrink(&write, covered, tip.0)? else {
+            return Ok(());
+        };
         let mut report = TipRevalidateReport::default();
+        self.shrink_tip_to(&write, kept, &mut report)
+    }
+
+    /// `None` keeps the tip. `Some` is the last height that still fits, or
+    /// empty when none do.
+    fn covered_tip_shrink(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        covered: u64,
+        tip: u32,
+    ) -> Result<Option<Option<u32>>, StoreError> {
         if let Some(bad) = self.class_a_confirmed_cut(covered)? {
-            let kept = bad.checked_sub(1);
-            match self.header_tx_end(Height(bad))? {
-                Some(end) if end > covered => {
-                    if covered == 0 && !self.txs.bodies_allocated_past_header() {
-                        return Ok(());
-                    }
-                    let mut fks = Vec::new();
-                    for h in bad..=tip.0 {
-                        if let Some(fk) = self.confirmed.get(Height(h))? {
-                            fks.push(fk);
-                        }
-                    }
-                    self.clear_header_fks(&write, &fks)?;
-                    self.shrink_tip_to(&write, kept, &mut report)?;
-                }
-                None if self.strong_past_covered(covered)? => {
-                    self.shrink_tip_to(&write, kept, &mut report)?;
-                }
-                _ => {}
+            return self.shrink_at_cut(write, covered, bad, tip);
+        }
+        self.shrink_without_cut(covered, tip)
+    }
+
+    fn shrink_at_cut(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        covered: u64,
+        bad: u32,
+        tip: u32,
+    ) -> Result<Option<Option<u32>>, StoreError> {
+        let past = self
+            .header_tx_end(Height(bad))?
+            .is_some_and(|end| end > covered);
+        if past && covered == 0 && !self.txs.bodies_allocated_past_header() {
+            return Ok(None);
+        }
+        if past || self.strong_past_covered(covered)? {
+            if past {
+                self.clear_confirmed_headers(write, bad, tip)?;
             }
-            return Ok(());
+            return Ok(Some(bad.checked_sub(1)));
         }
-        if self.header_tx_end(tip)?.is_some() || !self.strong_past_covered(covered)? {
-            return Ok(());
+        Ok(None)
+    }
+
+    fn shrink_without_cut(
+        &self,
+        covered: u64,
+        tip: u32,
+    ) -> Result<Option<Option<u32>>, StoreError> {
+        if self.header_tx_end(Height(tip))?.is_some() || !self.strong_past_covered(covered)? {
+            return Ok(None);
         }
-        if self.highest_height_with_tx_range(tip.0)?.is_some() {
-            return Ok(());
+        if self.highest_height_with_tx_range(tip)?.is_some() {
+            return Ok(None);
         }
-        self.shrink_tip_to(&write, None, &mut report)
+        Ok(Some(None))
+    }
+
+    fn clear_confirmed_headers(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        from: u32,
+        tip: u32,
+    ) -> Result<(), StoreError> {
+        let mut fks = Vec::new();
+        for h in from..=tip {
+            if let Some(fk) = self.confirmed.get(Height(h))? {
+                fks.push(fk);
+            }
+        }
+        self.clear_header_fks(write, &fks)
     }
 
     /// In-RAM `header_txs` only. A clean chain walks slots that are already

@@ -687,6 +687,12 @@ pub struct TxTable {
     /// already be shorter than the creates, and a create it does not name
     /// is not a bad block. Without the file, a missing locator still is.
     pub witness_stem_may_lag: std::sync::atomic::AtomicBool,
+    /// Last create the witness stem named before open filled the gap.
+    /// Zero when there is no gap.
+    witness_named_prefix: std::sync::atomic::AtomicU64,
+    /// Last create open filled with an empty witness row. Rows in
+    /// `(witness_named_prefix, witness_gap_through]` are not a witness.
+    witness_gap_through: std::sync::atomic::AtomicU64,
     /// `--datadir-hdd`: Class A body stems are one pwrite wave each.
     pub datadir_hdd: std::sync::atomic::AtomicBool,
     /// Historical spend slots not yet folded into `spent.body`.
@@ -1008,6 +1014,49 @@ pub fn class_a_skew_assert_aligned(
     Ok(())
 }
 
+/// A prune file left `seqsigwit.loc` behind the creates. Drop the body tail
+/// that locator does not name, then append one empty row per missing create
+/// so the next append's fk is the new create.
+fn align_short_witness_locator(
+    seqsigwit: &VarTable,
+    loc: &crate::delta_loc::DeltaLoc,
+    named: u64,
+    through: u64,
+) -> Result<bool, StoreError> {
+    if named >= through {
+        return Ok(false);
+    }
+    let end = if named == 0 {
+        crate::file::FILE_HEADER_LEN as u64
+    } else {
+        let (off, len) = loc
+            .range_batch(&[Fk(named)])?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or(StoreError::Corrupt(
+                "invariant: seqsigwit.loc range for gap",
+            ))?;
+        off.saturating_add(len)
+    };
+    if seqsigwit.body_logical_len() < end {
+        return Ok(false);
+    }
+    seqsigwit.truncate_body_to(named, end)?;
+    let n = usize::try_from(through - named)
+        .map_err(|_| StoreError::Corrupt("invariant: seqsigwit gap"))?;
+    let Some(prep) = seqsigwit.prepare_batch_encode(n, n.saturating_mul(8), |_i, _buf| {})? else {
+        return Ok(false);
+    };
+    let lens = prep.aligned_lens();
+    let staged = loc.stage(&prep.starts, &lens)?;
+    crate::var_table::write_prepared_bodies_one_wave(&[(seqsigwit, &prep)], false)?;
+    loc.write_staged(&staged)?;
+    let (_fks, durable) = publish_prepared_body(seqsigwit, prep, true)?;
+    let _ = loc.commit_staged(staged, durable);
+    Ok(loc.count() == through && seqsigwit.count() == through)
+}
+
 #[doc(hidden)]
 pub fn repair_class_a_count_skew(
     stems: ClassASkewStems<'_>,
@@ -1256,6 +1305,8 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(false),
             witness_stem_may_lag: std::sync::atomic::AtomicBool::new(false),
+            witness_named_prefix: std::sync::atomic::AtomicU64::new(0),
+            witness_gap_through: std::sync::atomic::AtomicU64::new(0),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages: crate::spend_page_log::SpendPageLog::create(dir),
         })
@@ -1410,6 +1461,13 @@ impl TxTable {
             repair_keeps_short_witness,
             input_existed,
         )?;
+        let witness_named = seqsigwit_loc.count();
+        let witness_through = create_loc.count();
+        let filled_witness_gap = if repair_keeps_short_witness {
+            align_short_witness_locator(&seqsigwit, &seqsigwit_loc, witness_named, witness_through)?
+        } else {
+            false
+        };
         let n_bodies = create_loc.count();
         if txstat.count() != n_bodies {
             rbitcoin_log::warn!(
@@ -1508,6 +1566,16 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
             witness_stem_may_lag: std::sync::atomic::AtomicBool::new(repair_keeps_short_witness),
+            witness_named_prefix: std::sync::atomic::AtomicU64::new(if filled_witness_gap {
+                witness_named
+            } else {
+                0
+            }),
+            witness_gap_through: std::sync::atomic::AtomicU64::new(if filled_witness_gap {
+                witness_through
+            } else {
+                0
+            }),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages: crate::spend_page_log::SpendPageLog::load_clipped(dir, spent_body_end)?,
         };
@@ -1652,6 +1720,25 @@ impl TxTable {
     pub fn witness_stem_may_lag(&self) -> bool {
         self.witness_stem_may_lag
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// `id` is an empty row open wrote so a later append does not reuse it.
+    pub fn witness_row_is_gap(&self, id: u64) -> bool {
+        let through = self
+            .witness_gap_through
+            .load(std::sync::atomic::Ordering::Acquire);
+        id > self
+            .witness_named_prefix
+            .load(std::sync::atomic::Ordering::Acquire)
+            && id <= through
+    }
+
+    fn class_a_append_counts_match(&self, base: u64) -> bool {
+        if self.spent.count() != base || self.txstat.count() != base || self.input.count() != base {
+            return false;
+        }
+        self.prune_seqsigwit_mode()
+            || (self.seqsigwit.count() == base && self.seqsigwit_loc.count() == base)
     }
 
     pub fn datadir_hdd(&self) -> bool {
@@ -3192,11 +3279,7 @@ impl TxTable {
             .map(|(_tx, ins, _outs)| 16 + ins.iter().map(|i| i.encoded_len()).sum::<usize>())
             .sum();
         let base = self.body.count();
-        if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
-            || self.spent.count() != base
-            || self.txstat.count() != base
-            || self.input.count() != base
-        {
+        if !self.class_a_append_counts_match(base) {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
         if items.iter().any(|(_, _, outs)| outs.is_empty()) {
@@ -3336,11 +3419,7 @@ impl TxTable {
         }
         let est_out: usize = pins.iter().map(|pin| pin.packed_outs_est()).sum();
         let base = self.body.count();
-        if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
-            || self.spent.count() != base
-            || self.txstat.count() != base
-            || self.input.count() != base
-        {
+        if !self.class_a_append_counts_match(base) {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
         let mut n_outs = Vec::with_capacity(pins.len());

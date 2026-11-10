@@ -42,6 +42,13 @@ fn outs(t: &TxTable, fk: u64) -> Vec<rbitcoin_store::tx_table::OutputRecord> {
         .1
 }
 
+fn seqsigwit_bytes(t: &TxTable, fk: u64) -> Vec<u8> {
+    let (off, len) = t.seqsigwit_range(rbitcoin_primitives::Fk(fk)).unwrap();
+    t.seqsigwit
+        .with_bytes_at(off, len, |b| Ok(b.to_vec()))
+        .unwrap()
+}
+
 fn numbered(n: u16) -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
     let mut txid = [0u8; 32];
     txid[..2].copy_from_slice(&n.to_le_bytes());
@@ -197,7 +204,24 @@ fn torn_prune_file_keeps_creates_past_the_witness_stem() {
     let t = TxTable::open_tiny(&dir).unwrap();
     assert_eq!(t.count(), 2);
     assert_eq!(t.create_loc.count(), 2);
-    assert_eq!(t.seqsigwit_loc.count(), 1);
+    assert_eq!(t.seqsigwit_loc.count(), 2);
+    assert!(
+        seqsigwit_bytes(&t, 2).iter().all(|&b| b == 0),
+        "the create the short locator did not name has no witness"
+    );
+    let mut third = one(3);
+    third.1[0].script_sig = vec![0xab];
+    t.put_full_batch_indexed(&[third], false).unwrap();
+    assert_eq!(t.count(), 3);
+    assert_eq!(t.seqsigwit_loc.count(), 3);
+    assert!(
+        seqsigwit_bytes(&t, 2).iter().all(|&b| b == 0),
+        "the next append must not reuse the gap slot"
+    );
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(3)).unwrap().1[0].script_sig,
+        vec![0xab]
+    );
     assert_eq!(outs(&t, 1)[0].script, vec![1]);
     assert_eq!(outs(&t, 2)[0].script, vec![2]);
 }

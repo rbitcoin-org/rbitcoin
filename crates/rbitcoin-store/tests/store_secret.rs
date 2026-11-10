@@ -74,6 +74,22 @@ fn load_or_create_and_missing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn secret_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir();
+    StoreSecret::from_bytes([3u8; SECRET_LEN])
+        .write_to_store_dir(&dir)
+        .unwrap();
+    let mode = std::fs::metadata(dir.join(SECRET_FILE))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn abandoned_secret_tmp_is_not_a_secret() {
     let dir = temp_dir();
