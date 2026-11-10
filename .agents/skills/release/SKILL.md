@@ -29,7 +29,7 @@ See the CI gates section of `docs/releases.md`.
 | `./scripts/release-cut.sh --dev-next` | just-shipped `X.Y.0` → `X.Y.99`; same lock rewrite |
 | `./scripts/release-gate.sh` | cargo / nix / changelog / lock; ship needs Highlights |
 | `./scripts/release-notes.sh` | GitHub Release text |
-| `./scripts/release.sh` | annotated tag on a ship version |
+| `./scripts/release.sh` | annotated tag on a ship version; refuses a stale or missing `Cargo.lock` |
 | `./scripts/release-post.sh` | tag, and for `X.Y.0` create `vX.Y.x` |
 
 Hermetic pins: `./scripts/release.test.sh`. Prefer `--no-push` on this VM,

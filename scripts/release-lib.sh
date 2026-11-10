@@ -124,8 +124,11 @@ release_set_nix_version() {
 
 # Package names of root workspace members that inherit
 # workspace.package.version. Empty when the tree has no such members.
+# Dies when a crate says version.workspace = true and this parse found
+# none: a silent empty list would let a cut and a tag skip the lock.
 release_workspace_package_names() {
-  local members member name
+  local members member name found
+  found=""
   members="$(awk '
     /^\[workspace\]$/ { ws = 1; next }
     ws && /^\[/ { ws = 0; inm = 0 }
@@ -139,8 +142,8 @@ release_workspace_package_names() {
     }
     inm && /^\]/ { inm = 0 }
   ' "$ROOT/Cargo.toml")"
-  [[ -n "$members" ]] || return 0
   while IFS= read -r member; do
+    [[ -n "$member" ]] || continue
     [[ -f "$ROOT/$member/Cargo.toml" ]] || continue
     grep -q '^version\.workspace = true' "$ROOT/$member/Cargo.toml" || continue
     name="$(awk '
@@ -152,8 +155,26 @@ release_workspace_package_names() {
         exit
       }
     ' "$ROOT/$member/Cargo.toml")"
-    [[ -n "$name" ]] && printf '%s\n' "$name"
+    if [[ -n "$name" ]]; then
+      found="${found}${name}"$'\n'
+    fi
   done <<<"$members"
+  if [[ -z "$found" ]]; then
+    if grep -R -q --include='Cargo.toml' --exclude-dir=target --exclude-dir=.git \
+      --exclude-dir=third_party '^version\.workspace = true' "$ROOT"; then
+      release_die "Cargo.toml has version.workspace = true but no workspace member was parsed"
+    fi
+    return 0
+  fi
+  printf '%s' "$found"
+}
+
+# Workspace locks only. third_party is a vendored tree and must stay byte-identical.
+release_lock_files() {
+  find "$ROOT" -name Cargo.lock \
+    -not -path '*/target/*' \
+    -not -path '*/.git/*' \
+    -not -path '*/third_party/*'
 }
 
 # Rewrite version = "old" to version = "new" on workspace member packages
@@ -176,11 +197,33 @@ release_rewrite_lock_versions() {
       sub(/^name = "/, "", name)
       sub(/"$/, "", name)
     }
-    /^version = "/ && member[name] && $0 == ("version = \"" old "\"") {
+    # `name in member` does not create a key. `member[name]` would, and the
+    # dependency rewrite below would then retag a non-member that shares
+    # the old version string.
+    /^version = "/ && (name in member) && $0 == ("version = \"" old "\"") {
       print "version = \"" new "\""
       next
     }
-    { print }
+    {
+      line = $0
+      for (m in member) {
+        needle = "\"" m " " old
+        repl = "\"" m " " new
+        out = ""
+        while ((i = index(line, needle)) > 0) {
+          after = substr(line, i + length(needle), 1)
+          if (after != "\"" && after != " ") {
+            out = out substr(line, 1, i)
+            line = substr(line, i + 1)
+            continue
+          }
+          out = out substr(line, 1, i - 1) repl
+          line = substr(line, i + length(needle))
+        }
+        line = out line
+      }
+      print line
+    }
   ' "$lock" >"$tmp"
   mv "$tmp" "$lock"
 }
@@ -190,20 +233,21 @@ release_set_lock_versions() {
   local new="$2"
   local names lock
   [[ "$old" == "$new" ]] && return 0
-  names="$(release_workspace_package_names)" || true
+  names="$(release_workspace_package_names)"
   [[ -n "$names" ]] || return 0
   while IFS= read -r lock; do
     [[ -n "$lock" && -f "$lock" ]] || continue
     release_rewrite_lock_versions "$lock" "$old" "$new" "$names"
-  done < <(find "$ROOT" -name Cargo.lock -not -path '*/target/*' -not -path '*/.git/*')
+  done < <(release_lock_files)
 }
 
 # Fail when a lock still records a workspace member at another version.
 release_check_lock_versions() {
   local want="$1"
   local names lock name ver
-  names="$(release_workspace_package_names)" || true
+  names="$(release_workspace_package_names)"
   [[ -n "$names" ]] || return 0
+  [[ -f "$ROOT/Cargo.lock" ]] || release_die "Cargo.lock is missing"
   while IFS= read -r lock; do
     [[ -n "$lock" && -f "$lock" ]] || continue
     while IFS= read -r name; do
@@ -226,7 +270,7 @@ release_check_lock_versions() {
       [[ "$ver" == "$want" ]] || \
         release_die "Cargo.lock package $name version=$ver != Cargo.toml $want ($(realpath --relative-to="$ROOT" "$lock" 2>/dev/null || echo "$lock"))"
     done <<<"$names"
-  done < <(find "$ROOT" -name Cargo.lock -not -path '*/target/*' -not -path '*/.git/*')
+  done < <(release_lock_files)
 }
 
 # Fold changelog.d/*.md into ## [Unreleased], then delete those files.

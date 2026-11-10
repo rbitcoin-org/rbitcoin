@@ -28,7 +28,9 @@ member (`Cargo.lock`, `fuzz/Cargo.lock`, `script-oracle/Cargo.lock`),
 `nix/rbitcoin.nix` `version`, `CHANGELOG.md`
 `## [X.Y.Z]` with a **`### Highlights`** subsection (1–11 bullets,
 operator-facing, then the thanks paragraph when this release has one).
-`./scripts/release-gate.sh` checks the bullets. Narrative banners
+`./scripts/release-gate.sh` checks the bullets. `./scripts/release.sh`
+refuses to tag when a workspace member's lock entry disagrees or the root
+lock is missing. Narrative banners
 (README, SECURITY, `docs/operator/mainnet.md`)
 are edited on the same bump PR; the scripts do not rewrite them.
 
@@ -115,7 +117,7 @@ All hermetic pins: `./scripts/release.test.sh` (includes
 | `./scripts/release-cut.sh --latest-maint` | highest `vX.Y.x` ref |
 | `./scripts/release-gate.sh` | cargo/nix/changelog/lock; ship needs Highlights; `--kind` → `ship`\|`dev` |
 | `./scripts/release-notes.sh` | GitHub Release / tag text (blurb + Highlights) |
-| `./scripts/release.sh` | annotated tag on a **ship** version |
+| `./scripts/release.sh` | annotated tag on a **ship** version; refuses a stale or missing `Cargo.lock` |
 | `./scripts/release.sh --tag-only` | push the tag, not the branch |
 | `./scripts/release-post.sh` | tag + for `X.Y.0` create `vX.Y.x` |
 | `./scripts/docker-tags.sh vX.Y.Z` | image tags: `X.Y.Z`; `X.Y` when newest on its line; `latest` when newest overall |
