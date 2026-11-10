@@ -1137,7 +1137,10 @@ impl Query {
             for r in sh_creates {
                 tip_sh_max_fk = tip_sh_max_fk.max(r.create_tx_fk.0);
             }
-            let (n, timing) = self.store.scripthash.put_create_batch_append(sh_creates)?;
+            let (n, timing) = self
+                .store
+                .scripthash
+                .put_create_batch_append_through(sh_creates, self.store.txs.count())?;
             crate::note_confirm(&self.confirm_stats().sh_written_n, n as u64);
             let st = self.confirm_stats();
             st.add_sh_part(&st.sh_sort_ns, timing.sort_ns);

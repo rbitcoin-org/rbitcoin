@@ -4,7 +4,7 @@ use rbitcoin_query::sh_builder::{load_seal, store_seal};
 use rbitcoin_query::testutil::FixtureChain;
 use rbitcoin_query::Query;
 use rbitcoin_store::StoreError;
-use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, ScriptHashRecord, TxRecord};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -220,6 +220,184 @@ fn missing_tail_outputs_lower_the_watermark_without_a_rebuild() {
     assert!(q.sh_is_tip_ready());
     assert_eq!(q.finalize_sh_runs().unwrap(), 0);
     assert_eq!(q.store.scripthash.entry_count(), count_before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+thread_local! {
+    static SAW_HWM_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn snap_hwm_before_replace(q: &Query) {
+    SAW_HWM_PUBLISH.with(|c| c.set(true));
+    let covered = q.store.txs.count();
+    assert!(q.sh_run.sealed_max_create_fk() <= covered);
+    let path = q.store.path().join(rbitcoin_store::INCLUDE_HWM_NAME);
+    assert!(
+        path.is_file(),
+        "the watermark file is replaced, not deleted first"
+    );
+    let buf = std::fs::read(&path).unwrap();
+    let cur = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    assert!(cur > covered);
+}
+
+fn connect_spk(q: &Query, h: u32, prev: Fk, parent_hash: Option<[u8; 32]>, spk: &[u8]) -> Fk {
+    let (header, mut ta) = coinbase_block(h, prev, parent_hash);
+    ta.outputs[0] = OutputRecord::unspent(50_0000_0000, spk.to_vec());
+    q.connect_block(Height(h), &header, &[ta]).unwrap()
+}
+
+/// The packed row still ends on a create past the covered count. A later
+/// create of that script, below that end and inside the live count, is stored.
+/// Replaying a create already inside the live count does not duplicate it.
+#[test]
+fn stale_tail_stores_a_lower_live_create() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-stale-lower");
+    q.enter_direct_index_mode().unwrap();
+    let script_s = [0x51u8, 0xab];
+    let script_t = [0x51u8, 0xcd];
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    for (h, spk) in [
+        script_s.as_slice(),
+        script_t.as_slice(),
+        script_s.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fk = connect_spk(&q, h as u32, prev, parent, spk);
+        parent = Some(q.get_header(fk).unwrap().hash);
+        prev = fk;
+    }
+    q.finalize_sh_runs().unwrap();
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(1, end).unwrap();
+    q.store.txs.create_loc.truncate_to_count(1).unwrap();
+    assert_eq!(q.store.txs.count(), 1);
+    q.finalize_sh_runs().unwrap();
+    let sh = rbitcoin_store::script_hash(&script_s);
+    let before: Vec<u64> = q
+        .store
+        .scripthash
+        .entries(&sh)
+        .unwrap()
+        .into_iter()
+        .map(|(fk, _)| fk.0)
+        .collect();
+    assert_eq!(
+        before,
+        vec![1, 3],
+        "packed row keeps the cut tail: {before:?}"
+    );
+    let recs = [
+        ScriptHashRecord::from_fk(sh, Fk(1)),
+        ScriptHashRecord::from_fk(sh, Fk(2)),
+        ScriptHashRecord::from_fk(sh, Fk(8)),
+    ];
+    let (n, _) = q
+        .store
+        .scripthash
+        .put_create_batch_append_through(&recs, 2)
+        .unwrap();
+    assert_eq!(n, 1, "the new create below the stale end must be stored");
+    let after: Vec<u64> = q
+        .store
+        .scripthash
+        .entries(&sh)
+        .unwrap()
+        .into_iter()
+        .map(|(fk, _)| fk.0)
+        .collect();
+    assert_eq!(after, vec![1, 2]);
+    let (n2, _) = q
+        .store
+        .scripthash
+        .put_create_batch_append_through(&recs, 2)
+        .unwrap();
+    assert_eq!(
+        n2, 0,
+        "a create already inside the live count is not stored again"
+    );
+    let again: Vec<u64> = q
+        .store
+        .scripthash
+        .entries(&sh)
+        .unwrap()
+        .into_iter()
+        .map(|(fk, _)| fk.0)
+        .collect();
+    assert_eq!(again, vec![1, 2]);
+    let sh_hole = rbitcoin_store::script_hash(&[0x51, 0xee]);
+    q.store
+        .scripthash
+        .put_create_batch_append(&[
+            ScriptHashRecord::from_fk(sh_hole, Fk(1)),
+            ScriptHashRecord::from_fk(sh_hole, Fk(4)),
+            ScriptHashRecord::from_fk(sh_hole, Fk(9)),
+        ])
+        .unwrap();
+    let (n_hole, _) = q
+        .store
+        .scripthash
+        .put_create_batch_append_through(&[ScriptHashRecord::from_fk(sh_hole, Fk(2))], 5)
+        .unwrap();
+    assert_eq!(n_hole, 1);
+    let hole: Vec<u64> = q
+        .store
+        .scripthash
+        .entries(&sh_hole)
+        .unwrap()
+        .into_iter()
+        .map(|(fk, _)| fk.0)
+        .collect();
+    assert_eq!(hole, vec![1, 2, 4]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The seal drops before the watermark file is replaced. A crash in between
+/// still has the old watermark, so the next start retries instead of copying
+/// the old seal back into a missing file.
+#[test]
+fn lost_tail_lowers_the_seal_before_replacing_the_watermark() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-hwm-order");
+    q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(1, end).unwrap();
+    q.store.txs.create_loc.truncate_to_count(1).unwrap();
+    assert!(q.store.scripthash.include_hwm() > 1);
+    assert!(q.sh_run.sealed_max_create_fk() > 1);
+    SAW_HWM_PUBLISH.with(|c| c.set(false));
+    set_sh_hwm_publish_for_test(Some(snap_hwm_before_replace));
+    let n = q.finalize_sh_runs().unwrap();
+    set_sh_hwm_publish_for_test(None);
+    assert!(
+        SAW_HWM_PUBLISH.with(|c| c.get()),
+        "publish hook did not run"
+    );
+    assert_eq!(n, 0);
+    assert_eq!(q.store.scripthash.include_hwm(), 1);
+    assert!(q.sh_run.sealed_max_create_fk() <= 1);
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn replace_include_hwm_overwrites_a_higher_mark() {
+    let dir = std::env::temp_dir().join(format!("rbtc-hwm-replace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    rbitcoin_store::scripthash::store_include_hwm(&dir, 9).unwrap();
+    rbitcoin_store::scripthash::replace_include_hwm(&dir, 2).unwrap();
+    assert_eq!(rbitcoin_store::scripthash::load_include_hwm(&dir), 2);
+    rbitcoin_store::scripthash::store_include_hwm(&dir, 1).unwrap();
+    assert_eq!(
+        rbitcoin_store::scripthash::load_include_hwm(&dir),
+        2,
+        "the hot path still refuses a decrease"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

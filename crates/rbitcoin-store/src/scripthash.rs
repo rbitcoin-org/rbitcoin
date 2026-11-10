@@ -126,6 +126,18 @@ pub fn load_include_hwm(store_dir: &Path) -> u64 {
     u64::from_le_bytes(word)
 }
 
+/// Replace the inclusion HWM, including with a lower value.
+///
+/// The hot path stays [`store_include_hwm`], which never decreases. Recovery
+/// uses this when the covered prefix is shorter than the mark already on disk.
+pub fn replace_include_hwm(store_dir: &Path, max_create_fk: u64) -> Result<(), StoreError> {
+    if max_create_fk == 0 {
+        return Ok(());
+    }
+    let p = store_dir.join(INCLUDE_HWM_NAME);
+    crate::file::write_synced_tmp_rename(&p, &max_create_fk.to_le_bytes())
+}
+
 /// Store durable inclusion HWM (monotonic: never decreases).
 pub fn store_include_hwm(store_dir: &Path, max_create_fk: u64) -> Result<(), StoreError> {
     if max_create_fk == 0 {
@@ -1334,6 +1346,11 @@ impl ScriptHashTable {
         store_include_hwm(self.store_dir(), max_create_fk)
     }
 
+    /// Write the inclusion HWM even when `max_create_fk` is below the file.
+    pub fn replace_include_hwm(&self, max_create_fk: u64) -> Result<(), StoreError> {
+        replace_include_hwm(self.store_dir(), max_create_fk)
+    }
+
     /// True when every main shard's pack mark is durable.
     ///
     /// Pass-1 BDZ, ingest creates, and overflow are not a pack-complete head.
@@ -1640,6 +1657,18 @@ impl ScriptHashTable {
         &self,
         recs: &[ScriptHashRecord],
     ) -> Result<(usize, AppendTiming), StoreError> {
+        self.put_create_batch_append_through(recs, u64::MAX)
+    }
+
+    /// Like [`Self::put_create_batch_append`]. `live_through` is the create
+    /// count already in Class A. A row whose last fk sits past that count is
+    /// repaired against it. `u64::MAX` leaves every row on the append path.
+    #[doc(hidden)]
+    pub fn put_create_batch_append_through(
+        &self,
+        recs: &[ScriptHashRecord],
+        live_through: u64,
+    ) -> Result<(usize, AppendTiming), StoreError> {
         let mut timing = AppendTiming::default();
         if recs.is_empty() {
             return Ok((0, timing));
@@ -1681,6 +1710,7 @@ impl ScriptHashTable {
 
         let t_body = std::time::Instant::now();
         let mut head_final: Vec<([u8; 32], ShHeadValue, KeyHome)> = Vec::new();
+        let mut retire: Vec<([u8; 32], KeyHome, ShHeadValue)> = Vec::new();
         let mut written = 0usize;
 
         let mut i = 0usize;
@@ -1709,20 +1739,33 @@ impl ScriptHashTable {
             fk_vals.dedup();
 
             let cur = heads.get(&key).cloned().unwrap_or(ShHeadValue::Empty);
-            let kh_early = home.get(&key).copied().unwrap_or(KeyHome::Absent);
-            let max = self.last_create_fk_on(self.body_for(&key, kh_early), &cur)?;
+            let kh = home.get(&key).copied().unwrap_or(KeyHome::Absent);
+            let body = self.body_for(&key, kh);
+            let max = self.last_create_fk_on(body, &cur)?;
             let max_u = max.map(|f| f.0).unwrap_or(0);
+            // A row that still names a create past the live count would skip
+            // every later fk at or below that stale end. Drop those creates
+            // and merge this batch, which can land below a create we keep.
+            if max.is_some() && max_u > live_through {
+                let Some((new_val, n_new)) =
+                    self.repair_posting_through(&key, kh, &cur, &fk_vals, live_through)?
+                else {
+                    continue;
+                };
+                written += n_new;
+                head_final.push((key, new_val, kh));
+                retire.push((key, kh, cur));
+                continue;
+            }
             let add: Vec<Fk> = fk_vals
                 .into_iter()
-                .filter(|&fk| max.is_none() || fk > max_u)
+                .filter(|&fk| fk <= live_through && (max.is_none() || fk > max_u))
                 .map(Fk)
                 .collect();
             if add.is_empty() {
                 continue;
             }
             written += add.len();
-            let kh = home.get(&key).copied().unwrap_or(KeyHome::Absent);
-            let body = self.body_for(&key, kh);
             let alloc_mu = self.alloc_for(&key, kh);
             let mut alloc = alloc_mu.lock().unwrap();
             let new_val = self.append_sorted_creates(body, &mut alloc, &cur, &add)?;
@@ -1739,7 +1782,76 @@ impl ScriptHashTable {
             self.apply_head_upserts(&head_final, flush_each)?;
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }
+        for (key, kh, old) in retire {
+            let body = self.body_for(&key, kh);
+            let alloc_mu = self.alloc_for(&key, kh);
+            let mut alloc = alloc_mu.lock().unwrap();
+            self.free_if_paged(body, &mut alloc, &old)?;
+            write_alloc_header(body, &alloc)?;
+        }
         Ok((written, timing))
+    }
+
+    /// The row's last create is past `live_through`. Keep the creates at or
+    /// below that count, merge `fk_vals` in that same range, and pack the
+    /// list again. A new fk can sit below one we kept, so this is not an append.
+    fn repair_posting_through(
+        &self,
+        key: &[u8; 32],
+        kh: KeyHome,
+        cur: &ShHeadValue,
+        fk_vals: &[u64],
+        live_through: u64,
+    ) -> Result<Option<(ShHeadValue, usize)>, StoreError> {
+        let body = self.body_for(key, kh);
+        let old = self.collect_entries_from(body, cur)?;
+        let old_len = old.len();
+        let mut live = Vec::with_capacity(old_len.saturating_add(fk_vals.len()));
+        for fk in &old {
+            if fk.0 <= live_through {
+                live.push(*fk);
+            }
+        }
+        for &fk in fk_vals {
+            if fk > 0 && fk <= live_through {
+                live.push(Fk(fk));
+            }
+        }
+        live.sort_unstable_by_key(|f| f.0);
+        live.dedup();
+        if live.len() == old_len && live.iter().eq(old.iter()) {
+            return Ok(None);
+        }
+        let mut already = HashSet::with_capacity(old_len);
+        for fk in &old {
+            already.insert(fk.0);
+        }
+        let n_new = live.iter().filter(|fk| !already.contains(&fk.0)).count();
+        let alloc_mu = self.alloc_for(key, kh);
+        let mut alloc = alloc_mu.lock().unwrap();
+        let saved = *alloc;
+        let new_val = match self.rewrite_entries_for_key(body, &mut alloc, &live) {
+            Ok(v) => v,
+            Err(e) => {
+                *alloc = saved;
+                return Err(e);
+            }
+        };
+        if live.len() >= old_len {
+            alloc.live_count = alloc
+                .live_count
+                .saturating_add((live.len() - old_len) as u64);
+        } else {
+            alloc.live_count = alloc
+                .live_count
+                .saturating_sub((old_len - live.len()) as u64);
+        }
+        if let Err(e) = write_alloc_header(body, &alloc) {
+            *alloc = saved;
+            let _ = write_alloc_header(body, &alloc);
+            return Err(e);
+        }
+        Ok(Some((new_val, n_new)))
     }
 
     /// Route head upserts without get-then-insert:

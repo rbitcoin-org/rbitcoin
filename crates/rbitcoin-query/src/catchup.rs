@@ -214,19 +214,28 @@ impl Query {
             self.store.scripthash.unlink_creates_batch(&groups)?;
             self.store.scripthash.commit_deferred_empty_heads()?;
         }
-        let path = self.store.path().join(rbitcoin_store::INCLUDE_HWM_NAME);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(StoreError::io(&path, e)),
-        }
-        if covered > 0 {
-            self.store.scripthash.note_include_hwm(covered)?;
-        }
+        // Seal first. A crash before the watermark moves still has the high
+        // mark, so the next start sees the lost tail and tries again. Deleting
+        // the file first looks like a legacy head: the old seal is copied back
+        // and the index never becomes tip-ready.
         self.sh_run.refresh_seal();
         if self.sh_run.sealed_max_create_fk() > covered {
             crate::sh_builder::store_seal(&self.sh_run.runs_dir, covered)?;
             self.sh_run.refresh_seal();
+        }
+        #[cfg(debug_assertions)]
+        if let Some(hook) = sh_hwm_publish_hook() {
+            hook(self);
+        }
+        if covered > 0 {
+            self.store.scripthash.replace_include_hwm(covered)?;
+        } else {
+            let path = self.store.path().join(rbitcoin_store::INCLUDE_HWM_NAME);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StoreError::io(&path, e)),
+            }
         }
         Ok(true)
     }
@@ -515,7 +524,9 @@ impl Query {
                         })?;
                     if !recs.is_empty() {
                         total = total.saturating_add(recs.len() as u64);
-                        self.store.scripthash.put_create_batch_append(&recs)?;
+                        self.store
+                            .scripthash
+                            .put_create_batch_append_through(&recs, self.store.txs.count())?;
                     }
                     lo = hi.saturating_add(1);
                 }
@@ -546,6 +557,24 @@ impl Query {
     pub fn sh_run_enabled(&self) -> bool {
         self.sh_run.is_enabled()
     }
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SH_HWM_PUBLISH: std::cell::Cell<Option<fn(&Query)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+fn sh_hwm_publish_hook() -> Option<fn(&Query)> {
+    SH_HWM_PUBLISH.with(|c| c.take())
+}
+
+/// One-shot hook just before the lost-tail watermark file is published.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_sh_hwm_publish_for_test(hook: Option<fn(&Query)>) {
+    SH_HWM_PUBLISH.with(|c| c.set(hook));
 }
 
 #[cfg(debug_assertions)]

@@ -29,6 +29,10 @@ Fixed
   rebuild it from Class A.
 - **Scripthash inclusion stays inside the covered create count.** A watermark
   just above that count unlinks the tail when the outputs are still there.
-  When those outputs are already gone, the watermark and seal fall to the
-  covered count and the packed head stays. A shard offset past its file
-  rebuilds once. A floor that already matches the count does not.
+  When those outputs are already gone, the seal falls first and the watermark
+  file is replaced with the covered count. The packed head stays. A crash
+  between those two writes still has the high watermark, so the next start
+  tries again. A later append of that script stores a create at or below the
+  live count even when the row still ends past that count, and drops the
+  creates past the count from the row. A shard offset past its file rebuilds
+  once. A floor that already matches the count does not.
