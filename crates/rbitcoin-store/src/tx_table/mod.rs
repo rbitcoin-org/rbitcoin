@@ -1522,14 +1522,16 @@ impl TxTable {
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
         crate::store::rename_legacy_input_files(seqsigwit_dir)?;
         // Sidecar lives on the hot store, including when the stem is cold.
-        // A torn file is not a height. Its short locator must not drop
-        // creates, and the next append still writes the witness stem.
-        // A 4-byte height is the prune cut. Locator 0 is the finished cut.
-        // A positive short locator is the prefix that landed, so open
-        // drops the creates past it.
+        // A torn file is not a height. A positive short locator must not
+        // drop creates, and the next append still writes the witness stem.
+        // Locator 0 on that torn file is the finished cut with the height
+        // bytes missing. Open stores a 4-byte height so the next append
+        // does not try to extend an empty stem. A 4-byte height is the
+        // prune cut. A positive short locator on it is the prefix that
+        // landed, so open drops the creates past it.
         let prune_path = dir.join("seqsigwit.prune");
-        let prune_seqsigwit_mode = prune_sidecar_is_height(&prune_path)?;
-        let torn_marker = prune_path.is_file() && !prune_seqsigwit_mode;
+        let mut prune_seqsigwit_mode = prune_sidecar_is_height(&prune_path)?;
+        let mut torn_marker = prune_path.is_file() && !prune_seqsigwit_mode;
         let (seal_bits, workers) = Self::resolve_open_opts(opts);
         unlink_leftover_class_a_idx(dir)?;
         if seqsigwit_dir != dir {
@@ -1542,6 +1544,15 @@ impl TxTable {
         let create_loc = open_or_create_create_loc(dir)?;
         let seqsigwit_loc = open_or_create_seqsigwit_loc(seqsigwit_dir)?;
         let loc_count = create_loc.count();
+        // The stem cut already zeroed the locator and the 4-byte height
+        // did not land. There is no row to put the next scriptSig in.
+        // u32::MAX is the height this file did not record: nothing in it
+        // names a dropped prefix. An empty chain is not that cut.
+        if torn_marker && seqsigwit_loc.count() == 0 && loc_count > 0 {
+            crate::file::write_synced_tmp_rename(&prune_path, &u32::MAX.to_le_bytes())?;
+            prune_seqsigwit_mode = true;
+            torn_marker = false;
+        }
         // A file opens the witness body at the short locator. Locator 0 is
         // the finished cut. A torn marker keeps the creates. A 4-byte height
         // whose locator is already 0 does too. A positive short locator on
@@ -1634,6 +1645,10 @@ impl TxTable {
                 dir,
             )?;
         }
+        // A 4-byte height with a positive locator does not fill, so align
+        // did not run. A span past the covered count would mark the next
+        // create as an empty pad. Align's own clamp is the fill path.
+        clamp_witness_gap_to_count(dir, create_loc.count())?;
         let witness_gaps = load_witness_gap(dir)?;
         let n_bodies = create_loc.count();
         if txstat.count() != n_bodies {

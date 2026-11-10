@@ -19,9 +19,15 @@ Fixed
 - **The next block after a torn witness locator keeps its own witness.**
   Open appends an empty witness row for each create a short, non-zero
   locator did not name. A locator already cut to zero stays empty, so the
-  keep-window rewrite is not handed those rows. A 0-byte prune file is
-  only that torn marker, so the following append still writes the witness
-  stem. A 4-byte height is prune mode. A positive short locator on that
+  keep-window rewrite is not handed those rows. A 0-byte prune file with
+  a positive locator is only that torn marker, so the following append
+  still writes the witness stem. A 0-byte file whose locator is already 0
+  is the finished cut: open writes a 4-byte height and does not fill empty
+  rows. When that cut has no keep-window files, the prune height becomes
+  the tip. A missing prefix of an otherwise present window sets the prune
+  height to the last missing height, and the files still on disk stay.
+  The next block's scriptSig is written to the keep window. A missing tip
+  file does not delete the older files. A 4-byte height is prune mode. A positive short locator on that
   height is the prefix that landed, so open drops the creates past it.
   Locator 0 is the finished cut and does not drop the chain. The empty rows are still not a witness
   after a restart, and the tip stays. Deleting a gap span syncs the store
@@ -29,6 +35,8 @@ Fixed
   A later torn locator is its own span, so a witness stored between the
   two fills stays available. A witness locator ahead of the covered create
   count is cut back to that count, and a gap span past it is dropped.
+  A 4-byte height drops that span too, including when open does not fill
+  empty rows.
   When that locator already matches, the witness body counter is set
   back to that count and a tail past it is dropped before the next append.
   A pruned confirm still writes the keep file from the witness it just

@@ -794,6 +794,71 @@ fn pruned_retry_seals_a_missing_keep_file() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The witness stem was already cut and the height file is 0 bytes.
+/// Open keeps the chain. The next block connects, and its scriptSig is in
+/// the keep window after the append cache is gone.
+#[test]
+fn torn_finished_cut_stores_the_next_block_witness() {
+    let (dir, q) = temp_query("torn-cut-next");
+    let (prev, parent) = connect_checked(&q, 0, Fk::NULL, [0u8; 32]);
+    let (prev, parent) = connect_checked(&q, 1, prev, parent);
+    q.store().flush_class_c_tip().unwrap();
+    q.store().txs.cut_seqsigwit_stem_to_header().unwrap();
+    drop(q);
+    std::fs::write(dir.path().join("seqsigwit.prune"), []).unwrap();
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.store().txs.count(), 2);
+    assert_eq!(q.store().txs.seqsigwit_loc.count(), 0);
+    assert!(q.prune_seqsigwit());
+    assert_eq!(q.pruneheight(), Some(Height(1)));
+    assert_eq!(q.tip_height(), Some(Height(1)));
+    let old = q.block_tx_fks(Height(1)).unwrap()[0];
+    let err = q.tx_input_at_fk(old, &q.get_tx(old).unwrap(), 0).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Pruned { .. }),
+        "the cut witness stays gone: {err:?}"
+    );
+    let added = connect_witness(&q, 2, prev, parent, &[0xab; 8]);
+    q.clear_seqsigwit_ram_window();
+    assert!(q.seqsigwit_available(added).unwrap());
+    assert_eq!(witness_of(&q, added), vec![vec![0xab; 8]]);
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(2)));
+    let added = q.block_tx_fks(Height(2)).unwrap()[0];
+    q.clear_seqsigwit_ram_window();
+    assert_eq!(witness_of(&q, added), vec![vec![0xab; 8]]);
+    let _ = dir;
+}
+
+/// The newest keep files survived and the oldest one did not. Open drops
+/// only the missing prefix. The next block's scriptSig is still stored.
+#[test]
+fn torn_finished_cut_keeps_the_suffix_and_stores_the_next_witness() {
+    let (dir, q) = temp_query("torn-cut-suffix");
+    let (mut prev, mut parent) = connect_checked(&q, 0, Fk::NULL, [0u8; 32]);
+    for h in 1..=2 {
+        connect_witness(&q, h, prev, parent, &[0x61]);
+        prev = q.tip_header_fk().unwrap().unwrap();
+        parent = q.get_header(prev).unwrap().hash;
+    }
+    q.set_prune_seqsigwit(true).unwrap();
+    q.store().flush_class_c_tip().unwrap();
+    let kept = q.block_tx_fks(Height(2)).unwrap()[0];
+    std::fs::remove_file(q.store().path().join("seqsigwit.window/0.bin")).unwrap();
+    drop(q);
+    std::fs::write(dir.path().join("seqsigwit.prune"), []).unwrap();
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(0)));
+    assert_eq!(q.tip_height(), Some(Height(2)));
+    q.clear_seqsigwit_ram_window();
+    assert_eq!(witness_of(&q, kept), vec![vec![0x61]]);
+    let added = connect_witness(&q, 3, prev, parent, &[0x62; 8]);
+    q.clear_seqsigwit_ram_window();
+    assert_eq!(witness_of(&q, added), vec![vec![0x62; 8]]);
+    let _ = dir;
+}
+
 /// One coinbase whose merkle and header hash survive tip revalidate.
 fn connect_checked(q: &Query, h: u32, prev: Fk, parent_hash: [u8; 32]) -> (Fk, [u8; 32]) {
     let (mut header, ta) = coinbase_block(h, prev, Some(parent_hash));

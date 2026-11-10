@@ -957,9 +957,47 @@ impl Query {
         {
             q.repair_sp_tweaks(t)?;
         }
+        q.seal_finished_cut_pruneheight()?;
         q.sweep_spill_at_or_below_pruneheight()?;
         q.release_pruned_seqsigwit_stem()?;
         Ok(q)
+    }
+
+    /// A finished stem cut whose height file did not name a prefix has to
+    /// leave a watermark the next block can connect under. A missing prefix
+    /// of the keep window becomes that watermark. The tip file is not
+    /// invented, and a file that is still on disk is not deleted to paper
+    /// over a hole at the tip. An empty window sets the watermark to the tip.
+    fn seal_finished_cut_pruneheight(&self) -> Result<(), QueryError> {
+        if !self.prune_seqsigwit() || self.pruneheight().is_some() {
+            return Ok(());
+        }
+        if self.store.txs.seqsigwit_loc.count() != 0 {
+            return Ok(());
+        }
+        let Some(tip) = self.tip_height() else {
+            return Ok(());
+        };
+        let tip = tip.0;
+        let from = self.seqsigwit_keep_lo(tip);
+        let mut h = tip;
+        while self.seqsigwit_spill_file(h)?.is_file() {
+            if h == from {
+                return Ok(());
+            }
+            h -= 1;
+        }
+        // `h` is missing. The tip file is the one case that must not raise
+        // the watermark over older files that are still on disk.
+        if h == tip {
+            for height in from..tip {
+                if self.seqsigwit_spill_file(height)?.is_file() {
+                    return Ok(());
+                }
+            }
+            return self.set_pruneheight(Some(Height(tip)));
+        }
+        self.set_pruneheight(Some(Height(h)))
     }
 
     /// Rewrite the keep window from the witness stem, then cut that stem

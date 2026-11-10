@@ -395,6 +395,45 @@ fn witness_ahead_of_the_covered_prefix_is_cut_back() {
     );
 }
 
+/// A 4-byte height skips the empty-row fill. The cut still has to drop a
+/// gap span that names creates past the prefix, or the next create is an
+/// empty pad.
+#[test]
+fn four_byte_prune_drops_a_gap_past_the_covered_prefix() {
+    let dir = super::tempfile_dir("witness-ahead-height");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    let mut first = one(1);
+    first.1[0].script_sig = vec![0x11];
+    t.put_full_batch_indexed(&[first], false).unwrap();
+    let tx_end = on_disk_hwm(&t.body.body);
+    let sp_end = on_disk_hwm(&t.spent.body);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    let mut third = one(3);
+    third.1[0].script_sig = vec![0x33];
+    t.put_full_batch_indexed(&[third], false).unwrap();
+    set_disk_hwm(&t.body.body, tx_end);
+    set_disk_hwm(&t.spent.body, sp_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), u32::MAX.to_le_bytes()).unwrap();
+    let mut gap = [0u8; 16];
+    gap[..8].copy_from_slice(&1u64.to_le_bytes());
+    gap[8..].copy_from_slice(&3u64.to_le_bytes());
+    std::fs::write(dir.join("seqsigwit.gap"), gap).unwrap();
+
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1);
+    assert!(!t.witness_row_is_gap(1));
+    let mut next = one(4);
+    next.1[0].script_sig = vec![0x44];
+    t.put_full_batch_indexed(&[next], false).unwrap();
+    assert_eq!(t.count(), 2);
+    assert!(
+        !t.witness_row_is_gap(2),
+        "the create after the cut is not an empty pad"
+    );
+    assert!(!dir.join("seqsigwit.gap").exists());
+}
+
 /// The witness locator already names the covered prefix. The body counter
 /// was opened at the longer create count and must come back before append.
 #[test]
@@ -462,6 +501,36 @@ fn finished_witness_cut_does_not_fill_empty_rows() {
     assert_eq!(t.seqsigwit_loc.count(), 0);
     assert!(!t.witness_row_is_gap(1));
     assert!(!t.witness_row_is_gap(2));
+}
+
+/// Locator 0 is the finished cut. The next create has to land, and its
+/// scriptSig is not an empty pad on the stem.
+#[test]
+fn finished_torn_cut_accepts_the_next_create() {
+    let dir = super::tempfile_dir("witness-cut-append");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    t.cut_seqsigwit_stem_to_header().unwrap();
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 0);
+    assert!(t.prune_seqsigwit_mode());
+    assert_eq!(
+        std::fs::read(dir.join("seqsigwit.prune")).unwrap(),
+        u32::MAX.to_le_bytes()
+    );
+    let mut third = one(3);
+    third.1[0].script_sig = vec![0xab];
+    t.put_full_batch_indexed(&[third], false).unwrap();
+    assert_eq!(t.count(), 3);
+    assert_eq!(t.seqsigwit_loc.count(), 0);
+    assert_eq!(t.seqsigwit.count(), 0);
+    assert!(!t.witness_row_is_gap(3));
+    assert!(!dir.join("seqsigwit.gap").exists());
+    assert_eq!(outs(&t, 3)[0].script, vec![3]);
 }
 
 /// Deleting a gap span past the covered count has to sync the directory.
