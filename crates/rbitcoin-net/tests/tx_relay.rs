@@ -152,6 +152,38 @@ fn confirm_target_two_is_the_two_block_rate() {
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
+/// Core's `estimateSmartFee` answers target 1 as 2. Ours does while the
+/// 1-block quote still blends in the cold q0.999 history (flow fullness < 1).
+#[test]
+fn smart_fee_target_one_is_two_until_flow_is_warm() {
+    let store_dir = tmp();
+    let mp_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+    let rates: Vec<Option<u64>> = FEE_SNAPSHOT_DEPTHS
+        .iter()
+        .enumerate()
+        .map(|(i, _)| Some(10_000 - i as u64 * 100))
+        .collect();
+    let at = |t| fee_at_target_sat_kvb(FEE_SNAPSHOT_DEPTHS, &rates, t);
+    for (fullness, one_as) in [(0.0, 2), (0.99, 2), (1.0, 1)] {
+        let mut snap = FeeSnapshot::empty(Instant::now());
+        snap.depth_rates_sat_kvb = rates.clone();
+        snap.flow_fullness = fullness;
+        hub.fee_dirty.store(false, Ordering::Release);
+        hub.fee_snapshot.store(Arc::new(snap));
+        assert_eq!(
+            hub.estimate_smart_fee_sat_kvb(1),
+            (one_as, at(one_as)),
+            "fullness {fullness}"
+        );
+        assert_eq!(hub.estimate_smart_fee_sat_kvb(2), (2, at(2)));
+        assert_eq!(hub.estimate_smart_fee_sat_kvb(6), (6, at(6)));
+    }
+    let _ = std::fs::remove_dir_all(&mp_dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
 #[test]
 fn recent_reject_at_the_cap_does_not_clear() {
     let dir = tmp();

@@ -327,6 +327,8 @@ pub struct FeeSnapshot {
     pub vsize: u64,
     /// Σ `fee_sat` over live entries.
     pub total_fee: u64,
+    /// Flow fullness α at this refresh (`0.0..=1.0`; see `FeeFlowMeter::fullness`).
+    pub flow_fullness: f64,
     pub computed_at: Instant,
 }
 
@@ -340,6 +342,7 @@ impl FeeSnapshot {
             count: 0,
             vsize: 0,
             total_fee: 0,
+            flow_fullness: 0.0,
             computed_at: now,
         }
     }
@@ -568,6 +571,20 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
 
 /// Cap for Esplora `/mempool/recent` (newest accepts, process-local).
 pub const MEMPOOL_RECENT_CAP: usize = 32;
+
+/// Core `estimateSmartFee` treats target 1 as 2 ("not possible to get
+/// reasonable estimates for confTarget of 1"). Ours does while flow is not
+/// warm (`flow_fullness < 1`): until then the 1-block quote blends in the
+/// cold q0.999 history, which a quiet network (signet) keeps far above
+/// target 2. Electrum target 0 stays the 1-block horizon. `estimaterawfee`
+/// and Esplora keep target 1.
+pub fn smart_fee_target(conf_target: u32, flow_fullness: f64) -> u32 {
+    if conf_target == 1 && flow_fullness < 1.0 {
+        2
+    } else {
+        conf_target
+    }
+}
 
 /// Flow fullness `0.0..=1.0` as a decile. `* 10` is the scale; `+` and `/` are not.
 #[doc(hidden)]
@@ -4398,19 +4415,6 @@ impl MempoolHub {
         }
     }
 
-    /// Core `estimateSmartFee` treats target 1 as 2 ("not possible to get
-    /// reasonable estimates for confTarget of 1"). Only 1 moves: Electrum
-    /// target 0 stays the 1-block horizon. `estimatesmartfee` and Electrum
-    /// `blockchain.estimatefee` quote this target. `estimaterawfee` and
-    /// Esplora keep target 1.
-    pub fn smart_fee_target(conf_target: u32) -> u32 {
-        if conf_target == 1 {
-            2
-        } else {
-            conf_target
-        }
-    }
-
     /// Lazy singleflight refresh when dirty or older than [`FEE_SNAPSHOT_MAX_AGE`].
     #[doc(hidden)]
     pub fn maybe_refresh_fee_snapshot(&self) {
@@ -4513,6 +4517,7 @@ impl MempoolHub {
             count,
             vsize,
             total_fee,
+            flow_fullness: alpha,
             computed_at: t0,
         }));
         self.fee_dirty.store(false, Ordering::Release);
@@ -6620,6 +6625,16 @@ impl MempoolHub {
         self.fee_snapshot
             .load()
             .rate_sat_kvb(depth, self.mempool_min_fee_sat_kvb())
+    }
+
+    /// `estimatesmartfee` / Electrum `blockchain.estimatefee`: the target
+    /// answered ([`smart_fee_target`]) and its rate, from one snapshot.
+    pub fn estimate_smart_fee_sat_kvb(&self, conf_target: u32) -> (u32, Option<u64>) {
+        self.maybe_refresh_fee_snapshot();
+        let snap = self.fee_snapshot.load();
+        let blocks = smart_fee_target(conf_target, snap.flow_fullness);
+        let rate = snap.rate_sat_kvb(Self::fee_depth(blocks), self.mempool_min_fee_sat_kvb());
+        (blocks, rate)
     }
 
     /// Esplora `/fee-estimates` targets in one Arc load (+ optional refresh):
