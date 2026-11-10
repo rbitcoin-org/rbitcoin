@@ -1093,6 +1093,40 @@ fn pruned_spill_cover_reads_the_height_file_once() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A replacement block whose txid does not match the stored create is refused.
+/// The stored txid stays, and the missing keep file stays missing.
+#[test]
+fn resubmit_rejects_a_coinbase_whose_txid_does_not_match() {
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::accept_and_connect_block;
+
+    let (dir, q) = temp_query("prune-resubmit-txid");
+    q.set_prune_seqsigwit(true).unwrap();
+    let params = ChainParams::regtest();
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    accept_and_connect_block(&q, &params, Height(0), &genesis, Milestone::NONE).unwrap();
+    let tx_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    let stored = q.store().txs.body_txid(tx_fk).unwrap();
+    let spill = q.store().path().join("seqsigwit.window/0.bin");
+    std::fs::remove_file(&spill).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let mut evil = genesis.clone();
+    evil.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![0x04, 1, 2, 3, 4]);
+    assert_ne!(evil.txdata[0].compute_txid().to_byte_array(), stored);
+    let header_fk = q.header_at_height(Height(0)).unwrap().unwrap().0;
+    let err = q
+        .note_pruned_archived_seqsigwit(header_fk, &evil)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("txid"), "{err:?}");
+    assert_eq!(q.store().txs.body_txid(tx_fk).unwrap(), stored);
+    assert!(!spill.is_file());
+    accept_and_connect_block(&q, &params, Height(0), &genesis, Milestone::NONE).unwrap();
+    assert!(spill.is_file());
+    assert_eq!(q.store().txs.body_txid(tx_fk).unwrap(), stored);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The wire facade used to reject a block that is already the tip once its
 /// keep file was gone. Resubmitting that block writes the file again.
 #[test]

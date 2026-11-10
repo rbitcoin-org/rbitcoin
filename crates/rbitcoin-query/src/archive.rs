@@ -1478,6 +1478,10 @@ impl Query {
                     "invariant: archived seqsigwit input count",
                 ));
             }
+            let wire_txid = tx.compute_txid().to_byte_array();
+            if self.store.txs.body_txid(fk)? != wire_txid {
+                return Err(StoreError::Corrupt("invariant: archived seqsigwit txid"));
+            }
             let edges: Vec<crate::SpendEdge> = stored
                 .iter()
                 .enumerate()
