@@ -213,8 +213,11 @@ after the index is built when that index covers every height the cut drops.
 A restart reseals a tweak gap from `seqsigwit.window` (RAM, then one read of
 each spill file) before it advances the prune height. If that repair still
 does not cover the height about to be dropped, startup refuses and leaves
-the prune height where it was. The error says to run without `--prune-seqsigwit`, with `--sp-tweaks`,
-until the index catches up, then turn prune on. Sealed rows serve from
+the prune height where it was. Turning prune on while the index is short
+says to stay unpruned with `--sp-tweaks` until the index catches up, or to
+delete the index files. A datadir that is already pruned cannot turn prune
+off, so that error says only to delete `store/sp_tweaks.idx` and
+`store/sp_tweaks.body`. Sealed rows serve from
 `sp_tweaks` plus `txout`. A pruned silent-payment scan and
 `blockchain.tweaks.subscribe` read that index. An unsealed tip still in
 the keep window is built from that window. A missing file, or a height

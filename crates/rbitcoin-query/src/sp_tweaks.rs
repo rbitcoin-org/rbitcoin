@@ -280,14 +280,17 @@ impl Query {
     }
 
     /// A missing index still has to start before taproot. An index that is
-    /// already on disk, and does not cover the drop, is a hole.
+    /// already on disk, and does not cover the drop, is a hole. Prune cannot
+    /// be turned off, so that datadir only hears the delete remedy.
     fn tweak_prune_miss(&self) -> QueryError {
         let present =
             self.sptweaks_enabled() || SpTweaksTable::files_present(self.store.cold_files_dir());
-        let msg = if present {
-            SP_TWEAKS_PRUNE_INDEX_SHORT
-        } else {
+        let msg = if !present {
             SP_TWEAKS_PRUNE_BEFORE_TAPROOT
+        } else if self.prune_seqsigwit() {
+            SP_TWEAKS_PRUNE_INDEX_SHORT_ON
+        } else {
+            SP_TWEAKS_PRUNE_INDEX_SHORT
         };
         StoreError::Layout(msg.into())
     }
@@ -370,10 +373,15 @@ impl Query {
 pub(crate) const SP_TWEAKS_PRUNE_BEFORE_TAPROOT: &str =
     "silent payment tweaks on --prune-seqsigwit must be enabled before taproot activation";
 
-/// Index files exist, and the next height is not past the prune height.
-/// Callers match `does not cover`. This text does not say `taproot`.
+/// Index files exist, prune is not on yet, and the next height is not past
+/// the cut. Callers match `does not cover`. This text does not say `taproot`.
 pub(crate) const SP_TWEAKS_PRUNE_INDEX_SHORT: &str =
     "silent payment tweak index does not cover every height --prune-seqsigwit would drop; delete store/sp_tweaks.idx and store/sp_tweaks.body to prune without that index, or run without --prune-seqsigwit and with --sp-tweaks until the index catches up, then turn --prune-seqsigwit on";
+
+/// Same hole on a datadir that is already pruned. Prune cannot be turned
+/// off, so the unpruned catch-up is not a remedy.
+pub(crate) const SP_TWEAKS_PRUNE_INDEX_SHORT_ON: &str =
+    "silent payment tweak index does not cover every height --prune-seqsigwit would drop; delete store/sp_tweaks.idx and store/sp_tweaks.body to prune without that index";
 
 /// What startup logs when prune is on, tweak files exist, and this start
 /// left `--sp-tweaks` off.
