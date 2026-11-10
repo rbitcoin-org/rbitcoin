@@ -2525,9 +2525,12 @@ async fn add_wallet_onion(
     if !listener.onion(config) {
         return Ok(None);
     }
-    shutdown
-        .run_until_cancelled(ctl.add_named_onion(config.datadir.path(), listener.name(), bound))
-        .await
+    // `cancelled` wins when both are ready, so SIGTERM does not sit in ADD_ONION.
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => Ok(None),
+        done = ctl.add_named_onion(config.datadir.path(), listener.name(), bound) => done.map(Some),
+    }
 }
 
 /// SAM `STREAM FORWARD` to a wallet listener. `None` when its I2P switch is off.
