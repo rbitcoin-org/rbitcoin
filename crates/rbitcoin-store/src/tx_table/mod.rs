@@ -784,11 +784,12 @@ pub fn class_a_skew_target_count(
     if let Some(n) = short_new_layout_input {
         return Some(n);
     }
-    // A prune file means a short witness locator is the stem, not a reason
-    // to drop creates. Count 0 is that finished cut: min-ing it would drop
-    // the chain. Without the file, a positive locator that is short of the
-    // creates is an unfinished commit, and the chain truncates to the rows
-    // it still names.
+    // A torn marker, or a 4-byte height whose locator is already 0, is not
+    // a reason to drop creates. Count 0 is that finished cut: min-ing it
+    // would drop the chain. A 4-byte height with a positive short locator
+    // is the prefix that landed, and the chain truncates to it. Without
+    // the file, a positive locator that is short of the creates is an
+    // unfinished commit.
     if prune_seqsigwit_mode {
         if n_txids == n_loc {
             return None;
@@ -1521,14 +1522,14 @@ impl TxTable {
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
         crate::store::rename_legacy_input_files(seqsigwit_dir)?;
         // Sidecar lives on the hot store, including when the stem is cold.
-        // A prune file, even a torn one, means the witness locator may
-        // already be shorter than the creates. Repair must not cut the
-        // chain back to it. Only a 4-byte height is prune mode: a 0-byte
-        // file is the torn marker, and the next append still writes the
-        // witness stem.
+        // A torn file is not a height. Its short locator must not drop
+        // creates, and the next append still writes the witness stem.
+        // A 4-byte height is the prune cut. Locator 0 is the finished cut.
+        // A positive short locator is the prefix that landed, so open
+        // drops the creates past it.
         let prune_path = dir.join("seqsigwit.prune");
-        let repair_keeps_short_witness = prune_path.is_file();
         let prune_seqsigwit_mode = prune_sidecar_is_height(&prune_path)?;
+        let torn_marker = prune_path.is_file() && !prune_seqsigwit_mode;
         let (seal_bits, workers) = Self::resolve_open_opts(opts);
         unlink_leftover_class_a_idx(dir)?;
         if seqsigwit_dir != dir {
@@ -1541,10 +1542,13 @@ impl TxTable {
         let create_loc = open_or_create_create_loc(dir)?;
         let seqsigwit_loc = open_or_create_seqsigwit_loc(seqsigwit_dir)?;
         let loc_count = create_loc.count();
-        // Any prune file, including a torn 0-byte marker, opens the witness
-        // body at the short locator. A locator of 0 is that finished cut.
-        // Reads and later appends stay on the stem until the file is a height.
-        let stem_retired = repair_keeps_short_witness && seqsigwit_loc.count() < loc_count;
+        // A file opens the witness body at the short locator. Locator 0 is
+        // the finished cut. A torn marker keeps the creates. A 4-byte height
+        // whose locator is already 0 does too. A positive short locator on
+        // a 4-byte height is the prefix that landed.
+        let stem_retired = prune_path.is_file() && seqsigwit_loc.count() < loc_count;
+        let repair_keeps_short_witness =
+            torn_marker || (prune_seqsigwit_mode && seqsigwit_loc.count() == 0);
         let body = if had_txout {
             VarTable::open_body_only(dir, "txout", TableKind::TxOut, loc_count)?
         } else {

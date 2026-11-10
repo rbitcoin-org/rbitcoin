@@ -1838,15 +1838,13 @@ impl Query {
             let mut appended = self.seqsigwit_append_cache.lock().unwrap();
             for &fk in tx_fks {
                 let id = fk.get().unwrap_or(0);
-                // Prune mode does not advance the witness locator, so the
-                // scriptSig this confirm just appended lives only in the
-                // cache. A create the locator does not name, and that this
-                // confirm did not append, has no stem row.
                 let cached = fk.get().and_then(|id| appended.remove(&id));
-                if cached.is_none()
-                    && (id > self.store.txs.seqsigwit_loc.count()
-                        || self.store.txs.witness_row_is_gap(id))
-                {
+                // The witness this confirm just appended is only in the
+                // cache: prune mode does not advance the locator, and the
+                // stem cut leaves that count at 0. A gap row is the empty
+                // pad and has no keep-file witness. Any other cache miss
+                // has to read the keep file or fail the seal.
+                if cached.is_none() && self.store.txs.witness_row_is_gap(id) {
                     continue;
                 }
                 let ins = if let Some(v) = cached {

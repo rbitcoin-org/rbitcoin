@@ -21,7 +21,9 @@ Fixed
   locator did not name. A locator already cut to zero stays empty, so the
   keep-window rewrite is not handed those rows. A 0-byte prune file is
   only that torn marker, so the following append still writes the witness
-  stem. A 4-byte height is prune mode. The empty rows are still not a witness
+  stem. A 4-byte height is prune mode. A positive short locator on that
+  height is the prefix that landed, so open drops the creates past it.
+  Locator 0 is the finished cut and does not drop the chain. The empty rows are still not a witness
   after a restart, and the tip stays. Deleting a gap span syncs the store
   directory.
   A later torn locator is its own span, so a witness stored between the
@@ -30,8 +32,10 @@ Fixed
   When that locator already matches, the witness body counter is set
   back to that count and a tail past it is dropped before the next append.
   A pruned confirm still writes the keep file from the witness it just
-  appended, even when the locator does not name that create. Turning
-  prune on skips an empty pad instead of decoding it as an input. A `tx.head` that still has
+  appended, even when the locator does not name that create. A later
+  seal with an empty append cache reads that keep file. A height at or
+  below the prune height, and a missing keep file, fail the seal.
+  Turning prune on skips an empty pad instead of decoding it as an input. A `tx.head` that still has
   `meta` is shortened to that count. Its slots stay, and open does not
   rebuild it from Class A.
 - **Scripthash inclusion stays inside the covered create count.** A watermark
