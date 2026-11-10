@@ -4352,6 +4352,44 @@ fn submitpackage_child_fail_keeps_parent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core `rpc_packages.py` `test_submitpackage_other_wtxid`: a member whose
+/// txid is live under another witness reports only `other-wtxid`.
+#[test]
+fn submitpackage_reports_other_wtxid_for_a_live_witness_variant() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (parent_hex, parent) =
+        mature_coinbase_spend(&ctx, 50_0000_0000 - 1_000, p2wsh_script(1).to_p2wsh());
+    dispatch(&ctx, "sendrawtransaction", vec![json!(parent_hex)]).unwrap();
+    let prev = bitcoin::OutPoint {
+        txid: parent.compute_txid(),
+        vout: 0,
+    };
+    let value = parent.output[0].value.to_sat();
+    let one = p2wsh_with_lens(prev, value, 1_000, 1, &[1]);
+    let two = p2wsh_with_lens(prev, value, 1_000, 1, &[2]);
+    assert_eq!(one.compute_txid(), two.compute_txid());
+    assert_ne!(one.compute_wtxid(), two.compute_wtxid());
+    let one_hex = rbitcoin_primitives::hex_encode(serialize(&one));
+    let two_hex = rbitcoin_primitives::hex_encode(serialize(&two));
+    dispatch(&ctx, "sendrawtransaction", vec![json!(one_hex)]).unwrap();
+    let pkg = dispatch(&ctx, "submitpackage", vec![json!([two_hex])]).unwrap();
+    assert_eq!(
+        pkg,
+        json!({
+            "package_msg": "success",
+            "tx-results": {
+                hash_hex_display(&two.compute_wtxid().to_byte_array()): {
+                    "txid": hash_hex_display(&two.compute_txid().to_byte_array()),
+                    "other-wtxid": hash_hex_display(&one.compute_wtxid().to_byte_array()),
+                },
+            },
+            "replaced-transactions": [],
+        })
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn submitpackage_maxfeerate_skips_package_eval_and_reports_replacements() {
     use bitcoin::absolute::LockTime;

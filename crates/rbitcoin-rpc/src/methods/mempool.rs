@@ -2376,8 +2376,19 @@ fn submitpackage_plan(
             );
             continue;
         }
-        if !mp.contains(&tx.compute_txid()) {
+        let Some(live) = mp.wtxid_of(&tx.compute_txid()) else {
             to_admit.push(tx.clone());
+            continue;
+        };
+        // Core `DIFFERENT_WITNESS`: the txid is live under another witness.
+        if live != tx.compute_wtxid() {
+            tx_results.insert(
+                wtxid,
+                json!({
+                    "txid": txid_s,
+                    "other-wtxid": hash_hex_display(&live.to_byte_array()),
+                }),
+            );
             continue;
         }
         if let (Some((fee, _)), Some(weight)) = (
