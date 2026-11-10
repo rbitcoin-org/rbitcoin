@@ -2178,7 +2178,12 @@ impl TxTable {
 
     #[doc(hidden)]
     pub fn seqsigwit_has_inline_prevout(&self, fk: Fk) -> Result<bool, StoreError> {
-        let (off, len) = self.seqsigwit_range(fk)?;
+        // `seqsigwit_range` refuses every row once prune mode is on. The
+        // stem can still name this create. Backfill has to read that row.
+        let Some(Some((off, len))) = self.seqsigwit_loc.range_batch(&[fk])?.into_iter().next()
+        else {
+            return Ok(false);
+        };
         if len == 0 {
             return Ok(false);
         }

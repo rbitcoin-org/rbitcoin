@@ -1229,6 +1229,89 @@ fn reopen_resumes_partial_legacy_input_backfill() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The prune sidecar is on, and the witness stem still holds the legacy
+/// prevouts. An interrupted backfill has to finish from that stem.
+#[test]
+fn pruned_open_resumes_a_partial_legacy_input_backfill() {
+    let dir = tempfile_dir("input-backfill-prune");
+    let t = create_tiny(&dir);
+    let coinbase = (
+        TxRecord {
+            txid: [1u8; 32],
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    );
+    let spend = (
+        TxRecord {
+            txid: [2u8; 32],
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        vec![InputRecord {
+            prev_txid: [1u8; 32],
+            parent: InputParent::Prevout {
+                create_fk: Fk(1),
+                vout: 0,
+            },
+            sequence: u32::MAX,
+            script_sig: vec![0xab; 8],
+            witness: vec![vec![0x30; 16]],
+        }],
+        vec![OutputRecord::unspent(2, vec![0x51])],
+    );
+    t.put_full_batch_indexed(&[coinbase, spend], true).unwrap();
+    for (i, payload) in [
+        vec![
+            input_flags::NULL_PREV
+                | input_flags::SEQ_FINAL
+                | input_flags::EMPTY_SCRIPT
+                | input_flags::EMPTY_WITNESS,
+        ],
+        {
+            let mut v = vec![
+                input_flags::SEQ_FINAL | input_flags::EMPTY_SCRIPT | input_flags::EMPTY_WITNESS,
+            ];
+            v.extend_from_slice(&1u64.to_le_bytes());
+            write_compact_size(&mut v, 0);
+            v
+        },
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (off, len) = t.seqsigwit_range(Fk((i + 1) as u64)).unwrap();
+        let mut raw = payload.clone();
+        raw.resize(len as usize, 0);
+        t.seqsigwit.write_body_abs(off, &raw).unwrap();
+    }
+    drop(t);
+    for name in ["input.loc", "input.off", "input.body"] {
+        std::fs::remove_file(dir.join(name)).unwrap();
+    }
+    let partial = rbitcoin_store::input::Input::create(&dir).unwrap();
+    partial
+        .append(&[vec![rbitcoin_store::input::InputEdge::coinbase()]])
+        .unwrap();
+    drop(partial);
+    write_prune_sidecar(&dir);
+    let t2 = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(
+        t2.input.edges(Fk(2)).unwrap().unwrap(),
+        vec![rbitcoin_store::input::InputEdge {
+            parent: Fk(1),
+            vout: 0
+        }]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A resumed input backfill starts at the creates already backfilled, so
 /// `/progress` does not drop to 0% after a restart. fk 1 was done before the
 /// restart; fk 2's record is garbage, so the stage ends at the seed.
