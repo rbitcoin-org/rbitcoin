@@ -985,6 +985,22 @@ fn one_peer_batch_takes_the_overlay_slot_only_without_a_live_overlay() {
     assert!(matches!(got.as_slice(), [NetAddr::Ip(_)]), "{got:?}");
 }
 
+/// A failed onion stays eligible while every clearnet row is last-resort. A
+/// one-peer batch must not hand it the slot again inside the recent-attempt
+/// window, or that slot never returns to clearnet.
+#[test]
+fn one_peer_batch_skips_a_recently_attempted_overlay() {
+    let mut am = AddrMan::new();
+    am.set_onion_reachable(true);
+    am.add(addr(1));
+    am.note_connect_failed_addr(NetAddr::Ip(addr(1)), false);
+    am.add_addr(onion());
+    am.note_attempt_addr(onion());
+    am.note_connect_failed_addr(onion(), false);
+    let got = am.take_dial_candidates_net(1, &HashSet::new(), &[], false);
+    assert_eq!(got, vec![NetAddr::Ip(addr(1))], "{got:?}");
+}
+
 #[test]
 fn dns_seeds_match_core_v32() {
     assert_eq!(

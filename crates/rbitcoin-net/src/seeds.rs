@@ -492,8 +492,13 @@ impl AddrMan {
         let mut out = ip;
         // A full clearnet batch used to return before any onion or I2P row.
         // Keep one slot for the best eligible overlay. A one-peer batch keeps
-        // it only while no overlay outbound is live.
-        if !overlay.is_empty() && out.len() >= max && (max >= 2 || !overlay_live) {
+        // it only while no overlay outbound is live. An overlay that was only
+        // kept as a fallback (every row attempted inside the recent window)
+        // does not displace a clearnet row.
+        let overlay_fresh = overlay
+            .iter()
+            .any(|(_, a)| !self.recently_attempted_addr(*a, now));
+        if overlay_fresh && out.len() >= max && (max >= 2 || !overlay_live) {
             out.pop();
         }
         for (_, a) in overlay {
