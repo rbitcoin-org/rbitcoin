@@ -40,6 +40,7 @@ pub fn tweaks_at_height(
             }
             return Ok(out);
         }
+        Ok(None) if query.prune_seqsigwit() => return Ok(BTreeMap::new()),
         Ok(None) => {
             rbitcoin_log::debug!(
                 "sp_tweaks: naive fallback h={} (hole or index off)",
