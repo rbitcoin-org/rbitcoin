@@ -2129,12 +2129,41 @@ pub fn apply_startup_index_mode(
     }
     if config.prune_seqsigwit {
         query.set_prune_seqsigwit(true)?;
+    }
+    let origin = rbitcoin_primitives::Height(taproot_height);
+    let tweaks_on = if config.sptweaks {
+        match query.set_sptweaks_enabled(true, origin) {
+            Ok(()) => true,
+            // Prune refusals stay fatal. Any other enable error on an
+            // unpruned node is the old warning: the node still starts.
+            Err(e) if config.prune_seqsigwit => {
+                return Err(NodeError::Config(e.to_string()));
+            }
+            Err(e) => {
+                warn!("sp_tweaks: enable failed: {e}");
+                false
+            }
+        }
+    } else {
+        query
+            .set_sptweaks_enabled(false, origin)
+            .map_err(|e| NodeError::Config(e.to_string()))?;
+        false
+    };
+    // The tip can be durable before the tweak rows. Seal that gap while
+    // the spills are still on disk, then advance the prune height.
+    if config.prune_seqsigwit && tweaks_on {
+        rbitcoin_query::prepare_live_indexes(query).map_err(|e| {
+            crate::error::NodeError::Init(format!("index startup repair failed: {e}"))
+        })?;
+        query
+            .refuse_prune_advance_past_tweaks()
+            .map_err(|e| NodeError::Config(e.to_string()))?;
+    }
+    if config.prune_seqsigwit {
         query.apply_prune_seqsigwit_tip()?;
     }
-    query
-        .set_sptweaks_enabled(config.sptweaks, rbitcoin_primitives::Height(taproot_height))
-        .map_err(|e| NodeError::Config(e.to_string()))?;
-    if config.sptweaks {
+    if tweaks_on {
         info!("sp_tweaks: enabled origin={taproot_height}");
     } else if let Some(warning) = query.sp_tweaks_prune_omit_warning() {
         warn!("{}", warning.log_line());

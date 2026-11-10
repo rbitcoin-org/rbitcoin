@@ -305,6 +305,18 @@ impl Query {
             None => true,
         })
     }
+
+    /// Startup repaired the tweak gap. Advancing the prune height now would
+    /// delete a spill the index has not sealed.
+    pub fn refuse_prune_advance_past_tweaks(&self) -> Result<(), QueryError> {
+        if !self.sptweaks_enabled() {
+            return Ok(());
+        }
+        if self.tweak_watermark_covers(self.sptweaks_origin(), self.predicted_pruneheight())? {
+            return Ok(());
+        }
+        Err(self.tweak_prune_miss())
+    }
 }
 
 /// No tweak index on disk. Callers match `prune-seqsigwit` and `taproot`.
