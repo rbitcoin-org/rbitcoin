@@ -326,7 +326,7 @@ pub(crate) const SP_TWEAKS_PRUNE_BEFORE_TAPROOT: &str =
 /// Index files exist, and the next height is not past the prune height.
 /// Callers match `does not cover`. This text does not say `taproot`.
 pub(crate) const SP_TWEAKS_PRUNE_INDEX_SHORT: &str =
-    "silent payment tweak index does not cover every height --prune-seqsigwit would drop";
+    "silent payment tweak index does not cover every height --prune-seqsigwit would drop; delete store/sp_tweaks.idx and store/sp_tweaks.body to prune without that index, or pass --sp-tweaks while those heights are still in the keep window";
 
 /// What startup logs when prune is on, tweak files exist, and this start
 /// left `--sp-tweaks` off.

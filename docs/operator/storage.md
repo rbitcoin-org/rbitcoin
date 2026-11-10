@@ -206,14 +206,20 @@ walk). Flag on = persist + serve-from-index. Stream shape and Sparrow/Frigate:
 [`COMPAT.md`](../../COMPAT.md) (Electrum surface).
 
 IBD seals the index from the taproot origin when the flag is on before that
-height, on the confirm write thread. With `--prune-seqsigwit`, that is the
-only time a new index can start: after the activation block leaves the keep
-window, the witnesses are gone and startup refuses. A restart whose
-watermark is still above the prune height reseals from `seqsigwit.window`
-(RAM, then the spill file), not from `seqsigwit.body`. Sealed rows serve
-from `sp_tweaks` plus `txout`. Unpruned, a later enable still backfills from
-`seqsigwit.body` on `rbtc-idx-wb`. Electrum during a hole uses the naive
-walk, which a pruned node refuses.
+height, on the confirm write thread. With `--prune-seqsigwit`, a new index
+can also start while nothing has been dropped, and prune can be turned on
+after the index is built when that index covers every height the cut drops.
+A restart reseals a tweak gap from `seqsigwit.window` (RAM, then one read of
+each spill file) before it advances the prune height. If that repair still
+does not cover the height about to be dropped, startup refuses and leaves
+the prune height where it was. The error names deleting `store/sp_tweaks.idx`
+and `store/sp_tweaks.body`, or passing `--sp-tweaks` while those heights are
+still in the keep window. Sealed rows serve from `sp_tweaks` plus `txout`.
+A pruned silent-payment scan and `blockchain.tweaks.subscribe` read that
+index. An unsealed tip is an empty height. A height the index does not cover
+is an error. Neither falls through to the witness walk. Unpruned, a later
+enable still backfills from `seqsigwit.body` on `rbtc-idx-wb`, and an enable
+failure is logged while the node still starts.
 
 On disk (schema 17 dirs; leftover single files are unlinked on startup):
 

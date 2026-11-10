@@ -321,6 +321,7 @@ fn adding_prune_after_the_tweak_index_is_built_keeps_serving() {
     let err = q.refuse_adding_prune_with_tweaks(Height(0)).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("does not cover"), "{msg}");
+    assert!(msg.contains("sp_tweaks.idx"), "{msg}");
     assert!(!msg.contains("taproot"), "{msg}");
     assert_eq!(q.store().txs.seqsigwit_loc.count(), before);
     let err = q.set_prune_seqsigwit(true).unwrap_err();
