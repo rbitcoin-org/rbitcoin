@@ -1281,14 +1281,22 @@ impl Query {
         view: &ChainView,
     ) -> Result<Vec<Fk>, QueryError> {
         let genesis = self.genesis_coinbase_fk()?;
+        let suspect = rbitcoin_store::scripthash::sh_recheck_span(self.store.path())?;
         let mut fks = Vec::new();
         for fk in self.store.scripthash.create_fks(scripthash)? {
-            if Some(fk) != genesis && self.confirmed_strong_in(fk, view)? {
-                fks.push(fk);
+            if Some(fk) == genesis || !self.confirmed_strong_in(fk, view)? {
+                continue;
             }
+            if self.reused_cut_fk(scripthash, fk, suspect)? {
+                continue;
+            }
+            fks.push(fk);
         }
         for fk in self.pending_sh_create_fks(scripthash) {
             if Some(fk) == genesis || !self.confirmed_strong_in(fk, view)? {
+                continue;
+            }
+            if self.reused_cut_fk(scripthash, fk, suspect)? {
                 continue;
             }
             if let Err(at) = fks.binary_search_by_key(&fk.0, |f| f.0) {
@@ -1296,6 +1304,28 @@ impl Query {
             }
         }
         Ok(fks)
+    }
+
+    /// A create number inside the lost-tail span whose current transaction
+    /// does not pay `scripthash`. Outside that span this is false and does
+    /// not read Class A.
+    fn reused_cut_fk(
+        &self,
+        scripthash: &[u8; 32],
+        fk: Fk,
+        suspect: Option<(u64, u64)>,
+    ) -> Result<bool, QueryError> {
+        let Some((covered, old_hwm)) = suspect else {
+            return Ok(false);
+        };
+        if fk.0 <= covered || fk.0 > old_hwm {
+            return Ok(false);
+        }
+        match self.tx_output_run_class_a(fk) {
+            Ok(outs) => Ok(!outs.iter().any(|o| script_hash(&o.script) == *scripthash)),
+            Err(StoreError::NotFound) => Ok(true),
+            Err(e) => Err(e),
+        }
     }
 
     /// The stored genesis coinbase, once [`Query::set_genesis_coinbase_txid`]

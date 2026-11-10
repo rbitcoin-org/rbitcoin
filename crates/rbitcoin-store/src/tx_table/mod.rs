@@ -1013,6 +1013,16 @@ pub fn class_a_skew_assert_aligned(
 
 const WITNESS_GAP_FILE: &str = "seqsigwit.gap";
 
+/// A 4-byte `seqsigwit.prune` is the prune height. Any other length, including
+/// a torn 0-byte file, is not. Missing is not an error.
+fn prune_sidecar_is_height(path: &Path) -> Result<bool, StoreError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes.len() == 4),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(StoreError::io(path, e)),
+    }
+}
+
 /// Spans from a previous fill. Missing file means none. Each record is
 /// `named ‖ through`. A short or inverted record is corrupt.
 fn load_witness_gap(dir: &Path) -> Result<Vec<(u64, u64)>, StoreError> {
@@ -1110,7 +1120,7 @@ fn clamp_witness_gap_to_count(dir: &Path, creates: u64) -> Result<(), StoreError
     if kept.is_empty() {
         let path = dir.join(WITNESS_GAP_FILE);
         match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
+            Ok(()) => crate::file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(StoreError::io(&path, e)),
         }
@@ -1141,8 +1151,10 @@ fn coalesce_witness_gaps(spans: &mut Vec<(u64, u64)>) {
 
 /// A prune file left `seqsigwit.loc` behind the creates. Drop the body tail
 /// that locator does not name, then append one empty row per missing create
-/// so the next append's fk is the new create. A locator ahead of the covered
-/// create count still names dropped creates, so it is cut back to that count.
+/// so the next append's fk is the new create. A locator of 0 is the finished
+/// stem cut: those empty rows are not a witness, and the keep-window rewrite
+/// stops the cut from finishing. A locator ahead of the covered create count
+/// still names dropped creates, so it is cut back to that count.
 fn align_short_witness_locator(
     seqsigwit: &VarTable,
     loc: &crate::delta_loc::DeltaLoc,
@@ -1156,26 +1168,27 @@ fn align_short_witness_locator(
     }
     clamp_witness_gap_to_count(gap_dir, through)?;
     if named >= through {
-        // Open counted the witness body from the pre-cut create locator.
-        // The locator already matches, so that counter is the only one left high.
-        if seqsigwit.count() != through {
+        // The counter can already match while the file still holds a tail
+        // the covered prefix dropped. The next append would start past that
+        // tail, and the locator delta would keep naming the old row.
+        let end = witness_body_end(loc, through)?;
+        if seqsigwit.count() != through || seqsigwit.body_logical_len() != end {
             cut_witness_body_to(seqsigwit, loc, through)?;
         }
         return Ok(false);
     }
-    let end = if named == 0 {
-        crate::file::FILE_HEADER_LEN as u64
-    } else {
-        let (off, len) = loc
-            .range_batch(&[Fk(named)])?
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or(StoreError::Corrupt(
-                "invariant: seqsigwit.loc range for gap",
-            ))?;
-        off.saturating_add(len)
-    };
+    if named == 0 {
+        return Ok(false);
+    }
+    let (off, len) = loc
+        .range_batch(&[Fk(named)])?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or(StoreError::Corrupt(
+            "invariant: seqsigwit.loc range for gap",
+        ))?;
+    let end = off.saturating_add(len);
     if seqsigwit.body_logical_len() < end {
         return Ok(false);
     }
@@ -1503,16 +1516,19 @@ impl TxTable {
         seqsigwit_dir: &Path,
         opts: HeadOpenOpts,
     ) -> Result<Self, StoreError> {
-        // A prune file, even a torn one, means the witness locator may
-        // already be shorter than the creates. Repair must not cut the
-        // chain back to it.
-        let repair_keeps_short_witness = dir.join("seqsigwit.prune").is_file();
         crate::store::rename_legacy_inwit_files(dir)?;
         crate::store::rename_legacy_input_files(dir)?;
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
         crate::store::rename_legacy_input_files(seqsigwit_dir)?;
         // Sidecar lives on the hot store, including when the stem is cold.
-        let prune_seqsigwit_mode = dir.join("seqsigwit.prune").is_file();
+        // A prune file, even a torn one, means the witness locator may
+        // already be shorter than the creates. Repair must not cut the
+        // chain back to it. Only a 4-byte height is prune mode: a 0-byte
+        // file is the torn marker, and the next append still writes the
+        // witness stem.
+        let prune_path = dir.join("seqsigwit.prune");
+        let repair_keeps_short_witness = prune_path.is_file();
+        let prune_seqsigwit_mode = prune_sidecar_is_height(&prune_path)?;
         let (seal_bits, workers) = Self::resolve_open_opts(opts);
         unlink_leftover_class_a_idx(dir)?;
         if seqsigwit_dir != dir {
@@ -1525,9 +1541,10 @@ impl TxTable {
         let create_loc = open_or_create_create_loc(dir)?;
         let seqsigwit_loc = open_or_create_seqsigwit_loc(seqsigwit_dir)?;
         let loc_count = create_loc.count();
-        // The sidecar is prune mode for reads and later appends. The witness
-        // stem still seals the tip until its locator no longer covers creates.
-        let stem_retired = prune_seqsigwit_mode && seqsigwit_loc.count() < loc_count;
+        // Any prune file, including a torn 0-byte marker, opens the witness
+        // body at the short locator. A locator of 0 is that finished cut.
+        // Reads and later appends stay on the stem until the file is a height.
+        let stem_retired = repair_keeps_short_witness && seqsigwit_loc.count() < loc_count;
         let body = if had_txout {
             VarTable::open_body_only(dir, "txout", TableKind::TxOut, loc_count)?
         } else {
@@ -1840,8 +1857,11 @@ impl TxTable {
     }
 
     /// Witness locator no longer names every create. Seal and skew ignore it.
+    ///
+    /// The torn 0-byte marker counts here. Prune mode does not: that flag
+    /// is the 4-byte height, and it is what stops a later append.
     fn seqsigwit_stem_retired(&self) -> bool {
-        self.prune_seqsigwit_mode() && self.seqsigwit_loc.count() < self.count()
+        self.witness_stem_may_lag() && self.seqsigwit_loc.count() < self.count()
     }
 
     pub fn set_prune_seqsigwit_mode(&self, on: bool) {

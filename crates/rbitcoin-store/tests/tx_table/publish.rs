@@ -433,6 +433,67 @@ fn matched_witness_locator_resets_the_body_count() {
     );
 }
 
+/// The witness stem was already cut to an empty locator. Open must not
+/// invent an empty witness row for every create still in the chain.
+#[test]
+fn finished_witness_cut_does_not_fill_empty_rows() {
+    let dir = super::tempfile_dir("witness-cut-zero");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    assert_eq!(t.count(), 2);
+    t.cut_seqsigwit_stem_to_header().unwrap();
+    assert_eq!(t.seqsigwit_loc.count(), 0);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 0);
+    assert_eq!(t.seqsigwit.count(), 0);
+    assert!(!t.witness_row_is_gap(1));
+    assert!(!t.witness_row_is_gap(2));
+    assert!(
+        !dir.join("seqsigwit.gap").exists(),
+        "a finished cut is not an empty-witness span"
+    );
+    drop(t);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 0);
+    assert!(!t.witness_row_is_gap(1));
+    assert!(!t.witness_row_is_gap(2));
+}
+
+/// Deleting a gap span past the covered count has to sync the directory.
+/// A crash that restores the old dirent would hide a later witness.
+#[test]
+fn removing_a_witness_gap_syncs_the_directory() {
+    let dir = super::tempfile_dir("witness-gap-dir");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let tx_end = on_disk_hwm(&t.body.body);
+    let sp_end = on_disk_hwm(&t.spent.body);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    set_disk_hwm(&t.body.body, tx_end);
+    set_disk_hwm(&t.spent.body, sp_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let mut gap = [0u8; 16];
+    gap[..8].copy_from_slice(&1u64.to_le_bytes());
+    gap[8..].copy_from_slice(&3u64.to_le_bytes());
+    std::fs::write(dir.join("seqsigwit.gap"), gap).unwrap();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1);
+    assert!(!dir.join("seqsigwit.gap").exists());
+    drop(t);
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(
+        synced.iter().any(|p| p == &dir),
+        "the gap dirent delete must be durable; synced {synced:?}"
+    );
+}
+
 /// A 1024-create window whose `create.off` checkpoint did not land opens at
 /// the last create that does not need that checkpoint.
 #[test]

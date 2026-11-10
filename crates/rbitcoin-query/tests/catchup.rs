@@ -355,6 +355,282 @@ fn stale_tail_stores_a_lower_live_create() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The live count has already moved past the stale end. A real create at or
+/// below that end is still stored, and storing it again does not duplicate it.
+#[test]
+fn live_count_past_the_stale_end_stores_the_lower_create() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-stale-past");
+    q.enter_direct_index_mode().unwrap();
+    let script_s = [0x51u8, 0xab];
+    let script_t = [0x51u8, 0xcd];
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    for (h, spk) in [
+        script_s.as_slice(),
+        script_t.as_slice(),
+        script_s.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fk = connect_spk(&q, h as u32, prev, parent, spk);
+        parent = Some(q.get_header(fk).unwrap().hash);
+        prev = fk;
+    }
+    q.finalize_sh_runs().unwrap();
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(1, end).unwrap();
+    q.store.txs.create_loc.truncate_to_count(1).unwrap();
+    q.finalize_sh_runs().unwrap();
+    let sh = rbitcoin_store::script_hash(&script_s);
+    let before: Vec<u64> = q
+        .store
+        .scripthash
+        .entries(&sh)
+        .unwrap()
+        .into_iter()
+        .map(|(fk, _)| fk.0)
+        .collect();
+    assert_eq!(before, vec![1, 3]);
+    let rec = [ScriptHashRecord::from_fk(sh, Fk(2))];
+    let (n, _) = q
+        .store
+        .scripthash
+        .put_create_batch_append_through(&rec, 10)
+        .unwrap();
+    assert_eq!(n, 1, "a create under the stale end must be stored");
+    let after: Vec<u64> = q
+        .store
+        .scripthash
+        .entries(&sh)
+        .unwrap()
+        .into_iter()
+        .map(|(fk, _)| fk.0)
+        .collect();
+    assert!(after.contains(&2), "row after the late append: {after:?}");
+    let (n2, _) = q
+        .store
+        .scripthash
+        .put_create_batch_append_through(&rec, 10)
+        .unwrap();
+    assert_eq!(n2, 0, "the same create is not stored twice");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The shortened head is synced before the old slab is freed and before
+/// `live_count` drops. A crash in between must not subtract the tail twice
+/// or reuse the slab the head still names.
+#[test]
+fn repair_syncs_the_head_before_freeing_the_old_slab() {
+    use rbitcoin_store::scripthash::{KeyHome, ScriptHashTable};
+    use rbitcoin_store::ShHeadValue;
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        static BEFORE: Cell<u64> = const { Cell::new(0) };
+        static OFF: Cell<u64> = const { Cell::new(0) };
+        static PREFIX: RefCell<[u8; 8]> = const { RefCell::new([0; 8]) };
+        static KEY: RefCell<[u8; 32]> = const { RefCell::new([0; 32]) };
+        static SAW: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn snap(sh: &ScriptHashTable) {
+        let key = KEY.with(|c| *c.borrow());
+        let ents: Vec<u64> = sh
+            .entries(&key)
+            .unwrap()
+            .into_iter()
+            .map(|(fk, _)| fk.0)
+            .collect();
+        assert_eq!(ents, vec![1], "the new head is already published");
+        let before = BEFORE.with(|c| c.get());
+        assert_eq!(
+            sh.entry_count(),
+            before,
+            "live_count stays put until the head is synced"
+        );
+        let off = OFF.with(|c| c.get());
+        let expect = PREFIX.with(|c| *c.borrow());
+        let home = sh.locate_head(&key).unwrap().unwrap().1;
+        let body = sh.body_for(&key, KeyHome::from(home));
+        let mut got = [0u8; 8];
+        body.read_at(off, &mut got).unwrap();
+        assert_eq!(got, expect, "the old slab is not a freelist link yet");
+        assert!(
+            rbitcoin_store::scripthash::repair_heads_synced_for_test() > 0,
+            "the head file is synced before the free"
+        );
+        SAW.with(|c| c.set(true));
+    }
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-repair-sync");
+    q.enter_direct_index_mode().unwrap();
+    let script_s = [0x51u8, 0xab];
+    let script_t = [0x51u8, 0xcd];
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    for (h, spk) in [
+        script_s.as_slice(),
+        script_t.as_slice(),
+        script_s.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fk = connect_spk(&q, h as u32, prev, parent, spk);
+        parent = Some(q.get_header(fk).unwrap().hash);
+        prev = fk;
+    }
+    q.finalize_sh_runs().unwrap();
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(1, end).unwrap();
+    q.store.txs.create_loc.truncate_to_count(1).unwrap();
+    q.finalize_sh_runs().unwrap();
+    let sh = rbitcoin_store::script_hash(&script_s);
+    let (val, home) = q.store.scripthash.locate_head(&sh).unwrap().unwrap();
+    let off = match val {
+        ShHeadValue::Slab { off, .. } => off,
+        other => panic!("two creates sit in a slab, got {other:?}"),
+    };
+    let body = q.store.scripthash.body_for(&sh, KeyHome::from(home));
+    let mut prefix = [0u8; 8];
+    body.read_at(off, &mut prefix).unwrap();
+    BEFORE.with(|c| c.set(q.store.scripthash.entry_count()));
+    OFF.with(|c| c.set(off));
+    PREFIX.with(|c| *c.borrow_mut() = prefix);
+    KEY.with(|c| *c.borrow_mut() = sh);
+    SAW.with(|c| c.set(false));
+    rbitcoin_store::scripthash::set_repair_retire_hook_for_test(Some(snap));
+    let (n, _) = q
+        .store
+        .scripthash
+        .put_create_batch_append_through(&[ScriptHashRecord::from_fk(sh, Fk(1))], 1)
+        .unwrap();
+    rbitcoin_store::scripthash::set_repair_retire_hook_for_test(None);
+    assert!(SAW.with(|c| c.get()), "retire hook did not run");
+    assert_eq!(n, 0);
+    let after: Vec<u64> = q
+        .store
+        .scripthash
+        .entries(&sh)
+        .unwrap()
+        .into_iter()
+        .map(|(fk, _)| fk.0)
+        .collect();
+    assert_eq!(after, vec![1]);
+    assert_eq!(
+        q.store.scripthash.entry_count(),
+        BEFORE.with(|c| c.get()) - 1
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn txid_at(h: u32) -> [u8; 32] {
+    let mut txid = [0u8; 32];
+    txid[0..4].copy_from_slice(&h.to_le_bytes());
+    txid[31] = 0xcb;
+    txid
+}
+
+/// A cut create number that now pays a different script stays on the old
+/// row. Windowed history must not return it, and a newest page must not
+/// spend one of its slots on it.
+#[test]
+fn reused_cut_fk_stays_out_of_windowed_history() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-reused-hist");
+    q.enter_direct_index_mode().unwrap();
+    let script_s = [0x51u8, 0xab];
+    let script_o = [0x51u8, 0xee];
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    for (h, spk) in [
+        script_s.as_slice(),
+        script_s.as_slice(),
+        script_o.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fk = connect_spk(&q, h as u32, prev, parent, spk);
+        parent = Some(q.get_header(fk).unwrap().hash);
+        prev = fk;
+    }
+    q.finalize_sh_runs().unwrap();
+    let sh = rbitcoin_store::script_hash(&script_s);
+    q.store
+        .scripthash
+        .put_create_batch_append(&[ScriptHashRecord::from_fk(sh, Fk(3))])
+        .unwrap();
+    let mut mark = [0u8; 16];
+    mark[..8].copy_from_slice(&2u64.to_le_bytes());
+    mark[8..].copy_from_slice(&3u64.to_le_bytes());
+    std::fs::write(q.store.path().join("scripthash.recheck"), mark).unwrap();
+    let bad = txid_at(2);
+    let window = rbitcoin_query::HistoryFilter::height_window(2, None);
+    let hist = q.scripthash_history_filtered(&sh, &window).unwrap();
+    assert!(
+        hist.rows.iter().all(|row| row.txid != bad),
+        "from_height history returned the reused create: {:?}",
+        hist.rows.iter().map(|row| row.tx_fk).collect::<Vec<_>>()
+    );
+    let mut page = rbitcoin_query::HistoryFilter::esplora_chain_page(None);
+    page.limit = Some(2);
+    let rows = q.scripthash_history_filtered(&sh, &page).unwrap().rows;
+    assert!(
+        rows.iter().all(|row| row.txid != bad),
+        "the newest page included the reused create"
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "the reused create took a slot and the page came back short: {rows:?}"
+    );
+    let full = q
+        .scripthash_history_filtered(
+            &sh,
+            &rbitcoin_query::HistoryFilter::esplora_chain_page(None),
+        )
+        .unwrap();
+    assert!(full.rows.iter().all(|row| row.txid != bad));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn snap_recheck_before_watermark(q: &Query) {
+    let path = q.store.path().join("scripthash.recheck");
+    let bytes = std::fs::read(&path).expect("recheck marker before the watermark moves");
+    assert_eq!(bytes.len(), 16);
+    let covered = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let old = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    assert_eq!(covered, q.store.txs.count());
+    assert!(old > covered);
+    let hwm_bytes = std::fs::read(q.store.path().join(rbitcoin_store::INCLUDE_HWM_NAME)).unwrap();
+    let hwm = u64::from_le_bytes(hwm_bytes[0..8].try_into().unwrap());
+    assert!(hwm > covered, "the watermark file is still the high one");
+}
+
+/// The lost-tail repair records which create numbers may have been reused
+/// before it replaces the watermark. History uses that span later.
+#[test]
+fn lost_tail_records_the_recheck_span_before_the_watermark() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-recheck");
+    q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    let old = q.store.scripthash.include_hwm();
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(1, end).unwrap();
+    q.store.txs.create_loc.truncate_to_count(1).unwrap();
+    assert!(old > 1);
+    set_sh_hwm_publish_for_test(Some(snap_recheck_before_watermark));
+    q.finalize_sh_runs().unwrap();
+    set_sh_hwm_publish_for_test(None);
+    let bytes = std::fs::read(q.store.path().join("scripthash.recheck")).unwrap();
+    assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 1);
+    assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), old);
+    assert_eq!(q.store.scripthash.include_hwm(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The seal drops before the watermark file is replaced. A crash in between
 /// still has the old watermark, so the next start retries instead of copying
 /// the old seal back into a missing file.

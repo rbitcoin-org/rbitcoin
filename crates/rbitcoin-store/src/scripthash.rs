@@ -45,6 +45,9 @@ pub const COLD_PROGRESS_NAME: &str = "scripthash.cold_progress";
 pub const COLD_PROGRESS_MAGIC: &[u8; 8] = b"SHCOLDP1";
 /// Max create_fk fully present in durable SH (inclusion HWM; crash catch-up).
 pub const INCLUDE_HWM_NAME: &str = "scripthash.include_hwm";
+/// Creates in `(covered, old_hwm]` may name a transaction the cut dropped.
+/// Windowed history checks those foreign keys against Class A.
+pub const SH_RECHECK_NAME: &str = "scripthash.recheck";
 
 /// Present while a framing fault still has to be rebuilt from Class A.
 pub const SH_REBUILD_NAME: &str = "scripthash.rebuild";
@@ -112,6 +115,38 @@ impl ColdProgress {
     }
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static REPAIR_RETIRE_HOOK: std::cell::Cell<Option<fn(&ScriptHashTable)>> =
+        const { std::cell::Cell::new(None) };
+    static REPAIR_HEAD_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+fn take_repair_retire_hook() -> Option<fn(&ScriptHashTable)> {
+    REPAIR_RETIRE_HOOK.with(|c| c.take())
+}
+
+/// One-shot hook after a repaired scripthash head is synced and before the
+/// old slab is freed.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_repair_retire_hook_for_test(hook: Option<fn(&ScriptHashTable)>) {
+    REPAIR_RETIRE_HOOK.with(|c| c.set(hook));
+}
+
+/// How many repaired heads this thread has synced before freeing the old slab.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn repair_heads_synced_for_test() -> u64 {
+    REPAIR_HEAD_SYNCS.with(|c| c.get())
+}
+
+#[cfg(debug_assertions)]
+fn note_repair_head_synced() {
+    REPAIR_HEAD_SYNCS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
 /// Load durable inclusion HWM (`0` if missing/corrupt).
 pub fn load_include_hwm(store_dir: &Path) -> u64 {
     let p = store_dir.join(INCLUDE_HWM_NAME);
@@ -136,6 +171,81 @@ pub fn replace_include_hwm(store_dir: &Path, max_create_fk: u64) -> Result<(), S
     }
     let p = store_dir.join(INCLUDE_HWM_NAME);
     crate::file::write_synced_tmp_rename(&p, &max_create_fk.to_le_bytes())
+}
+
+type ShRecheckSpan = Option<(u64, u64)>;
+type ShRecheckMap = HashMap<PathBuf, ShRecheckSpan>;
+
+fn recheck_cache() -> &'static Mutex<ShRecheckMap> {
+    static CACHE: std::sync::OnceLock<Mutex<ShRecheckMap>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn read_sh_recheck(dir: &Path) -> Result<Option<(u64, u64)>, StoreError> {
+    let path = dir.join(SH_RECHECK_NAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(StoreError::io(&path, e)),
+    };
+    if bytes.len() != 16 {
+        return Err(StoreError::Corrupt("scripthash.recheck"));
+    }
+    let covered = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let old_hwm = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    if covered >= old_hwm {
+        return Err(StoreError::Corrupt("scripthash.recheck"));
+    }
+    Ok(Some((covered, old_hwm)))
+}
+
+/// Span of create numbers a lost tail may have left on a scripthash row.
+///
+/// Missing file means there is nothing to recheck. The result is cached for
+/// this process so a history lookup does not stat the file every time.
+pub fn sh_recheck_span(dir: &Path) -> Result<Option<(u64, u64)>, StoreError> {
+    {
+        let cache = recheck_cache().lock().unwrap();
+        if let Some(hit) = cache.get(dir) {
+            return Ok(*hit);
+        }
+    }
+    let span = read_sh_recheck(dir)?;
+    recheck_cache()
+        .lock()
+        .unwrap()
+        .insert(dir.to_path_buf(), span);
+    Ok(span)
+}
+
+/// Remember that creates in `(covered, old_hwm]` were indexed and then cut.
+///
+/// A later call widens the span. The hot path does not write this file.
+pub fn note_sh_recheck(dir: &Path, covered: u64, old_hwm: u64) -> Result<(), StoreError> {
+    if old_hwm <= covered {
+        return Ok(());
+    }
+    let (covered, old_hwm) = match read_sh_recheck(dir)? {
+        Some((prev_covered, prev_hwm)) => (covered.min(prev_covered), old_hwm.max(prev_hwm)),
+        None => (covered, old_hwm),
+    };
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&covered.to_le_bytes());
+    bytes[8..].copy_from_slice(&old_hwm.to_le_bytes());
+    crate::file::write_synced_tmp_rename(&dir.join(SH_RECHECK_NAME), &bytes)?;
+    recheck_cache()
+        .lock()
+        .unwrap()
+        .insert(dir.to_path_buf(), Some((covered, old_hwm)));
+    Ok(())
+}
+
+fn apply_live_delta(alloc: &mut AllocState, delta: i64) {
+    if delta >= 0 {
+        alloc.live_count = alloc.live_count.saturating_add(delta as u64);
+    } else {
+        alloc.live_count = alloc.live_count.saturating_sub(delta.unsigned_abs());
+    }
 }
 
 /// Store durable inclusion HWM (monotonic: never decreases).
@@ -1710,7 +1820,7 @@ impl ScriptHashTable {
 
         let t_body = std::time::Instant::now();
         let mut head_final: Vec<([u8; 32], ShHeadValue, KeyHome)> = Vec::new();
-        let mut retire: Vec<([u8; 32], KeyHome, ShHeadValue)> = Vec::new();
+        let mut retire: Vec<([u8; 32], KeyHome, ShHeadValue, i64)> = Vec::new();
         let mut written = 0usize;
 
         let mut i = 0usize;
@@ -1744,17 +1854,22 @@ impl ScriptHashTable {
             let max = self.last_create_fk_on(body, &cur)?;
             let max_u = max.map(|f| f.0).unwrap_or(0);
             // A row that still names a create past the live count would skip
-            // every later fk at or below that stale end. Drop those creates
-            // and merge this batch, which can land below a create we keep.
-            if max.is_some() && max_u > live_through {
-                let Some((new_val, n_new)) =
+            // every later fk at or below that stale end. Once the live count
+            // has passed that end, a real create at or below it is skipped
+            // the same way. Merge this batch instead of appending past the end.
+            let below_stale_end = max.is_some()
+                && fk_vals
+                    .iter()
+                    .any(|&fk| fk > 0 && fk <= max_u && fk <= live_through);
+            if max.is_some() && (max_u > live_through || below_stale_end) {
+                let Some((new_val, n_new, live_delta)) =
                     self.repair_posting_through(&key, kh, &cur, &fk_vals, live_through)?
                 else {
                     continue;
                 };
                 written += n_new;
                 head_final.push((key, new_val, kh));
-                retire.push((key, kh, cur));
+                retire.push((key, kh, cur, live_delta));
                 continue;
             }
             let add: Vec<Fk> = fk_vals
@@ -1776,25 +1891,54 @@ impl ScriptHashTable {
 
         timing.body_ns = t_body.elapsed().as_nanos() as u64;
 
+        for (key, kh, _, _) in &retire {
+            self.body_for(key, *kh).sync_data_only()?;
+        }
         if !head_final.is_empty() {
             let t_head = std::time::Instant::now();
             let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
             self.apply_head_upserts(&head_final, flush_each)?;
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }
-        for (key, kh, old) in retire {
+        for (key, kh, _, _) in &retire {
+            self.sync_repair_home(key, *kh)?;
+            #[cfg(debug_assertions)]
+            note_repair_head_synced();
+        }
+        #[cfg(debug_assertions)]
+        if !retire.is_empty() {
+            if let Some(hook) = take_repair_retire_hook() {
+                hook(self);
+            }
+        }
+        for (key, kh, old, live_delta) in retire {
             let body = self.body_for(&key, kh);
             let alloc_mu = self.alloc_for(&key, kh);
             let mut alloc = alloc_mu.lock().unwrap();
+            apply_live_delta(&mut alloc, live_delta);
             self.free_if_paged(body, &mut alloc, &old)?;
             write_alloc_header(body, &alloc)?;
         }
         Ok((written, timing))
     }
 
-    /// The row's last create is past `live_through`. Keep the creates at or
-    /// below that count, merge `fk_vals` in that same range, and pack the
-    /// list again. A new fk can sit below one we kept, so this is not an append.
+    /// Sync the home that holds the repaired value. A main update that missed
+    /// copied the value onto ingest, so that home syncs both.
+    fn sync_repair_home(&self, key: &[u8; 32], kh: KeyHome) -> Result<(), StoreError> {
+        let home = match kh {
+            KeyHome::Main => LocatedHome::Main,
+            KeyHome::SealedOvf => LocatedHome::SealedOvf,
+            KeyHome::Ingest => LocatedHome::Ingest,
+            KeyHome::Absent => return Ok(()),
+        };
+        self.sync_home(home, key)
+    }
+
+    /// Keep creates at or below `live_through`, merge `fk_vals` in that same
+    /// range, and pack the list again. A new fk can sit below one we kept,
+    /// so this is not an append. `live_count` stays unchanged until the caller
+    /// has synced the new head: subtracting first makes the next repair
+    /// subtract the same tail again.
     fn repair_posting_through(
         &self,
         key: &[u8; 32],
@@ -1802,7 +1946,7 @@ impl ScriptHashTable {
         cur: &ShHeadValue,
         fk_vals: &[u64],
         live_through: u64,
-    ) -> Result<Option<(ShHeadValue, usize)>, StoreError> {
+    ) -> Result<Option<(ShHeadValue, usize, i64)>, StoreError> {
         let body = self.body_for(key, kh);
         let old = self.collect_entries_from(body, cur)?;
         let old_len = old.len();
@@ -1837,21 +1981,13 @@ impl ScriptHashTable {
                 return Err(e);
             }
         };
-        if live.len() >= old_len {
-            alloc.live_count = alloc
-                .live_count
-                .saturating_add((live.len() - old_len) as u64);
-        } else {
-            alloc.live_count = alloc
-                .live_count
-                .saturating_sub((old_len - live.len()) as u64);
-        }
         if let Err(e) = write_alloc_header(body, &alloc) {
             *alloc = saved;
             let _ = write_alloc_header(body, &alloc);
             return Err(e);
         }
-        Ok(Some((new_val, n_new)))
+        let live_delta = (live.len() as i64).saturating_sub(old_len as i64);
+        Ok(Some((new_val, n_new, live_delta)))
     }
 
     /// Route head upserts without get-then-insert:

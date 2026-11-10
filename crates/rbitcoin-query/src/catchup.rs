@@ -214,6 +214,13 @@ impl Query {
             self.store.scripthash.unlink_creates_batch(&groups)?;
             self.store.scripthash.commit_deferred_empty_heads()?;
         }
+        // The cut numbers stay on rows whose outputs were already gone.
+        // History has to check those numbers after the chain reuses them.
+        // The file lands before the watermark moves, so a crash in between
+        // still retries this repair and still has the span.
+        if hwm > covered {
+            rbitcoin_store::scripthash::note_sh_recheck(self.store.path(), covered, hwm)?;
+        }
         // Seal first. A crash before the watermark moves still has the high
         // mark, so the next start sees the lost tail and tries again. Deleting
         // the file first looks like a legacy head: the old seal is copied back
