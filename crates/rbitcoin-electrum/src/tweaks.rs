@@ -108,6 +108,13 @@ pub fn height_map_json(
             let rows = batch.pop().map(|(_, r)| r).unwrap_or_default();
             Ok(encode_thin_height_json(h, &rows, min_dust))
         }
+        Ok(_) if query.prune_seqsigwit() => match query.tweak_index_next() {
+            // The tip moved before this height's tweak row was sealed.
+            // The naive walk cannot run. The notify after the seal has the row.
+            Some(n) if h >= n => Ok(empty_height_json(h)),
+            Some(_) => Err("silent payment tweak index does not cover this height".into()),
+            None => Err("silent payment tweaks are unavailable with --prune-seqsigwit".into()),
+        },
         Ok(_) => {
             let mut tweaks =
                 tweaks_for_height(query, chain, Height(h)).map_err(|e| e.to_string())?;
