@@ -228,6 +228,7 @@ itself changed.
     txout.body / create.loc / create.off / create.loc.ovf   # Class A outs (hot loc)
     seqsigwit.body / seqsigwit.loc / seqsigwit.off / seqsigwit.loc.ovf       # Class A inputs+witness when unpruned (cold loc). With seqsigwit.prune these four stay at the file header
     seqsigwit.prune                  # optional: u32 LE pruneheight sidecar (`--prune-seqsigwit`; missing = off). Presence is prune mode
+    seqsigwit.gap                    # optional: u64 LE named ‖ u64 LE through. Rows (named, through] are empty witness pads from a torn locator. Missing = none
     seqsigwit.window/                # prune window: one {height}.bin per kept height. The only witness payload while seqsigwit.prune exists
     seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked

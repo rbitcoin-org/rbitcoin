@@ -866,6 +866,19 @@ fn torn_prune_file_reports_the_height_the_witness_stem_covers() {
         .with_bytes_at(off, len, |b| Ok(b.to_vec()))
         .unwrap();
     assert!(gap.iter().all(|&b| b == 0), "gap row is not the new witness");
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(
+        q.tip_height(),
+        Some(Height(2)),
+        "a restart must keep the tip"
+    );
+    assert!(
+        !q.seqsigwit_available(cut).unwrap(),
+        "the empty row is still not a witness"
+    );
+    assert!(q.seqsigwit_available(added).unwrap());
+    assert_eq!(witness_of(&q, added), vec![vec![0xab; 8]]);
     q.set_prune_seqsigwit(true).unwrap();
     assert_eq!(q.pruneheight(), None, "a short locator is not a dropped prefix");
     assert!(q.seqsigwit_available(kept).unwrap());

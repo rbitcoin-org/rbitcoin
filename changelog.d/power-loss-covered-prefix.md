@@ -9,7 +9,7 @@ Fixed
   directory used to refuse as a legacy shard. Open wipes it and rebuilds from
   Class A. A monolithic `tx.head` and a flat `tx.head.meta` still refuse.
 - **Small durable files publish through a synced rename.** Store `meta`,
-  `store.secret`, `seqsigwit.prune`, mempool `meta`, and `unbroadcast` no
+  `store.secret`, `seqsigwit.prune`, `seqsigwit.gap`, mempool `meta`, and `unbroadcast` no
   longer truncate the live name. A short prune file is not a height. Open
   keeps creates the witness locator no longer names, and those creates have
   no scriptSig or witness. Without the prune file, that missing locator
@@ -19,7 +19,7 @@ Fixed
 - **The next block after a torn witness locator keeps its own witness.**
   Open appends an empty witness row for each create the short locator did
   not name. The following append files its scriptSig on the new create.
-  The empty rows are still not a witness, and the tip stays.
+  The empty rows are still not a witness after a restart, and the tip stays.
 - **Scripthash inclusion stays inside the covered create count.** A watermark
   just above that count unlinks the tail, or rebuilds the head when those
   outputs are gone. A shard offset past its file rebuilds once. A floor that

@@ -1014,6 +1014,46 @@ pub fn class_a_skew_assert_aligned(
     Ok(())
 }
 
+const WITNESS_GAP_FILE: &str = "seqsigwit.gap";
+
+/// `(named, through]` from a previous fill, if that file is a whole record.
+fn load_witness_gap(dir: &Path) -> Result<Option<(u64, u64)>, StoreError> {
+    let path = dir.join(WITNESS_GAP_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(StoreError::io(&path, e)),
+    };
+    if bytes.len() != 16 {
+        return Err(StoreError::Corrupt("seqsigwit.gap"));
+    }
+    let mut named_bytes = [0u8; 8];
+    let mut through_bytes = [0u8; 8];
+    named_bytes.copy_from_slice(&bytes[0..8]);
+    through_bytes.copy_from_slice(&bytes[8..16]);
+    let named = u64::from_le_bytes(named_bytes);
+    let through = u64::from_le_bytes(through_bytes);
+    if named >= through {
+        return Err(StoreError::Corrupt("seqsigwit.gap"));
+    }
+    Ok(Some((named, through)))
+}
+
+fn store_witness_gap(dir: &Path, named: u64, through: u64) -> Result<(), StoreError> {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&named.to_le_bytes());
+    bytes[8..].copy_from_slice(&through.to_le_bytes());
+    crate::file::write_synced_tmp_rename(&dir.join(WITNESS_GAP_FILE), &bytes)
+}
+
+/// A later fill can start inside an older gap. Keep the earlier prefix.
+fn merge_witness_gap(saved: Option<(u64, u64)>, named: u64, through: u64) -> (u64, u64) {
+    let Some((was_named, was_through)) = saved else {
+        return (named, through);
+    };
+    (was_named.min(named), was_through.max(through))
+}
+
 /// A prune file left `seqsigwit.loc` behind the creates. Drop the body tail
 /// that locator does not name, then append one empty row per missing create
 /// so the next append's fk is the new create.
@@ -1022,6 +1062,7 @@ fn align_short_witness_locator(
     loc: &crate::delta_loc::DeltaLoc,
     named: u64,
     through: u64,
+    gap_dir: &Path,
 ) -> Result<bool, StoreError> {
     if named >= through {
         return Ok(false);
@@ -1052,6 +1093,11 @@ fn align_short_witness_locator(
     let staged = loc.stage(&prep.starts, &lens)?;
     crate::var_table::write_prepared_bodies_one_wave(&[(seqsigwit, &prep)], false)?;
     loc.write_staged(&staged)?;
+    // The locator header is what the next open counts. Record the gap
+    // first, or that open reads these empty rows as a witness and drops
+    // the tip.
+    let (gap_named, gap_through) = merge_witness_gap(load_witness_gap(gap_dir)?, named, through);
+    store_witness_gap(gap_dir, gap_named, gap_through)?;
     let (_fks, durable) = publish_prepared_body(seqsigwit, prep, true)?;
     let _ = loc.commit_staged(staged, durable);
     Ok(loc.count() == through && seqsigwit.count() == through)
@@ -1463,11 +1509,16 @@ impl TxTable {
         )?;
         let witness_named = seqsigwit_loc.count();
         let witness_through = create_loc.count();
-        let filled_witness_gap = if repair_keeps_short_witness {
-            align_short_witness_locator(&seqsigwit, &seqsigwit_loc, witness_named, witness_through)?
-        } else {
-            false
-        };
+        if repair_keeps_short_witness {
+            align_short_witness_locator(
+                &seqsigwit,
+                &seqsigwit_loc,
+                witness_named,
+                witness_through,
+                dir,
+            )?;
+        }
+        let (gap_named, gap_through) = load_witness_gap(dir)?.unwrap_or((0, 0));
         let n_bodies = create_loc.count();
         if txstat.count() != n_bodies {
             rbitcoin_log::warn!(
@@ -1566,16 +1617,8 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
             witness_stem_may_lag: std::sync::atomic::AtomicBool::new(repair_keeps_short_witness),
-            witness_named_prefix: std::sync::atomic::AtomicU64::new(if filled_witness_gap {
-                witness_named
-            } else {
-                0
-            }),
-            witness_gap_through: std::sync::atomic::AtomicU64::new(if filled_witness_gap {
-                witness_through
-            } else {
-                0
-            }),
+            witness_named_prefix: std::sync::atomic::AtomicU64::new(gap_named),
+            witness_gap_through: std::sync::atomic::AtomicU64::new(gap_through),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages: crate::spend_page_log::SpendPageLog::load_clipped(dir, spent_body_end)?,
         };
