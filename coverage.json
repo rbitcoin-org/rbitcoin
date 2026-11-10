@@ -1,33 +1,33 @@
 {
   "schemaVersion": 1,
   "label": "coverage",
-  "message": "91.92%",
+  "message": "91.99%",
   "color": "brightgreen",
-  "pct": 91.92,
-  "lh": 111704,
-  "lf": 121527,
+  "pct": 91.99,
+  "lh": 111956,
+  "lf": 121700,
   "gate": 91,
   "scope": "production",
-  "sha": "62ea53099e0e",
+  "sha": "b5ee08be6c2f",
   "date": "2026-11-10",
   "crates": [
     {
       "name": "rbitcoin-cli",
-      "lh": 292,
-      "lf": 327,
-      "pct": 89.3
+      "lh": 529,
+      "lf": 583,
+      "pct": 90.74
     },
     {
       "name": "rbitcoin-consensus",
-      "lh": 6495,
+      "lh": 6494,
       "lf": 6676,
-      "pct": 97.29
+      "pct": 97.27
     },
     {
       "name": "rbitcoin-electrum",
-      "lh": 2980,
-      "lf": 3336,
-      "pct": 89.33
+      "lh": 2966,
+      "lf": 3290,
+      "pct": 90.15
     },
     {
       "name": "rbitcoin-esplora",
@@ -37,9 +37,9 @@
     },
     {
       "name": "rbitcoin-ibd",
-      "lh": 12796,
-      "lf": 13854,
-      "pct": 92.36
+      "lh": 12829,
+      "lf": 13882,
+      "pct": 92.41
     },
     {
       "name": "rbitcoin-log",
@@ -55,15 +55,15 @@
     },
     {
       "name": "rbitcoin-net",
-      "lh": 24256,
-      "lf": 26153,
-      "pct": 92.75
+      "lh": 24289,
+      "lf": 26184,
+      "pct": 92.76
     },
     {
       "name": "rbitcoin-node",
-      "lh": 4809,
-      "lf": 5740,
-      "pct": 83.78
+      "lh": 4759,
+      "lf": 5707,
+      "pct": 83.39
     },
     {
       "name": "rbitcoin-primitives",
@@ -73,21 +73,21 @@
     },
     {
       "name": "rbitcoin-query",
-      "lh": 15425,
+      "lh": 15460,
       "lf": 16709,
-      "pct": 92.32
+      "pct": 92.52
     },
     {
       "name": "rbitcoin-rpc",
-      "lh": 8408,
-      "lf": 9098,
-      "pct": 92.42
+      "lh": 8385,
+      "lf": 9035,
+      "pct": 92.81
     },
     {
       "name": "rbitcoin-store",
-      "lh": 25530,
+      "lh": 25532,
       "lf": 28067,
-      "pct": 90.96
+      "pct": 90.97
     },
     {
       "name": "rbitcoin-sv2",
