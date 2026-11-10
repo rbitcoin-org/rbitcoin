@@ -2201,9 +2201,12 @@ pub fn rewrite_meta_current(dir: &Path) -> Result<(), StoreError> {
             .map_err(|e| StoreError::io(&tmp, e))?;
         f.write_all(&SCHEMA_VERSION.to_le_bytes())
             .map_err(|e| StoreError::io(&tmp, e))?;
-        f.flush().map_err(|e| StoreError::io(&tmp, e))?;
+        f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
     }
     std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))?;
+    // The rename has to survive a crash before a witness cut. A 26 `meta`
+    // next to an empty witness locator is what an older binary truncates.
+    crate::file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
     Ok(())
 }
 

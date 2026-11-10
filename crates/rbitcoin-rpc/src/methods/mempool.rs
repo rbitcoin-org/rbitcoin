@@ -1820,15 +1820,17 @@ pub fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, V
 }
 
 /// Core's `estimatesmartfee` result: `feerate` and `blocks` with an estimate;
-/// `errors` and `blocks`, and no `feerate`, without one. The hub's published
-/// rates are already at least `mempoolminfee`.
+/// `errors` and `blocks`, and no `feerate`, without one. Target 1 answers
+/// as 2, like Core, while flow is not warm (`smart_fee_target`). The hub's
+/// published rates are already at least `mempoolminfee`.
 #[doc(hidden)]
 pub fn smart_fee_result(ctx: &RpcContext, conf_target: u32) -> Result<Value, Value> {
-    let blocks = conf_target.max(1);
     let Some(mp) = ctx.mempool.as_ref() else {
+        let blocks = rbitcoin_net::tx_relay::smart_fee_target(conf_target, 0.0);
         return Ok(json!({ "errors": ["mempool unavailable"], "blocks": blocks }));
     };
-    Ok(smart_fee_json(blocks, mp.estimate_fee_sat_kvb(conf_target)))
+    let (blocks, rate) = mp.estimate_smart_fee_sat_kvb(conf_target);
+    Ok(smart_fee_json(blocks, rate))
 }
 
 /// Core's result for `rate` (sat/kvB; `None` = no estimate): `feerate` and

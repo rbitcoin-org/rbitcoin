@@ -1,7 +1,7 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 26` (`rbitcoin_primitives`).  
-**Status:** 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
+**Version:** `SCHEMA_VERSION = 27` (`rbitcoin_primitives`).  
+**Status:** 27 rewrites `meta` only. `--prune-seqsigwit` can leave `seqsigwit` at a header while creates remain. A 26 binary treats that empty locator as damage and truncates the chain, so it refuses 27 `meta`. Opening any 22–26 datadir here, pruned or not, rewrites `meta` to 27 and syncs that directory before a witness cut. A 0.9.0 binary then refuses the directory. 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
 rewrites each 96 B row down to 88 B (`header.body.grow` then rename), dropping
 the trailing `size:u32` + `weight:u32`. Block size and weight are summed from
 `txstat` for that header's create range. A 25 binary refuses 26 `meta`.
@@ -23,7 +23,7 @@ divisible by 10 is Corrupt; zero is `e=0`, mantissa 0). Meta older than 22
 is one refuse, empty or occupied: `schema before 22 refuses this datadir;
 wipe datadir and redo IBD`. That is the last time `tx.body`, `txout.body`,
 or `inwit.body` / `seqsigwit.body` had to be deleted rather than rewritten.
-`schema_file_openable` is 22 through 26. A 23 binary refuses 24 `meta`.
+`schema_file_openable` is 22 through 27. A 23 binary refuses 24 `meta`. A 26 binary refuses 27 `meta`.
 
 Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
 [`docs/operator/storage.md`](./docs/operator/storage.md#schema-upgrade).
@@ -87,10 +87,11 @@ index refuses flat *.idx.meta; place files under store/{stem}.idx/ (meta + NNNNN
 index refuses Shared (file) scripthash.body; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
 index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
 ```  
-Table file headers **22–26** remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
+Table file headers **22–27** remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
 **22→23 open:** occupied Class A rewrites `create.loc.ovf` 12 B rows (`fk:u64` + two u16) to 16 B (`fk:u64` + two u32) and `store/meta` to 23. Empty 22 rewrites `meta`. A 22 binary refuses 23 `meta`. Spent vin stays u16 (stripped input ≥ ~41 B ⇒ ≲24k vins in a 1 MB block; widening would bump the 8 B spent slot).
-**23→24 open** (schema 24/25 binaries): rewrote `header.body` 88 B rows to 96 B. This binary does not expand. An 88 B body stays 88 B and `meta` rewrites to 26.
+**23→24 open** (schema 24/25 binaries): rewrote `header.body` 88 B rows to 96 B. This binary does not expand. An 88 B body stays 88 B and `meta` rewrites to 27.
 **24/25→26 open:** rewrite each 96 B `header.body` row to 88 B (drop trailing `size`/`weight`) via `header.body.grow` then rename; rewrite `meta` to 26. A body that is already 88 B is unchanged. A 25 binary refuses 26 `meta`. Crash with leftover `.grow` discards it and retries.
+**26→27 open:** rewrite `store/meta` to 27 and sync its directory. No table rewrite. A 26 binary refuses 27 `meta`. The sync lands before a witness stem cut, so a crash cannot leave schema 26 beside an empty witness locator.
 **24→25 open:** rewrite `meta` to 25; create or zero-extend `txstat.body` to `create.loc` count. Do **not** rewrite `txout.body`. Unlink leftover `txfixed.body`. A 24 binary refuses 25 `meta`.
 **Endianness:** little-endian for all multi-byte integers.
 
@@ -101,8 +102,8 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 ## Schema 17 freeze
 
 Class A shape settled here at schema 17 and is still the live layout under
-the `SCHEMA_VERSION` at the top of this file (26). Schemas 18–26 already
-shipped. Meta 22–26 is what this binary opens (rules above). Earlier
+the `SCHEMA_VERSION` at the top of this file (27). Schemas 18–27 already
+shipped. Meta 22–27 is what this binary opens (rules above). Earlier
 layouts are history in
 [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md). A byte-incompatible change bumps
 from that live constant
@@ -224,9 +225,9 @@ itself changed.
     header.adopt                     # IBD checkpoint list + milestone hash (not a header-chain copy)
     block.invalid                    # blocks that failed connect, kept across restart
     txout.body / create.loc / create.off / create.loc.ovf   # Class A outs (hot loc)
-    seqsigwit.body / seqsigwit.loc / seqsigwit.off / seqsigwit.loc.ovf       # Class A inputs+witness (cold loc)
-    seqsigwit.prune                  # optional: u32 LE pruneheight sidecar (`--prune-seqsigwit`; missing = off)
-    seqsigwit.window/                # optional prune window: one {height}.bin per kept height
+    seqsigwit.body / seqsigwit.loc / seqsigwit.off / seqsigwit.loc.ovf       # Class A inputs+witness when unpruned (cold loc). With seqsigwit.prune these four stay at the file header
+    seqsigwit.prune                  # optional: u32 LE pruneheight sidecar (`--prune-seqsigwit`; missing = off). Presence is prune mode
+    seqsigwit.window/                # prune window: one {height}.bin per kept height. The only witness payload while seqsigwit.prune exists
     seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
@@ -270,9 +271,10 @@ itself changed.
 files the IBD pin path does not read under `PATH/store/` and writes
 `seqsigwit.reloc` in the hot store: `seqsigwit.*`, `txstat.*`, `input.*`,
 and, once those indexes exist, `blockfilter.*` and `sp_tweaks.*`. Pin / SH /
-spend-annotate stay on the hot volume. `--prune-seqsigwit` is separate: it
-drops historical `seqsigwit` below tip−288 and keeps that window on the hot
-store. `txstat`, `input`, block filters, and tweaks are not pruned.
+spend-annotate stay on the hot volume. `--prune-seqsigwit` is separate: witness
+for the last 288 heights is only `seqsigwit.window/{height}.bin` on the hot
+store, and the stem stays a header (an archive enable copies that window out
+and cuts it). `txout`, `txstat`, `input`, block filters, and tweaks are not pruned.
 
 **Height → txs:** `confirmed[h]` → `header_fk` → contiguous Class A range  
 `[header_txs_first[h−1], header_txs_first[h−1] + header_txs_count[h−1])`.
@@ -286,7 +288,7 @@ store. `txstat`, `input`, block filters, and tweaks are not pruned.
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — live **26** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **22–26** remain `schema_file_openable` |
+| 4 | 2 | Schema version (u16) — live **27** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **22–27** remain `schema_file_openable` |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 

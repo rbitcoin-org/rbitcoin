@@ -468,6 +468,212 @@ fn thin_json_matches_value_encoder() {
     assert_eq!(v, expect);
 }
 
+/// Prune cannot walk the stem. An unsealed tip still in the keep window is
+/// read from that file. A missing file is an error. A hole below the
+/// watermark is an error, not an empty history.
+#[test]
+fn pruned_height_map_does_not_walk_a_hole() {
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("el-tweak-hole");
+    q.set_sptweaks_enabled(true, Height(5)).unwrap();
+    let mut prev = Fk::NULL;
+    let mut prev_hash = None;
+    let mut at_five = Fk::NULL;
+    for h in 0..=6 {
+        let header = rbitcoin_query::testutil::header_with_merkle_marker(h, prev, prev_hash, 0xec);
+        let script = if h == 5 {
+            let mut s = rbitcoin_primitives::P2TR_PREFIX.to_vec();
+            s.extend_from_slice(&[0x11; 32]);
+            s
+        } else if h == 6 {
+            let mut s = rbitcoin_primitives::P2TR_PREFIX.to_vec();
+            s.extend_from_slice(&[0x66; 32]);
+            s
+        } else {
+            vec![0x51]
+        };
+        let fk = q
+            .connect_block(
+                Height(h),
+                &header,
+                &[TxApply {
+                    tx: TxRecord {
+                        txid: [h as u8; 32],
+                        version: 1,
+                        locktime: 0,
+                        input_count: 1,
+                        output_count: 1,
+                    },
+                    inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                    outputs: vec![OutputRecord::unspent(50_0000_0000, script)],
+                }],
+            )
+            .unwrap();
+        if h == 5 {
+            at_five = fk;
+        }
+        prev = fk;
+        prev_hash = Some(header.hash);
+    }
+    let tweak = [0x02; 33];
+    q.put_sp_tweaks_block(Height(5), at_five, &[Some(tweak)])
+        .unwrap();
+    assert_eq!(q.tweak_index_next(), Some(6));
+    q.set_prune_seqsigwit(true).unwrap();
+    let chain = ChainParams::regtest();
+    let unsealed = height_map_json(&q, &chain, 6, false, 0).unwrap();
+    assert_eq!(unsealed, empty_height_json(6), "a coinbase has no tweak");
+    std::fs::remove_file(q.store().path().join("seqsigwit.window/6.bin")).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let missed = height_map_json(&q, &chain, 6, false, 0).unwrap_err();
+    assert!(
+        missed.contains("window miss"),
+        "an unsealed tip has to read the keep file, got {missed}"
+    );
+    let hole = height_map_json(&q, &chain, 4, false, 0).unwrap_err();
+    assert!(hole.contains("does not cover this height"), "{hole}");
+    let sealed = height_map_json(&q, &chain, 5, false, 0).unwrap();
+    let sealed_v: Value = serde_json::from_str(&sealed).unwrap();
+    assert_eq!(sealed_v["5"].as_object().unwrap().len(), 1, "{sealed}");
+    q.set_sptweaks_enabled(false, Height(5)).unwrap();
+    let off = height_map_json(&q, &chain, 4, false, 0).unwrap_err();
+    assert!(off.contains("unavailable with --prune-seqsigwit"), "{off}");
+    drop(q);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Prune is on and this height is not sealed. A real P2WPKH→P2TR spend
+/// still in the keep window has to be in the subscribe result. An empty
+/// map would tell the client the height was already scanned.
+#[test]
+fn unsealed_pruned_spend_is_not_an_empty_height() {
+    use bitcoin::hashes::{hash160, Hash};
+    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("el-tweak-unsealed");
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[2u8; 32]).unwrap();
+    let pk = PublicKey::from_secret_key(&secp, &sk);
+    let ser = pk.serialize();
+    let mut p2wpkh = vec![0x00, 0x14];
+    p2wpkh.extend_from_slice(hash160::Hash::hash(&ser).as_ref());
+    let (xonly, _) = pk.x_only_public_key();
+    let mut p2tr = vec![0x51, 0x20];
+    p2tr.extend_from_slice(&xonly.serialize());
+    let mut genesis_txid = [0u8; 32];
+    genesis_txid[31] = 0xcb;
+    let mut merkle0 = [0u8; 32];
+    merkle0[5] = 0xec;
+    let h0 = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207fffff,
+        nonce: 0,
+        merkle_root: merkle0,
+        hash: merkle0,
+        size: 0,
+        weight: 0,
+    };
+    let fk0 = q
+        .connect_block(
+            Height(0),
+            &h0,
+            &[TxApply {
+                tx: TxRecord {
+                    txid: genesis_txid,
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, p2wpkh)],
+            }],
+        )
+        .unwrap();
+    q.put_sp_tweaks_block(Height(0), fk0, &[None]).unwrap();
+    let create0 = q.block_tx_fks(Height(0)).unwrap()[0];
+    let mut spend_txid = [0u8; 32];
+    spend_txid[0] = 0x11;
+    spend_txid[31] = 0xcd;
+    let hash1 = rbitcoin_store::block_header_hash(1, &h0.hash, &[0x11; 32], 2, 0x207fffff, 1);
+    let h1 = HeaderRecord {
+        prev_fk: fk0,
+        version: 1,
+        timestamp: 2,
+        bits: 0x207fffff,
+        nonce: 1,
+        merkle_root: [0x11; 32],
+        hash: hash1,
+        size: 0,
+        weight: 0,
+    };
+    q.connect_block(
+        Height(1),
+        &h1,
+        &[TxApply {
+            tx: TxRecord {
+                txid: spend_txid,
+                version: 2,
+                locktime: 0,
+                input_count: 1,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: genesis_txid,
+                parent: rbitcoin_store::InputParent::Prevout {
+                    create_fk: create0,
+                    vout: 0,
+                },
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![vec![0u8; 64], ser.to_vec()],
+            }],
+            outputs: vec![OutputRecord::unspent(49_0000_0000, p2tr)],
+        }],
+    )
+    .unwrap();
+    assert_eq!(q.tweak_index_next(), Some(1), "height 1 is not sealed");
+    q.set_prune_seqsigwit(true).unwrap();
+    let chain = ChainParams::regtest();
+    let map = height_map_json(&q, &chain, 1, false, 0).unwrap();
+    let v: Value = serde_json::from_str(&map).unwrap();
+    assert_eq!(
+        v["1"].as_object().unwrap().len(),
+        1,
+        "an unsealed payment must not be an empty height: {map}"
+    );
+    let cut = height_map_json(&q, &chain, 1, true, 0).unwrap();
+    let cut_v: Value = serde_json::from_str(&cut).unwrap();
+    assert_eq!(
+        cut_v["1"].as_object().unwrap().len(),
+        1,
+        "the output is unspent, so cut-through keeps it: {cut}"
+    );
+    let wave = first_subscribe_wave(&q, &chain, 1, 1, subscribe_serve_limits(false), 0).unwrap();
+    assert!(
+        wave.result_json.contains("tweak"),
+        "subscribe must not scan past the payment: {}",
+        wave.result_json
+    );
+    assert_ne!(
+        wave.result_json,
+        empty_height_json(1),
+        "{}",
+        wave.result_json
+    );
+    drop(q);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn dust_row(txid0: u8, p2tr: Vec<(u32, [u8; 32], u64)>) -> ThinTweakRow {
     let mut txid = [0u8; 32];
     txid[0] = txid0;

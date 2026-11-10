@@ -906,6 +906,194 @@ fn dns_seeds_not_resolved_locally_when_proxy() {
     );
 }
 
+/// `--only-net onion` has no IPv4 or IPv6 to reach. A DNS seed lookup, local
+/// or through `--proxy`, would tell a clearnet resolver or seed that this
+/// host runs a node. Only the fixed onion seeds apply.
+#[test]
+fn only_net_without_clearnet_asks_no_dns_seed() {
+    use rbitcoin_net::OnlyNet;
+    let mut cfg = NodeConfig::default();
+    cfg.listen.onion = Some("127.0.0.1:9050".parse().unwrap());
+    cfg.listen.only_net = vec![OnlyNet::Onion];
+    assert!(should_resolve_default_seeds(&cfg), "fixed onion seeds stay");
+    assert!(!should_resolve_dns_seeds(&cfg));
+    cfg.listen.only_net = vec![OnlyNet::Onion, OnlyNet::Ipv4];
+    assert!(should_resolve_dns_seeds(&cfg));
+    cfg.listen.only_net.clear();
+    assert!(should_resolve_dns_seeds(&cfg));
+
+    let mut proxied = NodeConfig::default();
+    proxied.listen.proxy = Some("127.0.0.1:9050".parse().unwrap());
+    assert!(should_queue_proxy_seeds(&proxied));
+    proxied.listen.only_net = vec![OnlyNet::Onion];
+    assert!(!should_queue_proxy_seeds(&proxied));
+}
+
+#[test]
+fn proxy_seeds_follow_the_local_seed_rules() {
+    use rbitcoin_primitives::Network;
+    let proxied = |network| {
+        let mut cfg = NodeConfig::default().with_network(network);
+        cfg.listen.proxy = Some("127.0.0.1:9050".parse().unwrap());
+        cfg
+    };
+    assert!(should_queue_proxy_seeds(&proxied(Network::Signet)));
+    assert!(!should_queue_proxy_seeds(&NodeConfig::default()));
+    assert!(
+        !should_queue_proxy_seeds(&proxied(Network::Regtest)),
+        "regtest has no seed to ask"
+    );
+
+    let mut connect = proxied(Network::Signet);
+    connect.listen.connect = vec![rbitcoin_net::NetAddr::from_socket(
+        "127.0.0.1:38333".parse().unwrap(),
+    )];
+    assert!(
+        !should_queue_proxy_seeds(&connect),
+        "--connect pins the peers"
+    );
+
+    let mut named = proxied(Network::Signet);
+    named.listen.connect_dns = vec!["node.example:38333".into()];
+    assert!(!should_queue_proxy_seeds(&named));
+
+    let mut custom = proxied(Network::Signet);
+    custom.signet_challenge = Some(bitcoin::ScriptBuf::from_bytes(vec![0x51]));
+    assert!(
+        !should_queue_proxy_seeds(&custom),
+        "default signet seeds serve another chain"
+    );
+
+    let mut no_seeds = proxied(Network::Signet);
+    no_seeds.listen.use_seeds = false;
+    assert!(!should_queue_proxy_seeds(&no_seeds));
+
+    let mut trusted = proxied(Network::Signet);
+    trusted.trust_peer = Some(rbitcoin_net::NetAddr::from_socket(
+        "127.0.0.1:38333".parse().unwrap(),
+    ));
+    assert!(
+        !should_queue_proxy_seeds(&trusted),
+        "--trust-peer pins one peer"
+    );
+}
+
+#[tokio::test]
+async fn regtest_proxy_start_does_not_wait_for_seeds() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-regtest-proxy-seeds-{nanos}"));
+    let proxy_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
+    cfg.listen.proxy = Some(proxy_l.local_addr().unwrap());
+    cfg.max_run_secs = Some(0);
+    let result = tokio::time::timeout(Duration::from_secs(5), run_p2p(cfg)).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+        .expect("regtest has no seed answer to wait for")
+        .unwrap();
+}
+
+/// `--proxy --only-net onion` reaches no clearnet seed, so the fixed onion
+/// seeds are the only way to a first peer. The node dials one through SOCKS.
+#[tokio::test]
+async fn proxy_only_net_onion_dials_a_fixed_onion_seed() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = rbitcoin_store::testutil::TempDir::new().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = NodeConfig::default()
+        .with_datadir(dir.path())
+        .with_network(rbitcoin_primitives::Network::Signet)
+        .with_tiny_heads();
+    cfg.apply_kv("milestone", "0").unwrap();
+    cfg.apply_kv("listen", "0").unwrap();
+    cfg.apply_kv("max_inbound", "0").unwrap();
+    cfg.apply_kv("only_net", "onion").unwrap();
+    cfg.apply_kv("proxy", &listener.local_addr().unwrap().to_string())
+        .unwrap();
+    cfg.max_run_secs = Some(0);
+    cfg.validate().unwrap();
+
+    let capture = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut greeting = [0; 2];
+        socket.read_exact(&mut greeting).await.unwrap();
+        let mut methods = vec![0; greeting[1] as usize];
+        socket.read_exact(&mut methods).await.unwrap();
+        if methods.contains(&2) {
+            socket.write_all(&[5, 2]).await.unwrap();
+            assert_eq!(socket.read_u8().await.unwrap(), 1);
+            for _ in 0..2 {
+                let len = socket.read_u8().await.unwrap();
+                let mut field = vec![0; len as usize];
+                socket.read_exact(&mut field).await.unwrap();
+            }
+            socket.write_all(&[1, 0]).await.unwrap();
+        } else {
+            socket.write_all(&[5, 0]).await.unwrap();
+        }
+        let mut header = [0; 5];
+        socket.read_exact(&mut header).await.unwrap();
+        assert_eq!(&header[..4], &[5, 1, 0, 3]);
+        let mut host = vec![0; header[4] as usize];
+        socket.read_exact(&mut host).await.unwrap();
+        socket
+            .write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        String::from_utf8(host).unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(45), run_p2p(cfg))
+        .await
+        .expect("run must stop")
+        .unwrap();
+    let host = tokio::time::timeout(Duration::from_secs(1), capture)
+        .await
+        .expect("a fixed onion seed must reach SOCKS CONNECT")
+        .unwrap();
+    assert!(host.ends_with(".onion"), "dialed {host}");
+}
+
+/// Under `--proxy` a `--connect` hostname is pinned by name: catch-up and the
+/// follow dial hand that name to SOCKS, and `--trust-peer` sees a pin. A bare
+/// IPv6 literal needs no lookup and stays a socket at the default port.
+#[test]
+fn proxy_pins_the_connect_hostname_for_the_follow_dial() {
+    let pinned = proxied_connect_names(
+        &[
+            "peer.example:8444".to_string(),
+            "bare.example".to_string(),
+            "2001:db8::1".to_string(),
+        ],
+        rbitcoin_primitives::Network::Regtest,
+    );
+    let dialed: Vec<_> = outbound_dial_targets(true, &pinned, &AddrMan::default(), 8, &[])
+        .into_iter()
+        .map(rbitcoin_net::DialTarget::from_net)
+        .collect();
+    let want = |host: &str, port| rbitcoin_net::DialTarget::Domain {
+        host: host.into(),
+        port,
+    };
+    assert_eq!(
+        dialed,
+        [
+            want("peer.example", 8444),
+            want(
+                "bare.example",
+                rbitcoin_primitives::Network::Regtest.default_p2p_port()
+            ),
+            rbitcoin_net::DialTarget::Socket(std::net::SocketAddr::new(
+                "2001:db8::1".parse().unwrap(),
+                rbitcoin_primitives::Network::Regtest.default_p2p_port()
+            ))
+        ]
+    );
+}
+
 #[test]
 fn proxy_seed_bootstrap_queues_domain_addrfetch() {
     let peers = rbitcoin_net::PeerHub::new();
@@ -1232,6 +1420,112 @@ fn startup_sets_sh_force_rebuild_on_the_query() {
     cfg.sh_force_rebuild = true;
     apply_startup_index_mode(&q, &cfg, 0).unwrap();
     assert!(q.sh_force_rebuild());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pruned datadir does not start when this process omitted the flag.
+/// The witness files are already the only copy.
+#[test]
+fn pruned_datadir_without_the_flag_does_not_start() {
+    let dir = scratch_dir("prune-flag-off");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    let cfg = NodeConfig::default();
+    let err = apply_startup_index_mode(&q, &cfg, 0).unwrap_err();
+    assert!(
+        err.to_string().contains("restart with --prune-seqsigwit"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--sh-index` on a store with no scripthash head stays in Direct mode.
+/// Confirm still defers Class B until the head exists.
+#[test]
+fn startup_with_shindex_stays_direct_without_a_durable_head() {
+    let dir = scratch_dir("sh-direct");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    let mut cfg = NodeConfig::default();
+    cfg.shindex = true;
+    apply_startup_index_mode(&q, &cfg, 0).unwrap();
+    assert!(q.index_mode().unwrap().is_direct());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pack-marked head is already the scripthash index. Startup resumes Tip
+/// mode instead of collecting Class A again.
+#[test]
+fn startup_resumes_tip_mode_when_the_scripthash_head_is_durable() {
+    let dir = scratch_dir("sh-tip");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    let bump = q.store().scripthash.alloc_bump();
+    let session = q.store().scripthash.pack_shard_session(0).unwrap();
+    let pack = session.finish_pack().unwrap();
+    assert_eq!(pack.bump, bump);
+    q.store().scripthash.publish_packed_shard(0, pack).unwrap();
+    let mut cfg = NodeConfig::default();
+    cfg.shindex = true;
+    apply_startup_index_mode(&q, &cfg, 0).unwrap();
+    assert!(q.index_mode().unwrap().is_tip());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The tweak watermark is behind the tip and the keep file is gone.
+/// Startup has to say the repair failed. It must not advance prune height.
+#[test]
+fn startup_reports_a_tweak_repair_that_cannot_read_the_keep_file() {
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::testutil::FixtureChain;
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let dir = scratch_dir("tweak-repair-miss");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut script = rbitcoin_primitives::P2TR_PREFIX.to_vec();
+    script.extend_from_slice(&[0x11; 32]);
+    let mut txid = [0u8; 32];
+    txid[31] = 0xcb;
+    let ta = TxApply {
+        tx: TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord::coinbase(
+            u32::MAX,
+            vec![0x04, 1],
+            vec![vec![0x22]],
+        )],
+        outputs: vec![OutputRecord::unspent(50_0000_0000, script)],
+    };
+    let header = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207f_ffff,
+        nonce: 0,
+        merkle_root: txid,
+        hash: txid,
+        size: 0,
+        weight: 0,
+    };
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let spill = q.store().path().join("seqsigwit.window/0.bin");
+    assert!(spill.is_file());
+    std::fs::remove_file(&spill).unwrap();
+    let mut cfg = NodeConfig::default();
+    cfg.prune_seqsigwit = true;
+    cfg.sptweaks = true;
+    let err = apply_startup_index_mode(&q, &cfg, 0).unwrap_err();
+    assert!(
+        err.to_string().contains("index startup repair failed"),
+        "{err}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

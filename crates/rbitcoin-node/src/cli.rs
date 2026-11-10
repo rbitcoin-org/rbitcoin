@@ -345,7 +345,7 @@ pub fn operator_usage() -> String {
     [--listen ADDR] [--no-listen] [--connect ADDR]... [--trust-peer ADDR] [--seed-node HOST]... [--proxy HOST:PORT] [--onion HOST:PORT] [--proxy-randomize[=0|1]] [--only-net NET]... \\\n\
     [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
-    [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] [--health-listen [ADDR]] [--metrics] \\\n\
+    [--electrum-listen ADDR] [--esplora-listen ADDR] [--electrum-onion[=0|1]] [--esplora-onion[=0|1]] [--electrum-i2p[=0|1]] [--esplora-i2p[=0|1]] [--health-listen [ADDR]] [--metrics] \\\n\
     [--sv2-tp-listen ADDR] [--sv2-tp-authority-sec KEY] [--sv2-tp-authority-sec-file PATH] [--sv2-tp-cert-validity SECS] [--sv2-tp-stale-grace SECS] [--sv2-tp-idle-timeout SECS] [--sv2-tp-fee-delta SATS] [--sv2-tp-template-interval SECS] \\\n\
     [--sh-index] [--block-filter-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--datadir-hdd] [--store-read-budget N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--heavy-sh-creates N] [--electrum-max-subs N] [--esplora-max-inflight N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rest] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-cookie-file PATH] [--rpc-cookie-perms owner|group|all] [--rpc-work-queue N] \\\n\
@@ -387,7 +387,7 @@ Trust-peer: --trust-peer ADDR (conf trustpeer=) dials only that address, the sam
   failed AUTH is a start error. Unset: no control connection.\n\
   --tor-control-cookie PATH (default /run/tor/control.authcookie). --tor-control-password PASS.\n\
   --i2p-sam [HOST:PORT] SAM v3 to system i2pd (default 127.0.0.1:7656). --only-net=i2p requires it.\n\
-  --i2p-accept-incoming persist {{datadir}}/i2p/p2p.priv and STREAM FORWARD to the P2P bind. Needs --listen.\n\
+  --i2p-accept-incoming persist {{datadir}}/i2p/p2p.priv and STREAM FORWARD to the P2P bind. Needs --listen. P2P only.\n\
   --listen-onion ADD_ONION the P2P port (loopback bind even with --no-listen). Needs --tor-control and --max-inbound > 0.\n\
   --cjdns-reachable treat fc00::/8 as CJDNS (dial and advertise). --only-net=cjdns requires it.\n\
   --trusted / --always-relay / --relay are inbound permission knobs.\n\
@@ -396,8 +396,9 @@ Trust-peer: --trust-peer ADDR (conf trustpeer=) dials only that address, the sam
 Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora address history.\n\
 Block filters: --block-filter-index (default off) builds BIP158 basic filters. Independent of --sh-index.\n\
   Electrum/Esplora start without it; scripthash/address methods fail closed.\n\
-  --prune-seqsigwit refuse seqsigwit reconstruct below tip-288 heights; advertise NETWORK_LIMITED.\n\
-    Kept heights are store/seqsigwit.window/{{height}}.bin plus a RAM cache. Unpruned nodes read seqsigwit.body.\n\
+  --prune-seqsigwit keep witness only for the last 288 heights, in store/seqsigwit.window/{{height}}.bin plus a RAM cache.\n\
+    seqsigwit.body stays a header. Enabling the flag on an archive copies that window out and cuts the stem. Advertise NETWORK_LIMITED.\n\
+    Unpruned nodes read seqsigwit.body. txout, input, txstat, and filters are not pruned.\n\
   --prune-seqsigwit-ram-threshold-bytes N RAM cap for that cache (default 268435456; 0 keeps nothing in RAM).\n\
   --max-sh-creates N refuses an unpaged Electrum/Esplora join with more than N creates (default 10000; 0 = unlimited). A paged history request is still served.\n\
   --heavy-sh-creates N runs unpaged Electrum/Esplora joins with more than N creates one at a time across the node (default 10000; 0 = no limit). Lighter joins stay parallel.\n\
@@ -405,9 +406,16 @@ Block filters: --block-filter-index (default off) builds BIP158 basic filters. I
   --esplora-max-inflight N caps Esplora requests in flight across the whole listener (default 256; >= 1). Further requests wait for a slot; the wait counts against the request timeout (408).\n\
   --store-read-budget N caps concurrent API store reads across RPC, REST, Electrum, Esplora, and BlindBit (N >= 1). Omitted or 0 uses the default: 1 when --datadir-hdd is set, otherwise one less than the core count, minimum 1. An explicit N overrides --datadir-hdd. Waiters do not hold a blocking-pool thread.\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
-  --esplora-onion (default on) ADD_ONION for --esplora-listen when --tor-control is set.\n\
+  --electrum-onion (default off) ADD_ONION for --electrum-listen. Needs --tor-control and a TCP listen on 127.0.0.1 or 0.0.0.0.\n\
+  --esplora-onion (default off) ADD_ONION for --esplora-listen. Needs --tor-control and a TCP listen on 127.0.0.1 or 0.0.0.0.\n\
+  --electrum-i2p / --esplora-i2p (default off) I2P destination and STREAM FORWARD for that listener. Need --i2p-sam and the same TCP listen.\n\
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
-  Not with --prune-seqsigwit (tweaks read scriptSig and witness).\n\
+  With --prune-seqsigwit, turn it on before taproot, or later once every\n\
+  height from that origin through the dropped range is sealed or still in\n\
+  the last 288 blocks. Turning prune on after the index is built is allowed\n\
+  when the index covers every height the cut will drop. Sealed rows stay served.\n\
+  Omitting --sp-tweaks while those files exist and prune is on logs how many\n\
+  blocks remain before the index cannot be enabled again.\n\
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
 Health: --health-listen [ADDR] serves GET /healthz, GET /readyz, and GET /progress (JSON:\n\
   the running index build, rebuild, or backfill stage, at any log level) from the first\n\
@@ -426,7 +434,7 @@ RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (defau
 Cold files: --datadir-cold PATH puts append-only IBD files under PATH/store\n\
   (seqsigwit, txstat, input, and blockfilter / sp_tweaks once enabled).\n\
   Default (flag omitted): those files live under --datadir. --prune-seqsigwit\n\
-  is separate: it drops old seqsigwit and keeps a 288-height window on the hot store.\n\
+  is separate: witness lives only in the 288 hot height files, and seqsigwit.body stays a header.\n\
   --datadir-hdd says the main datadir is rotating media. The node does not probe the device. When --store-read-budget is omitted or 0, API store reads are limited to 1.\n\
   Default off keeps the SSD confirm schedule.\n\
 Conf: --conf FILE (snake_case key=value; CLI kebab overrides conf). See OPERATOR.md and docs/rpc.md.\n\
@@ -473,7 +481,10 @@ pub fn is_bool_key(key: &str) -> bool {
             | "datadir_hdd"
             | "sp_tweaks"
             | "esplora_block_template"
+            | "electrum_onion"
             | "esplora_onion"
+            | "electrum_i2p"
+            | "esplora_i2p"
             | "blocks_only"
             | "prefill_compact"
             | "persist_mempool"

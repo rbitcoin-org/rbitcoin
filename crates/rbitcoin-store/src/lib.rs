@@ -162,7 +162,6 @@ pub use scripthash_materialize::{
     unsorted_collect_workers, unsorted_done_last_fk, unsorted_pack_workers, unsorted_shard_dir,
 };
 pub use sorted_run::free_gib_label;
-pub use sorted_run::host_mem_available_bytes;
 pub use sp_tweaks::{SpTweaksTable, TrimLast};
 pub use sp_tweaks_uring::{load_tweak_wave, LoadedTweakTx};
 pub use spend_annotate_uring::spend_ann_backend;

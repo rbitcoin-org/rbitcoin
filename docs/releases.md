@@ -23,10 +23,14 @@ Patch **99** is the in-tree sentinel, not a published patch. `./scripts/release.
 refuses to tag it. `--patch` refuses to create it (`Z` stays `< 99`).
 
 Homes that must match on a ship commit: `Cargo.toml`
-`[workspace.package].version`, `nix/rbitcoin.nix` `version`, `CHANGELOG.md`
+`[workspace.package].version`, every `Cargo.lock` that records a workspace
+member (`Cargo.lock`, `fuzz/Cargo.lock`, `script-oracle/Cargo.lock`),
+`nix/rbitcoin.nix` `version`, `CHANGELOG.md`
 `## [X.Y.Z]` with a **`### Highlights`** subsection (1–11 bullets,
 operator-facing, then the thanks paragraph when this release has one).
-`./scripts/release-gate.sh` checks the bullets. Narrative banners
+`./scripts/release-gate.sh` checks the bullets. `./scripts/release.sh`
+refuses to tag when a workspace member's lock entry disagrees or the root
+lock is missing. Narrative banners
 (README, SECURITY, `docs/operator/mainnet.md`)
 are edited on the same bump PR; the scripts do not rewrite them.
 
@@ -105,15 +109,15 @@ All hermetic pins: `./scripts/release.test.sh` (includes
 
 | Command | Does |
 |---------|------|
-| `./scripts/release-cut.sh --minor` | `X.Y.99` → `X.(Y+1).0`; folds `changelog.d/` into CHANGELOG, then cuts |
-| `./scripts/release-cut.sh --major` | `X.Y.99` → `(X+1).0.0`; same changelog fold as `--minor` |
-| `./scripts/release-cut.sh --patch` | `X.Y.Z` → `X.Y.(Z+1)` on `vX.Y.x`; same changelog fold |
-| `./scripts/release-cut.sh --dev-next` | just-shipped `X.Y.0` → `X.Y.99` |
+| `./scripts/release-cut.sh --minor` | `X.Y.99` → `X.(Y+1).0`; folds `changelog.d/` into CHANGELOG, then cuts. Rewrites workspace package versions in every `Cargo.lock` |
+| `./scripts/release-cut.sh --major` | `X.Y.99` → `(X+1).0.0`; same changelog fold and lock rewrite as `--minor` |
+| `./scripts/release-cut.sh --patch` | `X.Y.Z` → `X.Y.(Z+1)` on `vX.Y.x`; same changelog fold and lock rewrite |
+| `./scripts/release-cut.sh --dev-next` | just-shipped `X.Y.0` → `X.Y.99`; same lock rewrite |
 | `./scripts/release-cut.sh --print-plan …` | prints `ship=` / `maint=` / `dev_next=` |
 | `./scripts/release-cut.sh --latest-maint` | highest `vX.Y.x` ref |
-| `./scripts/release-gate.sh` | cargo/nix/changelog; ship needs Highlights; `--kind` → `ship`\|`dev` |
+| `./scripts/release-gate.sh` | cargo/nix/changelog/lock; ship needs Highlights; `--kind` → `ship`\|`dev` |
 | `./scripts/release-notes.sh` | GitHub Release / tag text (blurb + Highlights) |
-| `./scripts/release.sh` | annotated tag on a **ship** version |
+| `./scripts/release.sh` | annotated tag on a **ship** version; refuses a stale or missing `Cargo.lock` |
 | `./scripts/release.sh --tag-only` | push the tag, not the branch |
 | `./scripts/release-post.sh` | tag + for `X.Y.0` create `vX.Y.x` |
 | `./scripts/docker-tags.sh vX.Y.Z` | image tags: `X.Y.Z`; `X.Y` when newest on its line; `latest` when newest overall |
@@ -174,7 +178,7 @@ show as `core-functional / core-functional` and so on.
 
 | Check | Who |
 |-------|-----|
-| `qc` `test` `windows` `macos` `coverage` `pread` `rust-forward` | Every PR (`ci.yml`). `qc` runs fmt, ast-grep, unwrap-ratchet, hex-ratchet, deny, script self-tests, clippy, then nixos-module-eval. `pread` is `RBITCOIN_IO=pread cargo test -p rbitcoin-store -p rbitcoin-query` on Ubuntu. `rust-forward` is `cargo check --workspace --all-targets` on the channel in `rust-forward.toml`. Both `need` `qc` and `test`, so they start with `coverage`. The `test` job leaves `RBITCOIN_IO` unset (io_uring) and uses rustc 1.95. |
+| `qc` `test` `windows` `macos` `coverage` `pread` `rust-forward` `nixos-module-eval` | Every PR (`ci.yml`). `qc` runs fmt, ast-grep, unwrap-ratchet, hex-ratchet, deny, script self-tests, then clippy. `pread` is `RBITCOIN_IO=pread cargo test -p rbitcoin-store -p rbitcoin-query` on Ubuntu. `rust-forward` is `cargo check --workspace --all-targets` on the channel in `rust-forward.toml`. `pread`, `rust-forward`, and `nixos-module-eval` `need` `qc` and `test`, so they start with `coverage`. The module eval does not gate `coverage`. It is not a Protected status check until the ruleset names `nixos-module-eval`. The `test` job leaves `RBITCOIN_IO` unset (io_uring) and uses rustc 1.95. |
 | `mutants` | Nightly `47 0 * * *` (17:47 Pacific during PDT) and `workflow_dispatch` (`mutants.yml`). Workspace tests. New mutants until half of the first job's budget, then the backlog; the second job does not open another new window. 8 hour budget in two jobs. Not required. Cursor and `MISSED` lines are on the `mutants-state` branch. |
 | `core-functional` | Nightly, `workflow_dispatch`, label **`core-functional`**; via `release-gate.yml` on label **`release`** **or** ship version |
 | `overlay-functional` | Nightly (`42 6`), `workflow_dispatch`, label **`overlay-functional`**; via `release-gate.yml` on label **`release`** **or** ship version |
@@ -188,7 +192,9 @@ is missing.
 
 Ask the operator to add **`release-extra`** as a **required** status check
 on `master` / `main` / `v*.*.x` (ruleset). Until then, agents still wait
-for it before merge.
+for it before merge. Ask the operator to add **`nixos-module-eval`** the
+same way after this workflow is on those branches. Until then the eval job
+runs on every PR and does not block merge.
 
 Unlabeled non-ship PRs keep cargo gates only (detect=`dev`, the three
 functional suites skipped, `release-extra` green).

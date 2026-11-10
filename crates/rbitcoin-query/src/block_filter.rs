@@ -154,8 +154,57 @@ impl Query {
     }
 
     /// Read a window of blocks and the parents they spend (completion session).
+    ///
+    /// Prune mode does not pread `seqsigwit.body`. P2TR inputs come from the
+    /// keep window: RAM, then `seqsigwit.window`.
     pub fn read_index_window(&self, heights: &[IndexHeight]) -> Result<IndexWindow, QueryError> {
-        read_index_window(&self.store.txs, heights)
+        let mut window = read_index_window(&self.store.txs, heights)?;
+        if self.prune_seqsigwit() {
+            self.fill_pruned_tweak_inputs(&mut window)?;
+        }
+        Ok(window)
+    }
+
+    fn fill_pruned_tweak_inputs(&self, window: &mut IndexWindow) -> Result<(), QueryError> {
+        for block in &mut window.blocks {
+            let mut file_wants = Vec::new();
+            // Keep this lookup. Confirm can evict the RAM row before the
+            // second pass, and the spill file is still the right copy.
+            let mut ram_hits = std::collections::HashMap::new();
+            for tx in &block.txs {
+                if !tx.need_seqsigwit {
+                    continue;
+                }
+                if let Some(ram) = self.seqsigwit_ram_inputs(tx.fk) {
+                    ram_hits.insert(tx.fk, ram);
+                } else {
+                    file_wants.push((tx.fk, tx.rec.input_count));
+                }
+            }
+            let from_file = self.read_spill_rows(block.height.0, &file_wants)?;
+            for tx in &mut block.txs {
+                if !tx.need_seqsigwit {
+                    continue;
+                }
+                let inputs = if let Some(ram) = ram_hits.remove(&tx.fk) {
+                    ram
+                } else if let Some(row) = from_file.get(&tx.fk) {
+                    row.clone()
+                } else {
+                    return Err(self.pruned_tweak_witness_miss(block.height));
+                };
+                tx.inputs = Some(inputs);
+            }
+        }
+        Ok(())
+    }
+
+    fn pruned_tweak_witness_miss(&self, height: Height) -> QueryError {
+        let dropped = self.pruneheight().is_some_and(|ph| height.0 <= ph.0);
+        if dropped {
+            return StoreError::Layout(crate::sp_tweaks::SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into());
+        }
+        StoreError::Corrupt("seqsigwit window miss")
     }
 
     /// Basic filter of `window.blocks[i]`. Reads the block hash from the header.
@@ -497,6 +546,16 @@ impl Query {
     /// The write side of [`Self::index_live`]. Startup sets it; confirm does not.
     pub fn set_index_live(&self, on: bool) {
         self.index_live.store(on, Ordering::Release);
+    }
+
+    /// Pruned tweak append is on. Independent of [`Self::index_live`].
+    pub fn tweak_follow(&self) -> bool {
+        self.tweak_follow.load(Ordering::Acquire)
+    }
+
+    /// The write side of [`Self::tweak_follow`].
+    pub fn set_tweak_follow(&self, on: bool) {
+        self.tweak_follow.store(on, Ordering::Release);
     }
 
     /// Next filter height to seal (`None` when the filter index is off).

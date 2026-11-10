@@ -422,7 +422,7 @@ impl AddrMan {
 
     #[doc(hidden)]
     pub fn dialable(&self, addr: NetAddr) -> bool {
-        self.reachable(OnlyNet::of(addr))
+        !matches!(addr, NetAddr::Name { .. }) && self.reachable(OnlyNet::of(addr))
     }
 
     #[doc(hidden)]

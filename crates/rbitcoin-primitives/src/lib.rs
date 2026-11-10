@@ -105,6 +105,10 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
+/// **27:** `meta` only. `--prune-seqsigwit` can leave `seqsigwit` at a header
+///         while creates remain. A 26 binary treats that empty locator as
+///         damage and truncates the chain. This binary rewrites `meta` to 27
+///         on open, including an unpruned datadir. A 26 binary refuses 27 `meta`.
 /// **26:** `header.body` is 88 B again. Occupied 24/25 strips the trailing
 ///         `size:u32` + `weight:u32`. Block size and weight come from `txstat`.
 ///         A 25 binary refuses 26 `meta`.
@@ -124,14 +128,15 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         this binary opens.
 /// **21 and older:** not opened. Meta below 22 is one wipe-and-IBD refuse.
 ///         Those layouts are archaeology in `SCHEMA_HISTORY.md`.
-pub const SCHEMA_VERSION: u16 = 26;
+pub const SCHEMA_VERSION: u16 = 27;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **26** is current. Meta **22** through **26** opens. Occupied **22**
+/// Schema **27** is current. Meta **22** through **27** opens. Occupied **22**
 /// rewrites `create.loc.ovf` 12 B rows to 16 B. Occupied **24/25** strips
-/// trailing size/weight from 96 B `header.body` rows. Any meta below **26**
-/// is rewritten to 26; a short `txstat.body` is aligned to the loc count.
+/// trailing size/weight from 96 B `header.body` rows. Any meta below **27**
+/// is rewritten to 27; a short `txstat.body` is aligned to the loc count.
+/// Table bytes do not change for 26. A 26 binary refuses 27 `meta`.
 /// Meta older than **22** is not
 /// openable: those Class A bodies (`tx.body`, `txout.body`, `inwit.body` /
 /// `seqsigwit.body`) were wiped, not rewritten.

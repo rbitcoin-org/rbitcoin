@@ -946,7 +946,8 @@ pub fn queue_addr_list(
                 crate::NetAddr::Ip(s) => Some((t, Address::new(&s, services))),
                 crate::NetAddr::Onion { .. }
                 | crate::NetAddr::I2p { .. }
-                | crate::NetAddr::Cjdns { .. } => None,
+                | crate::NetAddr::Cjdns { .. }
+                | crate::NetAddr::Name { .. } => None,
             })
             .collect();
         queue_accounted(session, out, NetworkMessage::Addr(list))

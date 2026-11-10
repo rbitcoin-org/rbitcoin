@@ -198,6 +198,10 @@ impl DialTarget {
         match addr {
             crate::NetAddr::Ip(s) => Self::Socket(s),
             crate::NetAddr::Cjdns { ip, port } => Self::Socket(SocketAddr::from((ip, port))),
+            crate::NetAddr::Name { id, port } => Self::Domain {
+                host: id.host(),
+                port,
+            },
             other => Self::Domain {
                 host: other.host_str(),
                 port: other.port(),
@@ -217,15 +221,50 @@ impl DialTarget {
         self.version_socket()
     }
 
-    /// An overlay host is its own `NetAddr`. A DNS name (a `--proxy` seed
-    /// addr-fetch) has no address until the proxy resolves it, so it is the
-    /// [`Self::version_socket`] `0.0.0.0:port`.
+    /// Whether the target has a key of its own. False for a name once the
+    /// interner is full: such a dial is refused, never keyed `0.0.0.0:port`,
+    /// where it would share a key with every other overflow name.
+    pub fn has_key(&self) -> bool {
+        match self {
+            Self::Socket(_) => true,
+            Self::Domain { host, port } => {
+                format!("{host}:{port}").parse::<crate::NetAddr>().is_ok()
+                    || crate::NetAddr::name(host, *port).is_some()
+            }
+        }
+    }
+
+    /// An overlay host is its own `NetAddr`. A DNS name has no address until
+    /// the proxy resolves it, so the name is its key. Callers refuse a target
+    /// without [`Self::has_key`] first; the `0.0.0.0:port` fallback only keeps
+    /// this total.
     pub fn net_addr(&self) -> crate::NetAddr {
         match self {
             Self::Socket(addr) => crate::NetAddr::from_socket(*addr),
             Self::Domain { host, port } => format!("{host}:{port}")
                 .parse()
-                .unwrap_or_else(|_| crate::NetAddr::from_socket(self.version_socket())),
+                .ok()
+                .or_else(|| crate::NetAddr::name(host, *port))
+                .unwrap_or_else(|| crate::NetAddr::from_socket(self.version_socket())),
+        }
+    }
+}
+
+/// The refusal for a name past the interner cap.
+#[doc(hidden)]
+pub const NO_NAME_KEY: &str =
+    "too many distinct proxied host names this run; restart the node to dial a new one";
+
+impl DialTarget {
+    /// [`Self::net_addr`] without interning: `None` for a name nobody added,
+    /// which can be neither live nor removable.
+    fn known_net_addr(&self) -> Option<crate::NetAddr> {
+        match self {
+            Self::Socket(addr) => Some(crate::NetAddr::from_socket(*addr)),
+            Self::Domain { host, port } => format!("{host}:{port}")
+                .parse()
+                .ok()
+                .or_else(|| crate::NetAddr::known_name(host, *port)),
         }
     }
 }
@@ -705,6 +744,18 @@ impl LivePeer {
             crate::NetAddr::Onion { .. } => return SelfAnnounceLink::Tor,
             crate::NetAddr::I2p { .. } => return SelfAnnounceLink::I2p,
             crate::NetAddr::Cjdns { .. } => return SelfAnnounceLink::Cjdns,
+            crate::NetAddr::Name { .. } => {
+                // Only a `--proxy` dials a name: the link is the proxy's, like a proxied IP.
+                let proxied = hub
+                    .proxies()
+                    .proxy_for(crate::OnlyNet::of(self.net))
+                    .is_some();
+                return if proxied {
+                    SelfAnnounceLink::Tor
+                } else {
+                    SelfAnnounceLink::Unknown
+                };
+            }
             crate::NetAddr::Ip(sock) => sock,
         };
         if !self.inbound {
@@ -1693,6 +1744,7 @@ impl DiscourageKey {
             crate::NetAddr::Onion { pk, .. } => Some(Self::Onion(pk)),
             crate::NetAddr::I2p { dest, .. } => Some(Self::I2p(dest)),
             crate::NetAddr::Cjdns { ip, .. } => Some(Self::Ip(IpAddr::V6(ip))),
+            crate::NetAddr::Name { .. } => None,
             crate::NetAddr::Ip(sock) => {
                 let ip = sock.ip();
                 if ip_skips_discourage(ip) {
@@ -1905,6 +1957,7 @@ impl OwnAddrs {
             }
             crate::NetAddr::Ip(sock) => self.has_ip(sock.ip()),
             crate::NetAddr::Cjdns { ip, .. } => self.has_ip(IpAddr::V6(ip)),
+            crate::NetAddr::Name { .. } => false,
         }
     }
 
@@ -3197,6 +3250,9 @@ impl PeerHub {
         tx: &mpsc::UnboundedSender<DialRequest>,
         target: DialTarget,
     ) -> Result<(), String> {
+        if !target.has_key() {
+            return Err(NO_NAME_KEY.to_string());
+        }
         self.trust_allows_target(&target)?;
         // Claim before the live check: a dial registers its session before
         // it drops its claim, so no window shows the endpoint as neither.
@@ -3235,9 +3291,11 @@ impl PeerHub {
     }
 
     /// `addnode` with the operator string. IP, onion, I2P, and CJDNS parse as
-    /// [`crate::NetAddr`]. Anything else is clearnet DNS, resolved at dial.
+    /// [`crate::NetAddr`]. Anything else is clearnet DNS, resolved at dial,
+    /// or by the proxy when `--proxy` is set.
     /// `add` keeps the string when DNS fails so a later redial can succeed.
-    /// `onetry` fails if the name does not resolve now.
+    /// `onetry` fails if the name does not resolve now, except under
+    /// `--proxy`, where it queues the name and returns `Ok`.
     pub fn addnode_host(&self, node: &str, cmd: &str, default_port: u16) -> Result<(), String> {
         let ready = self.dial_ready()?;
         ready.addnode_host(node, cmd, default_port)
@@ -3467,12 +3525,29 @@ impl PeerHub {
         if let Ok(net) = parse_peer_net(&with_port) {
             return Ok(DialTarget::from_net(net));
         }
+        if let Some(target) = self.proxied_domain_target(&with_port) {
+            return Ok(target);
+        }
         let addr =
             parse_peer_addr_with_port(node, self.default_port_opt()).map_err(|e| e.to_string())?;
         if self.trust_host_matches(node) {
             self.note_trust_resolved(addr);
         }
         Ok(DialTarget::Socket(addr))
+    }
+
+    /// `host:port` as a by-name target when `--proxy` is set, so the proxy
+    /// resolves it. An IP literal needs no lookup and stays a socket.
+    fn proxied_domain_target(&self, host_port: &str) -> Option<DialTarget> {
+        self.proxies().dialer.proxy_for(crate::OnlyNet::Ipv4)?;
+        if host_port.parse::<SocketAddr>().is_ok() {
+            return None;
+        }
+        let (host, port) = host_port.rsplit_once(':')?;
+        Some(DialTarget::Domain {
+            host: host.to_string(),
+            port: port.parse().ok()?,
+        })
     }
 
     fn trust_host_matches(&self, node: &str) -> bool {
@@ -3533,7 +3608,9 @@ impl PeerHub {
                 self.disconnect_addr(*addr)
             }
             DialTarget::Domain { .. } => {
-                let net = target.net_addr();
+                let Some(net) = target.known_net_addr() else {
+                    return false;
+                };
                 self.added
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -3629,9 +3706,9 @@ impl PeerHub {
         let peers = self.snapshot();
         match target {
             DialTarget::Socket(addr) => peers.iter().any(|p| p.addr == *addr),
-            DialTarget::Domain { host, port } => peers
-                .iter()
-                .any(|p| p.net.host_str() == *host && p.net.port() == *port),
+            DialTarget::Domain { .. } => target
+                .known_net_addr()
+                .is_some_and(|net| peers.iter().any(|p| p.net == net)),
         }
     }
 
@@ -4012,6 +4089,10 @@ pub fn parse_peer_net(s: &str) -> Result<crate::NetAddr, NetError> {
 pub fn ensure_host_port(node: &str, default_port: Option<u16>) -> Result<String, String> {
     if node.parse::<SocketAddr>().is_ok() {
         return Ok(node.to_string());
+    }
+    if let Ok(ip) = node.parse::<IpAddr>() {
+        let port = default_port.ok_or_else(|| format!("bad peer address {node}"))?;
+        return Ok(SocketAddr::new(ip, port).to_string());
     }
     if let Some((host, port_s)) = node.rsplit_once(':') {
         if !host.is_empty() && !host.starts_with('[') && port_s.parse::<u16>().is_ok() {

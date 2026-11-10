@@ -60,16 +60,34 @@ pub fn tmp_sidecar_path(path: &Path) -> PathBuf {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TmpSync {
+    None,
+    /// File `sync_all` only. The caller syncs the parent directory.
+    File,
+    /// File `sync_all`, then `fsync` the parent directory.
+    FileAndDir,
+}
+
 /// Write `bytes` to a sibling tmp, then rename over `path`. No `sync_all`.
 pub fn write_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    write_tmp_file(path, false, |f| {
+    write_tmp_synced(path, TmpSync::None, |f| {
         f.write_all(bytes).map_err(|e| StoreError::io(path, e))
     })
 }
 
 /// Write `bytes` to a sibling tmp, `sync_all`, then rename over `path`.
 pub fn write_synced_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    write_tmp_file(path, true, |f| {
+    write_tmp_synced(path, TmpSync::FileAndDir, |f| {
+        f.write_all(bytes).map_err(|e| StoreError::io(path, e))
+    })
+}
+
+/// Write `bytes` to a sibling tmp and `sync_all` the file before rename.
+///
+/// The parent directory is left unsynced so a batch can fsync it once.
+pub fn write_file_synced_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    write_tmp_synced(path, TmpSync::File, |f| {
         f.write_all(bytes).map_err(|e| StoreError::io(path, e))
     })
 }
@@ -81,11 +99,26 @@ pub fn write_synced_tmp_file<F>(path: &Path, write: F) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
 {
-    write_tmp_file(path, true, write)
+    write_tmp_synced(path, TmpSync::FileAndDir, write)
 }
 
 #[doc(hidden)]
 pub fn write_tmp_file<F>(path: &Path, sync: bool, write: F) -> Result<(), StoreError>
+where
+    F: FnOnce(&mut File) -> Result<(), StoreError>,
+{
+    write_tmp_synced(
+        path,
+        if sync {
+            TmpSync::FileAndDir
+        } else {
+            TmpSync::None
+        },
+        write,
+    )
+}
+
+fn write_tmp_synced<F>(path: &Path, sync: TmpSync, write: F) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
 {
@@ -98,12 +131,12 @@ where
     {
         let mut f = File::create(&tmp).map_err(|e| StoreError::io(&tmp, e))?;
         write(&mut f)?;
-        if sync {
+        if sync != TmpSync::None {
             f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
         }
     }
     std::fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))?;
-    if sync {
+    if sync == TmpSync::FileAndDir {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
@@ -120,12 +153,52 @@ where
 pub fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        std::fs::File::open(dir)?.sync_all()
+        let result = std::fs::File::open(dir)?.sync_all();
+        #[cfg(debug_assertions)]
+        if result.is_ok() {
+            note_fsynced_dir(dir);
+        }
+        result
     }
     #[cfg(not(unix))]
     {
         let _ = dir;
         Ok(())
+    }
+}
+
+/// Record directories passed to [`fsync_parent_dir`] on this thread.
+///
+/// Debug tests use this to check that `store/` is synced after
+/// `seqsigwit.window` exists. A release build does not record.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fsync_dir_trace() {
+    FSYNC_TRACE.with(|on| on.set(true));
+    FSYNC_DIRS.with(|dirs| dirs.borrow_mut().clear());
+}
+
+/// Stop recording and return the directories synced since [`arm_fsync_dir_trace`].
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_fsynced_dirs() -> Vec<PathBuf> {
+    FSYNC_TRACE.with(|on| on.set(false));
+    FSYNC_DIRS.with(|dirs| std::mem::take(&mut *dirs.borrow_mut()))
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static FSYNC_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FSYNC_DIRS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// Only Unix calls this. Windows `fsync_parent_dir` is a no-op, and a
+// private helper with no caller fails `-D warnings` there.
+#[cfg(all(debug_assertions, unix))]
+fn note_fsynced_dir(dir: &Path) {
+    if FSYNC_TRACE.with(|on| on.get()) {
+        FSYNC_DIRS.with(|dirs| dirs.borrow_mut().push(dir.to_path_buf()));
     }
 }
 
@@ -570,6 +643,19 @@ impl TableFile {
             self.publish_prefixed_len(logical)?;
         }
         self.needs_sync.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Publish `logical` and drop the file allocation past it.
+    ///
+    /// [`Self::set_logical_len`] leaves the fallocated tail in place. Prune
+    /// uses this so the bytes come back.
+    pub fn release_to_len(&self, logical: u64) -> Result<(), StoreError> {
+        self.set_logical_len(logical)?;
+        let file = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        set_file_len(&file, &self.path, logical)?;
+        drop(file);
+        self.file_cap.store(logical, Ordering::Release);
         Ok(())
     }
 

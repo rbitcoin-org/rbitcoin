@@ -2692,6 +2692,107 @@ async fn sp_scan_stops_when_the_client_hangs_up() {
     );
 }
 
+/// A pruned height whose keep file is gone is an error. The scan must not
+/// report progress 1.0 with an empty history, or the client walks past it.
+#[tokio::test(flavor = "current_thread")]
+async fn pruned_scan_miss_is_not_an_empty_history() {
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+    use std::io::Cursor;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    let (dir, q) = tmp_store();
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut script = vec![0x51, 0x20];
+    script.extend_from_slice(&[0x11; 32]);
+    let merkle = [0x44; 32];
+    let header = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207fffff,
+        nonce: 0,
+        merkle_root: merkle,
+        hash: merkle,
+        size: 0,
+        weight: 0,
+    };
+    q.connect_block(
+        Height(0),
+        &header,
+        &[TxApply {
+            tx: TxRecord {
+                txid: merkle,
+                version: 1,
+                locktime: 0,
+                input_count: 1,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, script)],
+        }],
+    )
+    .unwrap();
+    std::fs::remove_file(q.store().path().join("seqsigwit.window/0.bin")).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let q = Arc::new(q);
+    let chain = Arc::new(ChainParams::regtest());
+    let scan = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
+    let spend = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
+    let params = json!([scan, spend, 0]);
+    let mut reader = BufReader::new(Cursor::new(b"\n".to_vec()));
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
+    let mut conn = ElectrumConn::new();
+    let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    serve_sp_subscribe(
+        &mut reader,
+        &mut writer,
+        &q,
+        &chain,
+        &peer,
+        json!(1),
+        &params,
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    let text = String::from_utf8(body).unwrap();
+    assert!(
+        text.contains("window miss"),
+        "a keep-file miss has to be an error, got {text}"
+    );
+    assert!(
+        !text.contains("\"progress\":1.0") && !text.contains("\"progress\": 1.0"),
+        "the miss must not finish the scan, got {text}"
+    );
+    assert!(
+        conn.sp_sub.is_none(),
+        "a failed scan is not a live subscription"
+    );
+    let sub =
+        rbitcoin_electrum::silent_scan::parse_sub(&params, bitcoin::Network::Regtest, Some(0))
+            .unwrap();
+    let mut tip_body = Vec::new();
+    let mut tip_writer = ConnWrite::new(Cursor::new(&mut tip_body), Duration::from_secs(2));
+    emit_sp_tip(&mut tip_writer, &q, &chain, &sub, 0)
+        .await
+        .unwrap();
+    let tip_text = String::from_utf8(tip_body).unwrap();
+    assert!(
+        tip_text.contains("window miss"),
+        "a tip note must not hide the miss, got {tip_text}"
+    );
+    assert!(
+        !tip_text.contains("progress"),
+        "a tip miss must not report the height scanned, got {tip_text}"
+    );
+    drop(q);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A client that never reads must not hold the request. The write itself
 /// returns; the connection task drops on that error.
 #[tokio::test]

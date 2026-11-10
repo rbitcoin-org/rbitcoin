@@ -315,6 +315,7 @@ impl Query {
     /// not move it. Seqsigwit prune keeps its window below that tip.
     #[doc(hidden)]
     pub fn flush_tip(&self, before: Option<Height>) -> Result<Option<Height>, QueryError> {
+        self.require_pruned_keep_spills()?;
         if self.index_mode()?.is_tip() {
             let landed = self.store.flush_class_c_tip()?;
             return Ok(self.sealed_tip.for_prune(before, landed));
@@ -568,7 +569,11 @@ impl Query {
         if let Some(h) = self.height_of_hash(header_hash)? {
             if h == height {
                 if let Some((fk, _)) = self.get_header_by_hash(header_hash)? {
-                    return Ok(fk);
+                    // Same header at this height, but the witness file was
+                    // never written. Fall through and seal it.
+                    if self.pruned_spill_covers(fk)? {
+                        return Ok(fk);
+                    }
                 }
             }
         }
@@ -739,8 +744,15 @@ impl Query {
         let commit = self.lock_tip_commit()?;
         let durable_before = self.tip_height();
         if let Some(fk) = self.check_run_extends_tip(items)? {
+            // Already confirmed. Do not apply Class C again. A missing spill
+            // is still a failed confirm, not a successful retry.
+            self.seal_missing_pruned_spills(items)?;
             return Ok(vec![fk]);
         }
+
+        // The spill is the witness. Write it before any tip publish, so a
+        // failed write leaves the old tip in place and the append cache intact.
+        self.seal_confirmed_seqsigwit_spills(items)?;
 
         let write = rbitcoin_store::ClassCWrite::new();
         if !header_ranges.is_empty() {
@@ -801,6 +813,7 @@ impl Query {
         }
         // Do not forget pending here: drain may still be inserting tx.head
         // (67438). Write forgets after drain.join() *and* this extend.
+        // The spill was sealed before the tip moved. This flush commits it.
         let durable = self.flush_tip(durable_before)?;
         drop(commit);
         crate::note_confirm(
@@ -818,18 +831,72 @@ impl Query {
         Ok(out)
     }
 
+    /// Advance the prune watermark after the tip flush.
+    ///
+    /// [`Self::seal_confirmed_seqsigwit_spills`] wrote the keep-window
+    /// files before that flush. Heights that fell out of the window are
+    /// deleted here.
     #[doc(hidden)]
     pub fn record_confirmed_seqsigwit_window(
         &self,
-        items: &[ConfirmPrepared],
+        _items: &[ConfirmPrepared],
         durable: Option<Height>,
     ) -> Result<(), QueryError> {
-        self.prune_seqsigwit_below(durable)?;
+        // The tweak row for a height in this batch is sealed after the tip
+        // is published. Deleting the witness first leaves that row with
+        // nothing to rebuild from.
+        if self.tweak_seal_blocks_prune(durable)? {
+            return Ok(());
+        }
+        self.prune_seqsigwit_below(durable)
+    }
+
+    /// Drop witnesses the sealed tip no longer keeps, once those tweak rows
+    /// exist. The RAM tip can be a batch whose Class C flush has not landed.
+    /// Pruning to it deletes files that tip still has to keep.
+    #[doc(hidden)]
+    pub fn prune_seqsigwit_after_tweak_seal(&self) -> Result<(), QueryError> {
+        if !self.sptweaks_enabled() {
+            return Ok(());
+        }
+        let tip = self.sealed_tip.get();
+        if self.tweak_seal_blocks_prune(tip)? {
+            return Ok(());
+        }
+        self.prune_seqsigwit_below(tip)
+    }
+
+    fn seal_confirmed_seqsigwit_spills(&self, items: &[ConfirmPrepared]) -> Result<(), QueryError> {
         if !self.prune_seqsigwit() {
             return Ok(());
         }
         for item in items {
             self.note_seqsigwit_ram_for_confirmed(item.height, &item.tx_fks)?;
+        }
+        // One directory sync for the batch, after every file is synced and
+        // before the tip flush. `store/` is synced when this batch created
+        // the window directory.
+        self.sync_spill_dir()
+    }
+
+    /// Retry of a block that is already the tip. Seal only a height whose
+    /// file does not already hold that block.
+    pub(crate) fn seal_missing_pruned_spills(
+        &self,
+        items: &[ConfirmPrepared],
+    ) -> Result<(), QueryError> {
+        if !self.prune_seqsigwit() {
+            return Ok(());
+        }
+        let mut wrote = false;
+        for item in items {
+            if !self.pruned_spill_covers(item.header_fk)? {
+                self.note_seqsigwit_ram_for_confirmed(item.height, &item.tx_fks)?;
+                wrote = true;
+            }
+        }
+        if wrote {
+            self.sync_spill_dir()?;
         }
         Ok(())
     }

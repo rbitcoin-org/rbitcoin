@@ -1313,6 +1313,10 @@ where
     let scanned = scan_sp_off_connection(reader, query, chain, &sub, last).await;
     let hits = scanned.hits;
     conn.sp_scan_busy = false;
+    if let Some(message) = scanned.error {
+        writer.line(sp_scan_error_note(&sub, message)).await?;
+        return Ok(());
+    }
     // The client left before any chunk. A history line would write into a closed socket.
     if scanned.chunks == 0 && sub.start <= last {
         return Ok(());
@@ -1360,11 +1364,15 @@ pub async fn emit_sp_tip<W: AsyncWrite + Unpin>(
     let q = Arc::clone(query);
     let c = chain.clone();
     let piece = sub.clone();
-    let hits = budgeted_blocking(query, move || {
-        crate::silent_scan::scan_hits(&q, &c, &piece, height, height).unwrap_or_default()
+    let outcome = budgeted_blocking(query, move || {
+        crate::silent_scan::scan_hits(&q, &c, &piece, height, height)
     })
-    .await
-    .unwrap_or_default();
+    .await;
+    let hits = match outcome {
+        Ok(Ok(hits)) => hits,
+        Ok(Err(message)) => return writer.line(sp_scan_error_note(sub, message)).await,
+        Err(e) => return writer.line(sp_scan_error_note(sub, e.to_string())).await,
+    };
     if hits.is_empty() {
         return Ok(());
     }
@@ -1448,6 +1456,8 @@ pub struct SpScan {
     pub hits: Vec<Value>,
     /// Chunks scanned before the client hung up.
     pub chunks: usize,
+    /// A height could not be read. The scan did not finish.
+    pub error: Option<String>,
 }
 
 /// One poll. `fill_buf` does not consume: an empty ready buffer is EOF,
@@ -1486,16 +1496,47 @@ pub async fn scan_sp_off_connection<R: AsyncBufRead + Unpin>(
         let q = Arc::clone(query);
         let c = Arc::clone(chain);
         let piece = sub.clone();
-        let chunk = budgeted_blocking(query, move || {
+        let outcome = budgeted_blocking(query, move || {
             let _sp = permit;
-            crate::silent_scan::scan_hits(&q, &c, &piece, from, end).unwrap_or_default()
+            crate::silent_scan::scan_hits(&q, &c, &piece, from, end)
         })
-        .await
-        .unwrap_or_default();
+        .await;
+        let chunk = match outcome {
+            Ok(Ok(hits)) => hits,
+            Ok(Err(message)) => {
+                return SpScan {
+                    hits,
+                    chunks,
+                    error: Some(message),
+                };
+            }
+            Err(e) => {
+                return SpScan {
+                    hits,
+                    chunks,
+                    error: Some(e.to_string()),
+                };
+            }
+        };
         hits.extend(chunk);
         chunks += 1;
     }
-    SpScan { hits, chunks }
+    SpScan {
+        hits,
+        chunks,
+        error: None,
+    }
+}
+
+fn sp_scan_error_note(sub: &crate::silent_scan::SpSub, message: String) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "blockchain.silentpayments.subscribe",
+        "params": {
+            "subscription": crate::silent_scan::subscribe_result(sub),
+            "error": {"code": 1, "message": message}
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)] // matches handle_client call-site
@@ -2829,8 +2870,8 @@ pub fn dispatch_pinned(
         "blockchain.estimatefee" => {
             let target = param_u32(params, 0).unwrap_or(2);
             let fee = mempool
-                .map(|m| m.estimate_fee_btc_per_kb(target))
-                .unwrap_or(-1.0);
+                .and_then(|m| m.estimate_smart_fee_sat_kvb(target).1)
+                .map_or(-1.0, |sat| sat as f64 / 100_000_000.0);
             Ok(json!(fee))
         }
         "blockchain.relayfee" => {

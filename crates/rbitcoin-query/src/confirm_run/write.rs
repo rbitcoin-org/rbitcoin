@@ -133,6 +133,23 @@ pub fn finish_already_committed_write(
         .iter()
         .map(|p| (p.height.0, p.hash))
         .collect();
+    if query.prune_seqsigwit() {
+        let mut wrote = false;
+        for p in &batch.prepared {
+            if !query
+                .pruned_spill_covers(p.header_fk)
+                .map_err(ConfirmError::from)?
+            {
+                query
+                    .note_seqsigwit_ram_for_confirmed(p.height, &p.tx_fks)
+                    .map_err(ConfirmError::from)?;
+                wrote = true;
+            }
+        }
+        if wrote {
+            query.sync_spill_dir().map_err(ConfirmError::from)?;
+        }
+    }
     finish_post_commit_hashes(query, &items)?;
     if let Some(h) = items.iter().map(|(h, _)| *h).max() {
         query.prune_write_create_loc(h);
@@ -406,6 +423,9 @@ fn write_phase_inner(
 
         let seal = std::mem::take(&mut batch.index_seal);
         let idx_put_ns = super::index::seal_live_indexes(query, seal)?;
+        // The tip is already published. Prune only once the rows just sealed
+        // cover the height that prune would drop.
+        query.prune_seqsigwit_after_tweak_seal()?;
         if idx_put_ns > 0 {
             crate::note_confirm(&query.confirm_stats().idx_put_ns, idx_put_ns);
             crate::note_confirm(&query.confirm_stats().blockfilter_ns, idx_put_ns);
@@ -724,12 +744,16 @@ pub fn annotate_slots_from_connected_hash(
         return Ok(());
     };
     for (tx_i, &spend_fk) in tx_fks.iter().enumerate() {
-        let (_meta, ins, _outs) = query
+        // Parent edges live in `input`. Script and witness may be pruned.
+        let edges = query
             .store()
-            .get_tx_full(spend_fk)
-            .map_err(ConfirmError::from)?;
+            .input_edges(spend_fk)
+            .map_err(ConfirmError::from)?
+            .ok_or(ConfirmError::Store(StoreError::Corrupt(
+                "invariant: spend replay missing input edges",
+            )))?;
         if tx_i == 0 {
-            let coinbase = ins.len() == 1 && ins[0].is_coinbase();
+            let coinbase = edges.len() == 1 && edges[0].parent.is_null();
             if !coinbase {
                 return Err(ConfirmError::Store(StoreError::Corrupt(
                     "invariant: coinbase input edge",
@@ -737,12 +761,14 @@ pub fn annotate_slots_from_connected_hash(
             }
             continue;
         }
-        for (inp_i, inp) in ins.into_iter().enumerate() {
-            let rbitcoin_store::InputParent::Prevout { create_fk, vout } = inp.parent else {
+        for (inp_i, edge) in edges.iter().enumerate() {
+            if edge.parent.is_null() {
                 return Err(ConfirmError::Store(StoreError::Corrupt(
                     "invariant: non-coinbase input edge",
                 )));
-            };
+            }
+            let create_fk = edge.parent;
+            let vout = edge.vout;
             let (off, len) = query
                 .store()
                 .tx_spent_range(create_fk)

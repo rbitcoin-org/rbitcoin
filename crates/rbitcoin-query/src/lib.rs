@@ -85,6 +85,38 @@ pub use index_writebehind::{
     build_indexes_released, index_tip_entry, prepare_live_indexes, spawn_index_writebehind,
     IndexTipEntry, INDEX_STARTUP_GAP_HEIGHTS,
 };
+
+/// Count `{height}.bin` reads on this thread. Debug tests use this to pin
+/// one read per height. A release build does not record.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_spill_read_trace() {
+    SPILL_READ_TRACE.with(|on| on.set(true));
+    SPILL_READS.with(|n| n.set(0));
+}
+
+/// Stop recording and return the file reads since [`arm_spill_read_trace`].
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_spill_reads() -> u32 {
+    SPILL_READ_TRACE.with(|on| on.set(false));
+    SPILL_READS.with(|n| n.replace(0))
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SPILL_READ_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SPILL_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn note_spill_file_read() {
+    #[cfg(debug_assertions)]
+    SPILL_READ_TRACE.with(|on| {
+        if on.get() {
+            SPILL_READS.with(|n| n.set(n.get().saturating_add(1)));
+        }
+    });
+}
 pub use rbitcoin_consensus::{
     block_wire_len_from_pres, decode_block_precomputes, pres_for_tip, IdMap, OutPointHasher,
     OutPointSet, TxConnectPrecompute, TxPrecompute, TxScriptPrecompute, TxidHasher, TxidMap,
@@ -98,7 +130,9 @@ pub use soft_densify::{
     soft_confirm_window_n, soft_densify_band_hi, BQ_ASSIGN_STOP_BYTES, BQ_SOFT_FREE_BYTES,
     TIP_HOLE_MIN_AHEAD_BLOCKS,
 };
-pub use sp_read::{tweaks_at_height, tweaks_for_height, tweaks_from_thin_and_body};
+pub use sp_read::{
+    tweaks_at_height, tweaks_for_height, tweaks_from_pruned_keep, tweaks_from_thin_and_body,
+};
 pub use sp_tweaks::{BlockSpOutpoints, ThinTweakRangeLimits, ThinTweakRow};
 pub use versionbits::{
     compute_block_version, DeploymentState, ThresholdState, VERSIONBITS_TOP_BITS,
@@ -454,6 +488,10 @@ pub struct Query {
     /// when every enabled index is contiguous with the tip. Load reads it;
     /// the write thread is the only writer.
     pub index_live: std::sync::atomic::AtomicBool,
+    /// Pruned confirm appends tweak rows when that watermark already follows
+    /// the tip, even if a lagging filter index keeps [`Self::index_live`] off.
+    /// Unpruned tweaks stay on `index_live`.
+    pub tweak_follow: std::sync::atomic::AtomicBool,
     /// BIP158 basic filter table, opened when the index is first turned on.
     pub block_filters: std::sync::OnceLock<rbitcoin_store::BlockFilterTable>,
     pub bf_wb: block_filter::BlockFilterWriteBehind,
@@ -542,6 +580,8 @@ pub struct Query {
     pub spill_unlinked_through: AtomicU32,
     /// Operator `--prune-seqsigwit` (advertise NETWORK_LIMITED even before a drop).
     pub prune_seqsigwit: AtomicBool,
+    /// This process created `seqsigwit.window` and has not synced `store/` since.
+    seqsigwit_window_dir_fresh: AtomicBool,
     /// True while the net IBD engine is active.
     pub ibd_mode: AtomicBool,
     /// In prune+IBD mode, cap for recent witness kept in RAM.
@@ -667,6 +707,7 @@ impl Query {
             sh_force_rebuild: std::sync::atomic::AtomicBool::new(false),
             block_filter_enabled: std::sync::atomic::AtomicBool::new(false),
             index_live: std::sync::atomic::AtomicBool::new(false),
+            tweak_follow: std::sync::atomic::AtomicBool::new(false),
             block_filters: std::sync::OnceLock::new(),
             bf_wb: block_filter::BlockFilterWriteBehind::new(),
             sp_tweaks: Mutex::new(sp_tweaks),
@@ -710,6 +751,7 @@ impl Query {
             sealed_tip,
             spill_unlinked_through: AtomicU32::new(u32::MAX),
             prune_seqsigwit: AtomicBool::new(prune_on),
+            seqsigwit_window_dir_fresh: AtomicBool::new(false),
             ibd_mode: AtomicBool::new(false),
             seqsigwit_ram_threshold_bytes: AtomicU64::new(
                 Self::DEFAULT_SEQSIGWIT_RAM_THRESHOLD_BYTES,
@@ -732,7 +774,154 @@ impl Query {
             q.repair_sp_tweaks(t)?;
         }
         q.sweep_spill_at_or_below_pruneheight()?;
+        q.release_pruned_seqsigwit_stem()?;
         Ok(q)
+    }
+
+    /// Rewrite the keep window from the witness stem, then cut that stem
+    /// down to its header. A file already in the window is replaced when
+    /// the locator still names the rows. Master wrote those files in the
+    /// clear, and skipping one would keep the wrong bytes after the stem
+    /// is gone. A locator that is already empty cannot be read. The window
+    /// files from the earlier sync stay, and the leftover body is cut. A
+    /// stem that is already only a header is left alone, including the
+    /// create slack.
+    pub fn release_pruned_seqsigwit_stem(&self) -> Result<(), QueryError> {
+        if !self.prune_seqsigwit() || !self.store.txs.seqsigwit_stem_needs_release() {
+            return Ok(());
+        }
+        if self.store.txs.seqsigwit_loc.count() > 0 {
+            self.rewrite_keep_window_from_stem()?;
+        }
+        // A crash that keeps a truncated locator cannot read the stem.
+        // The spill files have to be durable before that truncate.
+        self.sync_keep_window_files()?;
+        // Schema 27 is on disk before the locator goes to zero. A crash
+        // that leaves schema 26 and an empty locator is what a 26 binary wipes.
+        rbitcoin_store::store::rewrite_meta_current(self.store.path())?;
+        self.store.txs.input.flush()?;
+        self.store.set_prune_seqsigwit_mode(true);
+        let before = std::fs::metadata(self.store.txs.seqsigwit.body_file_path())
+            .map(|m| m.len())
+            .unwrap_or_else(|_| self.store.txs.seqsigwit.body_logical_len());
+        let keep = self
+            .tip_height()
+            .map(|t| t.0.saturating_add(1).min(Self::SEQSIGWIT_KEEP_HEIGHTS))
+            .unwrap_or(0);
+        rbitcoin_log::info!(
+            "seqsigwit: cut the witness stem from {} to its header after keeping the last {keep} blocks",
+            fmt_byte_size(before)
+        );
+        self.store.txs.cut_seqsigwit_stem_to_header()
+    }
+
+    /// First height whose scriptSig and witness must still be on disk.
+    fn seqsigwit_keep_lo(&self, tip: u32) -> u32 {
+        match self.pruneheight() {
+            Some(ph) => ph.0.saturating_add(1),
+            None => tip.saturating_sub(Self::SEQSIGWIT_KEEP_HEIGHTS.saturating_sub(1)),
+        }
+    }
+
+    /// Prune mode has no `seqsigwit.body` row for a new block. The tip flush
+    /// is the commit, so every keep-window file has to exist before it runs.
+    pub(crate) fn require_pruned_keep_spills(&self) -> Result<(), QueryError> {
+        if !self.prune_seqsigwit() {
+            return Ok(());
+        }
+        let Some(tip) = self.tip_height() else {
+            return Ok(());
+        };
+        let from = self.seqsigwit_keep_lo(tip.0);
+        if from > tip.0 {
+            return Ok(());
+        }
+        for h in from..=tip.0 {
+            let path = self.seqsigwit_spill_file(h)?;
+            if !path.is_file() {
+                return Err(StoreError::Corrupt("seqsigwit window miss"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every keep height is written from the stem, including one that already
+    /// has a file. This runs only while the locator still names those rows.
+    fn rewrite_keep_window_from_stem(&self) -> Result<(), QueryError> {
+        let Some(tip) = self.tip_height() else {
+            return Ok(());
+        };
+        let from = self.seqsigwit_keep_lo(tip.0);
+        if from > tip.0 {
+            return Ok(());
+        }
+        for h in from..=tip.0 {
+            let fks = self.block_tx_fks(Height(h))?;
+            if fks.is_empty() {
+                return Err(StoreError::Corrupt("seqsigwit window miss"));
+            }
+            let mut owned = Vec::with_capacity(fks.len());
+            for fk in fks {
+                owned.push((fk, self.store.txs.seqsigwit_inputs_from_stem(fk)?));
+            }
+            let rows: Vec<(Fk, &[InputRecord])> = owned
+                .iter()
+                .map(|(fk, ins)| (*fk, ins.as_slice()))
+                .collect();
+            self.write_synced_seqsigwit_spill(Height(h), &rows)?;
+        }
+        Ok(())
+    }
+
+    /// `sync_all` every keep-window file and its directory.
+    ///
+    /// [`Self::write_synced_seqsigwit_spill`] already syncs a file it just
+    /// wrote. Files copied by an earlier process are still only a rename until
+    /// this runs, and the stem cut throws away the other copy.
+    fn sync_keep_window_files(&self) -> Result<(), QueryError> {
+        let Some(tip) = self.tip_height() else {
+            return Ok(());
+        };
+        let from = self.seqsigwit_keep_lo(tip.0);
+        if from > tip.0 {
+            return Ok(());
+        }
+        for h in from..=tip.0 {
+            let path = self.seqsigwit_spill_file(h)?;
+            // Windows `FlushFileBuffers` needs a write handle. A read-only
+            // open returns access denied, and this path runs on enable.
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|e| StoreError::io(&path, e))?;
+            file.sync_all().map_err(|e| StoreError::io(&path, e))?;
+        }
+        self.sync_spill_dir()
+    }
+
+    fn sync_spill_dir(&self) -> Result<(), QueryError> {
+        let dir = self.seqsigwit_spill_dir();
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        rbitcoin_store::file::fsync_parent_dir(&dir).map_err(|e| StoreError::io(&dir, e))?;
+        // The window directory's dirent lives in `store/`. The sidecar rename
+        // syncs that parent before `create_dir_all`, so the parent has to be
+        // synced once, when this process created the directory. Later calls
+        // only sync the window directory itself.
+        if self
+            .seqsigwit_window_dir_fresh
+            .swap(false, AtomicOrdering::AcqRel)
+        {
+            if let Some(parent) = dir.parent() {
+                if !parent.as_os_str().is_empty() {
+                    rbitcoin_store::file::fsync_parent_dir(parent)
+                        .map_err(|e| StoreError::io(parent, e))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -882,10 +1071,15 @@ impl Query {
 
     pub fn set_prune_seqsigwit(&self, on: bool) -> Result<(), QueryError> {
         let was_on = self.prune_seqsigwit();
-        if on && self.sptweaks_enabled() {
-            return Err(StoreError::Layout(
-                "refusing --prune-seqsigwit while silent payment tweaks are enabled".into(),
-            ));
+        // First cut only. A later start of an already-pruned datadir does not
+        // shorten the stem here, and a lagging tweak index must not abort it.
+        // Enabling tweaks still checks the persisted prune height.
+        if on
+            && !was_on
+            && (self.sptweaks_enabled()
+                || rbitcoin_store::SpTweaksTable::files_present(self.store.cold_files_dir()))
+        {
+            self.refuse_adding_prune_with_tweaks(self.sptweaks_origin())?;
         }
         if !on && self.prune_seqsigwit() {
             return Err(StoreError::Layout(
@@ -895,16 +1089,48 @@ impl Query {
         self.prune_seqsigwit.store(on, AtomicOrdering::Release);
         if on {
             if self.pruneheight().is_none() {
-                self.persist_pruneheight(u32::MAX)?;
+                // Record the real watermark before the stem cut. A crash
+                // in between used to reopen as "nothing dropped" with the
+                // witnesses already gone. Tip below 288 still drops nothing.
+                // A tweak hold leaves the sidecar unset on purpose and keeps
+                // the window file. Writing the predicted height here unlinks
+                // that file before startup can repair from it.
+                if let Some(h) = self.predicted_pruneheight() {
+                    if self.unset_prune_is_held(h) {
+                        self.persist_pruneheight(u32::MAX)?;
+                    } else {
+                        self.set_pruneheight(Some(Height(h)))?;
+                    }
+                } else {
+                    self.persist_pruneheight(u32::MAX)?;
+                }
             }
-            if !was_on {
+            // Seed while the stem is still readable. Later confirms must not
+            // append it.
+            // The stem still names rows, so release rewrites every keep file
+            // before the cut. Seeding would write those same files once and
+            // then throw that copy away. An empty locator cannot be rewritten.
+            if !was_on && self.store.txs.seqsigwit_loc.count() == 0 {
                 self.seed_recent_seqsigwit_from_store()?;
             }
+            self.store.set_prune_seqsigwit_mode(true);
+            self.release_pruned_seqsigwit_stem()?;
         } else {
             self.clear_seqsigwit_ram_window();
             self.set_pruneheight(None)?;
         }
         Ok(())
+    }
+
+    /// The sidecar still says nothing was dropped, the witness stem is already
+    /// a header, and `{predicted}.bin` is still on disk. Tweaks held the prune.
+    /// A crash that unlinked that file before the sidecar write leaves it gone.
+    pub(crate) fn unset_prune_is_held(&self, predicted: u32) -> bool {
+        if self.store.txs.seqsigwit_loc.count() > 0 {
+            return false;
+        }
+        self.seqsigwit_spill_file(predicted)
+            .is_ok_and(|path| path.is_file())
     }
 
     /// Durable-later watermark: creates at this height and below have no seqsigwit.
@@ -966,7 +1192,7 @@ impl Query {
         }
         self.spill_unlinked_through
             .store(new_h, AtomicOrdering::Release);
-        Ok(())
+        self.sync_spill_dir()
     }
 
     #[doc(hidden)]
@@ -995,23 +1221,34 @@ impl Query {
         }
         self.spill_unlinked_through
             .store(ph.0, AtomicOrdering::Release);
-        Ok(())
+        self.sync_spill_dir()
     }
 
     #[doc(hidden)]
     pub fn persist_pruneheight(&self, v: u32) -> Result<(), QueryError> {
         let path = self.store.path().join("seqsigwit.prune");
-        std::fs::write(&path, v.to_le_bytes()).map_err(|e| StoreError::io(path, e))
+        // The stem cut and the spill unlink both throw away witness. The
+        // sidecar has to be durable before either one, or a crash reopens
+        // the chain with no prune mode and a locator that no longer covers.
+        rbitcoin_store::file::write_synced_tmp_rename(&path, &v.to_le_bytes())?;
+        Ok(())
     }
 
     #[doc(hidden)]
     pub fn persist_pruneheight_clear(&self) -> Result<(), QueryError> {
         let path = self.store.path().join("seqsigwit.prune");
         match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(StoreError::io(path, e)),
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StoreError::io(&path, e)),
         }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                rbitcoin_store::file::fsync_parent_dir(parent)
+                    .map_err(|e| StoreError::io(parent, e))?;
+            }
+        }
+        Ok(())
     }
 
     pub const SEQSIGWIT_KEEP_HEIGHTS: u32 = 288;
@@ -1028,10 +1265,18 @@ impl Query {
         let Some(tip) = tip else {
             return Ok(());
         };
-        if tip.0 <= Self::SEQSIGWIT_KEEP_HEIGHTS {
+        // Tip 287 is heights 0..=287: the whole keep window, nothing dropped.
+        // Tip 288 is one past that, so height 0 is gone and the watermark is 0.
+        if tip.0 < Self::SEQSIGWIT_KEEP_HEIGHTS {
             return Ok(());
         }
-        self.set_pruneheight(Some(Height(tip.0 - Self::SEQSIGWIT_KEEP_HEIGHTS)))
+        let next = tip.0 - Self::SEQSIGWIT_KEEP_HEIGHTS;
+        // A shorter fork must not ask for a spill that was already deleted.
+        // Once a height is dropped it stays dropped.
+        if self.pruneheight().is_some_and(|ph| next < ph.0) {
+            return Ok(());
+        }
+        self.set_pruneheight(Some(Height(next)))
     }
 
     /// `false` when this create's connected height is at/below [`Self::pruneheight`].
@@ -1134,23 +1379,27 @@ impl Query {
         height: Height,
         rows: &[(Fk, &[InputRecord])],
     ) -> Result<(), QueryError> {
+        self.write_synced_seqsigwit_spill(height, rows)?;
+        // One height, one directory sync. A confirm batch syncs once after
+        // every file instead of calling this.
+        self.sync_spill_dir()
+    }
+
+    /// Sync the spill file only. The caller fsyncs `seqsigwit.window` and
+    /// `store/` after the batch, before the tip flush.
+    fn write_synced_seqsigwit_spill(
+        &self,
+        height: Height,
+        rows: &[(Fk, &[InputRecord])],
+    ) -> Result<(), QueryError> {
         let dir = self.seqsigwit_spill_dir();
+        let created = !dir.is_dir();
         std::fs::create_dir_all(&dir).map_err(|e| StoreError::io(&dir, e))?;
+        if created {
+            self.seqsigwit_window_dir_fresh
+                .store(true, AtomicOrdering::Release);
+        }
         let path = self.seqsigwit_spill_file(height.0)?;
-        let tmp_name = format!("{}.bin.tmp", height.0);
-        if tmp_name
-            .strip_suffix(".bin.tmp")
-            .and_then(|s| s.parse::<u32>().ok())
-            != Some(height.0)
-        {
-            return Err(StoreError::Corrupt("invariant: seqsigwit spill name"));
-        }
-        let tmp = dir.join(&tmp_name);
-        if !tmp.starts_with(&dir) {
-            return Err(StoreError::Corrupt(
-                "invariant: seqsigwit spill path escaped window dir",
-            ));
-        }
         let mut out = Vec::new();
         for (fk, ins) in rows {
             let Some(id) = fk.get() else {
@@ -1158,12 +1407,19 @@ impl Query {
             };
             out.extend_from_slice(&id.to_le_bytes());
             let mut enc = Vec::new();
-            rbitcoin_store::encode_seqsigwit_with_secret(ins, &mut enc, None);
+            rbitcoin_store::encode_seqsigwit_with_secret(
+                ins,
+                &mut enc,
+                Some(self.store.txs.store_secret()),
+            );
             out.extend_from_slice(&(enc.len() as u32).to_le_bytes());
             out.extend_from_slice(&enc);
         }
-        std::fs::write(&tmp, out).map_err(|e| StoreError::io(&tmp, e))?;
-        std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))
+        // Rename without a file sync is not a copy. This file is the only
+        // witness once the stem is cut or the tip flush commits the height.
+        rbitcoin_store::file::write_file_synced_tmp_rename(&path, &out)?;
+        note_keep_write();
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -1181,6 +1437,11 @@ impl Query {
         if self.pruneheight().is_some_and(|ph| height <= ph.0) {
             return Ok(None);
         }
+        self.read_spill_row(height, fk, input_count)
+    }
+
+    /// Bytes of `{height}.bin`, or `None` when the height file is absent.
+    fn read_spill_bytes(&self, height: u32) -> Result<Option<Vec<u8>>, QueryError> {
         let path = self.seqsigwit_spill_file(height)?;
         let canon = match path.canonicalize() {
             Ok(p) => p,
@@ -1196,11 +1457,68 @@ impl Query {
                 "invariant: seqsigwit spill path escaped window dir",
             ));
         }
-        let raw = match std::fs::read(&canon) {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(StoreError::io(&canon, e)),
+        match std::fs::read(&canon) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StoreError::io(&canon, e)),
+        }
+    }
+
+    /// Every wanted tx in `{height}.bin`, one file read.
+    fn read_spill_rows(
+        &self,
+        height: u32,
+        wants: &[(Fk, u32)],
+    ) -> Result<std::collections::HashMap<Fk, Vec<InputRecord>>, QueryError> {
+        let mut out = std::collections::HashMap::new();
+        if wants.is_empty() || self.pruneheight().is_some_and(|ph| height <= ph.0) {
+            return Ok(out);
+        }
+        let Some(raw) = self.read_spill_bytes(height)? else {
+            return Ok(out);
         };
+        note_spill_file_read();
+        let mut need: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for (fk, n_in) in wants {
+            if let Some(id) = fk.get() {
+                need.insert(id, *n_in);
+            }
+        }
+        let mut i = 0usize;
+        while i.saturating_add(12) <= raw.len() && !need.is_empty() {
+            let id = u64::from_le_bytes(raw[i..i + 8].try_into().unwrap());
+            i += 8;
+            let n = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            if i.saturating_add(n) > raw.len() {
+                return Err(StoreError::Corrupt("seqsigwit spill short row"));
+            }
+            if let Some(n_in) = need.remove(&id) {
+                let mut ins = rbitcoin_store::decode_seqsigwit_secret(
+                    &raw[i..i + n],
+                    n_in,
+                    Some(self.store.txs.store_secret()),
+                )?;
+                self.store.stamp_input_prevouts(Fk(id), &mut ins)?;
+                out.insert(Fk(id), ins);
+            }
+            i += n;
+        }
+        Ok(out)
+    }
+
+    /// One tx inside `{height}.bin`. The confirm height is known before the
+    /// fence publishes it, so a reconnect can read the file without `tx_height`.
+    fn read_spill_row(
+        &self,
+        height: u32,
+        fk: Fk,
+        input_count: u32,
+    ) -> Result<Option<Vec<InputRecord>>, QueryError> {
+        let Some(raw) = self.read_spill_bytes(height)? else {
+            return Ok(None);
+        };
+        note_spill_file_read();
         let mut i = 0usize;
         let want = fk.get().ok_or(StoreError::InvalidFk)?;
         while i.saturating_add(12) <= raw.len() {
@@ -1212,8 +1530,11 @@ impl Query {
                 return Err(StoreError::Corrupt("seqsigwit spill short row"));
             }
             if id == want {
-                let mut ins =
-                    rbitcoin_store::decode_seqsigwit_secret(&raw[i..i + n], input_count, None)?;
+                let mut ins = rbitcoin_store::decode_seqsigwit_secret(
+                    &raw[i..i + n],
+                    input_count,
+                    Some(self.store.txs.store_secret()),
+                )?;
                 self.store.stamp_input_prevouts(fk, &mut ins)?;
                 return Ok(Some(ins));
             }
@@ -1242,6 +1563,58 @@ impl Query {
         }
     }
 
+    /// The height file holds every tx in this header. RAM does not count:
+    /// shutdown can drop it, and the tip must not outlive the file.
+    /// A height at or below the prune height is covered: its witness was
+    /// dropped on purpose, and confirming it again must stay a no-op.
+    pub(crate) fn pruned_spill_covers(&self, header_fk: Fk) -> Result<bool, QueryError> {
+        if !self.prune_seqsigwit() {
+            return Ok(true);
+        }
+        let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
+            return Ok(false);
+        };
+        if tx_fks.is_empty() {
+            return Ok(false);
+        }
+        if let Some(ph) = self.pruneheight() {
+            if self
+                .store
+                .tx_height_get(tx_fks[0])?
+                .is_some_and(|h| h <= ph.0)
+            {
+                return Ok(true);
+            }
+        }
+        let Some(height) = self.store.tx_height_get(tx_fks[0])? else {
+            return Ok(false);
+        };
+        note_keep_read();
+        let Some(raw) = self.read_spill_bytes(height)? else {
+            return Ok(false);
+        };
+        let mut have = Vec::with_capacity(tx_fks.len());
+        let mut i = 0usize;
+        while i.saturating_add(12) <= raw.len() {
+            let id = u64::from_le_bytes(raw[i..i + 8].try_into().unwrap());
+            i += 8;
+            let n = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            if i.saturating_add(n) > raw.len() {
+                return Err(StoreError::Corrupt("seqsigwit spill short row"));
+            }
+            have.push(id);
+            i += n;
+        }
+        for fk in tx_fks {
+            let id = fk.get().ok_or(StoreError::InvalidFk)?;
+            if !have.contains(&id) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn note_seqsigwit_ram_for_confirmed(
         &self,
         height: Height,
@@ -1252,29 +1625,48 @@ impl Query {
         }
         let threshold = self.seqsigwit_ram_threshold_bytes();
         let mut staged: Vec<(Fk, Vec<InputRecord>, u64)> = Vec::with_capacity(tx_fks.len());
-        let mut appended = self.seqsigwit_append_cache.lock().unwrap();
-        for &fk in tx_fks {
-            let ins = if let Some(id) = fk.get() {
-                if let Some(v) = appended.remove(&id) {
-                    v
+        // Ids taken from the append cache. A failed spill puts these rows back
+        // so the retry still has the witness. Rows loaded from the store stay out.
+        let mut from_cache: Vec<u64> = Vec::new();
+        let built = (|| -> Result<(), QueryError> {
+            let mut appended = self.seqsigwit_append_cache.lock().unwrap();
+            for &fk in tx_fks {
+                let ins = if let Some(id) = fk.get() {
+                    if let Some(v) = appended.remove(&id) {
+                        from_cache.push(id);
+                        v
+                    } else {
+                        self.inputs_for_seal(height, fk)?
+                    }
                 } else {
-                    let (_tx, ins, _outs) = self.store.get_tx_full(fk)?;
-                    ins
+                    self.inputs_for_seal(height, fk)?
+                };
+                let bytes = ins.iter().map(|i| i.encoded_len() as u64).sum();
+                staged.push((fk, ins, bytes));
+            }
+            drop(appended);
+            self.drop_seqsigwit_ram_height(height.0);
+            let spill_rows: Vec<(Fk, &[InputRecord])> = staged
+                .iter()
+                .map(|(fk, ins, _)| (*fk, ins.as_slice()))
+                .collect();
+            self.write_synced_seqsigwit_spill(height, &spill_rows)?;
+            Ok(())
+        })();
+        if let Err(e) = built {
+            if !from_cache.is_empty() {
+                let mut cache = self.seqsigwit_append_cache.lock().unwrap();
+                for (fk, ins, _) in staged {
+                    let Some(id) = fk.get() else {
+                        continue;
+                    };
+                    if from_cache.contains(&id) {
+                        cache.entry(id).or_insert(ins);
+                    }
                 }
-            } else {
-                let (_tx, ins, _outs) = self.store.get_tx_full(fk)?;
-                ins
-            };
-            let bytes = ins.iter().map(|i| i.encoded_len() as u64).sum();
-            staged.push((fk, ins, bytes));
+            }
+            return Err(e);
         }
-        drop(appended);
-        self.drop_seqsigwit_ram_height(height.0);
-        let spill_rows: Vec<(Fk, &[InputRecord])> = staged
-            .iter()
-            .map(|(fk, ins, _)| (*fk, ins.as_slice()))
-            .collect();
-        self.persist_seqsigwit_spill_height(height, &spill_rows)?;
         if threshold == 0 {
             return Ok(());
         }
@@ -1312,26 +1704,39 @@ impl Query {
         Ok(())
     }
 
+    /// Witness for a height being sealed. The spill file is keyed by that
+    /// height, which may not be on the fence yet.
+    fn inputs_for_seal(&self, height: Height, fk: Fk) -> Result<Vec<InputRecord>, QueryError> {
+        let tx = self.get_tx(fk)?;
+        if self.pruneheight().is_none_or(|ph| height.0 > ph.0) {
+            if let Some(ins) = self.read_spill_row(height.0, fk, tx.input_count)? {
+                return Ok(ins);
+            }
+        }
+        if self.store.prune_seqsigwit_mode() {
+            return Err(StoreError::Corrupt("seqsigwit window miss"));
+        }
+        let (_tx, ins, _outs) = self.store.get_tx_full(fk)?;
+        Ok(ins)
+    }
+
     #[doc(hidden)]
     pub fn seed_recent_seqsigwit_from_store(&self) -> Result<(), QueryError> {
         let Some(tip) = self.tip_height() else {
             return Ok(());
         };
-        let from = tip
-            .0
-            .saturating_sub(Self::SEQSIGWIT_KEEP_HEIGHTS.saturating_sub(1));
+        let from = self.seqsigwit_keep_lo(tip.0);
         for h in from..=tip.0 {
-            let tx_fks = match self.block_tx_fks(Height(h)) {
-                Ok(v) => v,
-                Err(StoreError::NotFound) => continue,
-                Err(e) => return Err(e),
-            };
+            let tx_fks = self.block_tx_fks(Height(h))?;
             if tx_fks.is_empty() {
-                continue;
+                return Err(StoreError::Corrupt("seqsigwit window miss"));
             }
             self.note_seqsigwit_ram_for_confirmed(Height(h), &tx_fks)?;
         }
-        Ok(())
+        // An empty locator cannot be rewritten from the stem. These writes
+        // are the keep window. A locator that still names rows skips this
+        // and `release_pruned_seqsigwit_stem` writes each file once.
+        self.sync_spill_dir()
     }
 
     /// After `head_insert_many` returned these fks (inclusive max).
@@ -1619,6 +2024,8 @@ impl Query {
     /// See [`rbitcoin_store::Store::flush_for_shutdown`].
     pub fn flush_for_shutdown(&self) -> Result<(), QueryError> {
         let _commit = self.lock_tip_commit()?;
+        // A tip whose keep-window file is missing must not become the disk tip.
+        self.require_pruned_keep_spills()?;
         self.store.flush_for_shutdown()
     }
 }
@@ -2947,6 +3354,70 @@ pub fn wire_header(rec: &HeaderRecord, prev_blockhash: BlockHash) -> BlockHeader
         bits: CompactTarget::from_consensus(rec.bits),
         nonce: rec.nonce,
     }
+}
+
+#[cfg(debug_assertions)]
+std::thread_local! {
+    static KEEP_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static KEEP_WRITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static KEEP_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_keep_io_trace() {
+    KEEP_TRACE.with(|on| on.set(true));
+    KEEP_READS.with(|n| n.set(0));
+    KEEP_WRITES.with(|n| n.set(0));
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_keep_reads() -> u64 {
+    KEEP_TRACE.with(|on| on.set(false));
+    KEEP_READS.with(|n| n.replace(0))
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_keep_writes() -> u64 {
+    KEEP_TRACE.with(|on| on.set(false));
+    KEEP_WRITES.with(|n| n.replace(0))
+}
+
+/// On-disk size for the stem-cut log. GiB and MiB use one decimal.
+fn fmt_byte_size(n: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if n >= GIB {
+        let whole = n / GIB;
+        let frac = (n % GIB) * 10 / GIB;
+        format!("{whole}.{frac} GiB")
+    } else if n >= MIB {
+        let whole = n / MIB;
+        let frac = (n % MIB) * 10 / MIB;
+        format!("{whole}.{frac} MiB")
+    } else {
+        format!("{n} B")
+    }
+}
+
+fn note_keep_read() {
+    #[cfg(debug_assertions)]
+    KEEP_TRACE.with(|on| {
+        if on.get() {
+            KEEP_READS.with(|n| n.set(n.get().saturating_add(1)));
+        }
+    });
+}
+
+fn note_keep_write() {
+    #[cfg(debug_assertions)]
+    KEEP_TRACE.with(|on| {
+        if on.get() {
+            KEEP_WRITES.with(|n| n.set(n.get().saturating_add(1)));
+        }
+    });
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

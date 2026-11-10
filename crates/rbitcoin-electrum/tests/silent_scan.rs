@@ -237,3 +237,90 @@ fn tx_matches_bip352_simple_send() {
     };
     assert!(!tx_matches(&sub, &miss));
 }
+
+/// A pruned scan used to ask for the witness walk, which refuses, and the
+/// server turned that error into an empty history. The sealed index still
+/// has the payment.
+#[test]
+fn pruned_scan_returns_a_sealed_payment() {
+    use bitcoin::secp256k1::{PublicKey, Scalar, SecretKey};
+    use rbitcoin_consensus::silent_payments::tagged_hash;
+    use rbitcoin_consensus::ChainParams;
+    use rbitcoin_primitives::{hex_encode, Fk, Height};
+    use rbitcoin_query::testutil::FixtureChain;
+    use rbitcoin_query::tweaks_for_height;
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let secp = Secp256k1::new();
+    let scan_sk = SecretKey::from_slice(&[0x11; 32]).unwrap();
+    let spend_pk = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22; 32]).unwrap());
+    let a = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x33; 32]).unwrap());
+    let tweak = a.serialize();
+    let scan_scalar = Scalar::from_be_bytes(scan_sk.secret_bytes()).unwrap();
+    let shared = a.mul_tweak(&secp, &scan_scalar).unwrap();
+    let mut payload = [0u8; 37];
+    payload[..33].copy_from_slice(&shared.serialize());
+    let tk = SecretKey::from_slice(&tagged_hash(b"BIP0352/SharedSecret", &payload)).unwrap();
+    let output = spend_pk
+        .combine(&PublicKey::from_secret_key(&secp, &tk))
+        .unwrap();
+    let mut script = rbitcoin_primitives::P2TR_PREFIX.to_vec();
+    script.extend_from_slice(&output.x_only_public_key().0.serialize());
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("el-scan-hit");
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    let mut merkle = [0u8; 32];
+    merkle[31] = 0xcb;
+    let header = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207fffff,
+        nonce: 0,
+        merkle_root: merkle,
+        hash: merkle,
+        size: 0,
+        weight: 0,
+    };
+    let fk = q
+        .connect_block(
+            Height(0),
+            &header,
+            &[TxApply {
+                tx: TxRecord {
+                    txid: merkle,
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, script)],
+            }],
+        )
+        .unwrap();
+    q.put_sp_tweaks_block(Height(0), fk, &[Some(tweak)])
+        .unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    let chain = ChainParams::regtest();
+    let walked = tweaks_for_height(&q, &chain, Height(0)).unwrap_err();
+    assert!(
+        walked.to_string().contains("unavailable"),
+        "the witness walk must stay refused, got {walked}"
+    );
+    let sub = parse_sub(
+        &json!([
+            hex_encode(scan_sk.secret_bytes()),
+            hex_encode(spend_pk.serialize())
+        ]),
+        Network::Regtest,
+        Some(0),
+    )
+    .unwrap();
+    let hits = scan_hits(&q, &chain, &sub, 0, 0).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0]["height"], 0);
+    drop(q);
+    let _ = std::fs::remove_dir_all(&dir);
+}

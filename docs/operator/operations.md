@@ -93,17 +93,20 @@ Clean smoke:
 | `--no-seeds` | `no_seeds=` | seeds on |
 | `--sh-index` | `sh_index=` | **off** — Class B scripthash (address/history; Electrum/Esplora start without it) |
 | `--block-filter-index` | `block_filter_index=` | **off** — BIP158 basic filters. Independent of `--sh-index`. IBD seals them when the flag is on from the start. A later enable still materializes after catch-up: the `rbtc-idx-wb` builder fills the gap from Class A in the background (`index: build from=… to=…`, progress every 10 s with `read=` `build=` `commit=` ms for that interval, `index: build done`). A caught-up chain seals new blocks on the confirm write thread; follow, relay, and Electrum do not wait for it. With `--sp-tweaks` the same pass builds both indexes. Works with `--prune-seqsigwit`. `tip: accept` shows `bf=` and `bf_lag=`. `NODE_COMPACT_FILTERS` is advertised once filters first reach the tip (`blockfilter: caught up …`); peers that connected earlier do not learn the bit. RPC `getblockfilter` serves a sealed height, one block whose parent filter is already sealed, and a stale branch back to that sealed fork point. An unsealed best-chain gap is refused. `/rest/blockfilter/` and P2P serve heights the watermark covers; a stop past the watermark is silence |
-| `--prune-seqsigwit` | `prune_seqsigwit=` | **off** — unpruned reads `seqsigwit.body`. On: refuse wire reconstruct below tip−288 **heights**, advertise `NETWORK_LIMITED`, and keep those heights as `store/seqsigwit.window/{height}.bin` plus a RAM cache. Refused with `--sp-tweaks`, and once pruned a datadir serves no tweaks |
+| `--prune-seqsigwit` | `prune_seqsigwit=` | **off** — unpruned reads `seqsigwit.body`. On: witness for the last 288 heights lives only in `store/seqsigwit.window/{height}.bin` plus a RAM cache, and `seqsigwit.body` / `seqsigwit.loc` stay header-sized. Enabling the flag on an archive copies that window out of the stem and cuts the stem. Wire reconstruct below the watermark is refused. Advertises `NETWORK_LIMITED`. `txout`, `input`, `txstat`, and block filters are not pruned. `--sp-tweaks` is allowed before taproot, and later once every height from that origin through the dropped range is sealed or still in the last 288 blocks. A restart whose watermark is still above the prune height, or whose chain has not dropped anything yet, repairs tweaks from the keep window. Enabling tweaks is refused when the index does not already cover every height that has been dropped or will be dropped. Turning this flag on after the tweak index is built is allowed when that index covers every height the cut will drop, and sealed rows keep being served from the index and txout. Startup reseals a tweak gap from the keep window before it advances the prune height |
 | `--datadir-hdd` | `datadir_hdd=` | **off** — main datadir is rotating media. The node does not probe the device. On: each Class A body stem is its own pwrite wave; the write thread holds the spindle across those pwrites and again across spend annotate; `tx.head` insert starts after annotate. Lookup and load wait before each bulk read. Script threads, RPC, scripthash extract, and the index builder do not. Off keeps one shared wave and overlaps the head insert. When `--store-read-budget` is omitted or `0`, this also selects 1 API store read |
 | `--prune-seqsigwit-ram-threshold-bytes N` | `prune_seqsigwit_ram_threshold_bytes=` | `268435456` (256 MiB). `0` keeps nothing in RAM: every height, including tiny IBD blocks, is read from its file |
 | `--electrum-max-subs N` | `electrum_max_subs=` | **10000** — `blockchain.scripthash.subscribe` per Electrum connection (>= 1). Wallets subscribe every receive/change address up to their gap limit. |
 | `--max-sh-creates N` | `max_sh_creates=` | **10000** — unpaged SH join above N is refused (503 / JSON-RPC error). **0** is unlimited. A request that names a page still returns that page. |
 | `--heavy-sh-creates N` | `heavy_sh_creates=` | **10000**: an unpaged SH join above N waits until no other such join runs, across every Electrum and Esplora client. **0** turns the wait off. Matters once `--max-sh-creates` is raised above it. NixOS `services.rbitcoin.heavyShCreates` (null omits the flag) |
-| `--sp-tweaks` | `sp_tweaks=` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`). IBD seals it from the taproot origin when the flag is on from the start. A later enable still materializes after catch-up on `rbtc-idx-wb` (with block filters, one read of Class A). New tips are sealed on the confirm write thread once the watermark has caught the chain. Heights not yet sealed are served by the naive walk. Refused with `--prune-seqsigwit`: tweaks read input keys from scriptSig and witness |
+| `--sp-tweaks` | `sp_tweaks=` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`). IBD seals it from the taproot origin when the flag is on from the start. A later enable still materializes after catch-up on `rbtc-idx-wb` (with block filters, one read of Class A). New tips are sealed on the confirm write thread once the watermark has caught the chain. Heights not yet sealed are served by the naive walk. With `--prune-seqsigwit`, a later enable is allowed before taproot, and after taproot once every height from that origin through the dropped range is sealed or still in the last 288 blocks. It is refused when the watermark does not already cover every height that has been dropped or will be dropped. Prune can be turned on after the index is built when that watermark already covers every height the cut will drop. Confirm then seals tweaks from the wire block even when the filter watermark is behind. Omitting this flag while the index files exist and `--prune-seqsigwit` is on logs how many blocks remain before the index cannot be enabled again. A caught-up index has 288. The error that refuses prune over a short index says to delete `store/sp_tweaks.idx` and `store/sp_tweaks.body`, or to catch the index up without `--prune-seqsigwit` and then turn prune on. An unpruned node logs a tweak enable failure and still starts. With prune on, a silent-payment scan and `blockchain.tweaks.subscribe` read the sealed index. An unsealed tip still in the keep window is built from that window. A height the index does not cover is an error. Neither falls through to the witness walk. Unpruned, a later enable still backfills on `rbtc-idx-wb` from `seqsigwit.body` |
 | `--sp-tweaks-dust SATS` | `sp_tweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |
 | `--electrum-listen [ADDR]` | `electrum_listen=` | disabled; omit ADDR → `127.0.0.1:50001`. Address/scripthash methods need `--sh-index` |
 | `--esplora-listen [ADDR\|PATH]` | `esplora_listen=` | disabled (Esplora REST); omit ADDR → `127.0.0.1:3000`; a filesystem path is unix HTTP (mode **0660**, dummy `Host: api` is fine). Address/scripthash methods need `--sh-index` |
-| `--esplora-onion[=0\|1]` | `esplora_onion=` | **on** — `ADD_ONION` for Esplora when `--tor-control` is set |
+| `--electrum-onion[=0\|1]` | `electrum_onion=` | **off** — `ADD_ONION` for Electrum. Needs `--tor-control` and `--electrum-listen` on `127.0.0.1` or `0.0.0.0` |
+| `--esplora-onion[=0\|1]` | `esplora_onion=` | **off** — `ADD_ONION` for Esplora. Needs `--tor-control` and a TCP `--esplora-listen` on `127.0.0.1` or `0.0.0.0` |
+| `--electrum-i2p[=0\|1]` | `electrum_i2p=` | **off** — I2P destination for Electrum (`{datadir}/i2p/electrum.priv`). Needs `--i2p-sam` and `--electrum-listen` on `127.0.0.1` or `0.0.0.0` |
+| `--esplora-i2p[=0\|1]` | `esplora_i2p=` | **off** — I2P destination for Esplora (`{datadir}/i2p/esplora.priv`). Needs `--i2p-sam` and a TCP `--esplora-listen` on `127.0.0.1` or `0.0.0.0` |
 | `--health-listen [ADDR]` | `health_listen=` | disabled; omit ADDR → `127.0.0.1:9332`. Unauthenticated `GET /healthz`, `/readyz`, and `/progress`, bound before the store opens ([Health probes and metrics](#health-probes-and-metrics)). A bind failure stops the node |
 | `--metrics[=0\|1]` | `metrics=` | **off** — Prometheus `GET /metrics` on the health listener. Refused without `--health-listen` |
 | `--esplora-max-inflight N` | `esplora_max_inflight=` | **256** — Esplora requests in flight across the whole listener (>= 1, at most tokio's semaphore limit). Further requests wait for a slot rather than being refused; the wait counts against the 120 s request timeout (**408**). One wallet rescan can fill it; raise it for a busy public listener. |
@@ -161,7 +164,9 @@ mempool_size_mb=100
 
 `--proxy 127.0.0.1:9050` sends every P2P outbound through SOCKS5 CONNECT
 (system `tor`, not Arti). DNS seeds are not resolved locally on that path —
-pass `--connect ADDR` (or reuse a `peers` file). `--proxy-randomize` (default
+pass `--connect ADDR` (or reuse a `peers` file). A `--connect` or `addnode`
+hostname goes to the proxy by name (SOCKS5 address type 3), so the proxy, not
+the OS resolver, looks it up. `--proxy-randomize` (default
 on) uses a fresh SOCKS username per peer so Tor isolates circuits.
 `--proxy` or `--onion` also turns on **isolated local-tx broadcast**, unless `--trust-peer` is set (that session is the only announcement path):
 `sendrawtransaction`, Electrum `transaction.broadcast`, and Esplora
@@ -220,13 +225,15 @@ addresses when a peer gossips them back.
 
 `--tor-control [HOST:PORT]` talks to **system tor** (SAFECOOKIE/COOKIE or password). Omit
 ADDR for `127.0.0.1:9051`. Failed AUTH is a start error. Unset: no control
-socket. With `--electrum-listen`, the node `ADD_ONION`s that TCP port to
+socket. With `--electrum-onion`, the node `ADD_ONION`s the Electrum TCP port to
 `127.0.0.1:<bound>` and logs `….onion:port`. The private key is
 `{datadir}/onion/electrum.priv` (0600). `server.features.hosts` is
 `{ "<id>.onion": { "tcp_port": N } }` with no `ssl_port`. With
-`--esplora-listen`, the same control port `ADD_ONION`s Esplora (`{datadir}/onion/esplora.priv`);
-REST is on that TCP port (`http://….onion:<port>`). `--esplora-onion=0`
-skips Esplora HS. `getnetworkinfo.localaddresses` lists those onion hostnames
+`--esplora-onion`, the same control port `ADD_ONION`s Esplora (`{datadir}/onion/esplora.priv`);
+REST is on that TCP port (`http://….onion:<port>`). Without the switch a
+wallet service stays off Tor (no Electrum onion: `server.features.hosts` is
+`{}`). Tor forwards to `127.0.0.1:<port>`, so a switch whose listener is bound
+elsewhere, or is a unix socket, is a start error. `getnetworkinfo.localaddresses` lists the onion hostnames
 even with `--no-discover`. Sparrow: `tcp://<id>.onion:50001` (plain TCP; no
 in-binary TLS). JSON-RPC stays off the onion (`rpc.sock` / `--rpc-listen` only).
 Cookie path differs by distro; pass `--tor-control-cookie` rather than globbing.
@@ -236,7 +243,10 @@ Omit ADDR for `127.0.0.1:7656`. Failed HELLO / `SESSION CREATE` is a start
 error. Unset: I2P rows may still load from `peers` v2 but are not dialed.
 `--only-net i2p` without `--i2p-sam` is a start error. `--i2p-accept-incoming`
 creates a persistent local destination (`{datadir}/i2p/p2p.priv`, 0600) and
-`STREAM FORWARD`s to the P2P bind. That destination is published as
+`STREAM FORWARD`s to the P2P bind. `--electrum-i2p` and `--esplora-i2p` give
+that wallet listener its own destination and forward (`i2p/electrum.priv`,
+`i2p/esplora.priv`); they need `--i2p-sam`, not `--i2p-accept-incoming`, and
+the same `127.0.0.1` reach as the onion switches. The P2P destination is published as
 `{52}.b32.i2p:0` (SAM 3.1 has no ports; Core refuses any other I2P port)
 on `getnetworkinfo.localaddresses` and in addrv2, including with
 `--no-discover`. With `--listen=0` that is a start error
@@ -277,9 +287,11 @@ A hot-store sidecar `seqsigwit.reloc` records the split. Opening without
 `--datadir-cold` then refuses. Do not leave a cold file in both places.
 `--prune-seqsigwit` is not this split. It writes `{store}/seqsigwit.prune`
 (the pruneheight) and keeps the 288-height window at
-`{store}/seqsigwit.window/{height}.bin` on the **hot** store, including when
-`seqsigwit.body` is on `--datadir-cold`. It does not delete `txstat`, `input`,
-block filters, or tweaks. A datadir that already has the prune sidecar refuses
+`{store}/seqsigwit.window/{height}.bin` on the **hot** store. The witness
+stem (`seqsigwit.body`, `seqsigwit.loc`, and its off/ovf) stays a header,
+including when those files sit on `--datadir-cold`. Enabling the flag on an
+archive copies the kept heights out and cuts the stem. It does not delete
+`txstat`, `input`, block filters, or tweaks. A datadir that already has the prune sidecar refuses
 to start unless the flag is set again
 (`datadir is pruned-seqsigwit; restart with --prune-seqsigwit enabled`).
 Disconnect at or below that pruneheight fails closed. Moving an
@@ -667,7 +679,10 @@ Do **not** wipe `store/` for mempool slot/full/schema errors.
   warm `peers` file or a DNS answer for IPv4 and IPv6 leaves only the empty
   overlays to fill. `--onion` alone keeps IPv4 and IPv6 reachable and
   dialed direct, as in Core; `--only-net onion` adds only onion seeds.
-  `--proxy` takes the SOCKS addr-fetch path above and adds no fixed seeds.
+  `--proxy` takes the SOCKS addr-fetch path above and adds no fixed seeds,
+  unless `--only-net` leaves no IPv4 or IPv6: then it asks no seed hostname
+  and adds the fixed seeds of the overlays it can reach.
+  As in Core, it asks no seed with `--connect` or on a custom signet.
 - **Outbound diversity:** live IBD and tip-follow peers prefer unused
   **netgroups**. With a Core `ip_asn.dat` (DecodeAsmap format) the group is
   **ASN**; without a file it is IPv4 `/16` or IPv6 `/32`. Place Core’s map at

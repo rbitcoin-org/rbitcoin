@@ -613,3 +613,51 @@ fn pruned_tx_json_has_fee_from_txstat() {
     assert!(raw.get("sigops").is_none(), "{raw}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Prune mode is on and this height is still served. The JSON is the full
+/// transaction, not a pruned stub and not a missing witness.
+#[test]
+fn kept_pruned_tx_json_serves_the_witness() {
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("esplora-kept-prune");
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut merkle = [0u8; 32];
+    merkle[0] = 0xab;
+    let h0 = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207fffff,
+        nonce: 0,
+        merkle_root: merkle,
+        hash: merkle,
+        size: 0,
+        weight: 0,
+    };
+    let mut txid = [0u8; 32];
+    txid[31] = 0xcb;
+    let ta0 = TxApply {
+        tx: TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord::coinbase(
+            u32::MAX,
+            vec![0x11, 0x22],
+            vec![vec![0x33]],
+        )],
+        outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+    };
+    q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+    let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    let v = build_tx_json(&q, fk, Network::Regtest, None).unwrap();
+    assert!(v.get("pruned").is_none(), "{v}");
+    assert_eq!(v["vin"][0]["is_coinbase"], true);
+    assert_eq!(v["vin"][0]["scriptsig"], "1122");
+    let _ = std::fs::remove_dir_all(&dir);
+}

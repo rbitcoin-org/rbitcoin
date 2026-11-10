@@ -580,6 +580,65 @@ async fn redial_skips_a_connect_target_still_dialling() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `--proxy` name goes through SOCKS like an IP peer, so its connect gets
+/// the SOCKS bound, not the 8 s direct one. A proxy that accepts and never
+/// answers frees the dial when that bound runs out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxied_name_connect_gets_the_socks_bound() {
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let wake_accept = Arc::clone(&wake);
+    let stall = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = proxy.accept().await {
+            held.push(sock);
+            wake_accept.notify_one();
+        }
+    });
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-proxied-name-bound-{n}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let connect_bound = Duration::from_millis(300);
+    let dialer =
+        rbitcoin_net::socks::Dialer::socks(proxy_addr, false).with_connect_floor(connect_bound);
+    let node = P2PNode::start_outbound_only(
+        Query::open_or_create_tiny(&dir).unwrap(),
+        ChainParams::regtest(),
+        Milestone::NONE,
+        "/rbitcoin:0.1.0(name-bound)/".into(),
+        0,
+        dialer.clone(),
+        rbitcoin_net::REDIAL_INTERVAL_TEST,
+    )
+    .await
+    .unwrap();
+    node.peers.set_proxies(rbitcoin_net::NetProxies {
+        dialer,
+        i2p_sam: None,
+    });
+    node.peers
+        .addnode_host("peer.invalid", "onetry", 18444)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), wake.notified())
+        .await
+        .expect("the name dial never reached the proxy");
+    let deadline = std::time::Instant::now() + connect_bound * 3;
+    while !node.peers.in_flight_nets().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a stalled SOCKS connect to a name must end at the SOCKS bound"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    stall.abort();
+    drop(node);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn outbound_connect_timeout_is_eight_seconds() {
     assert_eq!(OUTBOUND_CONNECT_TIMEOUT, Duration::from_secs(8));

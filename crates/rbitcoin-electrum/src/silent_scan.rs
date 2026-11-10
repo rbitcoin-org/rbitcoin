@@ -5,7 +5,7 @@ use bitcoin::Network;
 use rbitcoin_consensus::silent_payments::labeled_spend_key;
 use rbitcoin_consensus::{taproot_matches_scan, ChainParams};
 use rbitcoin_primitives::Height;
-use rbitcoin_query::tweaks_for_height;
+use rbitcoin_query::tweaks_at_height;
 use rbitcoin_query::Query;
 use serde_json::{json, Value};
 
@@ -111,7 +111,7 @@ pub fn scan_hits(
 ) -> Result<Vec<Value>, String> {
     let mut hits = Vec::new();
     for h in from..=to {
-        let map = tweaks_for_height(query, chain, Height(h)).map_err(|e| e.to_string())?;
+        let map = tweaks_at_height(query, chain, Height(h)).map_err(|e| e.to_string())?;
         for (txid, tw) in map {
             if tx_matches(sub, &tw) {
                 hits.push(json!({

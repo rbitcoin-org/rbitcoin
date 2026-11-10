@@ -302,7 +302,9 @@ impl NetPermTable {
         bind: SocketAddr,
     ) -> NetPermissionFlags {
         match net {
-            crate::NetAddr::Onion { .. } | crate::NetAddr::I2p { .. } => NetPermissionFlags::NONE,
+            crate::NetAddr::Onion { .. }
+            | crate::NetAddr::I2p { .. }
+            | crate::NetAddr::Name { .. } => NetPermissionFlags::NONE,
             crate::NetAddr::Ip(s) => self.flags_for(s.ip(), inbound, bind),
             crate::NetAddr::Cjdns { ip, .. } => self.flags_for(IpAddr::V6(ip), inbound, bind),
         }

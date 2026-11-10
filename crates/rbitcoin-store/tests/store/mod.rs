@@ -744,6 +744,49 @@ fn open_schema24_occupied_creates_zero_txstat() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn poke_logical_len(path: &Path, logical: u64) {
+    let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    f.seek(SeekFrom::Start(8)).unwrap();
+    f.write_all(&logical.to_le_bytes()).unwrap();
+}
+
+/// A 26 datadir whose witness locator is already the finished cut must open,
+/// keep the creates, and rewrite meta to 27. A 26 binary wipes that layout.
+#[test]
+fn pruned_schema_26_rewrites_meta_before_the_creates_are_read() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let item = coinbase_item([0x27u8; 32], vec![OutputRecord::unspent(50, vec![0x51])]);
+        s.put_tx_full_batch_indexed(&[item], true).unwrap();
+        s.flush().unwrap();
+    }
+    write_store_meta_ver(&dir, 26);
+    let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
+    for name in [
+        "seqsigwit.loc",
+        "seqsigwit.off",
+        "seqsigwit.loc.ovf",
+        "seqsigwit.body",
+    ] {
+        poke_logical_len(&dir.join(name), header);
+    }
+    std::fs::write(dir.join("seqsigwit.prune"), u32::MAX.to_le_bytes()).unwrap();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1, "schema 26 prune open must keep creates");
+    drop(s);
+    assert_eq!(read_store_meta_ver(&dir), 27);
+    assert_eq!(SCHEMA_VERSION, 27);
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(
+        synced.iter().any(|p| p == dir.path()),
+        "meta 27 must be durable before the witness cut; synced {synced:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn check_meta_refuses_schema_past_this_binary() {
     let dir = tmp();

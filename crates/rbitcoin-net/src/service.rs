@@ -683,6 +683,9 @@ pub async fn prepare_outbound_session(
     typ: PeerConnType,
     dialer: crate::socks::Dialer,
 ) -> Result<PreparedOutbound, NetError> {
+    if !peer.has_key() {
+        return Err(NetError::Protocol("too many distinct proxied host names"));
+    }
     let tip_at_handshake = hub.tip_hash();
     hub.clock.note_connection_attempt();
     rbitcoin_log::debug!("{}", crate::peers::trying_connection_log(typ, &peer));

@@ -72,7 +72,7 @@ counts, ingest OA, and refuse lines: [`SCHEMA.md`](../../SCHEMA.md) and
 
 ## Schema upgrade
 
-Live bytes: [`SCHEMA.md`](../../SCHEMA.md) (`SCHEMA_VERSION = 26`). This section is
+Live bytes: [`SCHEMA.md`](../../SCHEMA.md) (`SCHEMA_VERSION = 27`). This section is
 the operator copy-paste only — do not treat it as a second layout map.
 
 Open **never silently wipes** a populated store (policy:
@@ -82,17 +82,17 @@ names the dirs. Corrupt files are **not** repaired in-process.
 
 | Incoming `meta` | What this binary does |
 |-----------------|------------------------|
-| **26** | Open. |
-| **25** | If `header.body` is still 96 B, rewrite each row to 88 B (`header.body.grow`, then rename), dropping trailing size and weight. An 88 B body is left alone. Then rewrite `meta` to 26. |
-| **24** | Same header shrink as 25. Zero-extend `txstat.body` to the `create.loc` count (no `txout.body` rewrite). Unlink leftover `txfixed.body`. Rewrite `meta` to 26. |
-| **23** | Headers stay 88 B. Rewrite `meta` to 26. `txstat.body` is created and aligned to the loc count when it is missing or short. |
+| **26** | Rewrite `meta` to 27 and sync the store directory. No table rewrite. A 0.9.0 binary then refuses the directory. |
+| **25** | If `header.body` is still 96 B, rewrite each row to 88 B (`header.body.grow`, then rename), dropping trailing size and weight. An 88 B body is left alone. Then rewrite `meta` to 27. |
+| **24** | Same header shrink as 25. Zero-extend `txstat.body` to the `create.loc` count (no `txout.body` rewrite). Unlink leftover `txfixed.body`. Rewrite `meta` to 27. |
+| **23** | Headers stay 88 B. Rewrite `meta` to 27. `txstat.body` is created and aligned to the loc count when it is missing or short. |
 | **22**, occupied Class A | Rewrite `create.loc.ovf` 12 B→16 B. Headers stay 88 B. Then the same `meta` rewrite and `txstat` align as 23. |
-| **22**, empty Class A | Rewrite `meta` to 26, then open. |
+| **22**, empty Class A | Rewrite `meta` to 27, then open. |
 | **Below 22**, empty or occupied | **Refuse.** One line: `schema before 22 refuses this datadir; wipe datadir and redo IBD`. Wipe the datadir and redo IBD. No per-version rewrite. |
 
 On every open of meta 22–25 the node also renames leftover `inwit.*` to `seqsigwit.*` and `inputs.*` to `input.*`. A missing `input.loc` with seqsigwit prevouts backfills parent edges. A crash during the 96 B→88 B rewrite leaves the old `meta`; the next open retries the shrink. Size and weight after that come from `txstat`.
 
-A `txstat.body` cell written as four ULEBs starting with `n_in` (an unreleased 25 experiment) is not detected and is not rewritten. Resync that datadir. A **25 binary** refuses 26 `meta`. A **24 binary** refuses 25 `meta` (do not downgrade in place). A **23 binary** refuses 24+ `meta`. A **22 binary** refuses 23+ `meta`. A **21 binary** refuses 22+ `meta`. A **19 binary** refuses 20+ `meta`.
+A `txstat.body` cell written as four ULEBs starting with `n_in` (an unreleased 25 experiment) is not detected and is not rewritten. Resync that datadir. A **26 binary** refuses 27 `meta`. A **25 binary** refuses 26 `meta`. A **24 binary** refuses 25 `meta` (do not downgrade in place). A **23 binary** refuses 24+ `meta`. A **22 binary** refuses 23+ `meta`. A **21 binary** refuses 22+ `meta`. A **19 binary** refuses 20+ `meta`.
 
 When meta is below 22, the log line is:
 
@@ -205,13 +205,26 @@ scan). Default **off**. The method still exists when off (naive per-height
 walk). Flag on = persist + serve-from-index. Stream shape and Sparrow/Frigate:
 [`COMPAT.md`](../../COMPAT.md) (Electrum surface).
 
-**Not built during Direct IBD** (the write thread stays Class A + annotate).
-After catch-up, **SH materialize first** (if `--sh-index`), then a background
-walker fills `origin..=live tip` from Class A. Tip write-through only when
-`height == next_height`; if confirm is ahead, backfill owns the hole. Kill
-is safe: `next_height` is the last complete put; restart in Tip (or after
-the next Direct catch-up reaches tip) resumes the walker. Electrum during
-the hole uses the naive path.
+IBD seals the index from the taproot origin when the flag is on before that
+height, on the confirm write thread. With `--prune-seqsigwit`, a new index
+can also start before taproot, or later once every height from that origin
+through the dropped range is sealed or still in the last 288 blocks. Prune can be turned on
+after the index is built when that index covers every height the cut drops.
+A restart reseals a tweak gap from `seqsigwit.window` (RAM, then one read of
+each spill file) before it advances the prune height. If that repair still
+does not cover the height about to be dropped, startup refuses and leaves
+the prune height where it was. Turning prune on while the index is short
+says to stay unpruned with `--sp-tweaks` until the index catches up, or to
+delete the index files. A datadir that is already pruned cannot turn prune
+off, so that error says only to delete `store/sp_tweaks.idx` and
+`store/sp_tweaks.body`. Sealed rows serve from
+`sp_tweaks` plus `txout`. A pruned silent-payment scan and
+`blockchain.tweaks.subscribe` read that index. An unsealed tip still in
+the keep window is built from that window. A missing file, or a height
+the index does not cover,
+is an error. Neither falls through to the witness walk. Unpruned, a later
+enable still backfills from `seqsigwit.body` on `rbtc-idx-wb`, and an enable
+failure is logged while the node still starts.
 
 On disk (schema 17 dirs; leftover single files are unlinked on startup):
 
@@ -231,12 +244,9 @@ with `value <= SATS` and drops txs that then have none. Default **1000**.
 not Core dust: P2TR at 1 sat/vB is about **330** sats; 546 is the P2PKH
 figure Cake’s server used. The index is unchanged — only the Electrum JSON.
 
-IBD seals the index from the taproot origin (709632 on mainnet) when
-`--sp-tweaks` is on from the start, on the confirm write thread, shared with
-`--block-filter-index`. A restart gap of at most one write drain is sealed
-at startup; a later enable still materializes after catch-up
-(`rbtc-idx-wb`). Once the watermark covers the tip, new blocks are sealed on
-the confirm write thread. That materialize is one IO thread reading windows of heights on one completion session
+The builder is shared with `--block-filter-index`. Once the watermark covers
+the tip, new blocks are sealed on the confirm write thread. Catch-up is one
+IO thread reading windows of heights on one completion session
 (`seqsigwit` and parent txids only for P2TR-output txs); one CPU thread
 (`rbtc-idx-cpu`) publishes one job per height to `rbtc-scripts-*` (tweak EC,
 and filter GCS when that index is on) and commits one batched height-blob +
