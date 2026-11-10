@@ -1206,6 +1206,10 @@ fn reopen_resumes_partial_legacy_input_backfill() {
         }],
         "resume must read the legacy prevout, not stamp n_in 0"
     );
+    assert!(
+        !t2.input.pending_sync(),
+        "backfill must sync before open returns"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

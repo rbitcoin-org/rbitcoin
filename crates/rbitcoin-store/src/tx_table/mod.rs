@@ -2217,6 +2217,9 @@ impl TxTable {
             id = next_id;
         }
         rbitcoin_log::info!("store: input backfill complete n={n}");
+        // The witness stem can be cut after this open returns. The edges
+        // have to be durable first, or the next open has no way to rebuild them.
+        self.input.flush()?;
         Ok(())
     }
 
