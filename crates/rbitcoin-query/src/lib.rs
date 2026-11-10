@@ -1356,14 +1356,8 @@ impl Query {
         self.read_spill_row(height, fk, input_count)
     }
 
-    /// One tx inside `{height}.bin`. The confirm height is known before the
-    /// fence publishes it, so a reconnect can read the file without `tx_height`.
-    fn read_spill_row(
-        &self,
-        height: u32,
-        fk: Fk,
-        input_count: u32,
-    ) -> Result<Option<Vec<InputRecord>>, QueryError> {
+    /// Bytes of `{height}.bin`, or `None` when the height file is absent.
+    fn read_spill_bytes(&self, height: u32) -> Result<Option<Vec<u8>>, QueryError> {
         let path = self.seqsigwit_spill_file(height)?;
         let canon = match path.canonicalize() {
             Ok(p) => p,
@@ -1379,10 +1373,23 @@ impl Query {
                 "invariant: seqsigwit spill path escaped window dir",
             ));
         }
-        let raw = match std::fs::read(&canon) {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(StoreError::io(&canon, e)),
+        match std::fs::read(&canon) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StoreError::io(&canon, e)),
+        }
+    }
+
+    /// One tx inside `{height}.bin`. The confirm height is known before the
+    /// fence publishes it, so a reconnect can read the file without `tx_height`.
+    fn read_spill_row(
+        &self,
+        height: u32,
+        fk: Fk,
+        input_count: u32,
+    ) -> Result<Option<Vec<InputRecord>>, QueryError> {
+        let Some(raw) = self.read_spill_bytes(height)? else {
+            return Ok(None);
         };
         let mut i = 0usize;
         let want = fk.get().ok_or(StoreError::InvalidFk)?;
@@ -1451,12 +1458,29 @@ impl Query {
                 return Ok(true);
             }
         }
+        let Some(height) = self.store.tx_height_get(tx_fks[0])? else {
+            return Ok(false);
+        };
+        note_keep_read();
+        let Some(raw) = self.read_spill_bytes(height)? else {
+            return Ok(false);
+        };
+        let mut have = Vec::with_capacity(tx_fks.len());
+        let mut i = 0usize;
+        while i.saturating_add(12) <= raw.len() {
+            let id = u64::from_le_bytes(raw[i..i + 8].try_into().unwrap());
+            i += 8;
+            let n = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            if i.saturating_add(n) > raw.len() {
+                return Err(StoreError::Corrupt("seqsigwit spill short row"));
+            }
+            have.push(id);
+            i += n;
+        }
         for fk in tx_fks {
-            let tx = self.get_tx(fk)?;
-            if self
-                .seqsigwit_spill_inputs_with_count(fk, tx.input_count)?
-                .is_none()
-            {
+            let id = fk.get().ok_or(StoreError::InvalidFk)?;
+            if !have.contains(&id) {
                 return Ok(false);
             }
         }
@@ -3201,6 +3225,35 @@ pub fn wire_header(rec: &HeaderRecord, prev_blockhash: BlockHash) -> BlockHeader
         bits: CompactTarget::from_consensus(rec.bits),
         nonce: rec.nonce,
     }
+}
+
+#[cfg(debug_assertions)]
+std::thread_local! {
+    static KEEP_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static KEEP_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_keep_io_trace() {
+    KEEP_TRACE.with(|on| on.set(true));
+    KEEP_READS.with(|n| n.set(0));
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_keep_reads() -> u64 {
+    KEEP_TRACE.with(|on| on.set(false));
+    KEEP_READS.with(|n| n.replace(0))
+}
+
+fn note_keep_read() {
+    #[cfg(debug_assertions)]
+    KEEP_TRACE.with(|on| {
+        if on.get() {
+            KEEP_READS.with(|n| n.set(n.get().saturating_add(1)));
+        }
+    });
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

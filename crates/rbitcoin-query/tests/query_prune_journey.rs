@@ -1062,6 +1062,22 @@ fn confirm_of_a_pruned_height_stays_ok() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Coverage of one height reads that height file once, however many txs it holds.
+#[test]
+fn pruned_spill_cover_reads_the_height_file_once() {
+    let (dir, q) = temp_query("prune-one-read");
+    q.set_prune_seqsigwit(true).unwrap();
+    let (header, ta) = coinbase_block(0, Fk::NULL, None);
+    let mut second = ta.clone();
+    second.tx.txid[30] = 0x22;
+    q.connect_block(Height(0), &header, &[ta, second]).unwrap();
+    assert_eq!(q.block_tx_fks(Height(0)).unwrap().len(), 2);
+    rbitcoin_query::arm_keep_io_trace();
+    q.confirm_block(Height(0), &header.hash).unwrap();
+    assert_eq!(rbitcoin_query::take_keep_reads(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The wire facade used to reject a block that is already the tip once its
 /// keep file was gone. Resubmitting that block writes the file again.
 #[test]
