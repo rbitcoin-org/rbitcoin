@@ -27,7 +27,7 @@ pub fn netgroup_net(addr: NetAddr, asmap: Option<&AsMap>) -> u64 {
         NetAddr::Onion { pk, .. } => OVERLAY | (4 << 8) | u64::from(pk[0] >> 4),
         NetAddr::I2p { dest, .. } => OVERLAY | (5 << 8) | u64::from(dest[0] >> 4),
         // A `--proxy` hostname has no address bits to split on.
-        NetAddr::Name { .. } => OVERLAY | (0xff << 8),
+        NetAddr::Name { .. } => OVERLAY | (u64::from(u8::MAX) << 8),
     }
 }
 
