@@ -23,6 +23,8 @@ Fixed
   A later torn locator is its own span, so a witness stored between the
   two fills stays available. A witness locator ahead of the covered create
   count is cut back to that count, and a gap span past it is dropped.
+  When that locator already matches, the witness body counter is set
+  back to that count before the next append.
 - **Scripthash inclusion stays inside the covered create count.** A watermark
   just above that count unlinks the tail, or rebuilds the head when those
   outputs are gone. A shard offset past its file rebuilds once. A floor that

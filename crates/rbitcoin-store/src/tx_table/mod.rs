@@ -1061,6 +1061,21 @@ fn merge_witness_gap(saved: &[(u64, u64)], named: u64, through: u64) -> Vec<(u64
     spans
 }
 
+fn cut_witness_body_to(
+    seqsigwit: &VarTable,
+    loc: &crate::delta_loc::DeltaLoc,
+    creates: u64,
+) -> Result<(), StoreError> {
+    let end = witness_body_end(loc, creates)?;
+    if seqsigwit.body_logical_len() < end {
+        return Err(StoreError::Corrupt(
+            "invariant: seqsigwit body short of covered prefix",
+        ));
+    }
+    seqsigwit.truncate_body_to(creates, end)?;
+    Ok(())
+}
+
 fn witness_body_end(loc: &crate::delta_loc::DeltaLoc, creates: u64) -> Result<u64, StoreError> {
     if creates == 0 {
         return Ok(crate::file::FILE_HEADER_LEN as u64);
@@ -1136,17 +1151,16 @@ fn align_short_witness_locator(
     gap_dir: &Path,
 ) -> Result<bool, StoreError> {
     if named > through {
-        let end = witness_body_end(loc, through)?;
-        if seqsigwit.body_logical_len() < end {
-            return Err(StoreError::Corrupt(
-                "invariant: seqsigwit body short of covered prefix",
-            ));
-        }
-        seqsigwit.truncate_body_to(through, end)?;
+        cut_witness_body_to(seqsigwit, loc, through)?;
         loc.truncate_to_count(through)?;
     }
     clamp_witness_gap_to_count(gap_dir, through)?;
     if named >= through {
+        // Open counted the witness body from the pre-cut create locator.
+        // The locator already matches, so that counter is the only one left high.
+        if seqsigwit.count() != through {
+            cut_witness_body_to(seqsigwit, loc, through)?;
+        }
         return Ok(false);
     }
     let end = if named == 0 {

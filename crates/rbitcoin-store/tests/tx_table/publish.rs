@@ -319,6 +319,44 @@ fn witness_ahead_of_the_covered_prefix_is_cut_back() {
     );
 }
 
+/// The witness locator already names the covered prefix. The body counter
+/// was opened at the longer create count and must come back before append.
+#[test]
+fn matched_witness_locator_resets_the_body_count() {
+    let dir = super::tempfile_dir("witness-match");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    let mut first = one(1);
+    first.1[0].script_sig = vec![0x11];
+    t.put_full_batch_indexed(&[first], false).unwrap();
+    let tx_end = on_disk_hwm(&t.body.body);
+    let sp_end = on_disk_hwm(&t.spent.body);
+    let sw_end = on_disk_hwm(&t.seqsigwit_loc.loc);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    set_disk_hwm(&t.body.body, tx_end);
+    set_disk_hwm(&t.spent.body, sp_end);
+    set_disk_hwm(&t.seqsigwit_loc.loc, sw_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.seqsigwit_loc.count(), 1);
+    assert_eq!(t.seqsigwit.count(), 1);
+    let mut next = one(3);
+    next.1[0].script_sig = vec![0x33];
+    t.put_full_batch_indexed(&[next], false).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.seqsigwit.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 2);
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(2)).unwrap().1[0].script_sig,
+        vec![0x33]
+    );
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(1)).unwrap().1[0].script_sig,
+        vec![0x11]
+    );
+}
+
 /// A 1024-create window whose `create.off` checkpoint did not land opens at
 /// the last create that does not need that checkpoint.
 #[test]
