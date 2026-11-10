@@ -834,7 +834,13 @@ impl Query {
         }
         for h in from..=tip.0 {
             let path = self.seqsigwit_spill_file(h)?;
-            let file = std::fs::File::open(&path).map_err(|e| StoreError::io(&path, e))?;
+            // Windows `FlushFileBuffers` needs a write handle. A read-only
+            // open returns access denied, and this path runs on enable.
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|e| StoreError::io(&path, e))?;
             file.sync_all().map_err(|e| StoreError::io(&path, e))?;
         }
         self.sync_spill_dir()
