@@ -218,10 +218,21 @@ pub fn read_token_file(path: &Path) -> Result<RpcAuth, String> {
 /// A crash before the sync leaves at most a zero-length file, which
 /// [`resolve_rpc_auth`] replaces on the next start.
 pub fn write_token_file(path: &Path) -> Result<RpcAuth, String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("token parent: {e}"))?;
-    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| format!("token parent: {e}"))?;
     let auth = RpcAuth::new(random_token());
+    // Stage the whole token, then rename it into place, so a crash leaves no
+    // token or the full token, never a prefix that later starts accept.
+    let staged = rbitcoin_store::file::tmp_sidecar_path(path);
+    match fs::remove_file(&staged) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("remove stale token {}: {e}", staged.display()));
+        }
+        _ => {}
+    }
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -229,20 +240,31 @@ pub fn write_token_file(path: &Path) -> Result<RpcAuth, String> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path).map_err(|e| format!("token create: {e}"))?;
+    let mut f = opts
+        .open(&staged)
+        .map_err(|e| format!("token create: {e}"))?;
     let written = f
         .write_all(auth.token.as_bytes())
         .map_err(|e| format!("token write: {e}"))
         .and_then(|()| f.sync_all().map_err(|e| format!("token sync: {e}")));
-    if let Err(e) = written {
-        drop(f);
-        let _ = fs::remove_file(path);
+    drop(f);
+    // A rename replaces an existing name, so refuse one first. The datadir
+    // lock keeps a second node out of the gap before the rename.
+    let published = written
+        .and_then(|()| match fs::symlink_metadata(path) {
+            Ok(_) => Err(format!("token create: {} exists", path.display())),
+            Err(_) => Ok(()),
+        })
+        .and_then(|()| fs::rename(&staged, path).map_err(|e| format!("token create: {e}")));
+    if let Err(e) = published {
+        let _ = fs::remove_file(&staged);
         return Err(e);
     }
+    rbitcoin_store::file::fsync_parent_dir(parent).map_err(|e| format!("token dir sync: {e}"))?;
     Ok(auth)
 }
 
-/// Split `Authorization: <scheme> <credentials>` when the scheme matches in any case (RFC 7235).
+/// Split `Authorization: <scheme> <credentials>` when the scheme matches in any case (RFC 9110).
 fn auth_credentials<'a>(header: &'a str, scheme: &str) -> Option<&'a str> {
     let (got, credentials) = header.trim().split_once(' ')?;
     let credentials = credentials.trim();

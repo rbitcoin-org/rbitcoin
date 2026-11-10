@@ -174,6 +174,20 @@ fn resolve_still_refuses_a_blank_token() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The token is staged whole and renamed into place, so a crash leaves at
+/// most a staged file, never a prefix in `rpc.token`. The next start drops it.
+#[test]
+fn resolve_mints_a_token_past_a_staged_file_left_by_a_crash() {
+    let dir = tmp();
+    fs::create_dir_all(&dir).unwrap();
+    let staged = dir.join("rpc.token.tmp");
+    fs::write(&staged, "partial").unwrap();
+    let (a, p) = resolve_rpc_auth(&dir, None).unwrap();
+    assert_eq!(read_token_file(&p).unwrap(), a);
+    assert!(!staged.exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn write_token_file_refuses_an_existing_token() {
     let dir = tmp();
