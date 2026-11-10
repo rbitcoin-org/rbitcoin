@@ -855,16 +855,6 @@ pub fn pruned_uncovered_input_floor(
     if !prune_seqsigwit_mode || !input_existed {
         return None;
     }
-    // Count 0 is the finished cut. The stem cannot rebuild the missing
-    // edges. The input count is the committed prefix of that append.
-    if n_seqsigwit_loc == 0 {
-        let stem = stem_min(n_loc, n_txids, n_seqsigwit_loc, true);
-        let n_in = stems.input.count();
-        if stem == 0 || n_in >= stem {
-            return None;
-        }
-        return Some(n_in);
-    }
     let stem = stem_min(n_loc, n_txids, n_seqsigwit_loc, true);
     if stem == 0 || n_seqsigwit_loc >= stem {
         return None;
