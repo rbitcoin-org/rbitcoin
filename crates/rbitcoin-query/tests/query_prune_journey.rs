@@ -601,6 +601,48 @@ fn tweaks_hold_the_witness_until_the_row_is_sealed() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Direct mode publishes the tip before `flush_class_c_tip` lands.
+/// Sealing tweaks must not prune to that RAM tip. Height 0 stays until
+/// the flush is joined and the sealed tip is 288.
+#[test]
+fn direct_tweak_seal_prunes_only_the_flushed_tip() {
+    let (dir, q) = temp_query("prune-tweak-seal-direct");
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut hashes = Vec::new();
+    let keep = Query::SEQSIGWIT_KEEP_HEIGHTS;
+    connect_range(&q, Fk::NULL, None, keep, &[0x73], &mut hashes);
+    assert_eq!(q.tip_height(), Some(Height(keep - 1)));
+    assert_eq!(q.sealed_tip.get(), Some(Height(keep - 1)));
+    q.enter_direct_index_mode_sh(false).unwrap();
+    let (prev, parent) = resume(&q, &mut hashes);
+    connect_range(&q, prev, Some(parent), 1, &[0x73], &mut hashes);
+    assert_eq!(q.tip_height(), Some(Height(keep)));
+    assert_eq!(q.sealed_tip.get(), Some(Height(keep - 1)));
+    assert_eq!(q.pruneheight(), None);
+    assert!(q.store().path().join("seqsigwit.window/0.bin").is_file());
+    let header0 = q.header_at_height(Height(0)).unwrap().unwrap().0;
+    q.put_sp_tweaks_block(Height(0), header0, &[Some([0x02; 33])])
+        .unwrap();
+    assert_eq!(q.tweak_index_next(), Some(1));
+    q.prune_seqsigwit_after_tweak_seal().unwrap();
+    assert_eq!(
+        q.pruneheight(),
+        None,
+        "the RAM tip is 288 and its flush has not landed"
+    );
+    assert!(
+        q.store().path().join("seqsigwit.window/0.bin").is_file(),
+        "height 0 is still inside the flushed tip's keep window"
+    );
+    q.join_tip_flush().unwrap();
+    assert_eq!(q.sealed_tip.get(), Some(Height(keep)));
+    q.prune_seqsigwit_after_tweak_seal().unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(0)));
+    assert!(!q.store().path().join("seqsigwit.window/0.bin").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The sidecar can still say nothing was dropped after the stem is gone.
 /// Enabling tweaks has to refuse before it creates an index it cannot fill.
 #[test]

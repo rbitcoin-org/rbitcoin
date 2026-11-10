@@ -10,5 +10,6 @@ Fixed
 
 - A pruned `blockchain.tweaks.subscribe` reads an unsealed tip from the keep
   window. A confirm batch does not delete a witness until that height's tweak
-  row is sealed. A crash that cut the witness stem before saving the prune
-  height is treated as those heights already dropped.
+  row is sealed, and only through the tip whose flush has landed. A crash
+  that cut the witness stem before saving the prune height is treated as
+  those heights already dropped.

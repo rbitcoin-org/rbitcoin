@@ -851,15 +851,15 @@ impl Query {
         self.prune_seqsigwit_below(durable)
     }
 
-    /// After the tweak rows for this tip exist, drop witnesses the index
-    /// now covers. A confirm that skipped the prune calls this once the seal
-    /// has moved the watermark.
+    /// Drop witnesses the sealed tip no longer keeps, once those tweak rows
+    /// exist. The RAM tip can be a batch whose Class C flush has not landed.
+    /// Pruning to it deletes files that tip still has to keep.
     #[doc(hidden)]
     pub fn prune_seqsigwit_after_tweak_seal(&self) -> Result<(), QueryError> {
         if !self.sptweaks_enabled() {
             return Ok(());
         }
-        let tip = self.tip_height();
+        let tip = self.sealed_tip.get();
         if self.tweak_seal_blocks_prune(tip)? {
             return Ok(());
         }
