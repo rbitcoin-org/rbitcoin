@@ -1061,6 +1061,49 @@ fn merge_witness_gap(saved: &[(u64, u64)], named: u64, through: u64) -> Vec<(u64
     spans
 }
 
+fn witness_body_end(loc: &crate::delta_loc::DeltaLoc, creates: u64) -> Result<u64, StoreError> {
+    if creates == 0 {
+        return Ok(crate::file::FILE_HEADER_LEN as u64);
+    }
+    let (off, len) = loc
+        .range_batch(&[Fk(creates)])?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or(StoreError::Corrupt(
+            "invariant: seqsigwit.loc range for covered prefix",
+        ))?;
+    Ok(off.saturating_add(len))
+}
+
+/// A span past the covered create count would mark the next append's fk empty.
+fn clamp_witness_gap_to_count(dir: &Path, creates: u64) -> Result<(), StoreError> {
+    let saved = load_witness_gap(dir)?;
+    let mut kept = Vec::with_capacity(saved.len());
+    for (named, through) in saved.iter().copied() {
+        if named >= creates {
+            continue;
+        }
+        let through = through.min(creates);
+        if named < through {
+            kept.push((named, through));
+        }
+    }
+    if kept == saved {
+        return Ok(());
+    }
+    if kept.is_empty() {
+        let path = dir.join(WITNESS_GAP_FILE);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StoreError::io(&path, e)),
+        }
+    } else {
+        store_witness_gap(dir, &kept)
+    }
+}
+
 fn coalesce_witness_gaps(spans: &mut Vec<(u64, u64)>) {
     if spans.is_empty() {
         return;
@@ -1083,7 +1126,8 @@ fn coalesce_witness_gaps(spans: &mut Vec<(u64, u64)>) {
 
 /// A prune file left `seqsigwit.loc` behind the creates. Drop the body tail
 /// that locator does not name, then append one empty row per missing create
-/// so the next append's fk is the new create.
+/// so the next append's fk is the new create. A locator ahead of the covered
+/// create count still names dropped creates, so it is cut back to that count.
 fn align_short_witness_locator(
     seqsigwit: &VarTable,
     loc: &crate::delta_loc::DeltaLoc,
@@ -1091,6 +1135,17 @@ fn align_short_witness_locator(
     through: u64,
     gap_dir: &Path,
 ) -> Result<bool, StoreError> {
+    if named > through {
+        let end = witness_body_end(loc, through)?;
+        if seqsigwit.body_logical_len() < end {
+            return Err(StoreError::Corrupt(
+                "invariant: seqsigwit body short of covered prefix",
+            ));
+        }
+        seqsigwit.truncate_body_to(through, end)?;
+        loc.truncate_to_count(through)?;
+    }
+    clamp_witness_gap_to_count(gap_dir, through)?;
     if named >= through {
         return Ok(false);
     }

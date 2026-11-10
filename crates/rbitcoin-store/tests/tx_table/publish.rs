@@ -267,6 +267,58 @@ fn later_fill_keeps_the_witness_between_two_gaps() {
     assert!(t.witness_row_is_gap(4));
 }
 
+/// A short body header cuts the creates. A prune file must not leave the
+/// witness locator, or a gap span, naming the creates that were dropped.
+#[test]
+fn witness_ahead_of_the_covered_prefix_is_cut_back() {
+    let dir = super::tempfile_dir("witness-ahead");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    let mut first = one(1);
+    first.1[0].script_sig = vec![0x11];
+    t.put_full_batch_indexed(&[first], false).unwrap();
+    let tx_end = on_disk_hwm(&t.body.body);
+    let sp_end = on_disk_hwm(&t.spent.body);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    let mut third = one(3);
+    third.1[0].script_sig = vec![0x33];
+    t.put_full_batch_indexed(&[third], false).unwrap();
+    set_disk_hwm(&t.body.body, tx_end);
+    set_disk_hwm(&t.spent.body, sp_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let mut gap = [0u8; 16];
+    gap[..8].copy_from_slice(&1u64.to_le_bytes());
+    gap[8..].copy_from_slice(&3u64.to_le_bytes());
+    std::fs::write(dir.join("seqsigwit.gap"), gap).unwrap();
+
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.seqsigwit_loc.count(), 1);
+    assert!(!t.witness_row_is_gap(1));
+    let mut next = one(4);
+    next.1[0].script_sig = vec![0x44];
+    t.put_full_batch_indexed(&[next], false).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 2);
+    assert!(!t.witness_row_is_gap(2));
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(2)).unwrap().1[0].script_sig,
+        vec![0x44]
+    );
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(1)).unwrap().1[0].script_sig,
+        vec![0x11]
+    );
+    drop(t);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.seqsigwit_loc.count(), 2);
+    assert!(!t.witness_row_is_gap(2));
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(2)).unwrap().1[0].script_sig,
+        vec![0x44]
+    );
+}
+
 /// A 1024-create window whose `create.off` checkpoint did not land opens at
 /// the last create that does not need that checkpoint.
 #[test]

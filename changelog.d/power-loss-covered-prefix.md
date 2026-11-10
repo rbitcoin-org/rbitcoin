@@ -21,7 +21,8 @@ Fixed
   not name. The following append files its scriptSig on the new create.
   The empty rows are still not a witness after a restart, and the tip stays.
   A later torn locator is its own span, so a witness stored between the
-  two fills stays available.
+  two fills stays available. A witness locator ahead of the covered create
+  count is cut back to that count, and a gap span past it is dropped.
 - **Scripthash inclusion stays inside the covered create count.** A watermark
   just above that count unlinks the tail, or rebuilds the head when those
   outputs are gone. A shard offset past its file rebuilds once. A floor that
