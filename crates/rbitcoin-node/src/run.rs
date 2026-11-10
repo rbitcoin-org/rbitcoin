@@ -337,6 +337,10 @@ pub async fn mempool_blocking<T: Send + 'static>(
 #[doc(hidden)]
 pub const NETWORK_MARKER: &str = "network";
 
+/// Longest [`NETWORK_MARKER`] read. The line is a network name and eight hex
+/// digits; a longer file is not one this node wrote.
+const NETWORK_MARKER_MAX: u64 = 64;
+
 /// Start the node: ensure datadir, exclusive-lock, refuse another network's
 /// datadir, open store.
 pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
@@ -367,7 +371,7 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
 #[doc(hidden)]
 #[must_use = "record the marker once the store has opened"]
 pub struct DatadirNetwork {
-    path: PathBuf,
+    datadir: PathBuf,
     started: String,
     missing: bool,
 }
@@ -386,50 +390,91 @@ impl DatadirNetwork {
             network.as_str(),
             rbitcoin_net::service::magic_for_params(params)
         );
-        let stored = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self {
-                    path,
-                    started,
-                    missing: true,
-                });
-            }
-            Err(source) => return Err(NodeError::Datadir { path, source }),
-        };
+        let stored = read_network_marker(&path)?;
         let stored = stored.trim();
-        if stored != started {
+        let missing = stored.is_empty();
+        if !missing && stored != started {
             return Err(NodeError::Init(format!(
                 "Wrong datadir for network? stored network {stored} does not match started network {started}. Use a separate --datadir for each network."
             )));
         }
         Ok(Self {
-            path,
+            datadir: datadir.to_path_buf(),
             started,
-            missing: false,
+            missing,
         })
     }
 
-    /// Write a missing marker. A datadir from before the marker adopts the
-    /// started network here, after the genesis check passed.
+    /// Write a missing or empty marker. A datadir from before the marker
+    /// adopts the started network here, after the genesis check passed.
+    /// Every signet shares one genesis, so a legacy signet datadir adopts
+    /// whichever challenge this start passed.
     pub fn record(self) -> Result<(), NodeError> {
         if !self.missing {
             return Ok(());
         }
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, format!("{}\n", self.started))
-            .and_then(|()| std::fs::rename(&tmp, &self.path))
+        let path = self.datadir.join(NETWORK_MARKER);
+        self.write_synced(&path)
             .map_err(|source| NodeError::Datadir {
-                path: self.path.clone(),
+                path: path.clone(),
                 source,
             })?;
         info!(
             "datadir: no network marker in {}; adopting {}",
-            self.path.display(),
+            path.display(),
             self.started
         );
         Ok(())
     }
+
+    /// Temp file, `sync_all`, rename, then sync the datadir, so a crash
+    /// leaves no marker or the whole line. A symlinked temp is unlinked, not
+    /// followed.
+    fn write_synced(&self, path: &Path) -> std::io::Result<()> {
+        let tmp = path.with_extension("tmp");
+        match std::fs::remove_file(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut file =
+            crate::lock::no_follow(std::fs::OpenOptions::new().write(true).create_new(true))
+                .open(&tmp)?;
+        std::io::Write::write_all(&mut file, format!("{}\n", self.started).as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        rbitcoin_store::file::fsync_parent_dir(&self.datadir)
+    }
+}
+
+/// The marker's text, empty when there is none. A symlink or a file longer
+/// than [`NETWORK_MARKER_MAX`] is refused without reading it.
+fn read_network_marker(path: &Path) -> Result<String, NodeError> {
+    let file = match crate::lock::no_follow(std::fs::OpenOptions::new().read(true)).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(source) => {
+            return Err(NodeError::Datadir {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, NETWORK_MARKER_MAX + 1),
+        &mut bytes,
+    )
+    .map_err(|source| NodeError::Datadir {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if bytes.len() as u64 > NETWORK_MARKER_MAX {
+        return Err(NodeError::Init(format!(
+            "Wrong datadir for network? {} is longer than {NETWORK_MARKER_MAX} bytes and is not a network marker",
+            path.display()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Height 0 is the chain this datadir already stored. No height 0 is an
