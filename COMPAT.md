@@ -72,6 +72,7 @@ Full `/tx/:txid` JSON still has `vin[]`. Electrum has no outspend-vin surface.
 
 | Area | This node | Bitcoin Core |
 |------|-----------|--------------|
+| Datadir per network | One `--datadir` per network; the node never derives a subdirectory. `{datadir}/network` records the network and its message start, and a start on another network or signet challenge is refused | `-datadir` holds `testnet3/`, `testnet4/`, `signet/`, `signet_<message start>/` (custom `-signetchallenge`), `regtest/` |
 | Chainstore | Relational **map-free** archive (fd tables; see [`docs/io-modality.md`](./docs/io-modality.md)) | blocks/undo + LevelDB chainstate |
 | Historical blocks | Reconstruct from archive; tip via body queue + peer wire | `blocks/` blk*.dat |
 | Transport | **BIP324 v2 only** | v1 + v2 |

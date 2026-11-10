@@ -262,7 +262,7 @@ error. `--listen [fc00:…]:port` binds that address when the OS has it; no
 cjdns daemon in-process and no TUN in CI. NixOS: `cjdns.reachable`;
 `After`/`Wants` `cjdns.service`. Do not start a cjdns router from this module.
 
-`--datadir` holds the node root (`store/`, `mempool/`, `peers`, `rpc.token`, `rpc.sock`). After a listener binds, `{datadir}/run/{health,electrum,esplora,rpc}.addr` is that socket (the kernel port when the configured port is 0).
+`--datadir` holds the node root (`store/`, `mempool/`, `peers`, `network`, `rpc.token`, `rpc.sock`). Use one `--datadir` per network: the node never adds a per-network subdirectory. `network` is one line, the network name and its P2P message start (`signet 0a03cf40`), written on the first start. A custom `--signet-challenge` has its own message start. A start on another network, or on another signet challenge, refuses with `Wrong datadir for network?` before the store opens, before any peer, and before RPC serves. A datadir from before this file adopts the started network once its stored genesis matches, and logs `datadir: no network marker in … adopting …`. After a listener binds, `{datadir}/run/{health,electrum,esplora,rpc}.addr` is that socket (the kernel port when the configured port is 0).
 Omit `--datadir-cold` and the append-only files live there too. Set it to put
 those files on another volume. The confirm pin path does not read them. At the
 2026-08-13 census that is `seqsigwit.body` + `seqsigwit.loc` (~486 GiB + loc),

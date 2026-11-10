@@ -333,14 +333,23 @@ pub async fn mempool_blocking<T: Send + 'static>(
     .map_err(|e| NodeError::Config(format!("mempool task: {e}")))
 }
 
-/// Start the node: ensure datadir, exclusive-lock, open store.
+/// Datadir file that records the network the datadir was created for.
+#[doc(hidden)]
+pub const NETWORK_MARKER: &str = "network";
+
+/// Start the node: ensure datadir, exclusive-lock, refuse another network's
+/// datadir, open store.
 pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     config.ensure_datadir()?;
     let dir_locks = crate::lock::lock_node_dirs(&config)?;
+    let params = config.chain_params()?;
+    let marker = DatadirNetwork::check(config.datadir.path(), config.network, &params)?;
     let query = Query::open_or_create_layout_checkblocks(
         config.store_layout(),
         config.check_blocks_window(),
     )?;
+    refuse_foreign_genesis(&query, &params)?;
+    marker.record()?;
     rbitcoin_query::replay_spend_annotations(&query)
         .map_err(|e| NodeError::Init(format!("spend annotation replay: {e}")))?;
     Ok(NodeHandle {
@@ -349,6 +358,78 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         mempool: None,
         _dir_locks: dir_locks,
     })
+}
+
+/// The network a datadir was created for: its name and P2P message start,
+/// one line in [`NETWORK_MARKER`]. Every signet shares one genesis block, so
+/// [`refuse_foreign_genesis`] cannot tell two signets apart. The message
+/// start can.
+#[doc(hidden)]
+#[must_use = "record the marker once the store has opened"]
+pub struct DatadirNetwork {
+    path: PathBuf,
+    started: String,
+    missing: bool,
+}
+
+impl DatadirNetwork {
+    /// Refuse a datadir whose marker names another network. Runs before the
+    /// store opens, before any peer, and before RPC serves.
+    pub fn check(
+        datadir: &Path,
+        network: rbitcoin_primitives::Network,
+        params: &rbitcoin_consensus::ChainParams,
+    ) -> Result<Self, NodeError> {
+        let path = datadir.join(NETWORK_MARKER);
+        let started = format!(
+            "{} {}",
+            network.as_str(),
+            rbitcoin_net::service::magic_for_params(params)
+        );
+        let stored = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    path,
+                    started,
+                    missing: true,
+                });
+            }
+            Err(source) => return Err(NodeError::Datadir { path, source }),
+        };
+        let stored = stored.trim();
+        if stored != started {
+            return Err(NodeError::Init(format!(
+                "Wrong datadir for network? stored network {stored} does not match started network {started}. Use a separate --datadir for each network."
+            )));
+        }
+        Ok(Self {
+            path,
+            started,
+            missing: false,
+        })
+    }
+
+    /// Write a missing marker. A datadir from before the marker adopts the
+    /// started network here, after the genesis check passed.
+    pub fn record(self) -> Result<(), NodeError> {
+        if !self.missing {
+            return Ok(());
+        }
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, format!("{}\n", self.started))
+            .and_then(|()| std::fs::rename(&tmp, &self.path))
+            .map_err(|source| NodeError::Datadir {
+                path: self.path.clone(),
+                source,
+            })?;
+        info!(
+            "datadir: no network marker in {}; adopting {}",
+            self.path.display(),
+            self.started
+        );
+        Ok(())
+    }
 }
 
 /// Height 0 is the chain this datadir already stored. No height 0 is an
@@ -395,7 +476,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let handle = run_node(config.clone())?;
     status.enter(Phase::Starting);
     let params = config.chain_params()?;
-    refuse_foreign_genesis(&handle.query, &params)?;
     let milestone = config.milestone();
     if let Some(anchor) = milestone.anchor {
         info!(
