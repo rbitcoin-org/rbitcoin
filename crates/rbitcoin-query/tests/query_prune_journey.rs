@@ -12,6 +12,7 @@ fn connect_range(
         if !witness.is_empty() {
             ta.inputs[0].witness = vec![witness.to_vec()];
         }
+        bind_fixture_txid(&mut ta);
         // One coinbase: the merkle root is that txid. The fixture's stand-in
         // root fails tip revalidate and drops the height the spill is keyed by.
         if h > 0 {
@@ -36,6 +37,14 @@ fn connect_range(
 fn witness_of(q: &Query, fk: Fk) -> Vec<Vec<u8>> {
     let tx = q.get_tx(fk).unwrap();
     q.tx_input_at_fk(fk, &tx, 0).unwrap().witness
+}
+
+/// The store records this id, and a later connect checks it against the
+/// hash of the wire transaction. A height-shaped stand-in fails that check.
+fn bind_fixture_txid(ta: &mut TxApply) {
+    ta.tx.txid = rbitcoin_query::testutil::tx_apply_to_tx(ta)
+        .compute_txid()
+        .to_byte_array();
 }
 
 fn resume(q: &Query, hashes: &mut Vec<[u8; 32]>) -> (Fk, [u8; 32]) {
@@ -615,6 +624,7 @@ fn pruned_retry_seals_a_missing_keep_file() {
     q.set_prune_seqsigwit(true).unwrap();
     let (header, mut tx) = coinbase_block(0, Fk::NULL, None);
     tx.inputs[0].witness = vec![vec![0x42; 8]];
+    bind_fixture_txid(&mut tx);
     let fk = q.connect_block(Height(0), &header, &[tx.clone()]).unwrap();
     let tx_fk = q.block_tx_fks(Height(0)).unwrap()[0];
     let spill = q.store().path().join("seqsigwit.window/0.bin");
@@ -755,6 +765,7 @@ fn next_block(q: &Query, parent_hash: [u8; 32], witness: u8) -> (HeaderRecord, T
     let (mut header, mut ta) =
         coinbase_block(h, q.tip_header_fk().unwrap().unwrap(), Some(parent_hash));
     ta.inputs[0].witness = vec![vec![witness]];
+    bind_fixture_txid(&mut ta);
     header.merkle_root = ta.tx.txid;
     header.hash = rbitcoin_store::block_header_hash(
         header.version,
@@ -831,7 +842,10 @@ fn tagged_block(
     tag: u8,
 ) -> (HeaderRecord, TxApply) {
     let (mut header, mut ta) = next_block(q, parent_hash, witness);
-    ta.tx.txid[30] = tag;
+    // The tag has to change the coinbase script. Witness does not change txid,
+    // and a flipped id byte would no longer be the hash of this transaction.
+    ta.inputs[0].script_sig.push(tag);
+    bind_fixture_txid(&mut ta);
     header.merkle_root = ta.tx.txid;
     header.hash = rbitcoin_store::block_header_hash(
         header.version,
