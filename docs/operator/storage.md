@@ -72,7 +72,7 @@ counts, ingest OA, and refuse lines: [`SCHEMA.md`](../../SCHEMA.md) and
 
 ## Schema upgrade
 
-Live bytes: [`SCHEMA.md`](../../SCHEMA.md) (`SCHEMA_VERSION = 26`). This section is
+Live bytes: [`SCHEMA.md`](../../SCHEMA.md) (`SCHEMA_VERSION = 27`). This section is
 the operator copy-paste only — do not treat it as a second layout map.
 
 Open **never silently wipes** a populated store (policy:
@@ -82,17 +82,17 @@ names the dirs. Corrupt files are **not** repaired in-process.
 
 | Incoming `meta` | What this binary does |
 |-----------------|------------------------|
-| **26** | Open. |
-| **25** | If `header.body` is still 96 B, rewrite each row to 88 B (`header.body.grow`, then rename), dropping trailing size and weight. An 88 B body is left alone. Then rewrite `meta` to 26. |
-| **24** | Same header shrink as 25. Zero-extend `txstat.body` to the `create.loc` count (no `txout.body` rewrite). Unlink leftover `txfixed.body`. Rewrite `meta` to 26. |
-| **23** | Headers stay 88 B. Rewrite `meta` to 26. `txstat.body` is created and aligned to the loc count when it is missing or short. |
+| **26** | Rewrite `meta` to 27 and sync the store directory. No table rewrite. A 0.9.0 binary then refuses the directory. |
+| **25** | If `header.body` is still 96 B, rewrite each row to 88 B (`header.body.grow`, then rename), dropping trailing size and weight. An 88 B body is left alone. Then rewrite `meta` to 27. |
+| **24** | Same header shrink as 25. Zero-extend `txstat.body` to the `create.loc` count (no `txout.body` rewrite). Unlink leftover `txfixed.body`. Rewrite `meta` to 27. |
+| **23** | Headers stay 88 B. Rewrite `meta` to 27. `txstat.body` is created and aligned to the loc count when it is missing or short. |
 | **22**, occupied Class A | Rewrite `create.loc.ovf` 12 B→16 B. Headers stay 88 B. Then the same `meta` rewrite and `txstat` align as 23. |
-| **22**, empty Class A | Rewrite `meta` to 26, then open. |
+| **22**, empty Class A | Rewrite `meta` to 27, then open. |
 | **Below 22**, empty or occupied | **Refuse.** One line: `schema before 22 refuses this datadir; wipe datadir and redo IBD`. Wipe the datadir and redo IBD. No per-version rewrite. |
 
 On every open of meta 22–25 the node also renames leftover `inwit.*` to `seqsigwit.*` and `inputs.*` to `input.*`. A missing `input.loc` with seqsigwit prevouts backfills parent edges. A crash during the 96 B→88 B rewrite leaves the old `meta`; the next open retries the shrink. Size and weight after that come from `txstat`.
 
-A `txstat.body` cell written as four ULEBs starting with `n_in` (an unreleased 25 experiment) is not detected and is not rewritten. Resync that datadir. A **25 binary** refuses 26 `meta`. A **24 binary** refuses 25 `meta` (do not downgrade in place). A **23 binary** refuses 24+ `meta`. A **22 binary** refuses 23+ `meta`. A **21 binary** refuses 22+ `meta`. A **19 binary** refuses 20+ `meta`.
+A `txstat.body` cell written as four ULEBs starting with `n_in` (an unreleased 25 experiment) is not detected and is not rewritten. Resync that datadir. A **26 binary** refuses 27 `meta`. A **25 binary** refuses 26 `meta`. A **24 binary** refuses 25 `meta` (do not downgrade in place). A **23 binary** refuses 24+ `meta`. A **22 binary** refuses 23+ `meta`. A **21 binary** refuses 22+ `meta`. A **19 binary** refuses 20+ `meta`.
 
 When meta is below 22, the log line is:
 

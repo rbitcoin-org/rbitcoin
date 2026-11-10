@@ -5,7 +5,7 @@ in [`CHANGELOG.md`](../CHANGELOG.md). Peer-node notes:
 [`peer-clients.md`](./peer-clients.md) (do not copy here).
 
 **Last reaudit:** 2026-10-08. Live schema: [`SCHEMA.md`](../SCHEMA.md)
-(`SCHEMA_VERSION = 26`). **Q-64**, **Q-71**, and **Q-72** are off this list:
+(`SCHEMA_VERSION = 27`). **Q-64**, **Q-71**, and **Q-72** are off this list:
 SV2 plans A–C are in tree, and the Talip and Livera indexes are fully
 dispositioned.
 Core functional inventory: [`core-functional.md`](./core-functional.md).

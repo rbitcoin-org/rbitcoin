@@ -40,9 +40,10 @@ mainnet. `--network testnet4` is Bitcoin Core’s testnet4: BIP94, peer port
 48333, RPC port 48332.
 
 A 0.7 directory (schema 24) or a 0.8 directory (schema 26) opens in place.
-Schema 24 and 25 rewrite to 26 on open. A directory from 0.6 or earlier is
-refused: wipe that datadir and sync again. Do not point an older binary at a
-directory this release has opened.
+Schema 22 through 26 rewrite `meta` to 27 on open. That includes a datadir
+that never pruned witnesses. A 0.9.0 binary refuses 27 `meta`. A directory
+from 0.6 or earlier is refused: wipe that datadir and sync again. Do not
+point an older binary at a directory this release has opened.
 
 ## Catch-up
 

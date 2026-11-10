@@ -25,8 +25,9 @@ consensus/script** path.
 > script by default.
 >
 > Occupied **0.6.x** stores refuse: wipe the datadir and sync again.
-> Schema **24 and 25** open in place and rewrite to **26**. A published
-> **0.8** directory is already schema 26. Electrum and Esplora need
+> Schema **24 and 25** open in place. A published **0.8** directory is schema
+> 26. This binary rewrites that `meta` to **27**, pruned or not, and a 0.9.0
+> binary then refuses the directory. Electrum and Esplora need
 > **`--sh-index`** (default off) for address history. Report security
 > issues privately: [`SECURITY.md`](./SECURITY.md). Runbook:
 > [`docs/operator/mainnet.md`](./docs/operator/mainnet.md).

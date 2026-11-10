@@ -26,3 +26,6 @@ Fixed
   does not also read the witness locator. `txout`, `input`, `txstat`, and
   block filters stay.
   Unpruned nodes still read `seqsigwit.body`.
+  Opening a datadir rewrites `store/meta` to schema 27 and syncs that
+  directory before a witness cut. A 0.9.0 binary refuses schema 27, including
+  a datadir that never pruned witnesses. Schema 22 through 26 still open here.
