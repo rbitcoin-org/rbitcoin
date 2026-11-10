@@ -841,8 +841,8 @@ pub fn short_new_layout_input(
 }
 
 /// Prune mode with a witness loc that does not cover the creates cannot
-/// rebuild a short `input` from `seqsigwit`. The short input is the tail
-/// that never landed.
+/// rebuild a short `input` from `seqsigwit`. The input count is the prefix
+/// that landed.
 #[doc(hidden)]
 pub fn pruned_uncovered_input_floor(
     stems: &ClassASkewStems<'_>,
@@ -855,10 +855,15 @@ pub fn pruned_uncovered_input_floor(
     if !prune_seqsigwit_mode || !input_existed {
         return None;
     }
-    // Count 0 is the finished cut. A short input then is a lost backfill,
-    // and open reports the missing tail instead of deleting creates.
+    // Count 0 is the finished cut. The stem cannot rebuild the missing
+    // edges. The input count is the committed prefix of that append.
     if n_seqsigwit_loc == 0 {
-        return None;
+        let stem = stem_min(n_loc, n_txids, n_seqsigwit_loc, true);
+        let n_in = stems.input.count();
+        if stem == 0 || n_in >= stem {
+            return None;
+        }
+        return Some(n_in);
     }
     let stem = stem_min(n_loc, n_txids, n_seqsigwit_loc, true);
     if stem == 0 || n_seqsigwit_loc >= stem {

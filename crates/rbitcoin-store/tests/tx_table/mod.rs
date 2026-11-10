@@ -558,31 +558,24 @@ fn pruned_open_keeps_creates_when_seqsigwit_stem_is_header() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A finished witness cut and a short input is a lost backfill. Open errors
-/// and leaves the creates on disk.
+/// Creates and txids landed. The input append did not. The witness stem is
+/// already cut, so open keeps the input prefix instead of refusing to start.
 #[test]
-fn pruned_finished_cut_with_a_short_input_keeps_creates() {
+fn pruned_short_input_after_the_witness_cut_keeps_the_prefix() {
     let dir = tempfile_dir("prune-open-short-input");
     let t = create_tiny(&dir);
-    t.put_full_batch_indexed(&coinbase_batch(2), true).unwrap();
+    t.put_full_batch_indexed(&coinbase_batch(4), true).unwrap();
     t.flush().unwrap();
-    t.input.truncate_to_count(0).unwrap();
+    t.input.truncate_to_count(2).unwrap();
     t.flush().unwrap();
     drop(t);
     cut_file_to_header(&dir.join("seqsigwit.body"));
     cut_file_to_header(&dir.join("seqsigwit.loc"));
     write_prune_sidecar(&dir);
-    match TxTable::open_tiny(&dir) {
-        Err(StoreError::Corrupt(m)) if m.contains("input tail") => {}
-        Err(other) => panic!("open returned {other}"),
-        Ok(_) => panic!("open kept a finished cut with no input edges"),
-    }
-    let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
-    let txid_len = std::fs::metadata(dir.join("txid.body")).unwrap().len();
-    assert!(
-        txid_len > header + 32,
-        "creates must still be on disk, txid.body len {txid_len}"
-    );
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.txids.count(), 2);
+    assert_eq!(t.input.count(), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
