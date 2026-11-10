@@ -1163,3 +1163,39 @@ fn resubmit_rewrites_a_missing_keep_file() {
     assert_eq!(q.tip_height(), Some(Height(0)));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The append cache is empty on a later seal. The keep file is the witness.
+/// A height at or below the prune height is not read. A missing file above
+/// that height fails the seal.
+#[test]
+fn seal_uses_the_keep_file_when_the_append_cache_is_empty() {
+    let (dir, q) = temp_query("prune-seal-cache-miss");
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 2, &[0x5a], &mut hashes);
+    let kept = q.block_tx_fks(Height(1)).unwrap();
+    q.clear_seqsigwit_ram_window();
+    q.note_seqsigwit_ram_for_confirmed(Height(1), &kept).unwrap();
+    q.clear_seqsigwit_ram_window();
+    assert_eq!(witness_of(&q, kept[0]), vec![vec![0x5a]]);
+
+    q.set_pruneheight(Some(Height(0))).unwrap();
+    q.clear_seqsigwit_ram_window();
+    q.note_seqsigwit_ram_for_confirmed(Height(1), &kept).unwrap();
+    q.clear_seqsigwit_ram_window();
+    assert_eq!(witness_of(&q, kept[0]), vec![vec![0x5a]]);
+
+    let dropped = q.block_tx_fks(Height(0)).unwrap();
+    let err = q
+        .note_seqsigwit_ram_for_confirmed(Height(0), &dropped)
+        .unwrap_err();
+    assert!(err.to_string().contains("window miss"), "{err}");
+
+    std::fs::remove_file(q.store().path().join("seqsigwit.window/1.bin")).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let err = q
+        .note_seqsigwit_ram_for_confirmed(Height(1), &kept)
+        .unwrap_err();
+    assert!(err.to_string().contains("window miss"), "{err}");
+    let _ = std::fs::remove_dir_all(dir);
+}
