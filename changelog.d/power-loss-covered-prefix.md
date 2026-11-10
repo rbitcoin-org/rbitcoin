@@ -28,7 +28,10 @@ Fixed
   two fills stays available. A witness locator ahead of the covered create
   count is cut back to that count, and a gap span past it is dropped.
   When that locator already matches, the witness body counter is set
-  back to that count and a tail past it is dropped before the next append. A `tx.head` that still has
+  back to that count and a tail past it is dropped before the next append.
+  A pruned confirm still writes the keep file from the witness it just
+  appended, even when the locator does not name that create. Turning
+  prune on skips an empty pad instead of decoding it as an input. A `tx.head` that still has
   `meta` is shortened to that count. Its slots stay, and open does not
   rebuild it from Class A.
 - **Scripthash inclusion stays inside the covered create count.** A watermark

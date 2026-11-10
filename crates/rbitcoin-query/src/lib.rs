@@ -1046,6 +1046,12 @@ impl Query {
             }
             let mut owned = Vec::with_capacity(fks.len());
             for fk in fks {
+                let id = fk.get().unwrap_or(0);
+                // Open pads a torn locator with an empty row. Those bytes
+                // are not an input, and decoding them fails the stem cut.
+                if self.store.txs.witness_row_is_gap(id) {
+                    continue;
+                }
                 owned.push((fk, self.store.txs.seqsigwit_inputs_from_stem(fk)?));
             }
             let rows: Vec<(Fk, &[InputRecord])> = owned
@@ -1471,14 +1477,20 @@ impl Query {
     }
 
     /// `false` when this create's connected height is at/below [`Self::pruneheight`],
-    /// or the witness locator does not name the create.
+    /// the row is an empty pad, or the stem is still the witness store and
+    /// the locator does not name the create. After the stem cut the locator
+    /// is zero and the keep window holds the witness.
     pub fn seqsigwit_available(&self, fk: Fk) -> Result<bool, QueryError> {
         let id = fk.get().unwrap_or(0);
         if self.store.txs.witness_row_is_gap(id) {
             return Ok(false);
         }
         let named = self.store.txs.seqsigwit_loc.count();
-        if id > 0 && id <= self.store.txs.count() && id > named {
+        if !self.store.txs.prune_seqsigwit_mode()
+            && id > 0
+            && id <= self.store.txs.count()
+            && id > named
+        {
             return Ok(false);
         }
         let Some(ph) = self.pruneheight() else {
@@ -1826,18 +1838,22 @@ impl Query {
             let mut appended = self.seqsigwit_append_cache.lock().unwrap();
             for &fk in tx_fks {
                 let id = fk.get().unwrap_or(0);
-                if id > self.store.txs.seqsigwit_loc.count()
-                    || self.store.txs.witness_row_is_gap(id)
+                // Prune mode does not advance the witness locator, so the
+                // scriptSig this confirm just appended lives only in the
+                // cache. A create the locator does not name, and that this
+                // confirm did not append, has no stem row.
+                let cached = fk.get().and_then(|id| appended.remove(&id));
+                if cached.is_none()
+                    && (id > self.store.txs.seqsigwit_loc.count()
+                        || self.store.txs.witness_row_is_gap(id))
                 {
                     continue;
                 }
-                let ins = if let Some(id) = fk.get() {
-                    if let Some(v) = appended.remove(&id) {
+                let ins = if let Some(v) = cached {
+                    if id != 0 {
                         from_cache.push(id);
-                        v
-                    } else {
-                        self.inputs_for_seal(height, fk)?
                     }
+                    v
                 } else {
                     self.inputs_for_seal(height, fk)?
                 };
