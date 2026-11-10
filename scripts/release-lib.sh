@@ -122,6 +122,113 @@ release_set_nix_version() {
   mv "$tmp" "$ROOT/nix/rbitcoin.nix"
 }
 
+# Package names of root workspace members that inherit
+# workspace.package.version. Empty when the tree has no such members.
+release_workspace_package_names() {
+  local members member name
+  members="$(awk '
+    /^\[workspace\]$/ { ws = 1; next }
+    ws && /^\[/ { ws = 0; inm = 0 }
+    ws && /^members[[:space:]]*=/ { inm = 1 }
+    inm {
+      line = $0
+      while (match(line, /"[^"]+"/)) {
+        print substr(line, RSTART + 1, RLENGTH - 2)
+        line = substr(line, RSTART + RLENGTH)
+      }
+    }
+    inm && /^\]/ { inm = 0 }
+  ' "$ROOT/Cargo.toml")"
+  [[ -n "$members" ]] || return 0
+  while IFS= read -r member; do
+    [[ -f "$ROOT/$member/Cargo.toml" ]] || continue
+    grep -q '^version\.workspace = true' "$ROOT/$member/Cargo.toml" || continue
+    name="$(awk '
+      /^\[package\]/ { p = 1; next }
+      p && /^\[/ { exit }
+      p && /^name = "/ {
+        gsub(/"/, "", $3)
+        print $3
+        exit
+      }
+    ' "$ROOT/$member/Cargo.toml")"
+    [[ -n "$name" ]] && printf '%s\n' "$name"
+  done <<<"$members"
+}
+
+# Rewrite version = "old" to version = "new" on workspace member packages
+# only. A crates.io package that shares the old version string is left
+# alone. Nested locks (fuzz, script-oracle) record the same path crates.
+release_rewrite_lock_versions() {
+  local lock="$1"
+  local old="$2"
+  local new="$3"
+  local names="$4"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/rbitcoin-lock-ver.XXXXXX")"
+  awk -v old="$old" -v new="$new" -v names="$names" '
+    BEGIN {
+      n = split(names, arr, "\n")
+      for (i = 1; i <= n; i++) if (arr[i] != "") member[arr[i]] = 1
+    }
+    /^name = "/ {
+      name = $0
+      sub(/^name = "/, "", name)
+      sub(/"$/, "", name)
+    }
+    /^version = "/ && member[name] && $0 == ("version = \"" old "\"") {
+      print "version = \"" new "\""
+      next
+    }
+    { print }
+  ' "$lock" >"$tmp"
+  mv "$tmp" "$lock"
+}
+
+release_set_lock_versions() {
+  local old="$1"
+  local new="$2"
+  local names lock
+  [[ "$old" == "$new" ]] && return 0
+  names="$(release_workspace_package_names)" || true
+  [[ -n "$names" ]] || return 0
+  while IFS= read -r lock; do
+    [[ -n "$lock" && -f "$lock" ]] || continue
+    release_rewrite_lock_versions "$lock" "$old" "$new" "$names"
+  done < <(find "$ROOT" -name Cargo.lock -not -path '*/target/*' -not -path '*/.git/*')
+}
+
+# Fail when a lock still records a workspace member at another version.
+release_check_lock_versions() {
+  local want="$1"
+  local names lock name ver
+  names="$(release_workspace_package_names)" || true
+  [[ -n "$names" ]] || return 0
+  while IFS= read -r lock; do
+    [[ -n "$lock" && -f "$lock" ]] || continue
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      ver="$(awk -v name="$name" '
+        $0 == ("name = \"" name "\"") { hit = 1; next }
+        hit && /^version = "/ {
+          gsub(/"/, "", $3)
+          print $3
+          exit
+        }
+        hit && /^name = "/ { exit }
+      ' "$lock")"
+      if [[ -z "$ver" ]]; then
+        # The root lock lists every member. A nested lock lists only the
+        # path crates that workspace depends on.
+        [[ "$lock" == "$ROOT/Cargo.lock" ]] || continue
+        release_die "Cargo.lock has no package $name"
+      fi
+      [[ "$ver" == "$want" ]] || \
+        release_die "Cargo.lock package $name version=$ver != Cargo.toml $want ($(realpath --relative-to="$ROOT" "$lock" 2>/dev/null || echo "$lock"))"
+    done <<<"$names"
+  done < <(find "$ROOT" -name Cargo.lock -not -path '*/target/*' -not -path '*/.git/*')
+}
+
 # Fold changelog.d/*.md into ## [Unreleased], then delete those files.
 # README.md is the pointer, not a note. thanks.md is the one-shot thanks
 # paragraph for ### Highlights, not a category fragment. First non-empty

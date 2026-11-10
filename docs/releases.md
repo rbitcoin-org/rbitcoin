@@ -23,7 +23,9 @@ Patch **99** is the in-tree sentinel, not a published patch. `./scripts/release.
 refuses to tag it. `--patch` refuses to create it (`Z` stays `< 99`).
 
 Homes that must match on a ship commit: `Cargo.toml`
-`[workspace.package].version`, `nix/rbitcoin.nix` `version`, `CHANGELOG.md`
+`[workspace.package].version`, every `Cargo.lock` that records a workspace
+member (`Cargo.lock`, `fuzz/Cargo.lock`, `script-oracle/Cargo.lock`),
+`nix/rbitcoin.nix` `version`, `CHANGELOG.md`
 `## [X.Y.Z]` with a **`### Highlights`** subsection (1–11 bullets,
 operator-facing, then the thanks paragraph when this release has one).
 `./scripts/release-gate.sh` checks the bullets. Narrative banners
@@ -105,13 +107,13 @@ All hermetic pins: `./scripts/release.test.sh` (includes
 
 | Command | Does |
 |---------|------|
-| `./scripts/release-cut.sh --minor` | `X.Y.99` → `X.(Y+1).0`; folds `changelog.d/` into CHANGELOG, then cuts |
-| `./scripts/release-cut.sh --major` | `X.Y.99` → `(X+1).0.0`; same changelog fold as `--minor` |
-| `./scripts/release-cut.sh --patch` | `X.Y.Z` → `X.Y.(Z+1)` on `vX.Y.x`; same changelog fold |
-| `./scripts/release-cut.sh --dev-next` | just-shipped `X.Y.0` → `X.Y.99` |
+| `./scripts/release-cut.sh --minor` | `X.Y.99` → `X.(Y+1).0`; folds `changelog.d/` into CHANGELOG, then cuts. Rewrites workspace package versions in every `Cargo.lock` |
+| `./scripts/release-cut.sh --major` | `X.Y.99` → `(X+1).0.0`; same changelog fold and lock rewrite as `--minor` |
+| `./scripts/release-cut.sh --patch` | `X.Y.Z` → `X.Y.(Z+1)` on `vX.Y.x`; same changelog fold and lock rewrite |
+| `./scripts/release-cut.sh --dev-next` | just-shipped `X.Y.0` → `X.Y.99`; same lock rewrite |
 | `./scripts/release-cut.sh --print-plan …` | prints `ship=` / `maint=` / `dev_next=` |
 | `./scripts/release-cut.sh --latest-maint` | highest `vX.Y.x` ref |
-| `./scripts/release-gate.sh` | cargo/nix/changelog; ship needs Highlights; `--kind` → `ship`\|`dev` |
+| `./scripts/release-gate.sh` | cargo/nix/changelog/lock; ship needs Highlights; `--kind` → `ship`\|`dev` |
 | `./scripts/release-notes.sh` | GitHub Release / tag text (blurb + Highlights) |
 | `./scripts/release.sh` | annotated tag on a **ship** version |
 | `./scripts/release.sh --tag-only` | push the tag, not the branch |
