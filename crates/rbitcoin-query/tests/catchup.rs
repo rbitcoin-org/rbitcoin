@@ -184,6 +184,45 @@ fn sh_floor_above_the_create_count_drops_the_tail() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The tail creates are already gone from the locator, so their outputs
+/// cannot be read. Startup lowers the watermark and leaves the packed head.
+/// It does not build that head again from Class A.
+#[test]
+fn missing_tail_outputs_lower_the_watermark_without_a_rebuild() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-tail-missing");
+    q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    assert!(q.sh_is_tip_ready());
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(1, end).unwrap();
+    q.store.txs.create_loc.truncate_to_count(1).unwrap();
+    assert_eq!(q.store.txs.count(), 1);
+    assert!(q.store.scripthash.include_hwm() > 1);
+    let cut = rbitcoin_store::script_hash(&[0x51, 1]);
+    let before = q.store.scripthash.entries(&cut).unwrap();
+    assert!(
+        before.iter().any(|(fk, _)| fk.0 > 1),
+        "tail create must be indexed before repair: {before:?}"
+    );
+    let count_before = q.store.scripthash.entry_count();
+    let n = q.finalize_sh_runs().unwrap();
+    assert_eq!(n, 0, "missing outputs must not rematerialize Class A");
+    assert_eq!(q.store.scripthash.entry_count(), count_before);
+    let after = q.store.scripthash.entries(&cut).unwrap();
+    assert!(
+        after.iter().any(|(fk, _)| fk.0 > 1),
+        "a packed head has no key to unlink, so the row stays: {after:?}"
+    );
+    assert_eq!(q.store.scripthash.include_hwm(), 1);
+    assert!(q.sh_run.sealed_max_create_fk() <= 1);
+    assert!(!rbitcoin_store::scripthash::sh_rebuild_marked(&dir));
+    assert!(q.sh_is_tip_ready());
+    assert_eq!(q.finalize_sh_runs().unwrap(), 0);
+    assert_eq!(q.store.scripthash.entry_count(), count_before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A shard alloc bump past the file rebuilds from Class A once.
 #[test]
 fn sh_shard_offset_past_the_file_rebuilds_once() {

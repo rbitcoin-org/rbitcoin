@@ -1651,19 +1651,14 @@ impl TxTable {
                 Ok(h) => {
                     let covered = h.last_inserted_fk();
                     if covered > n_bodies {
-                        // Torn Class A truncate: stale head entries past the
-                        // bodies would fail a later seal — rebuild instead.
+                        // Meta still names the prefix. Shorten the count.
+                        // Wiping here would walk every remaining Class A row.
                         rbitcoin_log::warn!(
                             "store: tx.head leads Class A covered={covered} n={n_bodies} \
-                             — wipe + rebuild"
+                             — shorten the head count"
                         );
-                        drop(h);
-                        crate::segmented_head::wipe_segmented_head_files(dir);
-                        need_rebuild = n_bodies > 0;
-                        SegmentedTxHead::create(
-                            dir,
-                            crate::address_head::default_layout(opts.scale),
-                        )?
+                        h.clamp_to_create_count(n_bodies)?;
+                        h
                     } else {
                         if n_bodies > 0 && h.occupied() == 0 {
                             need_rebuild = true;

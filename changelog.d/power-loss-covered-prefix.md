@@ -24,8 +24,11 @@ Fixed
   two fills stays available. A witness locator ahead of the covered create
   count is cut back to that count, and a gap span past it is dropped.
   When that locator already matches, the witness body counter is set
-  back to that count before the next append.
+  back to that count before the next append. A `tx.head` that still has
+  `meta` is shortened to that count. Its slots stay, and open does not
+  rebuild it from Class A.
 - **Scripthash inclusion stays inside the covered create count.** A watermark
-  just above that count unlinks the tail, or rebuilds the head when those
-  outputs are gone. A shard offset past its file rebuilds once. A floor that
-  already matches the count does not.
+  just above that count unlinks the tail when the outputs are still there.
+  When those outputs are already gone, the watermark and seal fall to the
+  covered count and the packed head stays. A shard offset past its file
+  rebuilds once. A floor that already matches the count does not.

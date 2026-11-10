@@ -255,6 +255,42 @@ impl SegmentedTxHead {
         }
     }
 
+    /// Shorten the head to creates `1..=n`.
+    ///
+    /// `meta` is a synced rename. Body headers are not, so a covered-prefix
+    /// cut leaves this head naming creates the body dropped. Slot bytes and
+    /// sealed packs stay. A segment that starts past `n` leaves the list so
+    /// the next open still sees one contiguous span. Probes ignore a relative
+    /// fk above the shortened count.
+    pub fn clamp_to_create_count(&self, n: u64) -> Result<(), StoreError> {
+        let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let segs = self.segments_snapshot();
+        let mut list = Vec::with_capacity(segs.len());
+        let mut changed = false;
+        for s in segs.iter() {
+            if n == 0 || s.first_fk > n {
+                changed = true;
+                continue;
+            }
+            let c = s.count.load(Ordering::Relaxed);
+            let keep = n - s.first_fk + 1;
+            if c > keep {
+                s.count.store(keep, Ordering::Relaxed);
+                changed = true;
+            }
+            list.push(Arc::clone(s));
+        }
+        if list.len() != segs.len() {
+            changed = true;
+            let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
+            *guard = Arc::new(list);
+        }
+        if changed {
+            self.persist_meta_locked()?;
+        }
+        Ok(())
+    }
+
     /// Highest create_fk present in any segment (0 if empty).
     pub fn last_inserted_fk(&self) -> u64 {
         let segs = self.segments_snapshot();
@@ -589,7 +625,7 @@ impl SegmentedTxHead {
             let rel_lists = head.probe_fks_batch(&pass_keys);
             for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                 for r in rels.into_iter().rev() {
-                    if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {
+                    if let Some(fk) = abs_in_segment(seg, r.0) {
                         out[orig_i].push(fk);
                     }
                 }
@@ -657,7 +693,7 @@ impl SegmentedTxHead {
             let rel_lists = pack.read_rels_batch(&slots, ctx)?;
             for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                 for r in rels {
-                    if let Some(fk) = rel_to_abs(seg.first_fk, u64::from(r)) {
+                    if let Some(fk) = abs_in_segment(seg, u64::from(r)) {
                         out[orig_i].push(fk);
                     }
                 }
@@ -670,7 +706,7 @@ impl SegmentedTxHead {
                 .probe_fks_batch(&pass_keys);
             for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                 for r in rels.into_iter().rev() {
-                    if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {
+                    if let Some(fk) = abs_in_segment(seg, r.0) {
                         out[orig_i].push(fk);
                     }
                 }
@@ -1084,6 +1120,18 @@ pub fn rel_to_abs(first_fk: u64, rel: u64) -> Option<Fk> {
         return None;
     }
     Some(Fk(first_fk + rel - 1))
+}
+
+/// Absolute fk for a slot that is still inside the segment count.
+///
+/// A covered-prefix cut lowers `count` and leaves the old slot bytes. A
+/// relative fk above that count is a create the body no longer has.
+#[inline]
+fn abs_in_segment(seg: &Segment, rel: u64) -> Option<Fk> {
+    if rel == 0 || rel > seg.count.load(Ordering::Relaxed) {
+        return None;
+    }
+    rel_to_abs(seg.first_fk, rel)
 }
 
 #[doc(hidden)]

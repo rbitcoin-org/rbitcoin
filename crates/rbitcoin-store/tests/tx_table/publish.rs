@@ -138,6 +138,82 @@ fn tx_head_without_meta_rebuilds_from_class_a() {
     );
 }
 
+/// A covered-prefix cut leaves `tx.head/meta` naming creates the body
+/// headers never finished. Open shortens that count. It does not rebuild.
+#[test]
+fn tx_head_past_the_covered_prefix_keeps_its_meta() {
+    let dir = super::tempfile_dir("head-past-prefix");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    let first = one(1);
+    let txid1 = first.0.txid;
+    t.put_full_batch_indexed(&[first], true).unwrap();
+    let tx_end = on_disk_hwm(&t.body.body);
+    let in_end = on_disk_hwm(&t.seqsigwit.body);
+    let sp_end = on_disk_hwm(&t.spent.body);
+    let second = one(2);
+    let txid2 = second.0.txid;
+    t.put_full_batch_indexed(&[second], true).unwrap();
+    t.head.flush().unwrap();
+    assert_eq!(t.head.last_inserted_fk(), 2);
+    set_disk_hwm(&t.body.body, tx_end);
+    set_disk_hwm(&t.seqsigwit.body, in_end);
+    set_disk_hwm(&t.spent.body, sp_end);
+    drop(t);
+
+    rbitcoin_log::capture_logs(true);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    let first_open = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let text = first_open
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !text.contains("tx.head rebuild begin"),
+        "a head that still has meta was rebuilt: {text}"
+    );
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.head.last_inserted_fk(), 1);
+    assert_eq!(
+        t.get_by_txid(&txid1).unwrap().unwrap().0,
+        rbitcoin_primitives::Fk(1)
+    );
+    assert!(t.get_by_txid(&txid2).unwrap().is_none());
+    let third = one(3);
+    let txid3 = third.0.txid;
+    t.put_full_batch_indexed(&[third], true).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(
+        t.get_by_txid(&txid3).unwrap().unwrap().0,
+        rbitcoin_primitives::Fk(2)
+    );
+    assert!(t.get_by_txid(&txid2).unwrap().is_none());
+    drop(t);
+
+    rbitcoin_log::capture_logs(true);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    let second_open = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let text = second_open
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !text.contains("tx.head rebuild begin"),
+        "the shortened head rebuilds on the next open: {text}"
+    );
+    assert_eq!(
+        t.get_by_txid(&txid1).unwrap().unwrap().0,
+        rbitcoin_primitives::Fk(1)
+    );
+    assert_eq!(
+        t.get_by_txid(&txid3).unwrap().unwrap().0,
+        rbitcoin_primitives::Fk(2)
+    );
+}
+
 /// A monolithic `tx.head` file is not a torn segment directory.
 #[test]
 fn legacy_mono_tx_head_still_refuses_open() {

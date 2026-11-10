@@ -189,8 +189,9 @@ impl Query {
     }
 
     /// Drop index rows for creates past the stem, using the same unlink
-    /// disconnect uses. Missing outputs mean the body was cut: the caller
-    /// rebuilds from Class A instead.
+    /// disconnect uses. A packed head stores a mix of the key, not the key,
+    /// so a missing output cannot name the row. The watermark and SEAL still
+    /// move to `covered`, and the head stays.
     fn unlink_sh_tail(&self, covered: u64) -> Result<bool, QueryError> {
         use std::collections::HashMap;
         let hwm = self.store.scripthash.include_hwm();
@@ -198,7 +199,7 @@ impl Query {
         for id in covered.saturating_add(1)..=hwm {
             let outputs = match self.tx_output_run_class_a(Fk(id)) {
                 Ok(v) => v,
-                Err(StoreError::NotFound) => return Ok(false),
+                Err(StoreError::NotFound) => break,
                 Err(e) => return Err(e),
             };
             for o in &outputs {
