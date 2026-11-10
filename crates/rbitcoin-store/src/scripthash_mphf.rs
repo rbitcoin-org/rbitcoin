@@ -5,6 +5,7 @@
 //! fails the tag check.
 
 use crate::bdz::BdzMphf;
+use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::scripthash_layout::{pack8, unpack8, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN};
 use std::fs::{File, OpenOptions};
@@ -62,7 +63,7 @@ impl MphfHead {
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.val_file
-            .sync_data()
+            .durable_sync_data()
             .map_err(|e| StoreError::io(val_path(&self.base), e))
     }
 
@@ -103,7 +104,8 @@ impl MphfHead {
                 .map_err(|e| StoreError::io(&staging, e))?;
             f.write_all(&tags)
                 .map_err(|e| StoreError::io(&staging, e))?;
-            f.sync_all().map_err(|e| StoreError::io(&staging, e))?;
+            f.durable_sync_all()
+                .map_err(|e| StoreError::io(&staging, e))?;
         }
         std::fs::rename(&staging, &mp).map_err(|e| StoreError::io(&mp, e))?;
         let vp = val_path(base);
@@ -134,7 +136,7 @@ impl MphfHead {
         let path = val_path(&self.base);
         if words.is_empty() || len == 0 {
             self.val_file
-                .sync_data()
+                .durable_sync_data()
                 .map_err(|e| StoreError::io(&path, e))?;
             return Ok(());
         }
@@ -148,7 +150,7 @@ impl MphfHead {
                 .map_err(|e| StoreError::io(&path, e))?;
         }
         self.val_file
-            .sync_data()
+            .durable_sync_data()
             .map_err(|e| StoreError::io(&path, e))?;
         Ok(())
     }

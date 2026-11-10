@@ -147,6 +147,7 @@ use bitcoin::{
     TxMerkleNode, TxOut, Witness,
 };
 use rbitcoin_primitives::{Fk, Height};
+use rbitcoin_store::durability::Durable as _;
 use rbitcoin_store::{
     script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord,
     SpTweaksTable, Store, StoreError, StoreLayout, TxRecord,
@@ -895,7 +896,8 @@ impl Query {
                 .write(true)
                 .open(&path)
                 .map_err(|e| StoreError::io(&path, e))?;
-            file.sync_all().map_err(|e| StoreError::io(&path, e))?;
+            file.durable_sync_all()
+                .map_err(|e| StoreError::io(&path, e))?;
         }
         self.sync_spill_dir()
     }

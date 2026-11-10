@@ -2,7 +2,8 @@
 # Contract: ast-grep scan is clean on lint/ast-grep/fixtures/good and
 # reports error-severity hits on fixtures/bad (detached tokio::spawn,
 # mem::forget/Box::leak, dropped thread::spawn, dropped crate-root pub,
-# direct TcpListener::bind).
+# direct TcpListener::bind, direct sync_all / sync_data as a method or a
+# path call).
 # Does not scan crates/.
 # Missing binary: fail in CI, skip locally.
 set -euo pipefail
@@ -67,6 +68,11 @@ assert_ok "bad fixtures report listen-bind-direct" \
   grep -q 'listen-bind-direct' <<<"$bad_json"
 assert_ok "bad fixtures include short, tokio, and std TcpListener::bind" \
   python3 -c 'import json,sys; d=json.load(sys.stdin); assert {e["text"] for e in d if e["ruleId"]=="listen-bind-direct"} == {"TcpListener::bind(addr)", "tokio::net::TcpListener::bind(addr)", "std::net::TcpListener::bind(addr)"}' <<<"$bad_json"
+
+assert_ok "bad fixtures report sync-direct" \
+  grep -q 'sync-direct' <<<"$bad_json"
+assert_ok "bad fixtures include method and path sync_all and sync_data" \
+  python3 -c 'import json,sys; d=json.load(sys.stdin); assert {e["text"] for e in d if e["ruleId"]=="sync-direct"} == {"f.sync_all()", "f.sync_data()", "std::fs::File::sync_all(f)", "std::fs::File::sync_data(f)"}' <<<"$bad_json"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "ast-grep.test.sh: $PASS passed, $FAIL failed"

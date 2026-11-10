@@ -1,5 +1,6 @@
 //! RPC authentication: Bearer token plus optional Core cookie credentials.
 
+use rbitcoin_store::durability::Durable as _;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -246,7 +247,7 @@ pub fn write_token_file(path: &Path) -> Result<RpcAuth, String> {
     let written = f
         .write_all(auth.token.as_bytes())
         .map_err(|e| format!("token write: {e}"))
-        .and_then(|()| f.sync_all().map_err(|e| format!("token sync: {e}")));
+        .and_then(|()| f.durable_sync_all().map_err(|e| format!("token sync: {e}")));
     drop(f);
     // A rename replaces an existing name, so refuse one first. The datadir
     // lock keeps a second node out of the gap before the rename.

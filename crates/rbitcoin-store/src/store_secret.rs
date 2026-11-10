@@ -15,6 +15,7 @@
 //! Plaintext reconstruct always de-obfuscates on read. Missing secret on open of a
 //! schema-12+ store is an error (wipe / recreate datadir).
 
+use crate::durability::Durable as _;
 use crate::error::StoreError;
 use bitcoin_hashes::{sha256, Hash};
 use std::fs::OpenOptions;
@@ -72,7 +73,7 @@ impl StoreSecret {
         let mut f = opts.open(&path).map_err(|e| StoreError::io(&path, e))?;
         f.write_all(&self.bytes)
             .map_err(|e| StoreError::io(&path, e))?;
-        f.sync_all().map_err(|e| StoreError::io(&path, e))?;
+        f.durable_sync_all().map_err(|e| StoreError::io(&path, e))?;
         Ok(())
     }
 

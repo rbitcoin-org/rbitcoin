@@ -29,6 +29,8 @@ pub mod create_loc;
 #[doc(hidden)]
 pub mod delta_loc;
 #[doc(hidden)]
+pub mod durability;
+#[doc(hidden)]
 pub mod error;
 #[doc(hidden)]
 pub mod file;

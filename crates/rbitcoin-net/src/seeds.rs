@@ -9,6 +9,7 @@
 
 use bitcoin::p2p::ServiceFlags;
 use rbitcoin_primitives::Network;
+use rbitcoin_store::durability::Durable as _;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -1088,7 +1089,7 @@ impl AddrMan {
             for e in self.entries() {
                 writeln!(f, "{} 0x{:02x}", e.addr, e.flags.0)?;
             }
-            f.sync_all()?;
+            f.durable_sync_all()?;
         }
         std::fs::rename(&tmp, path)?;
         Ok(())

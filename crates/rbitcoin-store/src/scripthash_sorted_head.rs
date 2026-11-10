@@ -6,6 +6,7 @@
 //! **Main shards** are idx-only (misses pay one 4 KiB data pread). **Sealed
 //! ovf** still writes BF8R so a miss walk can skip the page.
 
+use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::fuse8_filter::{fuse_key_from_mixed, SealedFuse8};
 use crate::io_handle::IoHandle;
@@ -52,7 +53,7 @@ impl SortedHead {
     /// Durability barrier (shutdown / SH flush). Data already pwrite'd.
     pub fn flush(&self) -> Result<(), StoreError> {
         self.file
-            .sync_data()
+            .durable_sync_data()
             .map_err(|e| StoreError::io(&self.path, e))
     }
 
@@ -83,7 +84,7 @@ impl SortedHead {
                 f.write_all(k).map_err(|e| StoreError::io(path, e))?;
                 f.write_all(v).map_err(|e| StoreError::io(path, e))?;
             }
-            f.sync_all().map_err(|e| StoreError::io(path, e))?;
+            f.durable_sync_all().map_err(|e| StoreError::io(path, e))?;
         }
 
         let mut idx: Vec<(ShHeadKey, u64)> = Vec::new();

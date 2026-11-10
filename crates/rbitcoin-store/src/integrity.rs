@@ -11,6 +11,7 @@
 //! a later Class A truncate left past that count, including when the header
 //! clear landed and the tip shrink did not.
 
+use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::header_table::block_header_hash;
 use crate::store::Store;
@@ -148,7 +149,7 @@ impl TipSeal {
                 .open(&tmp)
                 .map_err(|e| StoreError::io(&tmp, e))?;
             f.write_all(&buf).map_err(|e| StoreError::io(&tmp, e))?;
-            f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+            f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
         }
         std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
         if let Some(parent) = p.parent() {

@@ -19,6 +19,7 @@ use rbitcoin_query::{spawn_sh_writebehind, Query, SpendSync};
 use rbitcoin_rpc::{
     gbt_template, run_rpc, HubRegtest, RpcActive, RpcConfig, RpcContext, RpcHandle, RpcRegtest,
 };
+use rbitcoin_store::durability::Durable as _;
 use rbitcoin_store::StoreError;
 use rbitcoin_sv2::{run_sv2_tp, Sv2TpConfig, Sv2TpHandle};
 use std::collections::HashMap;
@@ -455,7 +456,7 @@ impl DatadirNetwork {
             crate::lock::no_follow(std::fs::OpenOptions::new().write(true).create_new(true))
                 .open(&tmp)?;
         std::io::Write::write_all(&mut file, format!("{}\n", self.started).as_bytes())?;
-        file.sync_all()?;
+        file.durable_sync_all()?;
         std::fs::rename(&tmp, path)?;
         rbitcoin_store::file::fsync_parent_dir(&self.datadir)
     }
