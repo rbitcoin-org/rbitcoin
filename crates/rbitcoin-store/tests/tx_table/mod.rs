@@ -474,11 +474,11 @@ fn coinbases(n: u16) -> Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> {
         .collect()
 }
 
-/// The cut published the short checkpoint file and died before the locator
-/// header. The next open must not treat that as a 1023-create prefix.
+/// An append died after the locator grew and before the checkpoint landed.
+/// The sidecar is not a cut. Open keeps the checkpoint prefix and the stem.
 #[test]
-fn torn_witness_cut_keeps_creates_past_one_window() {
-    let dir = tempfile_dir("prune-torn-cut");
+fn pruned_short_checkpoint_keeps_the_witness_prefix() {
+    let dir = tempfile_dir("prune-short-checkpoint");
     let t = create_tiny(&dir);
     t.put_full_batch_indexed(&coinbases(1100), true).unwrap();
     t.flush().unwrap();
@@ -490,7 +490,30 @@ fn torn_witness_cut_keeps_creates_past_one_window() {
     drop(t);
     write_prune_sidecar(&dir);
     let t = TxTable::open_tiny(&dir).unwrap();
-    assert_eq!(t.count(), 1100, "a torn witness cut must keep creates");
+    assert_eq!(t.seqsigwit_loc.count(), 1023);
+    assert_eq!(t.count(), 1023);
+    assert_eq!(t.txids.count(), 1023);
+    assert_eq!(t.input.count(), 1023);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cut flushed locator length 0 and died before the checkpoint shrank.
+/// That header is the prefix. Open keeps the creates.
+#[test]
+fn header_first_witness_cut_keeps_creates() {
+    let dir = tempfile_dir("prune-header-first-cut");
+    let t = create_tiny(&dir);
+    t.put_full_batch_indexed(&coinbases(1100), true).unwrap();
+    t.flush().unwrap();
+    t.seqsigwit_loc
+        .loc
+        .set_logical_len(rbitcoin_store::file::FILE_HEADER_LEN as u64)
+        .unwrap();
+    t.seqsigwit_loc.loc.flush().unwrap();
+    drop(t);
+    write_prune_sidecar(&dir);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1100);
     assert_eq!(t.txids.count(), 1100);
     assert_eq!(t.input.count(), 1100);
     assert_eq!(t.seqsigwit_loc.count(), 0);

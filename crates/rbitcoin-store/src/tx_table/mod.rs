@@ -724,14 +724,9 @@ pub fn open_or_create_create_loc(dir: &Path) -> Result<crate::create_loc::Create
 #[doc(hidden)]
 pub fn open_or_create_seqsigwit_loc(
     seqsigwit_dir: &Path,
-    finish_torn_prune_cut: bool,
 ) -> Result<crate::delta_loc::DeltaLoc, StoreError> {
     if seqsigwit_dir.join("seqsigwit.loc").exists() {
-        if finish_torn_prune_cut {
-            crate::delta_loc::DeltaLoc::open_finish_torn_prune_cut(seqsigwit_dir, "seqsigwit")
-        } else {
-            crate::delta_loc::DeltaLoc::open(seqsigwit_dir, "seqsigwit")
-        }
+        crate::delta_loc::DeltaLoc::open(seqsigwit_dir, "seqsigwit")
     } else if class_a_body_occupied(seqsigwit_dir, "seqsigwit") {
         Err(StoreError::Corrupt("invariant: seqsigwit.loc missing"))
     } else {
@@ -1258,7 +1253,7 @@ impl TxTable {
         let had_seqsigwit = seqsigwit_dir.join("seqsigwit.body").exists();
         let had_spent = dir.join("spent.body").exists();
         let create_loc = open_or_create_create_loc(dir)?;
-        let seqsigwit_loc = open_or_create_seqsigwit_loc(seqsigwit_dir, prune_seqsigwit_mode)?;
+        let seqsigwit_loc = open_or_create_seqsigwit_loc(seqsigwit_dir)?;
         let loc_count = create_loc.count();
         // The sidecar is prune mode for reads and later appends. The witness
         // stem still seals the tip until its locator no longer covers creates.

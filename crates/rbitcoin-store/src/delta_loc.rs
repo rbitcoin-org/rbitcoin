@@ -295,20 +295,10 @@ impl DeltaLoc {
     }
 
     pub fn open(dir: &Path, stem: &str) -> Result<Self, StoreError> {
-        Self::open_inner(dir, stem, false)
+        Self::open_inner(dir, stem)
     }
 
-    /// Open a prune cut that died after the checkpoint file shrank.
-    ///
-    /// The loc file can still name every create. Trimming it to the last
-    /// checkpoint would throw those rows away. Publish length 0 instead.
-    /// A crash after that publish and before the checkpoint shrink is the
-    /// finished cut: the loc header is already the prefix.
-    pub fn open_finish_torn_prune_cut(dir: &Path, stem: &str) -> Result<Self, StoreError> {
-        Self::open_inner(dir, stem, true)
-    }
-
-    fn open_inner(dir: &Path, stem: &str, finish_torn_prune_cut: bool) -> Result<Self, StoreError> {
+    fn open_inner(dir: &Path, stem: &str) -> Result<Self, StoreError> {
         let loc = open_loc_file(&dir.join(format!("{stem}.loc")), TableKind::DeltaLoc)?;
         let ovf_path = dir.join(format!("{stem}.loc.ovf"));
         let ovf = if ovf_path.exists() {
@@ -348,10 +338,9 @@ impl DeltaLoc {
                 CREATE_OVF_MISSING
             },
         };
-        if finish_torn_prune_cut && count < full {
-            opened.truncate_to_zero_header_first()?;
-            return Ok(opened);
-        }
+        // A short checkpoint is an unpublished append tail, including when
+        // the prune sidecar already exists. The cut publishes locator length
+        // 0 before it shrinks the checkpoint, so that crash is count 0 here.
         opened.truncate_to_count(count)?;
         // A row past the overflow header belongs to a create this file does not name.
         let last_ovf = opened
