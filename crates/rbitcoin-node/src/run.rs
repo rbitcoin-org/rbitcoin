@@ -784,7 +784,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             addrman.len().saturating_sub(n_before),
             addrman.len()
         );
-    } else if !config.trust_peer_set() && config.listen.proxy.is_some() && config.listen.use_seeds {
+    } else if should_queue_proxy_seeds(&config) && !shutdown.requested() {
         proxy_seeds_queued = true;
         let n = queue_proxy_seed_addrfetch(&node.peers, config.network);
         info!("ibd: SOCKS proxy set — queued {n} seed hostnames via SOCKS addrfetch");
@@ -1697,6 +1697,7 @@ pub fn should_resolve_default_seeds(config: &NodeConfig) -> bool {
 #[doc(hidden)]
 pub fn should_queue_proxy_seeds(config: &NodeConfig) -> bool {
     seeds_allowed(config)
+        && !config.trust_peer_set()
         && config.listen.proxy.is_some()
         && config.listen.clearnet_reachable()
         && !socks_dns_seed_dests(config.network).is_empty()
@@ -1705,7 +1706,10 @@ pub fn should_queue_proxy_seeds(config: &NodeConfig) -> bool {
 /// Behind `--proxy` with no clearnet reachable, no seed hostname is asked,
 /// so the fixed onion, I2P, and CJDNS seeds are the only first peers.
 fn should_add_fixed_seeds_behind_proxy(config: &NodeConfig) -> bool {
-    seeds_allowed(config) && config.listen.proxy.is_some() && !config.listen.clearnet_reachable()
+    seeds_allowed(config)
+        && !config.trust_peer_set()
+        && config.listen.proxy.is_some()
+        && !config.listen.clearnet_reachable()
 }
 
 fn seeds_allowed(config: &NodeConfig) -> bool {
