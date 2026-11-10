@@ -762,7 +762,18 @@ assert_fail_msg "-signetchallenge rejects duplicates" "Error: -signetchallenge c
 # Core names a custom signet's datadir signet_<message start>. The default
 # challenge, given or not, stays signet. An explicit empty challenge is custom.
 message_start() {
-  python3 -c 'import hashlib,sys; r=bytes.fromhex(sys.argv[1]); print(hashlib.sha256(hashlib.sha256(bytes([len(r)])+r).digest()).digest()[:4].hex())' "$1"
+  python3 - "$1" <<'PY'
+import hashlib, sys
+r = bytes.fromhex(sys.argv[1])
+n = len(r)
+if n < 0xFD:
+    size = bytes([n])
+elif n <= 0xFFFF:
+    size = b"\xfd" + n.to_bytes(2, "little")
+else:
+    size = b"\xfe" + n.to_bytes(4, "little")
+print(hashlib.sha256(hashlib.sha256(size + r).digest()).digest()[:4].hex())
+PY
 }
 SIGNET_DEFAULT_CHALLENGE="512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae"
 SIGDIR_DD="$WORKDIR/signet-dirs"
@@ -789,6 +800,22 @@ signet_dir_case "explicit default -signetchallenge datadir is signet" \
   "$SIGDIR_DD/signet" "" -signetchallenge="$SIGNET_DEFAULT_CHALLENGE"
 signet_dir_case "empty -signetchallenge= datadir is signet_<magic>" \
   "$SIGDIR_DD/signet_$(message_start '')" "--signet-challenge=( |$)" -signetchallenge=
+# Core's GetSignetMessageStart takes a full CompactSize length prefix.
+LONG253="$(printf '51%.0s' $(seq 253))"
+LONG300="$(printf '51%.0s' $(seq 300))"
+signet_dir_case "253-byte -signetchallenge datadir uses a CompactSize prefix" \
+  "$SIGDIR_DD/signet_$(message_start "$LONG253")" "--signet-challenge=$LONG253( |$)" \
+  -signetchallenge="$LONG253"
+signet_dir_case "300-byte -signetchallenge datadir uses a CompactSize prefix" \
+  "$SIGDIR_DD/signet_$(message_start "$LONG300")" "--signet-challenge=$LONG300( |$)" \
+  -signetchallenge="$LONG300"
+# TryParseHex skips whitespace between bytes; the node gets plain hex.
+signet_dir_case "-signetchallenge skips whitespace between bytes like TryParseHex" \
+  "$SIGDIR_DD/signet_$(message_start 5151)" "--signet-challenge=5151( |$)" \
+  "-signetchallenge= 51 51 "
+assert_fail_msg "-signetchallenge rejects whitespace inside a byte" \
+  "Error: -signetchallenge must be hex, not '5 1'." \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$SIGDIR_DD" "-signetchallenge=5 1"
 
 # bitcoin-cli looks for the cookie in the same signet directory, honors
 # -rpccookiefile, and hints at -signetchallenge when auth fails on signet.
