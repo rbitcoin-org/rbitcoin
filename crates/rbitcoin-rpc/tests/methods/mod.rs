@@ -4390,6 +4390,55 @@ fn submitpackage_reports_other_wtxid_for_a_live_witness_variant() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core `AcceptPackage` rechecks each member by txid after `LimitMempoolSize`:
+/// a live witness variant that the package's trim evicted is `mempool full`.
+#[test]
+fn submitpackage_witness_variant_trimmed_by_the_package_is_mempool_full() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (parent_hex, parent) =
+        mature_coinbase_spend(&ctx, 50_0000_0000 - 1_000, p2wsh_script(1).to_p2wsh());
+    dispatch(&ctx, "sendrawtransaction", vec![json!(parent_hex)]).unwrap();
+    let prev = bitcoin::OutPoint {
+        txid: parent.compute_txid(),
+        vout: 0,
+    };
+    let value = parent.output[0].value.to_sat();
+    let one = p2wsh_with_lens(prev, value, 1_000, 1, &[1]);
+    let two = p2wsh_with_lens(prev, value, 1_000, 1, &[2]);
+    dispatch(
+        &ctx,
+        "sendrawtransaction",
+        vec![json!(rbitcoin_primitives::hex_encode(serialize(&one)))],
+    )
+    .unwrap();
+    let (rich_hex, rich) = spend_generated_coinbase(
+        &ctx,
+        2,
+        50_0000_0000 - 200_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    // Room for `rich` alone: the trim after it drops the parent and `one`.
+    let mp = ctx.mempool.as_ref().unwrap();
+    mp.set_max_weight(rich.weight().to_wu());
+    let two_hex = rbitcoin_primitives::hex_encode(serialize(&two));
+    let pkg = dispatch(&ctx, "submitpackage", vec![json!([two_hex, rich_hex])]).unwrap();
+    assert!(!mp.contains(&one.compute_txid()), "trim kept `one`: {pkg}");
+    assert!(mp.contains(&rich.compute_txid()), "{pkg}");
+    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
+    assert_eq!(
+        pkg["tx-results"][hash_hex_display(&two.compute_wtxid().to_byte_array())],
+        json!({
+            "txid": hash_hex_display(&two.compute_txid().to_byte_array()),
+            "error": "mempool full",
+        }),
+        "{pkg}"
+    );
+    let rich_row = &pkg["tx-results"][hash_hex_display(&rich.compute_wtxid().to_byte_array())];
+    assert!(rich_row.get("error").is_none(), "{pkg}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn submitpackage_maxfeerate_skips_package_eval_and_reports_replacements() {
     use bitcoin::absolute::LockTime;

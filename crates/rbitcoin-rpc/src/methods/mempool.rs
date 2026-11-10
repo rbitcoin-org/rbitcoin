@@ -2289,6 +2289,9 @@ struct PackagePlan {
     tx_results: serde_json::Map<String, Value>,
     replaced: Vec<String>,
     any_fail: bool,
+    /// Members whose txid was live at plan time. Their rows are written
+    /// after the package's trim ([`submitpackage_apply`]).
+    live: Vec<Transaction>,
     eval_txs: Vec<Transaction>,
     over_max: Vec<Transaction>,
     package_eval: bool,
@@ -2302,15 +2305,7 @@ pub fn submitpackage_admit(
 ) -> Value {
     let plan = submitpackage_plan(ctx, mp, txs, max_feerate);
     let rows = mp.submit_package_rpc_eval(&plan.eval_txs, plan.package_eval);
-    submitpackage_apply(
-        mp,
-        plan.tx_results,
-        plan.replaced,
-        plan.any_fail,
-        &plan.eval_txs,
-        plan.over_max,
-        rows,
-    )
+    submitpackage_apply(mp, plan, rows)
 }
 
 /// HTTP `submitpackage` admit. Scripts are awaited on the request task.
@@ -2335,18 +2330,7 @@ pub async fn submitpackage_admit_async(
             .await;
         park_before_unbroadcast_note(&mp_a).await;
         let mp_b = Arc::clone(&mp_a);
-        rbitcoin_net::off_pool(move || {
-            submitpackage_apply(
-                &mp_b,
-                plan.tx_results,
-                plan.replaced,
-                plan.any_fail,
-                &plan.eval_txs,
-                plan.over_max,
-                rows,
-            )
-        })
-        .await
+        rbitcoin_net::off_pool(move || submitpackage_apply(&mp_b, plan, rows)).await
     })
     .await
     .expect("submitpackage")
@@ -2361,6 +2345,7 @@ fn submitpackage_plan(
     let mut tx_results = serde_json::Map::new();
     let replaced = Vec::new();
     let mut to_admit = Vec::new();
+    let mut live = Vec::new();
     let mut any_fail = false;
     for tx in txs {
         let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
@@ -2376,37 +2361,10 @@ fn submitpackage_plan(
             );
             continue;
         }
-        let Some(live) = mp.wtxid_of(&tx.compute_txid()) else {
-            to_admit.push(tx.clone());
-            continue;
-        };
-        // Core `DIFFERENT_WITNESS`: the txid is live under another witness.
-        if live != tx.compute_wtxid() {
-            tx_results.insert(
-                wtxid,
-                json!({
-                    "txid": txid_s,
-                    "other-wtxid": hash_hex_display(&live.to_byte_array()),
-                }),
-            );
-            continue;
-        }
-        if let (Some((fee, _)), Some(weight)) = (
-            mp.get_live_meta(&tx.compute_txid()),
-            mp.get_live_adjusted_weight(&tx.compute_txid()),
-        ) {
-            tx_results.insert(
-                wtxid,
-                json!({
-                    "txid": txid_s,
-                    "vsize": rbitcoin_consensus::policy::vbytes_ceil(weight),
-                    "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(weight),
-                    "vsize_bip141": tx.vsize(),
-                    "fees": { "base": sat_btc_json(fee as i64) },
-                }),
-            );
+        if mp.contains(&tx.compute_txid()) {
+            live.push(tx.clone());
         } else {
-            tx_results.insert(wtxid, json!({ "txid": txid_s }));
+            to_admit.push(tx.clone());
         }
     }
     // Core compares each member's own feerate with `maxfeerate` before
@@ -2438,6 +2396,7 @@ fn submitpackage_plan(
         tx_results,
         replaced,
         any_fail,
+        live,
         eval_txs,
         over_max,
         package_eval,
@@ -2446,13 +2405,18 @@ fn submitpackage_plan(
 
 fn submitpackage_apply(
     mp: &MempoolHub,
-    mut tx_results: serde_json::Map<String, Value>,
-    mut replaced: Vec<String>,
-    mut any_fail: bool,
-    eval_txs: &[Transaction],
-    over_max: Vec<Transaction>,
+    plan: PackagePlan,
     rows: Vec<rbitcoin_net::tx_relay::SubmitPackageRow>,
 ) -> Value {
+    let PackagePlan {
+        mut tx_results,
+        mut replaced,
+        mut any_fail,
+        live,
+        eval_txs,
+        over_max,
+        package_eval: _,
+    } = plan;
     for (tx, row) in eval_txs.iter().zip(rows) {
         match row.result {
             Ok(ok) => {
@@ -2490,6 +2454,35 @@ fn submitpackage_apply(
                 );
             }
         }
+    }
+    // Core `AcceptPackage` rechecks these by txid after `LimitMempoolSize`:
+    // the package's trim, or a concurrent replace, may have changed them.
+    for tx in &live {
+        let txid = tx.compute_txid();
+        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        let txid_s = hash_hex_display(&txid.to_byte_array());
+        let row = match mp.wtxid_of(&txid) {
+            None => {
+                any_fail = true;
+                json!({ "txid": txid_s, "error": "mempool full" })
+            }
+            // Core `DIFFERENT_WITNESS`: the txid is live under another witness.
+            Some(other) if other != tx.compute_wtxid() => json!({
+                "txid": txid_s,
+                "other-wtxid": hash_hex_display(&other.to_byte_array()),
+            }),
+            Some(_) => match (mp.get_live_meta(&txid), mp.get_live_adjusted_weight(&txid)) {
+                (Some((fee, _)), Some(weight)) => json!({
+                    "txid": txid_s,
+                    "vsize": rbitcoin_consensus::policy::vbytes_ceil(weight),
+                    "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(weight),
+                    "vsize_bip141": tx.vsize(),
+                    "fees": { "base": sat_btc_json(fee as i64) },
+                }),
+                _ => json!({ "txid": txid_s }),
+            },
+        };
+        tx_results.insert(wtxid, row);
     }
     for tx in over_max {
         any_fail = true;
