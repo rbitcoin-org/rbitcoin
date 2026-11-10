@@ -762,6 +762,17 @@ impl Query {
         rbitcoin_store::store::rewrite_meta_current(self.store.path())?;
         self.store.txs.input.flush()?;
         self.store.set_prune_seqsigwit_mode(true);
+        let before = std::fs::metadata(self.store.txs.seqsigwit.body_file_path())
+            .map(|m| m.len())
+            .unwrap_or_else(|_| self.store.txs.seqsigwit.body_logical_len());
+        let keep = self
+            .tip_height()
+            .map(|t| t.0.saturating_add(1).min(Self::SEQSIGWIT_KEEP_HEIGHTS))
+            .unwrap_or(0);
+        rbitcoin_log::info!(
+            "seqsigwit: cut the witness stem from {} to its header after keeping the last {keep} blocks",
+            fmt_byte_size(before)
+        );
         self.store.txs.cut_seqsigwit_stem_to_header()
     }
 
@@ -3259,6 +3270,23 @@ pub fn take_keep_reads() -> u64 {
 pub fn take_keep_writes() -> u64 {
     KEEP_TRACE.with(|on| on.set(false));
     KEEP_WRITES.with(|n| n.replace(0))
+}
+
+/// On-disk size for the stem-cut log. GiB and MiB use one decimal.
+fn fmt_byte_size(n: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if n >= GIB {
+        let whole = n / GIB;
+        let frac = (n % GIB) * 10 / GIB;
+        format!("{whole}.{frac} GiB")
+    } else if n >= MIB {
+        let whole = n / MIB;
+        let frac = (n % MIB) * 10 / MIB;
+        format!("{whole}.{frac} MiB")
+    } else {
+        format!("{n} B")
+    }
 }
 
 fn note_keep_read() {

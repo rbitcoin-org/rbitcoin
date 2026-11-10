@@ -685,6 +685,36 @@ fn enabling_prune_at_keep_window_keeps_genesis() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The stem cut is the step that frees the witness file. An operator has to
+/// see that line once. A later start, with the stem already a header, does
+/// not say it again.
+#[test]
+fn cutting_the_witness_stem_logs_once() {
+    let (dir, q) = temp_query("prune-cut-log");
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 2, &[0x11], &mut hashes);
+    rbitcoin_log::capture_logs(true);
+    q.set_prune_seqsigwit(true).unwrap();
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(
+        logs.iter()
+            .any(|(_, line)| line.contains("cut the witness stem")),
+        "the cut has to say why the witness file shrank, got {logs:?}"
+    );
+    rbitcoin_log::capture_logs(true);
+    q.set_prune_seqsigwit(true).unwrap();
+    let again = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(
+        again
+            .iter()
+            .all(|(_, line)| !line.contains("cut the witness stem")),
+        "a header-only stem must not log another cut, got {again:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Tip 288 is one past the keep window. The stem cut drops genesis, so the
 /// watermark has to say so. A missing watermark lets reconstruct fail as
 /// pruned for a height the node still claims to have.
