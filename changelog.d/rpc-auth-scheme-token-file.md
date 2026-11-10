@@ -1,9 +1,10 @@
 Fixed
 
 - **RPC auth schemes match in any case.** `Authorization: BEARER …` and
-  `basic …` are accepted, as RFC 7235 and Core allow. Before, only
-  `Bearer`/`bearer` and `Basic`/`basic` passed.
-- **A crash while minting the RPC token no longer blocks the next start.**
-  The token is synced in `rpc.token.tmp` and then linked into place, so
-  `rpc.token` is never left empty. A zero-length `rpc.token` from an older
-  crash is replaced with a new token instead of failing startup.
+  `basic …` are accepted, since RFC 9110 makes auth schemes
+  case-insensitive. Before, only `Bearer`/`bearer` and `Basic`/`basic`
+  passed.
+- **An empty RPC token file no longer blocks start.** A crash between
+  creating and writing `rpc.token` left a zero-length file, and every later
+  start failed with "empty". The node now replaces a zero-length
+  `rpc.token` with a new token. A failed write removes the partial file.

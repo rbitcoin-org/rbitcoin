@@ -215,22 +215,13 @@ pub fn read_token_file(path: &Path) -> Result<RpcAuth, String> {
 
 /// Write a new token to `path`, which must not exist.
 ///
-/// The token is synced in a sibling tmp file first, so `path` never names a
-/// partial token after a crash.
+/// A crash before the sync leaves at most a zero-length file, which
+/// [`resolve_rpc_auth`] replaces on the next start.
 pub fn write_token_file(path: &Path) -> Result<RpcAuth, String> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent).map_err(|e| format!("token parent: {e}"))?;
-    let auth = RpcAuth::new(random_token());
-    let staged = rbitcoin_store::file::tmp_sidecar_path(path);
-    match fs::remove_file(&staged) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            return Err(format!("remove stale token {}: {e}", staged.display()));
-        }
-        _ => {}
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("token parent: {e}"))?;
     }
+    let auth = RpcAuth::new(random_token());
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -238,19 +229,16 @@ pub fn write_token_file(path: &Path) -> Result<RpcAuth, String> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts
-        .open(&staged)
-        .map_err(|e| format!("token create: {e}"))?;
-    f.write_all(auth.token.as_bytes())
-        .map_err(|e| format!("token write: {e}"))?;
-    f.sync_all().map_err(|e| format!("token sync: {e}"))?;
-    drop(f);
-    // A link fails when `path` exists. A rename would replace a token another
-    // process just wrote.
-    let published = fs::hard_link(&staged, path).map_err(|e| format!("token create: {e}"));
-    let _ = fs::remove_file(&staged);
-    published?;
-    rbitcoin_store::file::fsync_parent_dir(parent).map_err(|e| format!("token dir sync: {e}"))?;
+    let mut f = opts.open(path).map_err(|e| format!("token create: {e}"))?;
+    let written = f
+        .write_all(auth.token.as_bytes())
+        .map_err(|e| format!("token write: {e}"))
+        .and_then(|()| f.sync_all().map_err(|e| format!("token sync: {e}")));
+    if let Err(e) = written {
+        drop(f);
+        let _ = fs::remove_file(path);
+        return Err(e);
+    }
     Ok(auth)
 }
 
