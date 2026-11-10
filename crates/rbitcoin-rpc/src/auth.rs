@@ -215,8 +215,8 @@ pub fn read_token_file(path: &Path) -> Result<RpcAuth, String> {
 
 /// Write a new token to `path`, which must not exist.
 ///
-/// A crash before the sync leaves at most a zero-length file, which
-/// [`resolve_rpc_auth`] replaces on the next start.
+/// A crash before the rename leaves only `rpc.token.tmp`, which the next
+/// write removes.
 pub fn write_token_file(path: &Path) -> Result<RpcAuth, String> {
     let parent = path
         .parent()
