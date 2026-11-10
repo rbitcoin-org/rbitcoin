@@ -601,6 +601,40 @@ fn tweaks_hold_the_witness_until_the_row_is_sealed() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Prune and tweaks are on from an empty chain. The first batch past height
+/// 288 holds the prune watermark at unset and leaves `0.bin` on disk. A
+/// restart must not unlink that file, and tweaks must still turn on.
+#[test]
+fn held_prune_reopen_keeps_the_window_for_tweaks() {
+    let (dir, q) = temp_query("prune-hold-reopen");
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut hashes = Vec::new();
+    let n = Query::SEQSIGWIT_KEEP_HEIGHTS + 1;
+    connect_range(&q, Fk::NULL, None, n, &[0x71], &mut hashes);
+    assert_eq!(q.tip_height(), Some(Height(n - 1)));
+    assert_eq!(q.pruneheight(), None);
+    assert_eq!(q.tweak_index_next(), Some(0));
+    let spill = q.store().path().join("seqsigwit.window/0.bin");
+    assert!(spill.is_file());
+    q.store()
+        .sync_spend_durable(q.tip_height().unwrap().0)
+        .unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    assert!(
+        spill.is_file(),
+        "a held prune must not unlink the window on startup"
+    );
+    assert_eq!(q.pruneheight(), None);
+    q.set_sptweaks_enabled(true, Height(0))
+        .expect("tweaks still cover the chain while the window is on disk");
+    assert_eq!(q.tweak_index_next(), Some(0));
+    assert!(spill.is_file(), "enable must not delete the repair copy");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Direct mode publishes the tip before `flush_class_c_tip` lands.
 /// Sealing tweaks must not prune to that RAM tip. Height 0 stays until
 /// the flush is joined and the sealed tip is 288.

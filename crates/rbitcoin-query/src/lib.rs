@@ -1092,8 +1092,15 @@ impl Query {
                 // Record the real watermark before the stem cut. A crash
                 // in between used to reopen as "nothing dropped" with the
                 // witnesses already gone. Tip below 288 still drops nothing.
+                // A tweak hold leaves the sidecar unset on purpose and keeps
+                // the window file. Writing the predicted height here unlinks
+                // that file before startup can repair from it.
                 if let Some(h) = self.predicted_pruneheight() {
-                    self.set_pruneheight(Some(Height(h)))?;
+                    if self.unset_prune_is_held(h) {
+                        self.persist_pruneheight(u32::MAX)?;
+                    } else {
+                        self.set_pruneheight(Some(Height(h)))?;
+                    }
                 } else {
                     self.persist_pruneheight(u32::MAX)?;
                 }
@@ -1113,6 +1120,17 @@ impl Query {
             self.set_pruneheight(None)?;
         }
         Ok(())
+    }
+
+    /// The sidecar still says nothing was dropped, the witness stem is already
+    /// a header, and `{predicted}.bin` is still on disk. Tweaks held the prune.
+    /// A crash that unlinked that file before the sidecar write leaves it gone.
+    pub(crate) fn unset_prune_is_held(&self, predicted: u32) -> bool {
+        if self.store.txs.seqsigwit_loc.count() > 0 {
+            return false;
+        }
+        self.seqsigwit_spill_file(predicted)
+            .is_ok_and(|path| path.is_file())
     }
 
     /// Durable-later watermark: creates at this height and below have no seqsigwit.

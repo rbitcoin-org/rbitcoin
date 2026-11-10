@@ -295,8 +295,9 @@ impl Query {
     /// Prune height the tweak gate should trust.
     ///
     /// `None` after the stem is already cut, on a tip of at least 288, is
-    /// the crash between that cut and the sidecar write. Those heights are
-    /// gone. A shorter chain really has dropped nothing.
+    /// the crash between that cut and the sidecar write when the window file
+    /// is gone. Those heights are gone. A held prune keeps that file and has
+    /// dropped nothing. A shorter chain really has dropped nothing.
     pub(crate) fn witnessed_pruneheight(&self) -> Option<u32> {
         if let Some(ph) = self.pruneheight() {
             return Some(ph.0);
@@ -309,8 +310,9 @@ impl Query {
             return None;
         }
         let txs = &self.store.txs;
-        if txs.seqsigwit_loc.count() < txs.count() {
-            Some(tip - Self::SEQSIGWIT_KEEP_HEIGHTS)
+        let predicted = tip - Self::SEQSIGWIT_KEEP_HEIGHTS;
+        if txs.seqsigwit_loc.count() < txs.count() && !self.unset_prune_is_held(predicted) {
+            Some(predicted)
         } else {
             None
         }
