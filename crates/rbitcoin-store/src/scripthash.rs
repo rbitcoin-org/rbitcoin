@@ -1349,6 +1349,25 @@ pub fn unlink_scripthash_run_leftovers(store_dir: &Path) -> Result<(), StoreErro
     Ok(())
 }
 
+struct PostedKey {
+    value: ShHeadValue,
+    home: KeyHome,
+    written: usize,
+    repaired: Option<(ShHeadValue, i64)>,
+}
+
+struct SeededHeads {
+    values: HashMap<[u8; 32], ShHeadValue>,
+    home: HashMap<[u8; 32], KeyHome>,
+}
+
+struct RetiredPosting {
+    key: [u8; 32],
+    home: KeyHome,
+    previous: ShHeadValue,
+    live_delta: i64,
+}
+
 impl ScriptHashTable {
     pub fn entry_count(&self) -> u64 {
         let mut n = 0u64;
@@ -1789,119 +1808,187 @@ impl ScriptHashTable {
         order.sort_by(|&a, &b| recs[a].scripthash.cmp(&recs[b].scripthash));
         timing.sort_ns = t_sort.elapsed().as_nanos() as u64;
 
-        let mut heads: HashMap<[u8; 32], ShHeadValue> = HashMap::new();
-        let mut home: HashMap<[u8; 32], KeyHome> = HashMap::new();
-
         let t_seed = std::time::Instant::now();
-        // Cold body (no prior creates): skip N head gets — empty table probes.
-        if self.entry_count() > 0 || !self.head_is_empty() {
-            let mut keys: Vec<[u8; 32]> = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for &i in &order {
-                let rec = &recs[i];
-                if rec.create_tx_fk.is_null() {
-                    continue;
-                }
-                if seen.insert(rec.scripthash) {
-                    keys.push(rec.scripthash);
-                }
-            }
-            keys.sort_unstable();
-            for key in keys {
-                if let Some((v, kh)) = self.locate_head(&key)? {
-                    heads.insert(key, v);
-                    home.insert(key, KeyHome::from(kh));
-                } else {
-                    home.insert(key, KeyHome::Absent);
-                }
-            }
-        }
+        let seeded = self.seed_batch_heads(recs, &order)?;
         timing.seed_ns = t_seed.elapsed().as_nanos() as u64;
 
         let t_body = std::time::Instant::now();
         let mut head_final: Vec<([u8; 32], ShHeadValue, KeyHome)> = Vec::new();
-        let mut retire: Vec<([u8; 32], KeyHome, ShHeadValue, i64)> = Vec::new();
+        let mut retire: Vec<RetiredPosting> = Vec::new();
         let mut written = 0usize;
 
         let mut i = 0usize;
         while i < order.len() {
-            let rec0 = &recs[order[i]];
-            if rec0.create_tx_fk.is_null() {
-                i += 1;
+            let Some((key, fk_vals)) = Self::take_key_fks(recs, &order, &mut i) else {
                 continue;
-            }
-            let key = rec0.scripthash;
-            let mut fk_vals: Vec<u64> = Vec::new();
-            while i < order.len() {
-                let rec = &recs[order[i]];
-                if rec.scripthash != key {
-                    break;
-                }
-                if !rec.create_tx_fk.is_null() {
-                    fk_vals.push(rec.create_tx_fk.0);
-                }
-                i += 1;
-            }
-            if fk_vals.is_empty() {
+            };
+            let Some(posted) = self.post_sorted_key(key, fk_vals, &seeded, live_through)? else {
                 continue;
+            };
+            written += posted.written;
+            head_final.push((key, posted.value, posted.home));
+            if let Some((previous, live_delta)) = posted.repaired {
+                retire.push(RetiredPosting {
+                    key,
+                    home: posted.home,
+                    previous,
+                    live_delta,
+                });
             }
-            fk_vals.sort_unstable();
-            fk_vals.dedup();
-
-            let cur = heads.get(&key).cloned().unwrap_or(ShHeadValue::Empty);
-            let kh = home.get(&key).copied().unwrap_or(KeyHome::Absent);
-            let body = self.body_for(&key, kh);
-            let max = self.last_create_fk_on(body, &cur)?;
-            let max_u = max.map(|f| f.0).unwrap_or(0);
-            // A row that still names a create past the live count would skip
-            // every later fk at or below that stale end. Once the live count
-            // has passed that end, a real create at or below it is skipped
-            // the same way. Merge this batch instead of appending past the end.
-            let below_stale_end = max.is_some()
-                && fk_vals
-                    .iter()
-                    .any(|&fk| fk > 0 && fk <= max_u && fk <= live_through);
-            if max.is_some() && (max_u > live_through || below_stale_end) {
-                let Some((new_val, n_new, live_delta)) =
-                    self.repair_posting_through(&key, kh, &cur, &fk_vals, live_through)?
-                else {
-                    continue;
-                };
-                written += n_new;
-                head_final.push((key, new_val, kh));
-                retire.push((key, kh, cur, live_delta));
-                continue;
-            }
-            let add: Vec<Fk> = fk_vals
-                .into_iter()
-                .filter(|&fk| fk <= live_through && (max.is_none() || fk > max_u))
-                .map(Fk)
-                .collect();
-            if add.is_empty() {
-                continue;
-            }
-            written += add.len();
-            let alloc_mu = self.alloc_for(&key, kh);
-            let mut alloc = alloc_mu.lock().unwrap();
-            let new_val = self.append_sorted_creates(body, &mut alloc, &cur, &add)?;
-            write_alloc_header(body, &alloc)?;
-            drop(alloc);
-            head_final.push((key, new_val, kh));
         }
 
         timing.body_ns = t_body.elapsed().as_nanos() as u64;
 
-        for (key, kh, _, _) in &retire {
-            self.body_for(key, *kh).sync_data_only()?;
-        }
+        self.sync_repaired_bodies(&retire)?;
         if !head_final.is_empty() {
             let t_head = std::time::Instant::now();
             let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
             self.apply_head_upserts(&head_final, flush_each)?;
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }
-        for (key, kh, _, _) in &retire {
-            self.sync_repair_home(key, *kh)?;
+        self.free_repaired_rows(retire)?;
+        Ok((written, timing))
+    }
+
+    fn take_key_fks(
+        recs: &[ScriptHashRecord],
+        order: &[usize],
+        i: &mut usize,
+    ) -> Option<([u8; 32], Vec<u64>)> {
+        let rec0 = &recs[order[*i]];
+        if rec0.create_tx_fk.is_null() {
+            *i += 1;
+            return None;
+        }
+        let key = rec0.scripthash;
+        let mut fk_vals = Vec::new();
+        while *i < order.len() {
+            let rec = &recs[order[*i]];
+            if rec.scripthash != key {
+                break;
+            }
+            if !rec.create_tx_fk.is_null() {
+                fk_vals.push(rec.create_tx_fk.0);
+            }
+            *i += 1;
+        }
+        if fk_vals.is_empty() {
+            None
+        } else {
+            Some((key, fk_vals))
+        }
+    }
+
+    /// Cold body (no prior creates): skip N head gets — empty table probes.
+    fn seed_batch_heads(
+        &self,
+        recs: &[ScriptHashRecord],
+        order: &[usize],
+    ) -> Result<SeededHeads, StoreError> {
+        let mut values = HashMap::new();
+        let mut home = HashMap::new();
+        if self.entry_count() == 0 && self.head_is_empty() {
+            return Ok(SeededHeads { values, home });
+        }
+        let mut keys: Vec<[u8; 32]> = Vec::new();
+        let mut seen = HashSet::new();
+        for &i in order {
+            let rec = &recs[i];
+            if rec.create_tx_fk.is_null() {
+                continue;
+            }
+            if seen.insert(rec.scripthash) {
+                keys.push(rec.scripthash);
+            }
+        }
+        keys.sort_unstable();
+        for key in keys {
+            if let Some((v, kh)) = self.locate_head(&key)? {
+                values.insert(key, v);
+                home.insert(key, KeyHome::from(kh));
+            } else {
+                home.insert(key, KeyHome::Absent);
+            }
+        }
+        Ok(SeededHeads { values, home })
+    }
+
+    /// A stored end past `live_through` would skip every later fk at or below
+    /// that end. Once the live count has passed the end, a create at or below
+    /// it is skipped the same way. Both cases rebuild the row.
+    fn batch_meets_stale_end(max: Option<Fk>, fk_vals: &[u64], live_through: u64) -> bool {
+        let Some(max) = max else {
+            return false;
+        };
+        if max.0 > live_through {
+            return true;
+        }
+        fk_vals
+            .iter()
+            .any(|&fk| fk > 0 && fk <= max.0 && fk <= live_through)
+    }
+
+    fn post_sorted_key(
+        &self,
+        key: [u8; 32],
+        mut fk_vals: Vec<u64>,
+        seeded: &SeededHeads,
+        live_through: u64,
+    ) -> Result<Option<PostedKey>, StoreError> {
+        fk_vals.sort_unstable();
+        fk_vals.dedup();
+        let cur = seeded
+            .values
+            .get(&key)
+            .cloned()
+            .unwrap_or(ShHeadValue::Empty);
+        let kh = seeded.home.get(&key).copied().unwrap_or(KeyHome::Absent);
+        let body = self.body_for(&key, kh);
+        let max = self.last_create_fk_on(body, &cur)?;
+        let max_u = max.map(|f| f.0).unwrap_or(0);
+        if Self::batch_meets_stale_end(max, &fk_vals, live_through) {
+            let Some((new_val, n_new, live_delta)) =
+                self.repair_posting_through(&key, kh, &cur, &fk_vals, live_through)?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(PostedKey {
+                value: new_val,
+                home: kh,
+                written: n_new,
+                repaired: Some((cur, live_delta)),
+            }));
+        }
+        let add: Vec<Fk> = fk_vals
+            .into_iter()
+            .filter(|&fk| fk <= live_through && (max.is_none() || fk > max_u))
+            .map(Fk)
+            .collect();
+        if add.is_empty() {
+            return Ok(None);
+        }
+        let alloc_mu = self.alloc_for(&key, kh);
+        let mut alloc = alloc_mu.lock().unwrap();
+        let new_val = self.append_sorted_creates(body, &mut alloc, &cur, &add)?;
+        write_alloc_header(body, &alloc)?;
+        Ok(Some(PostedKey {
+            value: new_val,
+            home: kh,
+            written: add.len(),
+            repaired: None,
+        }))
+    }
+
+    fn sync_repaired_bodies(&self, retire: &[RetiredPosting]) -> Result<(), StoreError> {
+        for row in retire {
+            self.body_for(&row.key, row.home).sync_data_only()?;
+        }
+        Ok(())
+    }
+
+    fn free_repaired_rows(&self, retire: Vec<RetiredPosting>) -> Result<(), StoreError> {
+        for row in &retire {
+            self.sync_repair_home(&row.key, row.home)?;
             #[cfg(debug_assertions)]
             note_repair_head_synced();
         }
@@ -1911,15 +1998,15 @@ impl ScriptHashTable {
                 hook(self);
             }
         }
-        for (key, kh, old, live_delta) in retire {
-            let body = self.body_for(&key, kh);
-            let alloc_mu = self.alloc_for(&key, kh);
+        for row in retire {
+            let body = self.body_for(&row.key, row.home);
+            let alloc_mu = self.alloc_for(&row.key, row.home);
             let mut alloc = alloc_mu.lock().unwrap();
-            apply_live_delta(&mut alloc, live_delta);
-            self.free_if_paged(body, &mut alloc, &old)?;
+            apply_live_delta(&mut alloc, row.live_delta);
+            self.free_if_paged(body, &mut alloc, &row.previous)?;
             write_alloc_header(body, &alloc)?;
         }
-        Ok((written, timing))
+        Ok(())
     }
 
     /// Sync the home that holds the repaired value. A main update that missed
