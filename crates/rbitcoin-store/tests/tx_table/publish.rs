@@ -226,6 +226,47 @@ fn torn_prune_file_keeps_creates_past_the_witness_stem() {
     assert_eq!(outs(&t, 2)[0].script, vec![2]);
 }
 
+/// A second torn locator starts past the first gap. The creates between
+/// those fills already have a witness, so open must not mark them empty.
+#[test]
+fn later_fill_keeps_the_witness_between_two_gaps() {
+    let dir = super::tempfile_dir("gap-between");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let after_first = on_disk_hwm(&t.seqsigwit_loc.loc);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    set_disk_hwm(&t.seqsigwit_loc.loc, after_first);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert!(t.witness_row_is_gap(2));
+    assert!(!t.witness_row_is_gap(1));
+    let mut third = one(3);
+    third.1[0].script_sig = vec![0xab];
+    t.put_full_batch_indexed(&[third], false).unwrap();
+    let after_third = on_disk_hwm(&t.seqsigwit_loc.loc);
+    t.put_full_batch_indexed(&[one(4)], false).unwrap();
+    set_disk_hwm(&t.seqsigwit_loc.loc, after_third);
+    drop(t);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert!(t.witness_row_is_gap(2), "the first empty row stays a gap");
+    assert!(
+        !t.witness_row_is_gap(3),
+        "the witness between the fills is still a witness"
+    );
+    assert!(t.witness_row_is_gap(4), "the new short locator is a gap");
+    assert!(!t.witness_row_is_gap(1));
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(3)).unwrap().1[0].script_sig,
+        vec![0xab]
+    );
+    drop(t);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert!(t.witness_row_is_gap(2));
+    assert!(!t.witness_row_is_gap(3));
+    assert!(t.witness_row_is_gap(4));
+}
+
 /// A 1024-create window whose `create.off` checkpoint did not land opens at
 /// the last create that does not need that checkpoint.
 #[test]
