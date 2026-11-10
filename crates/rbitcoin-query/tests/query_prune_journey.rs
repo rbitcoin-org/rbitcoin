@@ -575,6 +575,69 @@ fn confirm_batch_syncs_the_window_directory_once() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Tweaks are on and not caught up. Confirm must not delete a witness the
+/// index has not sealed. Once that height is sealed, the prune can move.
+#[test]
+fn tweaks_hold_the_witness_until_the_row_is_sealed() {
+    let (dir, q) = temp_query("prune-tweak-hold");
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut hashes = Vec::new();
+    let n = Query::SEQSIGWIT_KEEP_HEIGHTS + 1;
+    connect_range(&q, Fk::NULL, None, n, &[0x71], &mut hashes);
+    let tip = n - 1;
+    assert_eq!(q.tip_height(), Some(Height(tip)));
+    assert_eq!(q.tweak_index_next(), Some(0));
+    assert!(q.store().path().join("seqsigwit.window/0.bin").is_file());
+    assert_eq!(q.pruneheight(), None);
+    let header0 = q.header_at_height(Height(0)).unwrap().unwrap().0;
+    q.put_sp_tweaks_block(Height(0), header0, &[Some([0x02; 33])])
+        .unwrap();
+    assert_eq!(q.tweak_index_next(), Some(1));
+    q.prune_seqsigwit_after_tweak_seal().unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(0)));
+    assert!(!q.store().path().join("seqsigwit.window/0.bin").exists());
+    assert!(q.store().path().join("seqsigwit.window/1.bin").is_file());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The sidecar can still say nothing was dropped after the stem is gone.
+/// Enabling tweaks has to refuse before it creates an index it cannot fill.
+#[test]
+fn cut_without_a_watermark_refuses_tweaks() {
+    let (dir, q) = temp_query("prune-cut-no-watermark");
+    let mut hashes = Vec::new();
+    let n = Query::SEQSIGWIT_KEEP_HEIGHTS + 1;
+    connect_range(&q, Fk::NULL, None, n, &[0x72], &mut hashes);
+    q.set_prune_seqsigwit(true).unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(0)));
+    q.store()
+        .sync_spend_durable(q.tip_height().unwrap().0)
+        .unwrap();
+    q.persist_pruneheight(u32::MAX).unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.pruneheight(), None);
+    assert!(q.prune_seqsigwit(), "reopen keeps prune mode");
+    assert_eq!(q.tip_height(), Some(Height(n - 1)));
+    assert!(
+        q.store().txs.seqsigwit_loc.count() < q.store().txs.count(),
+        "loc {} creates {}",
+        q.store().txs.seqsigwit_loc.count(),
+        q.store().txs.count()
+    );
+    let err = q.set_sptweaks_enabled(true, Height(0)).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("taproot") || msg.contains("does not cover"),
+        "{msg}"
+    );
+    assert!(!rbitcoin_store::SpTweaksTable::files_present(
+        q.store().cold_files_dir()
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn already_committed_batch(
     q: &Query,
     header_fk: Fk,
@@ -727,6 +790,11 @@ fn enabling_prune_at_288_marks_genesis_pruned() {
     let tip = q.tip_height().unwrap().0;
     assert_eq!(tip, Query::SEQSIGWIT_KEEP_HEIGHTS);
     q.set_prune_seqsigwit(true).unwrap();
+    assert_eq!(
+        q.pruneheight(),
+        Some(Height(0)),
+        "the watermark is on disk before the stem cut returns"
+    );
     q.apply_prune_seqsigwit_tip().unwrap();
     assert_eq!(q.pruneheight(), Some(Height(0)));
     assert_witness_stem_cut(&q);

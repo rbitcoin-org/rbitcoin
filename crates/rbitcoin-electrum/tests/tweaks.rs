@@ -468,8 +468,9 @@ fn thin_json_matches_value_encoder() {
     assert_eq!(v, expect);
 }
 
-/// Prune cannot walk witnesses. An unsealed tip is an empty map. A height
-/// the index never sealed is an error, not an empty history.
+/// Prune cannot walk the stem. An unsealed tip still in the keep window is
+/// read from that file. A missing file is an error. A hole below the
+/// watermark is an error, not an empty history.
 #[test]
 fn pruned_height_map_does_not_walk_a_hole() {
     use rbitcoin_primitives::{Fk, Height};
@@ -486,6 +487,10 @@ fn pruned_height_map_does_not_walk_a_hole() {
         let script = if h == 5 {
             let mut s = rbitcoin_primitives::P2TR_PREFIX.to_vec();
             s.extend_from_slice(&[0x11; 32]);
+            s
+        } else if h == 6 {
+            let mut s = rbitcoin_primitives::P2TR_PREFIX.to_vec();
+            s.extend_from_slice(&[0x66; 32]);
             s
         } else {
             vec![0x51]
@@ -520,7 +525,14 @@ fn pruned_height_map_does_not_walk_a_hole() {
     q.set_prune_seqsigwit(true).unwrap();
     let chain = ChainParams::regtest();
     let unsealed = height_map_json(&q, &chain, 6, false, 0).unwrap();
-    assert_eq!(unsealed, empty_height_json(6));
+    assert_eq!(unsealed, empty_height_json(6), "a coinbase has no tweak");
+    std::fs::remove_file(q.store().path().join("seqsigwit.window/6.bin")).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let missed = height_map_json(&q, &chain, 6, false, 0).unwrap_err();
+    assert!(
+        missed.contains("window miss"),
+        "an unsealed tip has to read the keep file, got {missed}"
+    );
     let hole = height_map_json(&q, &chain, 4, false, 0).unwrap_err();
     assert!(hole.contains("does not cover this height"), "{hole}");
     let sealed = height_map_json(&q, &chain, 5, false, 0).unwrap();

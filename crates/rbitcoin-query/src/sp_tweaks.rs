@@ -203,10 +203,10 @@ impl Query {
         Ok(origin.0)
     }
 
-    /// Prune drops scriptSig and witness at or below [`Self::pruneheight`].
+    /// Prune drops scriptSig and witness at or below the prune height.
     /// A new index can start while the tip is still below `origin`, while
-    /// nothing has been dropped, or when the watermark is already past
-    /// every dropped height.
+    /// the keep window is still the whole chain, or when the watermark is
+    /// already past every dropped height.
     pub(crate) fn require_sp_tweaks_start(&self, origin: Height) -> Result<(), QueryError> {
         if !self.prune_seqsigwit() {
             return Ok(());
@@ -215,7 +215,7 @@ impl Query {
         if tip.is_none_or(|t| t < origin.0) {
             return Ok(());
         }
-        if self.tweak_watermark_covers(origin, self.pruneheight().map(|h| h.0))? {
+        if self.tweak_watermark_covers(origin, self.witnessed_pruneheight())? {
             return Ok(());
         }
         Err(self.tweak_prune_miss())
@@ -238,7 +238,7 @@ impl Query {
 
     /// Height `prune_seqsigwit_below` will record for the current tip.
     /// Tip 288 drops height 0. A shorter chain drops nothing.
-    fn predicted_pruneheight(&self) -> Option<u32> {
+    pub(crate) fn predicted_pruneheight(&self) -> Option<u32> {
         let tip = self.tip_height().map(|h| h.0)?;
         if tip >= Self::SEQSIGWIT_KEEP_HEIGHTS {
             Some(tip - Self::SEQSIGWIT_KEEP_HEIGHTS)
@@ -292,18 +292,63 @@ impl Query {
         StoreError::Layout(msg.into())
     }
 
+    /// Prune height the tweak gate should trust.
+    ///
+    /// `None` after the stem is already cut, on a tip of at least 288, is
+    /// the crash between that cut and the sidecar write. Those heights are
+    /// gone. A shorter chain really has dropped nothing.
+    pub(crate) fn witnessed_pruneheight(&self) -> Option<u32> {
+        if let Some(ph) = self.pruneheight() {
+            return Some(ph.0);
+        }
+        if !self.prune_seqsigwit() {
+            return None;
+        }
+        let tip = self.tip_height()?.0;
+        if tip < Self::SEQSIGWIT_KEEP_HEIGHTS {
+            return None;
+        }
+        let txs = &self.store.txs;
+        if txs.seqsigwit_loc.count() < txs.count() {
+            Some(tip - Self::SEQSIGWIT_KEEP_HEIGHTS)
+        } else {
+            None
+        }
+    }
+
     fn tweak_watermark_covers(
         &self,
         origin: Height,
         pruneheight: Option<u32>,
     ) -> Result<bool, QueryError> {
         let next = self.tweak_watermark(origin)?;
-        Ok(match pruneheight {
+        let ph = match pruneheight {
+            Some(ph) => Some(ph),
+            None => self.witnessed_pruneheight(),
+        };
+        Ok(match ph {
             Some(ph) => next > ph,
-            // Nothing dropped. The keep window still has every witness,
-            // including a gap `class_c_commit` published before the seal.
+            // The keep window is still the whole chain.
             None => true,
         })
+    }
+
+    /// Confirm would delete a height whose tweak row is not sealed yet.
+    pub(crate) fn tweak_seal_blocks_prune(&self, tip: Option<Height>) -> Result<bool, QueryError> {
+        if !self.sptweaks_enabled() {
+            return Ok(false);
+        }
+        let Some(tip) = tip else {
+            return Ok(false);
+        };
+        if tip.0 < Self::SEQSIGWIT_KEEP_HEIGHTS {
+            return Ok(false);
+        }
+        let next_ph = tip.0 - Self::SEQSIGWIT_KEEP_HEIGHTS;
+        if self.pruneheight().is_some_and(|ph| next_ph < ph.0) {
+            return Ok(false);
+        }
+        Ok(!self.tweak_watermark_covers(self.sptweaks_origin(), Some(next_ph))?)
     }
 
     /// Startup repaired the tweak gap. Advancing the prune height now would
@@ -326,7 +371,7 @@ pub(crate) const SP_TWEAKS_PRUNE_BEFORE_TAPROOT: &str =
 /// Index files exist, and the next height is not past the prune height.
 /// Callers match `does not cover`. This text does not say `taproot`.
 pub(crate) const SP_TWEAKS_PRUNE_INDEX_SHORT: &str =
-    "silent payment tweak index does not cover every height --prune-seqsigwit would drop; delete store/sp_tweaks.idx and store/sp_tweaks.body to prune without that index, or pass --sp-tweaks while those heights are still in the keep window";
+    "silent payment tweak index does not cover every height --prune-seqsigwit would drop; delete store/sp_tweaks.idx and store/sp_tweaks.body to prune without that index, or run without --prune-seqsigwit and with --sp-tweaks until the index catches up, then turn --prune-seqsigwit on";
 
 /// What startup logs when prune is on, tweak files exist, and this start
 /// left `--sp-tweaks` off.

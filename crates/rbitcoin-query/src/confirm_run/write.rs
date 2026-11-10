@@ -423,6 +423,9 @@ fn write_phase_inner(
 
         let seal = std::mem::take(&mut batch.index_seal);
         let idx_put_ns = super::index::seal_live_indexes(query, seal)?;
+        // The tip is already published. Prune only once the rows just sealed
+        // cover the height that prune would drop.
+        query.prune_seqsigwit_after_tweak_seal()?;
         if idx_put_ns > 0 {
             crate::note_confirm(&query.confirm_stats().idx_put_ns, idx_put_ns);
             crate::note_confirm(&query.confirm_stats().blockfilter_ns, idx_put_ns);

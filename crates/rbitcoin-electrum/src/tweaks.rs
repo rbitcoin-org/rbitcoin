@@ -109,11 +109,20 @@ pub fn height_map_json(
             Ok(encode_thin_height_json(h, &rows, min_dust))
         }
         Ok(_) if query.prune_seqsigwit() => match query.tweak_index_next() {
-            // The tip moved before this height's tweak row was sealed.
-            // The naive walk cannot run. The notify after the seal has the row.
-            Some(n) if h >= n => Ok(empty_height_json(h)),
-            Some(_) => Err("silent payment tweak index does not cover this height".into()),
+            // Below the sealed watermark the index skipped this height.
+            Some(n) if h < n => Err("silent payment tweak index does not cover this height".into()),
             None => Err("silent payment tweaks are unavailable with --prune-seqsigwit".into()),
+            // The tip moved before this height's row was sealed. The keep
+            // window still has the witness. An empty map would tell the
+            // client the height was scanned.
+            Some(_) => {
+                let mut tweaks = rbitcoin_query::tweaks_from_pruned_keep(query, Height(h))
+                    .map_err(|e| e.to_string())?;
+                if cut_through {
+                    retain_unspent_taproot(query, Height(h), &mut tweaks)?;
+                }
+                Ok(encode_height_map(h, &tweaks, min_dust))
+            }
         },
         Ok(_) => {
             let mut tweaks =
@@ -121,16 +130,20 @@ pub fn height_map_json(
             if cut_through {
                 retain_unspent_taproot(query, Height(h), &mut tweaks)?;
             }
-            let mut s = String::new();
-            s.push('{');
-            push_quoted_u32(&mut s, h);
-            s.push(':');
-            push_height_object_json(&mut s, &tweaks, min_dust);
-            s.push('}');
-            Ok(s)
+            Ok(encode_height_map(h, &tweaks, min_dust))
         }
         Err(e) => Err(e.to_string()),
     }
+}
+
+fn encode_height_map(h: u32, tweaks: &BTreeMap<[u8; 32], TxTweak>, min_dust: u64) -> String {
+    let mut s = String::new();
+    s.push('{');
+    push_quoted_u32(&mut s, h);
+    s.push(':');
+    push_height_object_json(&mut s, tweaks, min_dust);
+    s.push('}');
+    s
 }
 
 /// Electrum notify line for one height (json-rpc wrapper + newline not included).

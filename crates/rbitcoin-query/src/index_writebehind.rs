@@ -189,10 +189,10 @@ fn refuse_pruned_tweak_gap(query: &Query, tip: Option<u32>) -> Result<(), Confir
     if tip < query.sptweaks_origin().0 {
         return Ok(());
     }
-    let Some(ph) = query.pruneheight() else {
+    let Some(ph) = query.witnessed_pruneheight() else {
         return Ok(());
     };
-    if next > ph.0 {
+    if next > ph {
         return Ok(());
     }
     Err(ConfirmError::Store(rbitcoin_store::StoreError::Layout(

@@ -130,7 +130,9 @@ pub use soft_densify::{
     soft_confirm_window_n, soft_densify_band_hi, BQ_ASSIGN_STOP_BYTES, BQ_SOFT_FREE_BYTES,
     TIP_HOLE_MIN_AHEAD_BLOCKS,
 };
-pub use sp_read::{tweaks_at_height, tweaks_for_height, tweaks_from_thin_and_body};
+pub use sp_read::{
+    tweaks_at_height, tweaks_for_height, tweaks_from_pruned_keep, tweaks_from_thin_and_body,
+};
 pub use sp_tweaks::{BlockSpOutpoints, ThinTweakRangeLimits, ThinTweakRow};
 pub use versionbits::{
     compute_block_version, DeploymentState, ThresholdState, VERSIONBITS_TOP_BITS,
@@ -1087,7 +1089,14 @@ impl Query {
         self.prune_seqsigwit.store(on, AtomicOrdering::Release);
         if on {
             if self.pruneheight().is_none() {
-                self.persist_pruneheight(u32::MAX)?;
+                // Record the real watermark before the stem cut. A crash
+                // in between used to reopen as "nothing dropped" with the
+                // witnesses already gone. Tip below 288 still drops nothing.
+                if let Some(h) = self.predicted_pruneheight() {
+                    self.set_pruneheight(Some(Height(h)))?;
+                } else {
+                    self.persist_pruneheight(u32::MAX)?;
+                }
             }
             // Seed while the stem is still readable. Later confirms must not
             // append it.

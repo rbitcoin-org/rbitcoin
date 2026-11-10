@@ -842,7 +842,28 @@ impl Query {
         _items: &[ConfirmPrepared],
         durable: Option<Height>,
     ) -> Result<(), QueryError> {
+        // The tweak row for a height in this batch is sealed after the tip
+        // is published. Deleting the witness first leaves that row with
+        // nothing to rebuild from.
+        if self.tweak_seal_blocks_prune(durable)? {
+            return Ok(());
+        }
         self.prune_seqsigwit_below(durable)
+    }
+
+    /// After the tweak rows for this tip exist, drop witnesses the index
+    /// now covers. A confirm that skipped the prune calls this once the seal
+    /// has moved the watermark.
+    #[doc(hidden)]
+    pub fn prune_seqsigwit_after_tweak_seal(&self) -> Result<(), QueryError> {
+        if !self.sptweaks_enabled() {
+            return Ok(());
+        }
+        let tip = self.tip_height();
+        if self.tweak_seal_blocks_prune(tip)? {
+            return Ok(());
+        }
+        self.prune_seqsigwit_below(tip)
     }
 
     fn seal_confirmed_seqsigwit_spills(&self, items: &[ConfirmPrepared]) -> Result<(), QueryError> {
