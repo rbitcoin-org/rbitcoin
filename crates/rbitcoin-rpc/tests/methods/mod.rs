@@ -611,6 +611,63 @@ fn filter_header_hex(filter_hex: &str, parent_header_hex: &str) -> String {
 }
 
 #[test]
+fn getindexinfo_lists_the_basic_filter_index_when_enabled() {
+    let (ctx, _dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let tip = dispatch(&ctx, "getblockcount", vec![]).unwrap();
+    let name = json!("basic block filter index");
+
+    let off = dispatch(&ctx, "getindexinfo", vec![]).unwrap();
+    assert_eq!(
+        off,
+        json!({ "txindex": { "synced": true, "best_block_height": tip } })
+    );
+    assert_eq!(
+        dispatch(&ctx, "getindexinfo", vec![name.clone()]).unwrap(),
+        json!({})
+    );
+
+    ctx.query.set_block_filter_index(true).unwrap();
+    let empty = dispatch(&ctx, "getindexinfo", vec![]).unwrap();
+    assert_eq!(
+        empty["basic block filter index"],
+        json!({ "synced": false, "best_block_height": 0 }),
+        "{empty}"
+    );
+
+    // Seal every height up to the tip, parents first, as the index builder commits them.
+    let tip_height = u32::try_from(tip.as_u64().unwrap()).unwrap();
+    for h in 0..=tip_height {
+        let hash = dispatch(&ctx, "getblockhash", vec![json!(h)]).unwrap();
+        let f = dispatch(&ctx, "getblockfilter", vec![hash]).unwrap();
+        let body = rbitcoin_primitives::hex_decode(f["filter"].as_str().unwrap()).unwrap();
+        let fk = ctx
+            .query
+            .store()
+            .confirmed
+            .get(Height(h))
+            .unwrap()
+            .expect("best-chain header");
+        let sealed = ctx
+            .query
+            .commit_window_filters(h, &[(bitcoin::bip158::BlockFilter::new(&body), fk)])
+            .unwrap();
+        assert_eq!(sealed, 1, "height {h}");
+    }
+    let built = json!({ "synced": true, "best_block_height": tip });
+    let all = dispatch(&ctx, "getindexinfo", vec![]).unwrap();
+    assert_eq!(all["basic block filter index"], built, "{all}");
+    assert_eq!(all["txindex"]["best_block_height"], tip);
+    assert_eq!(
+        dispatch(&ctx, "getindexinfo", vec![name]).unwrap(),
+        json!({ "basic block filter index": built })
+    );
+    assert_eq!(
+        dispatch(&ctx, "getindexinfo", vec![json!("txindex")]).unwrap(),
+        json!({ "txindex": { "synced": true, "best_block_height": tip } })
+    );
+}
+
+#[test]
 fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
     use bitcoin::bip158::BlockFilter;
 
