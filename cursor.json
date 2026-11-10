@@ -1,14 +1,14 @@
 {
   "new_base": "8e62e4ce4d60c30abc851cb0893e4b80149ac9e4",
   "new_skip": 290,
-  "old_index": 628,
-  "old_name": "crates/rbitcoin-consensus/src/script/mod.rs:55:5: replace verify_job_all_inputs -> Result<(), ConsensusError> with Ok(())",
+  "old_index": 1810,
+  "old_name": "crates/rbitcoin-consensus/src/script/nested.rs:41:5: replace try_p2sh_nested_segwit -> Option<Result<(), ConsensusError>> with None",
   "new_cap_used": true,
   "run_id": "42777792583",
   "new_len": 5415,
   "new_remaining": 5125,
   "old_len": 29051,
-  "old_remaining": 28423,
-  "completed_new": 290,
-  "completed_old": 628
+  "old_remaining": 27869,
+  "completed_new": 0,
+  "completed_old": 1182
 }
