@@ -1423,6 +1423,53 @@ fn startup_sets_sh_force_rebuild_on_the_query() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A pruned datadir does not start when this process omitted the flag.
+/// The witness files are already the only copy.
+#[test]
+fn pruned_datadir_without_the_flag_does_not_start() {
+    let dir = scratch_dir("prune-flag-off");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    let cfg = NodeConfig::default();
+    let err = apply_startup_index_mode(&q, &cfg, 0).unwrap_err();
+    assert!(
+        err.to_string().contains("restart with --prune-seqsigwit"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--sh-index` on a store with no scripthash head stays in Direct mode.
+/// Confirm still defers Class B until the head exists.
+#[test]
+fn startup_with_shindex_stays_direct_without_a_durable_head() {
+    let dir = scratch_dir("sh-direct");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    let mut cfg = NodeConfig::default();
+    cfg.shindex = true;
+    apply_startup_index_mode(&q, &cfg, 0).unwrap();
+    assert!(q.index_mode().unwrap().is_direct());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pack-marked head is already the scripthash index. Startup resumes Tip
+/// mode instead of collecting Class A again.
+#[test]
+fn startup_resumes_tip_mode_when_the_scripthash_head_is_durable() {
+    let dir = scratch_dir("sh-tip");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    let bump = q.store().scripthash.alloc_bump();
+    let session = q.store().scripthash.pack_shard_session(0).unwrap();
+    let pack = session.finish_pack().unwrap();
+    assert_eq!(pack.bump, bump);
+    q.store().scripthash.publish_packed_shard(0, pack).unwrap();
+    let mut cfg = NodeConfig::default();
+    cfg.shindex = true;
+    apply_startup_index_mode(&q, &cfg, 0).unwrap();
+    assert!(q.index_mode().unwrap().is_tip());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A pack-marked head whose inclusion floor is behind the tip must not open
 /// Electrum. Tip follow still starts so write-behind can catch up.
 #[test]
