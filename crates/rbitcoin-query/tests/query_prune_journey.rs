@@ -1062,6 +1062,21 @@ fn confirm_of_a_pruned_height_stays_ok() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Turning prune on writes each keep file once. The stem rewrite is that write.
+#[test]
+fn enabling_prune_writes_each_keep_file_once() {
+    let (dir, q) = temp_query("prune-one-write");
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 2, &[0x41], &mut hashes);
+    rbitcoin_query::arm_keep_io_trace();
+    q.set_prune_seqsigwit(true).unwrap();
+    assert_eq!(rbitcoin_query::take_keep_writes(), 2);
+    q.clear_seqsigwit_ram_window();
+    let fk = q.block_tx_fks(Height(1)).unwrap()[0];
+    assert_eq!(witness_of(&q, fk), vec![vec![0x41]]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Coverage of one height reads that height file once, however many txs it holds.
 #[test]
 fn pruned_spill_cover_reads_the_height_file_once() {

@@ -1038,7 +1038,10 @@ impl Query {
             }
             // Seed while the stem is still readable. Later confirms must not
             // append it.
-            if !was_on {
+            // The stem still names rows, so release rewrites every keep file
+            // before the cut. Seeding would write those same files once and
+            // then throw that copy away. An empty locator cannot be rewritten.
+            if !was_on && self.store.txs.seqsigwit_loc.count() == 0 {
                 self.seed_recent_seqsigwit_from_store()?;
             }
             self.store.set_prune_seqsigwit_mode(true);
@@ -1335,6 +1338,7 @@ impl Query {
         // Rename without a file sync is not a copy. This file is the only
         // witness once the stem is cut or the tip flush commits the height.
         rbitcoin_store::file::write_file_synced_tmp_rename(&path, &out)?;
+        note_keep_write();
         Ok(())
     }
 
@@ -1605,8 +1609,9 @@ impl Query {
             }
             self.note_seqsigwit_ram_for_confirmed(Height(h), &tx_fks)?;
         }
-        // Enable writes every keep file, then one directory sync, before the
-        // stem cut. `release_pruned_seqsigwit_stem` syncs again when it runs.
+        // An empty locator cannot be rewritten from the stem. These writes
+        // are the keep window. A locator that still names rows skips this
+        // and `release_pruned_seqsigwit_stem` writes each file once.
         self.sync_spill_dir()
     }
 
@@ -3230,6 +3235,7 @@ pub fn wire_header(rec: &HeaderRecord, prev_blockhash: BlockHash) -> BlockHeader
 #[cfg(debug_assertions)]
 std::thread_local! {
     static KEEP_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static KEEP_WRITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static KEEP_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -3238,6 +3244,7 @@ std::thread_local! {
 pub fn arm_keep_io_trace() {
     KEEP_TRACE.with(|on| on.set(true));
     KEEP_READS.with(|n| n.set(0));
+    KEEP_WRITES.with(|n| n.set(0));
 }
 
 #[cfg(debug_assertions)]
@@ -3247,11 +3254,27 @@ pub fn take_keep_reads() -> u64 {
     KEEP_READS.with(|n| n.replace(0))
 }
 
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_keep_writes() -> u64 {
+    KEEP_TRACE.with(|on| on.set(false));
+    KEEP_WRITES.with(|n| n.replace(0))
+}
+
 fn note_keep_read() {
     #[cfg(debug_assertions)]
     KEEP_TRACE.with(|on| {
         if on.get() {
             KEEP_READS.with(|n| n.set(n.get().saturating_add(1)));
+        }
+    });
+}
+
+fn note_keep_write() {
+    #[cfg(debug_assertions)]
+    KEEP_TRACE.with(|on| {
+        if on.get() {
+            KEEP_WRITES.with(|n| n.set(n.get().saturating_add(1)));
         }
     });
 }
