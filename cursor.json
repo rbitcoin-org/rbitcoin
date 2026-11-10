@@ -1,12 +1,14 @@
 {
   "new_base": "8e62e4ce4d60c30abc851cb0893e4b80149ac9e4",
-  "new_skip": 0,
-  "old_index": 0,
-  "old_name": "",
-  "new_cap_used": false,
-  "run_id": "",
-  "new_len": 5121,
-  "new_remaining": 5121,
-  "old_len": 29166,
-  "old_remaining": 29166
+  "new_skip": 290,
+  "old_index": 628,
+  "old_name": "crates/rbitcoin-consensus/src/script/mod.rs:55:5: replace verify_job_all_inputs -> Result<(), ConsensusError> with Ok(())",
+  "new_cap_used": true,
+  "run_id": "42777792583",
+  "new_len": 5415,
+  "new_remaining": 5125,
+  "old_len": 29051,
+  "old_remaining": 28423,
+  "completed_new": 290,
+  "completed_old": 628
 }
