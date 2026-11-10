@@ -9,7 +9,7 @@ use rbitcoin_ibd::{
 };
 use rbitcoin_log::{debug, enabled, info, warn, Level};
 use rbitcoin_net::{
-    default_port, netgroup, sample_reset_serve_perf, socks_dns_seed_dests, AddrMan, AsMap,
+    default_port, netgroup_net, sample_reset_serve_perf, socks_dns_seed_dests, AddrMan, AsMap,
     BlockingRegion, ChainHub, Dialer, MempoolHub, NetAddr, OutboundPass, P2PNode, PeerConnType,
     TipEvent,
 };
@@ -1700,10 +1700,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 continue;
             }
             let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
-            let addrs: Vec<SocketAddr> = rows.iter().map(|(_, addr)| *addr).collect();
-            let groups: Vec<u64> = addrs
+            let groups: Vec<u64> = rows
                 .iter()
-                .map(|a| netgroup(*a, addrman.asmap()))
+                .map(|(_, net)| netgroup_net(*net, addrman.asmap()))
                 .collect();
             let salt = node.hub.clock.now_secs();
             let Some(evict_id) = rbitcoin_net::pick_stale_follow_evict(&ids, salt, &groups) else {
@@ -3262,6 +3261,8 @@ pub fn outbound_dial_targets(
 }
 
 /// `--connect` is operator-pinned: no netgroup filter. Otherwise rank + diversity.
+/// An onion or I2P row in `occupied` is a live or in-flight outbound (inbound
+/// sessions key by socket), so a one-peer batch stays on clearnet while it lasts.
 pub fn follow_dial_targets(
     connect: &[rbitcoin_net::NetAddr],
     book: &AddrMan,
@@ -3277,7 +3278,8 @@ pub fn follow_dial_targets(
             .copied()
             .filter_map(rbitcoin_net::NetAddr::socket_addr)
             .collect();
-        book.take_dial_candidates_net(max, &exclude, &socks)
+        let overlay_live = occupied.iter().any(|a| a.is_overlay());
+        book.take_dial_candidates_net(max, &exclude, &socks, overlay_live)
     }
 }
 

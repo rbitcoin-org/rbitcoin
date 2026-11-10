@@ -439,11 +439,17 @@ impl AddrMan {
     }
 
     /// Like [`Self::take_dial_candidates`] plus onion and I2P rows this process can dial.
+    ///
+    /// `overlay_live` says an outbound onion or I2P peer is already live. A
+    /// batch of two or more always keeps one slot for an eligible overlay row.
+    /// A one-peer batch takes that slot only when `overlay_live` is false, so
+    /// a lost onion peer is replaced by the next single redial.
     pub fn take_dial_candidates_net(
         &self,
         max: usize,
         exclude: &HashSet<NetAddr>,
         occupied: &[SocketAddr],
+        overlay_live: bool,
     ) -> Vec<NetAddr> {
         let ip_ex: HashSet<SocketAddr> = exclude
             .iter()
@@ -460,8 +466,7 @@ impl AddrMan {
             .order
             .iter()
             .copied()
-            .filter(|a| matches!(a, NetAddr::Onion { .. } | NetAddr::I2p { .. }))
-            .filter(|a| self.dialable(*a) && !exclude.contains(a))
+            .filter(|a| a.is_overlay() && self.dialable(*a) && !exclude.contains(a))
             .map(|a| (self.flags_of(&a).dial_tier(), a))
             .collect();
         overlay.sort_by_key(|(tier, _)| *tier);
@@ -486,9 +491,9 @@ impl AddrMan {
         }
         let mut out = ip;
         // A full clearnet batch used to return before any onion or I2P row.
-        // Keep one slot for the best eligible overlay when the batch has room
-        // for more than a single peer.
-        if !overlay.is_empty() && out.len() >= max && max >= 2 {
+        // Keep one slot for the best eligible overlay. A one-peer batch keeps
+        // it only while no overlay outbound is live.
+        if !overlay.is_empty() && out.len() >= max && (max >= 2 || !overlay_live) {
             out.pop();
         }
         for (_, a) in overlay {

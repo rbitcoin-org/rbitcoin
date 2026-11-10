@@ -3899,23 +3899,16 @@ impl PeerHub {
             .collect()
     }
 
-    pub fn outbound_full_relay_addrs(&self) -> Vec<SocketAddr> {
-        self.outbound_full_relay_rows()
-            .into_iter()
-            .map(|(_, a)| a)
-            .collect()
-    }
-
     #[doc(hidden)]
-    pub fn outbound_full_relay_rows(&self) -> Vec<(u64, SocketAddr)> {
+    pub fn outbound_full_relay_rows(&self) -> Vec<(u64, crate::NetAddr)> {
         if self.is_noban() {
             return Vec::new();
         }
-        let mut rows: Vec<(u64, SocketAddr)> = self
+        let mut rows: Vec<(u64, crate::NetAddr)> = self
             .live_peers()
             .into_iter()
             .filter(|p| p.conn_type == PeerConnType::OutboundFullRelay && !p.inbound)
-            .map(|p| (p.id, p.addr))
+            .map(|p| (p.id, p.net))
             .collect();
         rows.sort_unstable_by_key(|(id, _)| *id);
         rows

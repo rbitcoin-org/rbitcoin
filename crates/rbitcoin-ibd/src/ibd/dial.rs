@@ -261,13 +261,15 @@ fn ibd_conn_type(connect: &[NetAddr], addr: NetAddr) -> PeerConnType {
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 /// Dial up to `count` ranked candidates from `book`. `already` is exclude
 /// (slots + cooldown). `occupied` is live addrs whose netgroups are skipped
-/// while unused-group candidates remain. A `connect` target is dialled as
-/// [`PeerConnType::Manual`].
+/// while unused-group candidates remain. `overlay_live` says an onion or I2P
+/// slot is alive, so a one-peer batch stays on clearnet. A `connect` target is
+/// dialled as [`PeerConnType::Manual`].
 pub async fn dial_batch(
     book: &AddrMan,
     count: usize,
     mut already: HashSet<rbitcoin_net::NetAddr>,
     occupied: &[SocketAddr],
+    overlay_live: bool,
     magic: Magic,
     local_addr: SocketAddr,
     tip_h: Option<u32>,
@@ -294,7 +296,7 @@ pub async fn dial_batch(
             .unwrap_or(false)
     };
 
-    let candidates = book.take_dial_candidates_net(count, &already, occupied);
+    let candidates = book.take_dial_candidates_net(count, &already, occupied, overlay_live);
     out.attempted = candidates.clone();
     let mut handles = Vec::new();
     for addr in candidates {
@@ -528,7 +530,7 @@ pub fn admit_cooldown_fallback(
     live: &HashSet<rbitcoin_net::NetAddr>,
 ) -> Option<rbitcoin_net::NetAddr> {
     if !book
-        .take_dial_candidates_net(1, exclude, occupied)
+        .take_dial_candidates_net(1, exclude, occupied, live.iter().any(|a| a.is_overlay()))
         .is_empty()
     {
         return None;
