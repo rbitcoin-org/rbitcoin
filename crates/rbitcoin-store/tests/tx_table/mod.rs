@@ -450,6 +450,70 @@ fn write_prune_sidecar(dir: &std::path::Path) {
     std::fs::write(dir.join("seqsigwit.prune"), u32::MAX.to_le_bytes()).unwrap();
 }
 
+fn coinbases(n: u16) -> Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> {
+    (1..=n)
+        .map(|i| {
+            let mut txid = [0u8; 32];
+            txid[0..2].copy_from_slice(&i.to_le_bytes());
+            (
+                TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![InputRecord::coinbase(
+                    u32::MAX,
+                    i.to_le_bytes().to_vec(),
+                    vec![],
+                )],
+                vec![OutputRecord::unspent(u64::from(i), vec![0x51])],
+            )
+        })
+        .collect()
+}
+
+/// The cut published the short checkpoint file and died before the locator
+/// header. The next open must not treat that as a 1023-create prefix.
+#[test]
+fn torn_witness_cut_keeps_creates_past_one_window() {
+    let dir = tempfile_dir("prune-torn-cut");
+    let t = create_tiny(&dir);
+    t.put_full_batch_indexed(&coinbases(1100), true).unwrap();
+    t.flush().unwrap();
+    assert_eq!(t.count(), 1100);
+    t.seqsigwit_loc
+        .off
+        .set_logical_len(rbitcoin_store::file::FILE_HEADER_LEN as u64)
+        .unwrap();
+    drop(t);
+    write_prune_sidecar(&dir);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1100, "a torn witness cut must keep creates");
+    assert_eq!(t.txids.count(), 1100);
+    assert_eq!(t.input.count(), 1100);
+    assert_eq!(t.seqsigwit_loc.count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The locator header itself is the short prefix. Open still drops the tail.
+#[test]
+fn pruned_open_still_truncates_a_short_witness_locator() {
+    let dir = tempfile_dir("prune-short-loc");
+    let t = create_tiny(&dir);
+    t.put_full_batch_indexed(&coinbases(4), true).unwrap();
+    t.flush().unwrap();
+    t.seqsigwit_loc.truncate_to_count(2).unwrap();
+    t.flush().unwrap();
+    drop(t);
+    write_prune_sidecar(&dir);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.txids.count(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Prune open keeps creates when the witness stem is only a header.
 #[test]
 fn pruned_open_keeps_creates_when_seqsigwit_stem_is_header() {

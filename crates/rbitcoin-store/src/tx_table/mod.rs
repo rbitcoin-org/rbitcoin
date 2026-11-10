@@ -724,9 +724,14 @@ pub fn open_or_create_create_loc(dir: &Path) -> Result<crate::create_loc::Create
 #[doc(hidden)]
 pub fn open_or_create_seqsigwit_loc(
     seqsigwit_dir: &Path,
+    finish_torn_prune_cut: bool,
 ) -> Result<crate::delta_loc::DeltaLoc, StoreError> {
     if seqsigwit_dir.join("seqsigwit.loc").exists() {
-        crate::delta_loc::DeltaLoc::open(seqsigwit_dir, "seqsigwit")
+        if finish_torn_prune_cut {
+            crate::delta_loc::DeltaLoc::open_finish_torn_prune_cut(seqsigwit_dir, "seqsigwit")
+        } else {
+            crate::delta_loc::DeltaLoc::open(seqsigwit_dir, "seqsigwit")
+        }
     } else if class_a_body_occupied(seqsigwit_dir, "seqsigwit") {
         Err(StoreError::Corrupt("invariant: seqsigwit.loc missing"))
     } else {
@@ -1248,7 +1253,7 @@ impl TxTable {
         let had_seqsigwit = seqsigwit_dir.join("seqsigwit.body").exists();
         let had_spent = dir.join("spent.body").exists();
         let create_loc = open_or_create_create_loc(dir)?;
-        let seqsigwit_loc = open_or_create_seqsigwit_loc(seqsigwit_dir)?;
+        let seqsigwit_loc = open_or_create_seqsigwit_loc(seqsigwit_dir, prune_seqsigwit_mode)?;
         let loc_count = create_loc.count();
         // The sidecar is prune mode for reads and later appends. The witness
         // stem still seals the tip until its locator no longer covers creates.
@@ -1608,7 +1613,9 @@ impl TxTable {
     /// Drop the witness stem's rows and its allocation back to the file header.
     pub fn cut_seqsigwit_stem_to_header(&self) -> Result<(), StoreError> {
         let header = crate::file::FILE_HEADER_LEN as u64;
-        self.seqsigwit_loc.truncate_to_count(0)?;
+        // Loc header at 0 is durable before off and ovf shrink. The other
+        // order leaves a long locator and a header-only checkpoint.
+        self.seqsigwit_loc.truncate_to_zero_header_first()?;
         self.seqsigwit_loc.loc.release_to_len(header)?;
         self.seqsigwit_loc.off.release_to_len(header)?;
         self.seqsigwit_loc.ovf.release_to_len(header)?;

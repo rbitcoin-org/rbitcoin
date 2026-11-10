@@ -295,6 +295,20 @@ impl DeltaLoc {
     }
 
     pub fn open(dir: &Path, stem: &str) -> Result<Self, StoreError> {
+        Self::open_inner(dir, stem, false)
+    }
+
+    /// Open a prune cut that died after the checkpoint file shrank.
+    ///
+    /// The loc file can still name every create. Trimming it to the last
+    /// checkpoint would throw those rows away. Publish length 0 instead.
+    /// A crash after that publish and before the checkpoint shrink is the
+    /// finished cut: the loc header is already the prefix.
+    pub fn open_finish_torn_prune_cut(dir: &Path, stem: &str) -> Result<Self, StoreError> {
+        Self::open_inner(dir, stem, true)
+    }
+
+    fn open_inner(dir: &Path, stem: &str, finish_torn_prune_cut: bool) -> Result<Self, StoreError> {
         let loc = open_loc_file(&dir.join(format!("{stem}.loc")), TableKind::DeltaLoc)?;
         let ovf_path = dir.join(format!("{stem}.loc.ovf"));
         let ovf = if ovf_path.exists() {
@@ -334,6 +348,10 @@ impl DeltaLoc {
                 CREATE_OVF_MISSING
             },
         };
+        if finish_torn_prune_cut && count < full {
+            opened.truncate_to_zero_header_first()?;
+            return Ok(opened);
+        }
         opened.truncate_to_count(count)?;
         // A row past the overflow header belongs to a create this file does not name.
         let last_ovf = opened
@@ -355,12 +373,34 @@ impl DeltaLoc {
         self.count.load(Ordering::Acquire)
     }
 
+    /// Publish loc length 0 and sync it, then shrink the checkpoint files.
+    ///
+    /// [`Self::truncate_to_count`] shrinks the checkpoint first. A crash in
+    /// that window leaves a long locator and a header-only checkpoint, and
+    /// the next open keeps only 1023 creates. Length 0 is the finished prune
+    /// cut, so a crash after this sync keeps the chain.
+    pub fn truncate_to_zero_header_first(&self) -> Result<(), StoreError> {
+        let header = FILE_HEADER_LEN as u64;
+        if self.loc.logical_len() != header {
+            self.loc.set_logical_len(header)?;
+            self.loc.flush()?;
+        }
+        self.checkpoints
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.count.store(0, Ordering::Release);
+        self.fit_off_and_ovf(0)?;
+        Ok(())
+    }
+
     pub fn truncate_to_count(&self, new_count: u64) -> Result<(), StoreError> {
         let cur = self.count.load(Ordering::Acquire);
         if new_count > cur {
             return Err(StoreError::Corrupt("seqsigwit.loc truncate past count"));
         }
         // Off and the overflow file never outlive the loc header.
+        // Zero on the prune cut uses [`Self::truncate_to_zero_header_first`].
         self.fit_off_and_ovf(new_count)?;
         if new_count == cur {
             return Ok(());
