@@ -410,11 +410,10 @@ Block filters: --block-filter-index (default off) builds BIP158 basic filters. I
   --esplora-onion (default off) ADD_ONION for --esplora-listen. Needs --tor-control and a TCP listen on 127.0.0.1 or 0.0.0.0.\n\
   --electrum-i2p / --esplora-i2p (default off) I2P destination and STREAM FORWARD for that listener. Need --i2p-sam and the same TCP listen.\n\
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
-  With --prune-seqsigwit, a later enable is allowed while nothing has been\n\
-  dropped, because the keep window still has those witnesses. It is refused\n\
-  when the index does not already cover every height that has been dropped\n\
-  or will be dropped. Turning prune on after that index is already built\n\
-  is allowed, and those sealed rows keep being served.\n\
+  With --prune-seqsigwit, turn it on before taproot, or later once every\n\
+  height from that origin through the dropped range is sealed or still in\n\
+  the last 288 blocks. Turning prune on after the index is built is allowed\n\
+  when the index covers every height the cut will drop. Sealed rows stay served.\n\
   Omitting --sp-tweaks while those files exist and prune is on logs how many\n\
   blocks remain before the index cannot be enabled again.\n\
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\

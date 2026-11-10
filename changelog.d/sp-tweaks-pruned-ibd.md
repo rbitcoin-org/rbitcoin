@@ -1,3 +1,14 @@
+Added
+
+- **`--sp-tweaks` can run beside `--prune-seqsigwit`.** Turn it on before
+  taproot, or later once every height from that origin through the dropped
+  range is sealed or still in the last 288 blocks. Prune can be turned on
+  after the index is built when the index covers every height the cut will
+  drop. Sealed rows keep being served from the index.
+
 Fixed
 
-- **`--sp-tweaks` can run with `--prune-seqsigwit` when it is enabled before taproot.** Confirm seals each tweak from the wire block. A restart whose watermark is still above the prune height repairs from `seqsigwit.window`. A later enable is allowed while nothing has been dropped. It is refused, before the witness stem is cut, when the index does not already cover every height that has been dropped or will be dropped. Turning prune on after that index is built is allowed, including a restart that has not loaded the flag yet, and sealed rows keep being served. A later start of a datadir that is already pruned does not fail because the tweak index has fallen behind; turning tweaks back on still refuses, and that error says the index does not cover the drop. Omitting `--sp-tweaks` while those files exist and prune is on logs how many blocks remain before the index cannot be enabled again. A restart seals a tweak gap from `seqsigwit.window` before it advances the prune height, so a tip that landed before the tweak rows does not delete the witnesses those rows need. The error that refuses prune over a short index says to delete `store/sp_tweaks.idx` and `store/sp_tweaks.body`, or to pass `--sp-tweaks` while those heights are still in the keep window. An unpruned node logs a tweak enable failure and still starts. A pruned silent-payment scan and `blockchain.tweaks.subscribe` read the sealed index. An unsealed tip height does not fall through to the witness walk. Unpruned nodes still backfill a later enable from `seqsigwit.body`.
+- A pruned `blockchain.tweaks.subscribe` reads an unsealed tip from the keep
+  window. A confirm batch does not delete a witness until that height's tweak
+  row is sealed. A crash that cut the witness stem before saving the prune
+  height is treated as those heights already dropped.
