@@ -9,6 +9,179 @@ before 1.0).
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-11-10
+
+### Highlights
+
+- **Opening a data directory with 0.9.1 is one-way.** Any open rewrites
+  `store/meta` to schema 27, whether or not `--prune-seqsigwit` is set.
+  The table bytes stay as they were. A 0.9.0 binary will not open that
+  directory.
+- **`--prune-seqsigwit` now drops witness history.** The flag keeps
+  scriptSig and witness for the last 288 blocks and deletes the rest of
+  `seqsigwit.body`. A directory that 0.9.0 already marked pruned is
+  rewritten into that window, and then the old body is freed. Later
+  blocks do not grow that file.
+- **Silent-payment tweaks can run on that prune.** Turn `--sp-tweaks` on
+  before taproot, or later once the index covers every height the cut
+  will drop. Sealed rows still serve. A scan that cannot read a height
+  returns that error.
+- **Wallet services stay off Tor and I2P unless you ask.** Electrum and
+  Esplora are no longer published from `--tor-control` or
+  `--i2p-accept-incoming` alone. Set `--electrum-onion`,
+  `--esplora-onion`, `--electrum-i2p`, or `--esplora-i2p`. Saved keys
+  are kept. A switch without its overlay, or without a TCP listener on
+  `127.0.0.1` or `0.0.0.0`, refuses to start.
+- **Names behind a proxy are no longer looked up on the host.**
+  `--connect` and `addnode` hostnames go to the SOCKS proxy.
+  `--only-net onion` does not query clearnet seeds. I2P tunnels use the
+  router default of three hops.
+- **A bad Tor onion key stops startup.** An `ADD_ONION` reply and a
+  saved `onion/*.priv` key must be a v3 service id and an `ED25519-V3`
+  key of 64 bytes. Remove the named file to generate a new key.
+- **`estimatesmartfee 1` answers as target 2 until the mempool is busy.**
+  Electrum `blockchain.estimatefee 1` does the same. Once flow is full,
+  target 1 is the 1-block quote. Electrum target 0, `estimaterawfee 1`,
+  and Esplora key `1` stay on the 1-block quote.
+- **A memory limit bounds the worker pools.** On Linux, the scripthash
+  build and the transaction-head rebuild use the smaller of host memory
+  and the cgroup limit (`MemoryMax=`, `docker --memory`).
+- **NixOS can set the operator flags.** Peering, mempool, RPC, indexes,
+  and Tor control are `services.rbitcoin` options. Wallet onion and I2P
+  forwards pass the new switches only when that listener is enabled.
+- **`cargo install --locked` matches this release.** The 0.9.0 tag left
+  the lock at 0.8.99. This tag's lock names 0.9.1.
+
+Thanks to @erskingardner, @botcount for changes in this release.
+
+### Added
+
+
+- **The NixOS module accepts the operator flags.** Peering, mempool, permission, index, RPC, signet, and notify settings are `services.rbitcoin` options. `p2p.maxInbound` defaults to 200 and omits `--max-inbound` at that value. `netPermissionBind` requires `p2p.listen`, is refused with `trustPeer`, and its port is opened when `p2p.openFirewall` is set. `rpc.tokenFile` and `rpc.workQueue` require an RPC listener. `esplora.hiddenService` requires `esplora.enable`. `electrum.hiddenService` requires `electrum.enable`. When an onion flag implies Tor control, the module enables `services.tor`, listens on `127.0.0.1:9051`, and writes a group-readable cookie at `/run/tor/control.authcookie`. A custom cookie must be a file in `/run/tor` or `/var/lib/tor`, because the tor unit cannot write anywhere else. The `tor` group uses the NixOS tor gid. `p2p.listenOnion` requires `p2p.maxInbound` above 0. `apiLog` outside the datadir is writable. The datadir, cold datadir, log, token, and socket paths are refused when they would take ownership of a system directory such as `/`, `/run`, `/tmp`, `/srv`, `/var`, `/var/log`, or `/var/lib`, or of another service's tree such as `/run/tor`, `/var/lib/tor`, `/var/lib/i2pd`, `/run/systemd`, or `/nix/store`. A `--connect` or `--trust-peer` address in `fc00::/8` requires `cjdns.reachable`. `onlyNet` onion requires `proxy` or `onionProxy`, and `onlyNet` i2p requires `i2p.sam`. `esplora.blockTemplate` and `esplora.socketPath` require `esplora.enable`. `ExecStart` writes each `%` as `%%`, so systemd leaves `%s` in `alertNotify` and `startupNotify` for the node. `extraArgs` remains for `--conf`, test knobs, and secrets that must stay off argv.
+
+
+- **`--sp-tweaks` can run beside `--prune-seqsigwit`.** Turn it on before
+  taproot, or later once every height from that origin through the dropped
+  range is sealed or still in the last 288 blocks. Prune can be turned on
+  after the index is built when the index covers every height the cut will
+  drop. Sealed rows keep being served from the index. A pruned
+  `blockchain.tweaks.subscribe` reads an unsealed tip from the keep window.
+  A confirm batch does not delete a witness until that height's tweak row
+  is sealed, and only through the tip whose flush has landed. A crash that
+  cut the witness stem before saving the prune height is treated as those
+  heights already dropped. A silent-payment scan that cannot read a
+  height returns that error and does not report the scan finished.
+
+
+### Changed
+
+
+- **NixOS module eval is its own CI job.** `nixos-module-eval` starts with `pread` and `rust-forward`, after `qc` and `test`, and does not gate `coverage`. It does not block merge until the Protected ruleset names that check. Assertion and argv checks evaluate the rbitcoin module without a full NixOS system for each case. The unix-socket argv is checked against a real NixOS `ExecStart`.
+
+
+- **`--prune-seqsigwit` keeps scriptSig and witness for the last 288 blocks.**
+  Turning the flag on removes the rest of `seqsigwit.body`, and later blocks
+  do not grow that file. That cut logs the size it freed. Opening a datadir that 0.9.0 already pruned rewrites
+  those 288 blocks into the new window and then frees the old body. Opening
+  any datadir, pruned or not, updates the store to schema 27. A 0.9.0 binary
+  will not open it.
+
+
+- **Electrum and Esplora go on Tor and I2P only when asked.** Before, a
+  listening Electrum was always published as an onion once `--tor-control`
+  was set, Esplora too unless `--esplora-onion=0`, and `--i2p-accept-incoming`
+  gave both their own I2P destination. Now each is a switch, **off by
+  default**: `--electrum-onion`, `--esplora-onion`, `--electrum-i2p`,
+  `--esplora-i2p` (config `electrum_onion=`, `esplora_onion=`,
+  `electrum_i2p=`, `esplora_i2p=`). `--i2p-accept-incoming` is P2P only.
+  **Upgrading:** a node that relied on `--tor-control` or
+  `--i2p-accept-incoming` alone to publish its wallet services stops
+  publishing them until the matching switch is set; the saved keys under
+  `onion/` and `i2p/` are kept, so the addresses come back unchanged. A
+  switch needs its overlay (`--tor-control` or `--i2p-sam`) and a TCP
+  listener on `127.0.0.1` or `0.0.0.0`, or the node refuses to start.
+- **NixOS.** `electrum.hiddenService` now passes `--electrum-onion` (it had
+  no effect before), and new `electrum.i2p` / `esplora.i2p` pass the I2P
+  switches. A NixOS node that set `tor.control` or `p2p.listenOnion` without
+  `hiddenService` no longer publishes its wallet onions.
+
+
+### Fixed
+
+
+- **Worker pools respect the cgroup memory limit.** The scripthash extract
+  and `tx.head` rebuild sized their workers from host `MemAvailable`, so a
+  node under systemd `MemoryMax=`, `docker --memory`, or a Kubernetes limit
+  could start more workers than the limit allowed and be OOM-killed during
+  the first scripthash build. On Linux the probe now takes the smaller of
+  `MemAvailable` and the cgroup v2 headroom. Reclaimable page cache counts as
+  headroom, so a cgroup full of file cache after IBD still gets its workers.
+
+
+- **`estimatesmartfee 1` and Electrum `blockchain.estimatefee 1` answer as
+  target 2, like Core, until mempool flow is warm.** Before flow fullness
+  reaches 1, the 1-block quote still blends in the cold 99.9% history: on
+  signet, where flow rarely warms, it was ~76x the 2-block rate.
+  `estimatesmartfee 1` then reports `"blocks": 2`. At full flow, target 1
+  is the warm 1-block quote. Electrum target 0 stays the 1-block quote.
+  `estimaterawfee 1` and Esplora `/fee-estimates` key `1` keep the 1-block
+  quote, as Core's `estimaterawfee` does (#1437).
+
+
+- **`--locked` builds work again** (#1448). `Cargo.lock` still listed the
+  workspace crates at `0.8.99` after the 0.9.0 cut, so `cargo build --locked`
+  and `cargo install --locked` refused the lock. The lock now names the
+  workspace version. The `qc` job now runs `cargo metadata --locked`, so a
+  release bump that leaves the lock behind fails CI.
+
+
+- **`--proxy` now resolves `--connect` and `addnode` names.** The node
+  hands the name to the SOCKS proxy (address type 3). Before, the OS resolver
+  looked it up first, so clear-text DNS queries for the peer left the host
+  outside the proxy, again every two seconds while the dial failed. The
+  name is also the key of its session now: a redial pass no longer opens a
+  second session to a name that is up, two names on one port stay apart, a
+  `--trust-peer` hostname's session is the trusted one, a `--connect`
+  name is dialed by catch-up and tip-follow, `disconnectnode` takes the
+  name `getpeerinfo` lists as `addr`, and a peer reached by name is told the
+  onion address we listen on, as a proxied IP peer is. Past 1024 distinct
+  proxied names a new one is refused instead of sharing one key (#1348).
+- **`--only-net onion` no longer asks clearnet seeds.** With no IPv4 or
+  IPv6 reachable, the node sends no DNS seed query, local or through
+  `--proxy`, and adds only the fixed onion seeds. Before, it looked up the
+  seed hostnames anyway and dropped the answers. With `--proxy` it added no
+  fixed seeds at all, so it had no first peer (#1348).
+- **The I2P session uses the router's tunnel length.** The node no longer
+  sets `inbound.length=1 outbound.length=1` in `SESSION CREATE`, which made
+  one-hop tunnels. The router default (three hops) applies, as in Core
+  (#1348).
+
+
+- **A release cut updates `Cargo.lock`.** `--minor`, `--major`, `--patch`,
+  and `--dev-next` rewrite each workspace crate's version in the root lock
+  and in the `fuzz` and `script-oracle` locks. A crate that is not a
+  workspace member keeps its version, including one that happens to use the
+  same version string. A quoted `name version` dependency spec moves with
+  that member. `third_party` locks are left alone. The cut fails when the
+  lock was not already on the pre-cut version, so a stale lock is not
+  committed as the new version. `./scripts/release.sh` refuses the tag
+  unless the lock matches. The 0.9.0 cut left the workspace crates at
+  `0.8.99`, so `cargo build --locked` failed. `release-gate` rejects a lock
+  that still names the old version.
+
+
+### Security
+
+
+- **A forged Tor control reply can no longer plant an onion key or address.**
+  The node checks each `ADD_ONION` reply before it saves or advertises
+  anything. The `ServiceID` must be a valid v3 onion address. A `PrivateKey`
+  must be `ED25519-V3:` followed by Base64 of 64 bytes. A saved
+  `onion/*.priv` key gets the same check before it goes into `ADD_ONION`, so
+  a key with a space or a line break cannot add arguments or a second
+  control command. A bad saved key stops the start with an error that names
+  the file to remove. Port of bitcoin/bitcoin#36142 (#1475).
+
 ## [0.9.0] — 2026-11-06
 
 ### Highlights
