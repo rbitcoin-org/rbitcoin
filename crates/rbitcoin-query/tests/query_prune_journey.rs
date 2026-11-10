@@ -1164,6 +1164,36 @@ fn resubmit_rewrites_a_missing_keep_file() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Witness is not in the txid. A resubmit that adds a witness and skips the
+/// commitment must not become the kept copy of this tip.
+#[test]
+fn resubmit_rejects_a_witness_without_a_commitment() {
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::accept_and_connect_block;
+
+    let (dir, q) = temp_query("prune-resubmit-wit");
+    q.set_prune_seqsigwit(true).unwrap();
+    let params = ChainParams::regtest();
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    accept_and_connect_block(&q, &params, Height(0), &genesis, Milestone::NONE).unwrap();
+    let spill = q.store().path().join("seqsigwit.window/0.bin");
+    std::fs::remove_file(&spill).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let mut evil = genesis.clone();
+    evil.txdata[0].input[0].witness = bitcoin::Witness::from_slice(&[&[0u8; 32]]);
+    assert_eq!(evil.block_hash(), genesis.block_hash());
+    let err =
+        accept_and_connect_block(&q, &params, Height(0), &evil, Milestone::NONE).unwrap_err();
+    assert!(
+        err.to_string().contains("missing witness commitment"),
+        "{err}"
+    );
+    assert!(!spill.is_file());
+    accept_and_connect_block(&q, &params, Height(0), &genesis, Milestone::NONE).unwrap();
+    assert!(spill.is_file());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The append cache is empty on a later seal. The keep file is the witness.
 /// A height at or below the prune height is not read. A missing file above
 /// that height fails the seal.

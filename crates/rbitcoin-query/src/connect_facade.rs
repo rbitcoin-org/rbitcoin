@@ -83,8 +83,11 @@ pub fn accept_and_connect_block_preverified(
                     confirm_run::finish_post_commit(query, height.0, &hash)?;
                     return Ok(fk);
                 }
-                // Already this tip, but the keep file is gone. Lookup would
-                // reject the height. Write the file from this block instead.
+                // Already this tip, but the keep file is gone. The block
+                // hash does not cover witness, so check the commitment
+                // before this block becomes the kept copy.
+                let ctx = ValidationContext::at(params, height, milestone);
+                validate_block_structure_hashed(&block, &ctx)?;
                 query
                     .note_pruned_archived_seqsigwit(fk, &block)
                     .map_err(ConfirmError::from)?;
