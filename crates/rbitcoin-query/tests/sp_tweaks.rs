@@ -421,3 +421,39 @@ fn omitting_sp_tweaks_reports_blocks_left_before_the_index_is_stranded() {
 fn header(h: u32, prev_fk: Fk, prev_hash: Option<[u8; 32]>) -> HeaderRecord {
     rbitcoin_query::testutil::header_with_merkle_marker(h, prev_fk, prev_hash, 0xec)
 }
+
+/// Two P2TR transactions share one `{height}.bin`. Repair reads that file
+/// once, and a RAM hit does not touch it.
+#[cfg(debug_assertions)]
+#[test]
+fn pruned_tweak_repair_reads_each_spill_once() {
+    let (dir, q) = tmp_q();
+    q.set_prune_seqsigwit(true).unwrap();
+    let header = header(0, Fk::NULL, None);
+    let p2tr = {
+        let mut s = rbitcoin_primitives::P2TR_PREFIX.to_vec();
+        s.extend_from_slice(&[0x11; 32]);
+        s
+    };
+    let tx = |mark: u8| TxApply {
+        tx: TxRecord {
+            txid: [mark; 32],
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord::coinbase(u32::MAX, vec![mark], vec![])],
+        outputs: vec![OutputRecord::unspent(50_0000_0000, p2tr.clone())],
+    };
+    q.connect_block(Height(0), &header, &[tx(0xcb), tx(0xcd)])
+        .unwrap();
+    q.clear_seqsigwit_ram_window();
+    let heights = q.index_heights(0, 0, Some(0)).unwrap();
+    assert_eq!(heights.len(), 1);
+    rbitcoin_query::arm_spill_read_trace();
+    let window = q.read_index_window(&heights).unwrap();
+    assert_eq!(rbitcoin_query::take_spill_reads(), 1);
+    assert!(window.blocks[0].txs.iter().all(|t| t.inputs.is_some()));
+    let _ = std::fs::remove_dir_all(&dir);
+}

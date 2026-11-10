@@ -85,6 +85,38 @@ pub use index_writebehind::{
     build_indexes_released, index_tip_entry, prepare_live_indexes, spawn_index_writebehind,
     IndexTipEntry, INDEX_STARTUP_GAP_HEIGHTS,
 };
+
+/// Count `{height}.bin` reads on this thread. Debug tests use this to pin
+/// one read per height. A release build does not record.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_spill_read_trace() {
+    SPILL_READ_TRACE.with(|on| on.set(true));
+    SPILL_READS.with(|n| n.set(0));
+}
+
+/// Stop recording and return the file reads since [`arm_spill_read_trace`].
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_spill_reads() -> u32 {
+    SPILL_READ_TRACE.with(|on| on.set(false));
+    SPILL_READS.with(|n| n.replace(0))
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SPILL_READ_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SPILL_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn note_spill_file_read() {
+    #[cfg(debug_assertions)]
+    SPILL_READ_TRACE.with(|on| {
+        if on.get() {
+            SPILL_READS.with(|n| n.set(n.get().saturating_add(1)));
+        }
+    });
+}
 pub use rbitcoin_consensus::{
     block_wire_len_from_pres, decode_block_precomputes, pres_for_tip, IdMap, OutPointHasher,
     OutPointSet, TxConnectPrecompute, TxPrecompute, TxScriptPrecompute, TxidHasher, TxidMap,
@@ -1405,6 +1437,49 @@ impl Query {
         }
     }
 
+    /// Every wanted tx in `{height}.bin`, one file read.
+    fn read_spill_rows(
+        &self,
+        height: u32,
+        wants: &[(Fk, u32)],
+    ) -> Result<std::collections::HashMap<Fk, Vec<InputRecord>>, QueryError> {
+        let mut out = std::collections::HashMap::new();
+        if wants.is_empty() || self.pruneheight().is_some_and(|ph| height <= ph.0) {
+            return Ok(out);
+        }
+        let Some(raw) = self.read_spill_bytes(height)? else {
+            return Ok(out);
+        };
+        note_spill_file_read();
+        let mut need: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for (fk, n_in) in wants {
+            if let Some(id) = fk.get() {
+                need.insert(id, *n_in);
+            }
+        }
+        let mut i = 0usize;
+        while i.saturating_add(12) <= raw.len() && !need.is_empty() {
+            let id = u64::from_le_bytes(raw[i..i + 8].try_into().unwrap());
+            i += 8;
+            let n = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            if i.saturating_add(n) > raw.len() {
+                return Err(StoreError::Corrupt("seqsigwit spill short row"));
+            }
+            if let Some(n_in) = need.remove(&id) {
+                let mut ins = rbitcoin_store::decode_seqsigwit_secret(
+                    &raw[i..i + n],
+                    n_in,
+                    Some(self.store.txs.store_secret()),
+                )?;
+                self.store.stamp_input_prevouts(Fk(id), &mut ins)?;
+                out.insert(Fk(id), ins);
+            }
+            i += n;
+        }
+        Ok(out)
+    }
+
     /// One tx inside `{height}.bin`. The confirm height is known before the
     /// fence publishes it, so a reconnect can read the file without `tx_height`.
     fn read_spill_row(
@@ -1416,6 +1491,7 @@ impl Query {
         let Some(raw) = self.read_spill_bytes(height)? else {
             return Ok(None);
         };
+        note_spill_file_read();
         let mut i = 0usize;
         let want = fk.get().ok_or(StoreError::InvalidFk)?;
         while i.saturating_add(12) <= raw.len() {

@@ -167,12 +167,24 @@ impl Query {
 
     fn fill_pruned_tweak_inputs(&self, window: &mut IndexWindow) -> Result<(), QueryError> {
         for block in &mut window.blocks {
+            let mut file_wants = Vec::new();
+            for tx in &block.txs {
+                if tx.need_seqsigwit && self.seqsigwit_ram_inputs(tx.fk).is_none() {
+                    file_wants.push((tx.fk, tx.rec.input_count));
+                }
+            }
+            let from_file = self.read_spill_rows(block.height.0, &file_wants)?;
             for tx in &mut block.txs {
                 if !tx.need_seqsigwit {
                     continue;
                 }
-                let Some(inputs) = self.seqsigwit_cached_inputs(tx.fk, tx.rec.input_count)? else {
-                    return Err(self.pruned_tweak_witness_miss(block.height));
+                let inputs = if let Some(ram) = self.seqsigwit_ram_inputs(tx.fk) {
+                    ram
+                } else {
+                    let Some(row) = from_file.get(&tx.fk) else {
+                        return Err(self.pruned_tweak_witness_miss(block.height));
+                    };
+                    row.clone()
                 };
                 tx.inputs = Some(inputs);
             }
