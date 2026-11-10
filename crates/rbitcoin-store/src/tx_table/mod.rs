@@ -860,6 +860,11 @@ pub fn pruned_uncovered_input_floor(
     if !prune_seqsigwit_mode || !input_existed {
         return None;
     }
+    // Count 0 is the finished cut. A short input then is a lost backfill,
+    // and open reports the missing tail instead of deleting creates.
+    if n_seqsigwit_loc == 0 {
+        return None;
+    }
     let stem = stem_min(n_loc, n_txids, n_seqsigwit_loc, true);
     if stem == 0 || n_seqsigwit_loc >= stem {
         return None;

@@ -535,23 +535,50 @@ fn pruned_open_keeps_creates_when_seqsigwit_stem_is_header() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A short input under prune, with no witness loc covering the creates, is the unpublished tail.
+/// A finished witness cut and a short input is a lost backfill. Open errors
+/// and leaves the creates on disk.
 #[test]
-fn pruned_open_truncates_to_short_input_when_seqsigwit_uncovered() {
+fn pruned_finished_cut_with_a_short_input_keeps_creates() {
     let dir = tempfile_dir("prune-open-short-input");
     let t = create_tiny(&dir);
     t.put_full_batch_indexed(&coinbase_batch(2), true).unwrap();
     t.flush().unwrap();
-    t.input.truncate_to_count(1).unwrap();
+    t.input.truncate_to_count(0).unwrap();
     t.flush().unwrap();
     drop(t);
     cut_file_to_header(&dir.join("seqsigwit.body"));
     cut_file_to_header(&dir.join("seqsigwit.loc"));
     write_prune_sidecar(&dir);
+    match TxTable::open_tiny(&dir) {
+        Err(StoreError::Corrupt(m)) if m.contains("input tail") => {}
+        Err(other) => panic!("open returned {other}"),
+        Ok(_) => panic!("open kept a finished cut with no input edges"),
+    }
+    let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
+    let txid_len = std::fs::metadata(dir.join("txid.body")).unwrap().len();
+    assert!(
+        txid_len > header + 32,
+        "creates must still be on disk, txid.body len {txid_len}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A positive short witness locator still cannot rebuild a short input.
+/// That tail is dropped. Count 0 is the finished cut and is not this case.
+#[test]
+fn pruned_open_truncates_a_positive_short_witness_locator_with_a_short_input() {
+    let dir = tempfile_dir("prune-open-positive-short");
+    let t = create_tiny(&dir);
+    t.put_full_batch_indexed(&coinbase_batch(2), true).unwrap();
+    t.flush().unwrap();
+    t.seqsigwit_loc.truncate_to_count(1).unwrap();
+    t.input.truncate_to_count(0).unwrap();
+    t.flush().unwrap();
+    drop(t);
+    write_prune_sidecar(&dir);
     let t = TxTable::open_tiny(&dir).unwrap();
-    assert_eq!(t.count(), 1, "unpublished create past input must drop");
-    assert_eq!(t.input.count(), 1);
-    assert_eq!(t.txids.count(), 1);
+    assert_eq!(t.count(), 0);
+    assert_eq!(t.input.count(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
