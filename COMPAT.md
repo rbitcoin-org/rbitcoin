@@ -184,7 +184,7 @@ Per-method notes, auth, and the shindex matrix live in
 | transaction.broadcast | done | Mempool accept + P2P inv. `broadcast_package` wraps `accept_package` (Electrum **1.6**; P2P BIP331 still Q-48). |
 | relayfee / estimatefee / histogram / `mempool.get_info` | done | `minrelaytxfee` is the configured minimum. `relayfee` and `mempoolminfee` are the enforced floor. `incrementalrelayfee` stays 100 sat/kvB. Estimates are the 10-minute flow/history product ([`docs/mempool-fee-estimation.md`](./docs/mempool-fee-estimation.md)), at least `mempoolminfee` like `estimatesmartfee`. `estimatefee` 1 is the target-2 rate, as Core-backed servers return, until mempool flow is warm. `mempool.get_info` is 1.6 (`minrelaytxfee` replaces `relayfee` for 1.6 clients; `relayfee` stays for 1.4). |
 | outpoint.get_status / subscribe / unsubscribe | done | Electrum **1.7** methods; `protocol_max` stays **1.6** until `scriptpubkey.*`. Spent = confirmed-strong or mempool. |
-| silentpayments.subscribe / unsubscribe | done | Frigate remote-scanner: session-only scan key; historical + tip notifies via tweak index / naive `tweaks_for_height`. Not Cake `tweaks.subscribe`. |
+| silentpayments.subscribe / unsubscribe | done | Frigate remote-scanner: session-only scan key; historical + tip notifies via tweak index / keep window. A height that cannot be read is an error on that method, not progress 1.0 with an empty history. Not Cake `tweaks.subscribe`. |
 | TLS | external | terminate at reverse proxy for **clearnet**; onion is plain TCP (`ADD_ONION` to loopback). In-binary 50002 + TLS is parked **Q-63**. |
 
 ### Protocol versions
