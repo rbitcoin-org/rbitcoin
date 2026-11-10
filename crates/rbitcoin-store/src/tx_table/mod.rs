@@ -683,6 +683,10 @@ pub struct TxTable {
     pub rebuild_seal_bits: u32,
     pub rebuild_workers: usize,
     pub prune_seqsigwit_mode: std::sync::atomic::AtomicBool,
+    /// `seqsigwit.prune` was present at open. The witness locator may
+    /// already be shorter than the creates, and a create it does not name
+    /// is not a bad block. Without the file, a missing locator still is.
+    pub witness_stem_may_lag: std::sync::atomic::AtomicBool,
     /// `--datadir-hdd`: Class A body stems are one pwrite wave each.
     pub datadir_hdd: std::sync::atomic::AtomicBool,
     /// Historical spend slots not yet folded into `spent.body`.
@@ -1251,6 +1255,7 @@ impl TxTable {
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(false),
+            witness_stem_may_lag: std::sync::atomic::AtomicBool::new(false),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages: crate::spend_page_log::SpendPageLog::create(dir),
         })
@@ -1502,6 +1507,7 @@ impl TxTable {
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
+            witness_stem_may_lag: std::sync::atomic::AtomicBool::new(repair_keeps_short_witness),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages: crate::spend_page_log::SpendPageLog::load_clipped(dir, spent_body_end)?,
         };
@@ -1641,6 +1647,11 @@ impl TxTable {
     pub fn set_prune_seqsigwit_mode(&self, on: bool) {
         self.prune_seqsigwit_mode
             .store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn witness_stem_may_lag(&self) -> bool {
+        self.witness_stem_may_lag
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn datadir_hdd(&self) -> bool {

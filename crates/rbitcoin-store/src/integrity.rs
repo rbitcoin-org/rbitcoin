@@ -547,17 +547,19 @@ impl Store {
             return Err(TipFault::Bad("input edges short"));
         }
         let prune = self.txs.prune_seqsigwit_mode();
+        // A prune file means this stem may already lag the creates. A
+        // create it does not name has no scriptSig count to match.
+        // Without that file, a missing locator is a bad record.
+        let lag = self.txs.witness_stem_may_lag();
         let mut parents: Vec<(Fk, u32)> = Vec::new();
         for (i, slot) in spans.iter().enumerate() {
             let Some(edges) = slot else {
                 return Err(TipFault::Bad("input unstamped"));
             };
             if !prune {
-                // No witness row is not a torn read. The locator does not
-                // name this create, so there is no scriptSig count to match.
                 let fk = Fk(first + i as u64);
                 match self.txs.seqsigwit_range(fk) {
-                    Err(StoreError::NotFound) => {}
+                    Err(StoreError::NotFound) if lag => {}
                     Err(e) => return Err(TipFault::read("seqsigwit range")(e)),
                     Ok(_) => {
                         let n = self.seqsigwit_input_count(fk)?;

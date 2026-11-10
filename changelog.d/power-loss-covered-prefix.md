@@ -12,7 +12,8 @@ Fixed
   `store.secret`, `seqsigwit.prune`, mempool `meta`, and `unbroadcast` no
   longer truncate the live name. A short prune file is not a height. Open
   keeps creates the witness locator no longer names, and those creates have
-  no scriptSig or witness. A short mempool `meta` is quarantined and the
+  no scriptSig or witness. Without the prune file, that missing locator
+  still drops the block. A short mempool `meta` is quarantined and the
   pool starts empty.
 - **Scripthash inclusion stays inside the covered create count.** A watermark
   just above that count unlinks the tail, or rebuilds the head when those
