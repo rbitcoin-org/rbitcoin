@@ -137,8 +137,7 @@ pub fn encode_sp_address(network: Network, scan_sk: &SecretKey, spend: &PublicKe
     let scan_pk = PublicKey::from_secret_key(&secp, scan_sk);
     let hrp = match network {
         Network::Bitcoin => "sp",
-        Network::Regtest => "sprt",
-        Network::Signet | Network::Testnet | Network::Testnet4 => "tsp",
+        Network::Regtest | Network::Signet | Network::Testnet | Network::Testnet4 => "tsp",
     };
     let mut data = Vec::with_capacity(66);
     data.extend_from_slice(&scan_pk.serialize());

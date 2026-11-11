@@ -169,7 +169,10 @@ async fn pin_silentpayments_1_6(stream: &mut TcpStream) {
     .await;
     assert_eq!(sp["result"]["start_height"], 0, "{sp}");
     assert!(
-        sp["result"]["address"].as_str().unwrap().contains("sp"),
+        sp["result"]["address"]
+            .as_str()
+            .unwrap()
+            .starts_with("tsp1q"),
         "{sp}"
     );
     let note = read_notify(stream, "silentpayments history").await;
