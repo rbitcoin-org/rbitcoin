@@ -607,6 +607,7 @@ the new `meta` or an unknown kind). See [Schema 17 freeze](#schema-17-freeze).
 | 1 | head fk into `spent.ovf` (`vin` in the sole slot is 0; vins live on ovf nodes) |
 
 Best-chain spentness also requires `is_confirmed_strong(spender)` (annotations may outlive reorgs).
+A Class A append fills the slot for a spend in the same write. When the write holds more than one spender of a vout (a double spend that write rejects), it names the first in chain order, the lowest fk. A rejected write keeps that append for the retry.
 
 ### Multi-spender overflow (`spent.ovf`)
 

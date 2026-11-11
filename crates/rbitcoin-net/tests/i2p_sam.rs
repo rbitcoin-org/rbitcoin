@@ -778,3 +778,12 @@ async fn stream_status_error_is_not_retried() {
     );
     assert!(err.to_string().contains("i2p sam forward"), "{err}");
 }
+
+#[test]
+fn sam_kv_skips_a_token_with_a_wide_char_at_the_key_boundary() {
+    // `DESTINATION` is 11 bytes; `é` spans bytes 11..13, across the `=` index.
+    let reply = "SESSION STATUS RESULT=OK DESTINATIONé DESTINATION=abc";
+    assert_eq!(sam_kv(reply, "DESTINATION"), Some("abc"));
+    assert_eq!(sam_kv("DESTINATIONé", "DESTINATION"), None);
+    assert_eq!(sam_kv("destination=abc", "DESTINATION"), Some("abc"));
+}

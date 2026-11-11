@@ -3017,8 +3017,8 @@ fn block_cache_and_mempool_hub_surface() {
     let cache = BlockCache::with_body_depth(4);
     assert!(cache.is_empty());
     assert!(cache.tip_height().is_none());
-    for b in &blocks {
-        cache.push_best(b.clone()).unwrap();
+    for (h, b) in (0u32..).zip(&blocks) {
+        cache.push_best(h, b.clone());
     }
     assert!(!cache.is_empty());
     assert_eq!(cache.tip_hash(), Some(tip));
@@ -3038,11 +3038,16 @@ fn block_cache_and_mempool_hub_surface() {
     let hdrs = cache.headers_after_locator(&[genesis_hash], stop);
     assert!(!hdrs.is_empty());
     assert_ne!(hdrs[0].block_hash(), genesis_hash);
+    cache.truncate_to_height(2);
+    assert_eq!(cache.tip_height(), Some(2));
     let mut bad = blocks.last().unwrap().clone();
     bad.header.prev_blockhash = BlockHash::from_byte_array([0xee; 32]);
-    assert!(cache.push_best(bad).is_err());
-    cache.truncate_to_height(2);
-    assert!(cache.tip_height().unwrap() <= 2);
+    cache.push_best(3, bad.clone());
+    assert_eq!(cache.tip_hash(), Some(bad.block_hash()));
+    assert!(
+        cache.hash_at_height(2).is_none(),
+        "a block that does not link restarts the list at its height"
+    );
     cache.clear();
     assert!(cache.is_empty());
     let empty = BlockCache::new();

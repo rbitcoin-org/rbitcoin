@@ -109,7 +109,7 @@ fn trust_peer_dials_only_that_peer() {
         unresolved.is_empty(),
         "unresolved trust-peer must not dial the peers file"
     );
-    let open = follow_dial_targets(&[], &book, 8, &[]);
+    let open = follow_dial_targets(&[], &book, 8, &[], false);
     assert!(
         !open.is_empty(),
         "the peers file is still a dial target when trust-peer is off"
@@ -117,14 +117,15 @@ fn trust_peer_dials_only_that_peer() {
     let shared = std::sync::Arc::new(std::sync::Mutex::new(book));
     let pinned = rbitcoin_net::NetAddr::Ip(addr.parse().unwrap());
     let trust_book = rbitcoin_ibd::PeerBookSession::new(ibd_shared_peers(true, &shared), &[pinned]);
-    let trust_cands = trust_book
-        .book()
-        .take_dial_candidates_net(8, &Default::default(), &[]);
+    let trust_cands =
+        trust_book
+            .book()
+            .take_dial_candidates_net(8, &Default::default(), &[], false);
     assert_eq!(trust_cands, vec![pinned], "{trust_cands:?}");
     let open_book = rbitcoin_ibd::PeerBookSession::new(ibd_shared_peers(false, &shared), &[]);
     let open_cands = open_book
         .book()
-        .take_dial_candidates_net(8, &Default::default(), &[]);
+        .take_dial_candidates_net(8, &Default::default(), &[], false);
     assert!(
         open_cands
             .iter()
@@ -152,7 +153,10 @@ fn follow_dial_targets_connect_bypasses_diversity() {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         8333,
     ))];
-    assert_eq!(follow_dial_targets(&connect, &am, 8, &occupied), want);
+    assert_eq!(
+        follow_dial_targets(&connect, &am, 8, &occupied, false),
+        want
+    );
     // Core reports `-connect` peers as `manual`; addrman picks are full relay.
     assert_eq!(follow_dial_type(&connect), PeerConnType::Manual);
     assert_eq!(follow_dial_type(&[]), PeerConnType::OutboundFullRelay);
@@ -363,7 +367,7 @@ fn follow_dial_targets_keeps_i2p_connect() {
         port: 8333,
     };
     let connect = vec![i2p];
-    let got = follow_dial_targets(&connect, &am, 8, &[]);
+    let got = follow_dial_targets(&connect, &am, 8, &[], false);
     assert_eq!(got, vec![i2p]);
 }
 
@@ -379,7 +383,7 @@ fn follow_dial_targets_skips_occupied_group() {
         IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)),
         8333,
     ))];
-    let got = follow_dial_targets(&[], &am, 1, &occupied);
+    let got = follow_dial_targets(&[], &am, 1, &occupied, false);
     assert_eq!(got, vec![rbitcoin_net::NetAddr::Ip(other)]);
 }
 
@@ -393,9 +397,9 @@ fn follow_dial_targets_picks_addrman_onion() {
     am.set_onion_reachable(true);
     am.set_only_net(vec![rbitcoin_net::OnlyNet::Onion]);
     am.add_addr(onion);
-    assert_eq!(follow_dial_targets(&[], &am, 1, &[]), vec![onion]);
+    assert_eq!(follow_dial_targets(&[], &am, 1, &[], false), vec![onion]);
     assert!(
-        follow_dial_targets(&[], &am, 1, &[onion]).is_empty(),
+        follow_dial_targets(&[], &am, 1, &[onion], true).is_empty(),
         "live onion net must not be re-dialed via 0.0.0.0 hint"
     );
 }
@@ -1973,6 +1977,146 @@ fn refill_skips_an_address_that_is_already_live() {
     );
 }
 
+fn onion_book(
+    clearnet: &[SocketAddr],
+    onion: rbitcoin_net::NetAddr,
+) -> Arc<std::sync::Mutex<AddrMan>> {
+    let mut book = AddrMan::new();
+    book.set_onion_reachable(true);
+    for addr in clearnet {
+        book.add(*addr);
+    }
+    book.add_addr(onion);
+    Arc::new(std::sync::Mutex::new(book))
+}
+
+fn dial_strings(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<rbitcoin_net::DialRequest>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(req) = rx.try_recv() {
+        assert_eq!(req.typ, PeerConnType::OutboundFullRelay);
+        out.push(req.target.to_string());
+    }
+    out
+}
+
+/// A one-slot refill with no live outbound onion or I2P peer dials the
+/// overlay row, so a lost onion peer is replaced (#1511).
+#[test]
+fn single_slot_refill_replaces_a_lost_onion_peer() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    peers.set_dialer(tx);
+    let onion: rbitcoin_net::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    let a: SocketAddr = "45.6.0.1:8333".parse().unwrap();
+    let b: SocketAddr = "45.7.0.1:8333".parse().unwrap();
+    let shared = onion_book(&[a, b], onion);
+    refill_outbound_full_relay(&NodeConfig::default(), &peers, &shared, 1);
+    assert_eq!(
+        dial_strings(&mut rx),
+        vec![onion.to_string()],
+        "with no live overlay outbound, one open slot goes to the onion row"
+    );
+}
+
+/// With an outbound onion peer already live, a one-slot refill stays on
+/// clearnet.
+#[test]
+fn single_slot_refill_stays_clearnet_while_an_onion_peer_is_live() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    peers.set_dialer(tx);
+    let live: rbitcoin_net::NetAddr =
+        "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:8333"
+            .parse()
+            .unwrap();
+    let onion: rbitcoin_net::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    let placeholder: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: bitcoin::p2p::ServiceFlags::NONE,
+        timestamp: 0,
+        receiver: bitcoin::p2p::Address::new(&placeholder, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::Address::new(&placeholder, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 0,
+        user_agent: String::new(),
+        start_height: 0,
+        relay: false,
+    };
+    let _live = peers.register_net(
+        placeholder,
+        live,
+        placeholder,
+        &ver,
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let a: SocketAddr = "45.6.0.1:8333".parse().unwrap();
+    let shared = onion_book(&[a], onion);
+    refill_outbound_full_relay(&NodeConfig::default(), &peers, &shared, 2);
+    assert_eq!(
+        dial_strings(&mut rx),
+        vec![a.to_string()],
+        "a live onion outbound keeps the single slot on clearnet"
+    );
+}
+
+/// Stale rotation picks its replacement before it disconnects the evicted
+/// peer. When that peer is the only onion session, the replacement may be
+/// an overlay row, and the evicted onion is not dialed again.
+#[test]
+fn stale_rotation_replaces_the_only_onion_peer_with_an_overlay() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let live: rbitcoin_net::NetAddr =
+        "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:8333"
+            .parse()
+            .unwrap();
+    let onion: rbitcoin_net::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    let placeholder: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    let clear: SocketAddr = "45.8.0.1:8333".parse().unwrap();
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: bitcoin::p2p::ServiceFlags::NONE,
+        timestamp: 0,
+        receiver: bitcoin::p2p::Address::new(&placeholder, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::Address::new(&placeholder, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 0,
+        user_agent: String::new(),
+        start_height: 0,
+        relay: false,
+    };
+    let evicted = peers.register_net(
+        placeholder,
+        live,
+        placeholder,
+        &ver,
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let _clear = peers.register(clear, clear, &ver, false, PeerConnType::OutboundFullRelay);
+    let mut book = AddrMan::new();
+    book.set_onion_reachable(true);
+    book.add("45.9.0.1:8333".parse().unwrap());
+    book.add_addr(live);
+    book.add_addr(onion);
+    let shared = Arc::new(std::sync::Mutex::new(book));
+    assert_eq!(
+        stale_follow_replacement(&peers, &shared, evicted.id),
+        vec![onion],
+        "evicting the only onion peer frees the overlay slot, not its address"
+    );
+}
+
 /// `--trusted` sets noban. Stale rotation still skips that hub. The book
 /// fill does not: an empty noban hub dials up to `--max-outbound`, and a
 /// hub already at the cap does not queue another wave.
@@ -2144,6 +2288,214 @@ async fn regtest_datadir_refuses_mainnet_before_peers_and_rpc() {
     assert!(
         std::net::TcpStream::connect_timeout(&rpc, Duration::from_millis(200)).is_err(),
         "rpc accepted a connection"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn tiny_signet(dir: &std::path::Path, challenge: Option<&str>) -> NodeConfig {
+    let mut cfg = NodeConfig::default()
+        .with_datadir(dir)
+        .with_network(rbitcoin_primitives::Network::Signet)
+        .with_tiny_heads();
+    cfg.signet_challenge =
+        challenge.map(|c| rbitcoin_node::config::parse_signet_challenge(c).unwrap());
+    cfg
+}
+
+fn open_and_close(cfg: NodeConfig) -> Result<(), rbitcoin_node::NodeError> {
+    run_node(cfg)?.shutdown()
+}
+
+/// Every signet shares one genesis, so only the recorded message start tells
+/// two signets' datadirs apart.
+#[test]
+fn datadir_reopens_under_the_signet_it_was_created_for() {
+    let dir = scratch_dir("net-same");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("same challenge reopens");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn datadir_refuses_a_different_signet_challenge() {
+    let dir = scratch_dir("net-other");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    let err = open_and_close(tiny_signet(&dir, Some("52"))).unwrap_err();
+    let started = rbitcoin_consensus::signet_magic(
+        rbitcoin_node::config::parse_signet_challenge("52")
+            .unwrap()
+            .as_script(),
+    );
+    let stored = rbitcoin_consensus::signet_magic(
+        rbitcoin_node::config::parse_signet_challenge("51")
+            .unwrap()
+            .as_script(),
+    );
+    let text = err.to_string();
+    assert!(text.contains("Wrong datadir for network?"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "stored network signet {}",
+            bitcoin::p2p::Magic::from_bytes(stored)
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "started network signet {}",
+            bitcoin::p2p::Magic::from_bytes(started)
+        )),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn datadir_refuses_a_custom_challenge_after_the_default_signet() {
+    let dir = scratch_dir("net-default");
+    open_and_close(tiny_signet(&dir, None)).expect("default signet opens");
+    let err = open_and_close(tiny_signet(&dir, Some("51"))).unwrap_err();
+    assert!(
+        err.to_string().contains("stored network signet 0a03cf40"),
+        "{err}"
+    );
+    let err = open_and_close(tiny_signet(&dir, Some(""))).unwrap_err();
+    assert!(
+        err.to_string().contains("Wrong datadir for network?"),
+        "{err}"
+    );
+    open_and_close(tiny_signet(&dir, None)).expect("default signet reopens");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A datadir from before the marker has no record of its network. The node
+/// adopts the started one, says so, and refuses a different one afterwards.
+#[test]
+fn datadir_without_a_marker_adopts_the_started_network() {
+    let dir = scratch_dir("net-legacy");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    std::fs::remove_file(dir.join(NETWORK_MARKER)).expect("marker written on create");
+    rbitcoin_log::capture_logs(true);
+    let reopened = open_and_close(tiny_signet(&dir, Some("51")));
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    reopened.expect("legacy datadir opens");
+    assert!(
+        lines
+            .iter()
+            .any(|(_, l)| l.contains("no network marker") && l.contains("adopting signet")),
+        "no adopt line in {lines:?}"
+    );
+    assert!(open_and_close(tiny_signet(&dir, Some("52"))).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A refused start leaves no marker, so the datadir still opens on its own
+/// network.
+#[test]
+fn foreign_genesis_refusal_does_not_adopt_the_started_network() {
+    let dir = scratch_dir("net-no-adopt");
+    plant_regtest_genesis(&dir);
+    let mainnet = tiny_regtest(&dir).with_network(rbitcoin_primitives::Network::Mainnet);
+    assert!(open_and_close(mainnet).is_err());
+    assert!(!dir.join(NETWORK_MARKER).exists());
+    open_and_close(tiny_regtest(&dir)).expect("regtest datadir still opens");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every signet shares one genesis, so a datadir from before the marker
+/// takes whichever challenge its first start passes. The other one is then
+/// refused, including the challenge the datadir was really made for.
+#[test]
+fn legacy_signet_datadir_adopts_the_first_challenge_it_is_started_with() {
+    let dir = scratch_dir("net-legacy-first");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    std::fs::remove_file(dir.join(NETWORK_MARKER)).expect("marker written on create");
+    open_and_close(tiny_signet(&dir, Some("52"))).expect("legacy datadir adopts 52");
+    let err = open_and_close(tiny_signet(&dir, Some("51"))).unwrap_err();
+    assert!(
+        err.to_string().contains("Wrong datadir for network?"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A torn marker write leaves an empty file. That adopts, like a missing
+/// marker, instead of locking the datadir out on every later start.
+#[test]
+fn empty_marker_adopts_the_started_network() {
+    let dir = scratch_dir("net-empty");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    std::fs::write(dir.join(NETWORK_MARKER), "").unwrap();
+    rbitcoin_log::capture_logs(true);
+    let reopened = open_and_close(tiny_signet(&dir, Some("51")));
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    reopened.expect("empty marker adopts");
+    assert!(
+        lines.iter().any(|(_, l)| l.contains("adopting signet")),
+        "no adopt line in {lines:?}"
+    );
+    assert!(open_and_close(tiny_signet(&dir, Some("52"))).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The marker write is synced: the datadir entry for the renamed file is
+/// fsynced before the store opens for work.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn marker_write_syncs_the_datadir() {
+    let dir = scratch_dir("net-sync");
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let opened = open_and_close(tiny_signet(&dir, Some("51")));
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    opened.expect("first open");
+    assert!(synced.contains(&dir), "datadir not fsynced: {synced:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A symlinked temp file is not followed: its target keeps its bytes.
+#[cfg(unix)]
+#[test]
+fn marker_write_does_not_follow_a_temp_symlink() {
+    let dir = scratch_dir("net-tmp-link");
+    let victim = dir.join("victim");
+    std::fs::write(&victim, "keep me\n").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::os::unix::fs::symlink(&victim, dir.join(format!("{NETWORK_MARKER}.tmp"))).unwrap();
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me\n");
+    assert!(!std::fs::symlink_metadata(dir.join(NETWORK_MARKER))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A huge or symlinked marker is refused without loading it into the error.
+#[cfg(unix)]
+#[test]
+fn oversized_or_symlinked_marker_refuses_with_a_short_error() {
+    let dir = scratch_dir("net-huge");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    let huge = "x".repeat(1 << 20);
+    std::fs::write(dir.join(NETWORK_MARKER), &huge).unwrap();
+    let err = open_and_close(tiny_signet(&dir, Some("51"))).unwrap_err();
+    assert!(
+        err.to_string().len() < 512,
+        "error carries the file: {} bytes",
+        err.to_string().len()
+    );
+
+    let target = dir.join("elsewhere");
+    std::fs::write(&target, &huge).unwrap();
+    std::fs::remove_file(dir.join(NETWORK_MARKER)).unwrap();
+    std::os::unix::fs::symlink(&target, dir.join(NETWORK_MARKER)).unwrap();
+    let err = open_and_close(tiny_signet(&dir, Some("51"))).unwrap_err();
+    assert!(
+        err.to_string().len() < 512,
+        "error carries the file: {} bytes",
+        err.to_string().len()
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

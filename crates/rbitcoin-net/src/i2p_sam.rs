@@ -505,11 +505,9 @@ pub fn i2p_b64_encode(raw: &[u8]) -> String {
 pub fn sam_kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("{key}=");
     line.split_whitespace().find_map(|tok| {
-        if tok.len() >= prefix.len() && tok[..prefix.len()].eq_ignore_ascii_case(&prefix) {
-            Some(&tok[prefix.len()..])
-        } else {
-            None
-        }
+        // Router text: a char across the `=` index is no key, not a panic.
+        let (k, v) = tok.split_at_checked(prefix.len())?;
+        k.eq_ignore_ascii_case(&prefix).then_some(v)
     })
 }
 

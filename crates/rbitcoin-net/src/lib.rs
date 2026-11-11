@@ -84,7 +84,7 @@ pub use net_permissions::{
     WhitebindGrant, WhitelistGrant, DEFAULT_WHITELISTFORCERELAY, DEFAULT_WHITELISTRELAY,
 };
 pub use netaddr::{is_cjdns_ip, NetAddr, OnlyNet};
-pub use netgroup::netgroup;
+pub use netgroup::{netgroup, netgroup_net};
 pub use peer::{
     drain_pending_now, flush_tx_invs, force_announce_txid, local_service_flags, run_feeler_timed,
     PendingBlocks, V2PlainSession, MAX_SERVE_BLOCKS,

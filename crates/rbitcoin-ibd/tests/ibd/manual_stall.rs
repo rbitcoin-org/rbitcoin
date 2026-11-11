@@ -810,6 +810,7 @@ async fn ibd_dial_of_a_connect_target_is_manual() {
             1,
             HashSet::new(),
             &[],
+            false,
             seed.magic,
             "127.0.0.1:0".parse().unwrap(),
             Some(0),

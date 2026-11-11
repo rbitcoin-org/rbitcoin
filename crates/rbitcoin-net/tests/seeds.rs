@@ -961,12 +961,44 @@ fn full_clearnet_batch_does_not_reserve_an_unreachable_overlay() {
     }
     am.add_addr(onion());
     am.add_addr(i2p());
-    let got = am.take_dial_candidates_net(8, &HashSet::new(), &[]);
+    let got = am.take_dial_candidates_net(8, &HashSet::new(), &[], false);
     assert_eq!(got.len(), 8, "{got:?}");
     assert!(
         got.iter().all(|a| matches!(a, NetAddr::Ip(_))),
         "an onion this process cannot dial must not take a clearnet slot: {got:?}"
     );
+}
+
+#[test]
+fn one_peer_batch_takes_the_overlay_slot_only_without_a_live_overlay() {
+    let mut am = AddrMan::new();
+    am.set_onion_reachable(true);
+    am.add(addr(1));
+    am.add(addr(2));
+    am.add_addr(onion());
+    assert_eq!(
+        am.take_dial_candidates_net(1, &HashSet::new(), &[], false),
+        vec![onion()],
+        "no live overlay outbound: the single redial replaces it"
+    );
+    let got = am.take_dial_candidates_net(1, &HashSet::new(), &[], true);
+    assert!(matches!(got.as_slice(), [NetAddr::Ip(_)]), "{got:?}");
+}
+
+/// A failed onion stays eligible while every clearnet row is last-resort. A
+/// one-peer batch must not hand it the slot again inside the recent-attempt
+/// window, or that slot never returns to clearnet.
+#[test]
+fn one_peer_batch_skips_a_recently_attempted_overlay() {
+    let mut am = AddrMan::new();
+    am.set_onion_reachable(true);
+    am.add(addr(1));
+    am.note_connect_failed_addr(NetAddr::Ip(addr(1)), false);
+    am.add_addr(onion());
+    am.note_attempt_addr(onion());
+    am.note_connect_failed_addr(onion(), false);
+    let got = am.take_dial_candidates_net(1, &HashSet::new(), &[], false);
+    assert_eq!(got, vec![NetAddr::Ip(addr(1))], "{got:?}");
 }
 
 #[test]
@@ -1153,7 +1185,7 @@ fn onion_only_fixed_seed_fallback_never_offers_clearnet() {
     am.set_only_net(vec![OnlyNet::Onion]);
     assert_eq!(am.add_fixed_seeds(Network::Mainnet), 512);
     assert_eq!(per_net(am.dial_order().iter().copied()), [0, 0, 512, 0, 0]);
-    let got = am.take_dial_candidates_net(16, &HashSet::new(), &[]);
+    let got = am.take_dial_candidates_net(16, &HashSet::new(), &[], false);
     assert_eq!(got.len(), 16);
     assert!(
         got.iter().all(|a| matches!(a, NetAddr::Onion { .. })),

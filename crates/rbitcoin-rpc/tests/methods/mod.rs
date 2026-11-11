@@ -611,6 +611,63 @@ fn filter_header_hex(filter_hex: &str, parent_header_hex: &str) -> String {
 }
 
 #[test]
+fn getindexinfo_lists_the_basic_filter_index_when_enabled() {
+    let (ctx, _dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let tip = dispatch(&ctx, "getblockcount", vec![]).unwrap();
+    let name = json!("basic block filter index");
+
+    let off = dispatch(&ctx, "getindexinfo", vec![]).unwrap();
+    assert_eq!(
+        off,
+        json!({ "txindex": { "synced": true, "best_block_height": tip } })
+    );
+    assert_eq!(
+        dispatch(&ctx, "getindexinfo", vec![name.clone()]).unwrap(),
+        json!({})
+    );
+
+    ctx.query.set_block_filter_index(true).unwrap();
+    let empty = dispatch(&ctx, "getindexinfo", vec![]).unwrap();
+    assert_eq!(
+        empty["basic block filter index"],
+        json!({ "synced": false, "best_block_height": 0 }),
+        "{empty}"
+    );
+
+    // Seal every height up to the tip, parents first, as the index builder commits them.
+    let tip_height = u32::try_from(tip.as_u64().unwrap()).unwrap();
+    for h in 0..=tip_height {
+        let hash = dispatch(&ctx, "getblockhash", vec![json!(h)]).unwrap();
+        let f = dispatch(&ctx, "getblockfilter", vec![hash]).unwrap();
+        let body = rbitcoin_primitives::hex_decode(f["filter"].as_str().unwrap()).unwrap();
+        let fk = ctx
+            .query
+            .store()
+            .confirmed
+            .get(Height(h))
+            .unwrap()
+            .expect("best-chain header");
+        let sealed = ctx
+            .query
+            .commit_window_filters(h, &[(bitcoin::bip158::BlockFilter::new(&body), fk)])
+            .unwrap();
+        assert_eq!(sealed, 1, "height {h}");
+    }
+    let built = json!({ "synced": true, "best_block_height": tip });
+    let all = dispatch(&ctx, "getindexinfo", vec![]).unwrap();
+    assert_eq!(all["basic block filter index"], built, "{all}");
+    assert_eq!(all["txindex"]["best_block_height"], tip);
+    assert_eq!(
+        dispatch(&ctx, "getindexinfo", vec![name]).unwrap(),
+        json!({ "basic block filter index": built })
+    );
+    assert_eq!(
+        dispatch(&ctx, "getindexinfo", vec![json!("txindex")]).unwrap(),
+        json!({ "txindex": { "synced": true, "best_block_height": tip } })
+    );
+}
+
+#[test]
 fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
     use bitcoin::bip158::BlockFilter;
 
@@ -4292,6 +4349,93 @@ fn submitpackage_child_fail_keeps_parent() {
             .is_some(),
         "child must be the failed member, got {pkg}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core `rpc_packages.py` `test_submitpackage_other_wtxid`: a member whose
+/// txid is live under another witness reports only `other-wtxid`.
+#[test]
+fn submitpackage_reports_other_wtxid_for_a_live_witness_variant() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (parent_hex, parent) =
+        mature_coinbase_spend(&ctx, 50_0000_0000 - 1_000, p2wsh_script(1).to_p2wsh());
+    dispatch(&ctx, "sendrawtransaction", vec![json!(parent_hex)]).unwrap();
+    let prev = bitcoin::OutPoint {
+        txid: parent.compute_txid(),
+        vout: 0,
+    };
+    let value = parent.output[0].value.to_sat();
+    let one = p2wsh_with_lens(prev, value, 1_000, 1, &[1]);
+    let two = p2wsh_with_lens(prev, value, 1_000, 1, &[2]);
+    assert_eq!(one.compute_txid(), two.compute_txid());
+    assert_ne!(one.compute_wtxid(), two.compute_wtxid());
+    let one_hex = rbitcoin_primitives::hex_encode(serialize(&one));
+    let two_hex = rbitcoin_primitives::hex_encode(serialize(&two));
+    dispatch(&ctx, "sendrawtransaction", vec![json!(one_hex)]).unwrap();
+    let pkg = dispatch(&ctx, "submitpackage", vec![json!([two_hex])]).unwrap();
+    assert_eq!(
+        pkg,
+        json!({
+            "package_msg": "success",
+            "tx-results": {
+                hash_hex_display(&two.compute_wtxid().to_byte_array()): {
+                    "txid": hash_hex_display(&two.compute_txid().to_byte_array()),
+                    "other-wtxid": hash_hex_display(&one.compute_wtxid().to_byte_array()),
+                },
+            },
+            "replaced-transactions": [],
+        })
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core `AcceptPackage` rechecks each member by txid after `LimitMempoolSize`:
+/// a live witness variant that the package's trim evicted is `mempool full`.
+#[test]
+fn submitpackage_witness_variant_trimmed_by_the_package_is_mempool_full() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (parent_hex, parent) =
+        mature_coinbase_spend(&ctx, 50_0000_0000 - 1_000, p2wsh_script(1).to_p2wsh());
+    dispatch(&ctx, "sendrawtransaction", vec![json!(parent_hex)]).unwrap();
+    let prev = bitcoin::OutPoint {
+        txid: parent.compute_txid(),
+        vout: 0,
+    };
+    let value = parent.output[0].value.to_sat();
+    let one = p2wsh_with_lens(prev, value, 1_000, 1, &[1]);
+    let two = p2wsh_with_lens(prev, value, 1_000, 1, &[2]);
+    dispatch(
+        &ctx,
+        "sendrawtransaction",
+        vec![json!(rbitcoin_primitives::hex_encode(serialize(&one)))],
+    )
+    .unwrap();
+    let (rich_hex, rich) = spend_generated_coinbase(
+        &ctx,
+        2,
+        50_0000_0000 - 200_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    // Room for `rich` alone: the trim after it drops the parent and `one`.
+    let mp = ctx.mempool.as_ref().unwrap();
+    mp.set_max_weight(rich.weight().to_wu());
+    let two_hex = rbitcoin_primitives::hex_encode(serialize(&two));
+    let pkg = dispatch(&ctx, "submitpackage", vec![json!([two_hex, rich_hex])]).unwrap();
+    assert!(!mp.contains(&one.compute_txid()), "trim kept `one`: {pkg}");
+    assert!(mp.contains(&rich.compute_txid()), "{pkg}");
+    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
+    assert_eq!(
+        pkg["tx-results"][hash_hex_display(&two.compute_wtxid().to_byte_array())],
+        json!({
+            "txid": hash_hex_display(&two.compute_txid().to_byte_array()),
+            "error": "mempool full",
+        }),
+        "{pkg}"
+    );
+    let rich_row = &pkg["tx-results"][hash_hex_display(&rich.compute_wtxid().to_byte_array())];
+    assert!(rich_row.get("error").is_none(), "{pkg}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -8659,6 +8803,7 @@ include!("../regtest_chain_ops_journey.rs");
 mod chain;
 mod decode;
 mod mempool;
+mod submit_spent_race;
 
 /// The HTTP route runs these methods on the request task
 /// (`dispatch_tip_connect`), not through `dispatch`. Core's block count and

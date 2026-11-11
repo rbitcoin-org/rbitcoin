@@ -1459,6 +1459,52 @@ fn pick_stale_follow_evict_prefers_duplicate_group() {
     }
 }
 
+/// An outbound onion or I2P session keys `addr` as `0.0.0.0:<port>`. Stale
+/// rotation groups by net, so two overlay peers are not one duplicate group
+/// that it evicts ahead of every clearnet peer (#1511).
+#[test]
+fn stale_follow_groups_overlay_peers_apart() {
+    use rbitcoin_net::{netgroup_net, NetAddr};
+    let hub = PeerHub::new();
+    let placeholder: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    let mut live = Vec::new();
+    for onion in [
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333",
+        "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:8333",
+    ] {
+        let net: NetAddr = onion.parse().unwrap();
+        live.push(hub.register_net(
+            placeholder,
+            net,
+            placeholder,
+            &ver("/rbitcoin:0.1.0/"),
+            false,
+            PeerConnType::OutboundFullRelay,
+        ));
+    }
+    let clear: SocketAddr = "45.1.0.1:8333".parse().unwrap();
+    let clear = hub.register(
+        clear,
+        clear,
+        &ver("/rbitcoin:0.1.0/"),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let rows = hub.outbound_full_relay_rows();
+    let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+    let groups: Vec<u64> = rows
+        .iter()
+        .map(|(_, net)| netgroup_net(*net, None))
+        .collect();
+    let picked: HashSet<u64> = (0..16u64)
+        .filter_map(|salt| pick_stale_follow_evict(&ids, salt, &groups))
+        .collect();
+    assert!(
+        picked.contains(&clear.id),
+        "two onion peers must not share one group: groups={groups:?}"
+    );
+}
+
 #[test]
 fn outbound_full_relay_ids_skips_inbound_and_noban() {
     let hub = PeerHub::new();

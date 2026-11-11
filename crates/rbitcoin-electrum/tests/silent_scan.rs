@@ -149,7 +149,11 @@ fn parse_sub_labels_start_and_networks() {
     .unwrap();
     assert_eq!(sub.start, 12);
     assert_eq!(sub.labels, vec![0, 1]);
-    assert!(sub.address.starts_with("sp1"), "{}", sub.address);
+    // BIP-352 send-and-receive vector 0: version `q`, then the two keys.
+    assert_eq!(
+        sub.address,
+        "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv"
+    );
     let tsp = parse_sub(&json!([scan, spend]), Network::Signet, Some(3)).unwrap();
     assert!(tsp.address.starts_with("tsp1"), "{}", tsp.address);
     let t4 = parse_sub(&json!([scan, spend]), Network::Testnet4, Some(3)).unwrap();
@@ -157,6 +161,11 @@ fn parse_sub_labels_start_and_networks() {
     let tn = parse_sub(&json!([scan, spend]), Network::Testnet, Some(3)).unwrap();
     assert!(tn.address.starts_with("tsp"), "{}", tn.address);
     let no_tip = parse_sub(&json!([scan, spend, 50]), Network::Regtest, None).unwrap();
+    // Regtest is a test network: the same payload under `tsp`.
+    assert_eq!(
+        no_tip.address,
+        "tsp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc3wk4yh"
+    );
     assert_eq!(no_tip.start, 50);
     let null_start = parse_sub(&json!([scan, spend, null]), Network::Regtest, Some(3)).unwrap();
     assert_eq!(null_start.start, 0);

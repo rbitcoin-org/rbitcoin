@@ -63,13 +63,11 @@ pub struct LockBusy;
 #[doc(hidden)]
 pub fn open_lockfile(path: &Path) -> io::Result<File> {
     let mut opts = OpenOptions::new();
-    opts.create(true).read(true).write(true);
+    no_follow(opts.create(true).read(true).write(true));
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
-        // A symlink `.lock` must fail closed. Do not create the target.
-        opts.custom_flags(libc::O_NOFOLLOW);
     }
     #[cfg(windows)]
     {
@@ -77,6 +75,18 @@ pub fn open_lockfile(path: &Path) -> io::Result<File> {
         opts.share_mode(0);
     }
     opts.open(path)
+}
+
+/// A symlinked datadir file fails closed: the open neither reads nor creates
+/// the link's target.
+#[doc(hidden)]
+pub fn no_follow(opts: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts
 }
 
 #[doc(hidden)]

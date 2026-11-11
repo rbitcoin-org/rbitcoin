@@ -466,8 +466,14 @@ fn write_phase_inner(
     if drain_join_ns > 0 {
         crate::note_confirm(&query.confirm_stats().write_drain_join_ns, drain_join_ns);
     }
-    if drain_res.is_err() {
-        query.store().txs.head_note_pending(&restore);
+    // The insert ran whether or not the checks below reject: a reject after
+    // the Class A append leaves these keys in `tx.head`, and an archived
+    // retry of the same blocks queues none. Note the drain on every joined
+    // insert, or the drain stays behind the fence until a fresh write.
+    match (&drain_res, drain_max_fk) {
+        (Ok(_), Some(fk)) => query.note_head_drain_fk(fk),
+        (Ok(_), None) => {}
+        (Err(_), _) => query.store().txs.head_note_pending(&restore),
     }
     let (out, n_blocks, structural_ns, struct_ph, class_c_ns, spend_ann_ns) = match overlap {
         Ok(v) => v,
@@ -480,9 +486,6 @@ fn write_phase_inner(
         }
     };
     drain_res.map_err(ConfirmError::from)?;
-    if let Some(fk) = drain_max_fk {
-        query.note_head_drain_fk(fk);
-    }
 
     // No tip GC of sparse pins (dropped with ScriptOkBatch).
     if let Some(h) = batch.prepared.iter().map(|p| p.height.0).max() {

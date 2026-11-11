@@ -392,6 +392,11 @@ impl NetAddr {
         }
     }
 
+    /// Onion or I2P: an overlay row the dial picker keeps a slot for.
+    pub fn is_overlay(self) -> bool {
+        matches!(self, NetAddr::Onion { .. } | NetAddr::I2p { .. })
+    }
+
     pub fn is_ipv6(self) -> bool {
         match self {
             NetAddr::Ip(s) => s.is_ipv6(),

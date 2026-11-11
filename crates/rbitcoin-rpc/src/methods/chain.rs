@@ -1350,6 +1350,9 @@ pub fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     }))
 }
 
+/// Core's name for the BIP158 basic filter index (`-blockfilterindex`).
+const BASIC_FILTER_INDEX: &str = "basic block filter index";
+
 pub fn getindexinfo(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["index_name"])?;
     let tip = ctx.query.tip_height().map(|h| h.0).unwrap_or(0);
@@ -1357,9 +1360,32 @@ pub fn getindexinfo(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
         "synced": true,
         "best_block_height": tip,
     });
+    // With --block-filter-index, Core lists the filter index too: synced once the committed
+    // filters reach the tip, at the last filtered height.
+    let filters = if ctx.query.block_filter_enabled() {
+        let hwm = ctx
+            .query
+            .basic_filter_hwm()
+            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+        Some(json!({
+            "synced": ctx.query.block_filter_lag_heights() == 0,
+            "best_block_height": hwm.unwrap_or(0),
+        }))
+    } else {
+        None
+    };
     match params.get(0, "index_name") {
-        None | Some(Value::Null) => Ok(json!({ "txindex": txindex })),
+        None | Some(Value::Null) => {
+            let mut all = json!({ "txindex": txindex });
+            if let Some(f) = filters {
+                all[BASIC_FILTER_INDEX] = f;
+            }
+            Ok(all)
+        }
         Some(Value::String(s)) if s == "txindex" => Ok(json!({ "txindex": txindex })),
+        Some(Value::String(s)) if s == BASIC_FILTER_INDEX => {
+            Ok(filters.map_or_else(|| json!({}), |f| json!({ BASIC_FILTER_INDEX: f })))
+        }
         Some(Value::String(_)) => Ok(json!({})),
         Some(_) => Err(rpc_error(ERR_INVALID_PARAMS, "index_name must be a string")),
     }

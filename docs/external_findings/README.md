@@ -112,6 +112,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [106](./106-historical-bitrot.md) | medium | Historical body bit-rot is an accepted reindex | accepted | none |
 | [107](./107-torn-spend-page.md) | medium | A torn spend page below the durable marker stays | accepted | none |
 | [108](./108-bobberb-store-index.md) | — | Bobberb store-integrity index | accepted | — |
+| [114](./114-respend-after-rejected-write.md) | critical | Re-spend of a same-block spend connects after a merged IBD write rejects | fixed | `respend_of_a_same_block_spend_rejects_on_single_block_retry`, `merged_respend_of_a_same_block_spend_is_rejected_alone` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
 `8f3990f`). Report-local 001–010 are **renumbered** here. Identity/BIP30

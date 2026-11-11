@@ -588,6 +588,7 @@ pub async fn ibd_cancellable(
             initial_dial_n,
             tried.clone(),
             &[],
+            false,
             magic,
             local_addr,
             hub.tip_height(),
@@ -1119,6 +1120,7 @@ pub async fn ibd_cancellable(
                 let mut already = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
                 let occupied = alive_dial_addrs(&st.slots);
                 let live: HashSet<_> = st.slots.iter().map(|s| s.net).collect();
+                let overlay_live = st.slots.iter().any(|s| s.alive && s.net.is_overlay());
                 if let Some(addr) = admit_cooldown_fallback(
                     peer_sess.book(),
                     &mut already,
@@ -1145,8 +1147,21 @@ pub async fn ibd_cancellable(
                 let connect_c = cfg.connect.clone();
                 redial_handle = Some(tokio::spawn(async move {
                     dial_batch(
-                        &book, want, already, &occupied, magic, local_addr, tip_h, sinks_r, cto,
-                        cancel_c, dialer_c, &clock_c, perms_c, &connect_c,
+                        &book,
+                        want,
+                        already,
+                        &occupied,
+                        overlay_live,
+                        magic,
+                        local_addr,
+                        tip_h,
+                        sinks_r,
+                        cto,
+                        cancel_c,
+                        dialer_c,
+                        &clock_c,
+                        perms_c,
+                        &connect_c,
                     )
                     .await
                 }));

@@ -1727,30 +1727,24 @@ fn submit_outcome_json(outcome: SubmitBlockOutcome) -> Result<Value, Value> {
     }
 }
 
-/// True when `block`'s parent header is the active tip. A known ancestor that
-/// is not the tip is a competing block; tip spentness does not apply.
-#[doc(hidden)]
-pub fn parent_extends_tip(
+/// The active tip as one read: its height and header fk.
+fn tip_at(
     query: &rbitcoin_query::Query,
-    block: &Block,
-) -> Result<bool, rbitcoin_store::StoreError> {
-    use rbitcoin_store::StoreError;
-    let prev = block.header.prev_blockhash.to_byte_array();
-    let parent_fk = match query.get_header_by_hash(&prev) {
-        Ok(Some((fk, _))) => fk,
-        Ok(None) | Err(StoreError::NotFound) => return Ok(false),
-        Err(e) => return Err(e),
+) -> Result<Option<(u32, rbitcoin_primitives::Fk)>, rbitcoin_store::StoreError> {
+    let Some(h) = query.tip_height() else {
+        return Ok(None);
     };
-    Ok(query.tip_header_fk()? == Some(parent_fk))
+    Ok(query.store().confirmed.get(h)?.map(|fk| (h.0, fk)))
 }
 
-/// Spend height of `block` when its parent is confirmed. The tip parent is a
-/// header-fk compare. Any other parent uses the best-chain hash index.
-#[doc(hidden)]
-pub fn cheap_spend_height(
+/// Spend height of `block` when its parent is confirmed, and whether that
+/// parent is `tip`. The tip parent is a header-fk compare. Any other parent
+/// uses the best-chain hash index.
+fn cheap_spend_height(
     query: &rbitcoin_query::Query,
     block: &Block,
-) -> Result<Option<u32>, rbitcoin_store::StoreError> {
+    tip: Option<(u32, rbitcoin_primitives::Fk)>,
+) -> Result<Option<(u32, bool)>, rbitcoin_store::StoreError> {
     use rbitcoin_store::StoreError;
     let prev = block.header.prev_blockhash.to_byte_array();
     let parent_fk = match query.get_header_by_hash(&prev) {
@@ -1758,10 +1752,14 @@ pub fn cheap_spend_height(
         Ok(None) | Err(StoreError::NotFound) => return Ok(None),
         Err(e) => return Err(e),
     };
-    if query.tip_header_fk()? == Some(parent_fk) {
-        return Ok(query.tip_height().map(|h| h.0.saturating_add(1)));
+    if let Some((h, fk)) = tip {
+        if fk == parent_fk {
+            return Ok(Some((h.saturating_add(1), true)));
+        }
     }
-    Ok(query.height_of_hash(&prev)?.map(|h| h.0.saturating_add(1)))
+    Ok(query
+        .height_of_hash(&prev)?
+        .map(|h| (h.0.saturating_add(1), false)))
 }
 
 /// Core `CheckTxInputs`: a coinbase spend inside the maturity window is
@@ -1858,6 +1856,34 @@ pub fn submit_reason_is_mutated(block: &Block, reason: &str) -> bool {
         || rbitcoin_consensus::block_mutated_without_coinbase(block)
 }
 
+/// Where a [`during_next_submit_inputs`] hook runs.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmitInputsPoint {
+    /// After the tip read, before the input reads.
+    BeforeInputs,
+    /// After the input reads, before the tip is read again.
+    BeforeRecheck,
+}
+
+#[cfg(debug_assertions)]
+type SubmitInputsHook = Box<dyn FnMut(SubmitInputsPoint)>;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SUBMIT_INPUTS_HOOK: std::cell::RefCell<Option<SubmitInputsHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` at each [`SubmitInputsPoint`] of the next `submitblock` input
+/// pre-check on this thread.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn during_next_submit_inputs(f: impl FnMut(SubmitInputsPoint) + 'static) {
+    SUBMIT_INPUTS_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+
 /// Input reads for a block that already passed
 /// `ChainHub::check_block_on_parent`, so its merkle root and structure hold.
 #[doc(hidden)]
@@ -1866,15 +1892,50 @@ pub fn cheap_submit_tx_reject(
     block: &Block,
     maturity: u32,
 ) -> Result<Option<String>, rbitcoin_store::StoreError> {
-    use bitcoin::{OutPoint, TxOut};
-    let spend_height = cheap_spend_height(query, block)?;
-    let parent_is_tip = parent_extends_tip(query, block)?;
-    let txids: Vec<Txid> = block.txdata.iter().map(Transaction::compute_txid).collect();
-    // A parent off the best chain can create the coins this block spends.
-    // Only the branch connect sees them (Core checks inputs in ConnectBlock).
-    if spend_height.is_none() {
+    // Core checks inputs only in ConnectBlock, serialized with every other
+    // connect. A reject read while the chain moved is left to that accept.
+    #[cfg(debug_assertions)]
+    let mut hook = SUBMIT_INPUTS_HOOK.with(|h| h.borrow_mut().take());
+    #[cfg(debug_assertions)]
+    let mut at = |point| {
+        if let Some(f) = hook.as_mut() {
+            f(point);
+        }
+    };
+    let disconnects = || query.disconnect_gen.load(Ordering::Acquire);
+    let gen = disconnects();
+    let tip = tip_at(query)?;
+    #[cfg(debug_assertions)]
+    at(SubmitInputsPoint::BeforeInputs);
+    let reason = tx_reject_on_tip(query, block, maturity, tip)?;
+    #[cfg(debug_assertions)]
+    at(SubmitInputsPoint::BeforeRecheck);
+    if reason.is_none() {
         return Ok(None);
     }
+    // A reject stands only if the chain did not move while it was read. A
+    // connect can resolve a parent txid to a newer instance, and a disconnect
+    // that was undone leaves the tip as it was. The generation moves after
+    // the slot is popped, so read the tip first.
+    if tip_at(query)? != tip || disconnects() != gen {
+        return Ok(None);
+    }
+    Ok(reason)
+}
+
+fn tx_reject_on_tip(
+    query: &rbitcoin_query::Query,
+    block: &Block,
+    maturity: u32,
+    tip: Option<(u32, rbitcoin_primitives::Fk)>,
+) -> Result<Option<String>, rbitcoin_store::StoreError> {
+    use bitcoin::{OutPoint, TxOut};
+    // A parent off the best chain can create the coins this block spends.
+    // Only the branch connect sees them (Core checks inputs in ConnectBlock).
+    let Some((spend_height, parent_is_tip)) = cheap_spend_height(query, block, tip)? else {
+        return Ok(None);
+    };
+    let txids: Vec<Txid> = block.txdata.iter().map(Transaction::compute_txid).collect();
     let parents = confirmed_parents_of(query, block, &txids)?;
     let mut spent = std::collections::HashSet::new();
     let mut created: std::collections::HashMap<OutPoint, TxOut> = std::collections::HashMap::new();
@@ -1919,13 +1980,17 @@ pub fn cheap_submit_tx_reject(
                 else {
                     return Ok(Some("bad-txns-inputs-missingorspent".into()));
                 };
-                if parent_is_tip && query.is_outpoint_spent(&op.txid.to_byte_array(), op.vout)? {
+                if parent_is_tip
+                    && query.is_outpoint_spent_at(
+                        &op.txid.to_byte_array(),
+                        op.vout,
+                        tip.map(|(h, _)| h),
+                    )?
+                {
                     return Ok(Some("bad-txns-inputs-missingorspent".into()));
                 }
-                if let Some(h) = spend_height {
-                    if cheap_immature_coinbase(query, fk, h, maturity)? {
-                        return Ok(Some("bad-txns-premature-spend-of-coinbase".into()));
-                    }
+                if cheap_immature_coinbase(query, fk, spend_height, maturity)? {
+                    return Ok(Some("bad-txns-premature-spend-of-coinbase".into()));
                 }
                 TxOut {
                     value: bitcoin::Amount::from_sat(out.value),

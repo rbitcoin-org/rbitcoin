@@ -2422,10 +2422,11 @@ impl WireRig {
         );
     }
 
-    fn start_engine(&mut self) {
+    /// Start the confirm engine. Returns its stage queue depths.
+    fn start_engine(&mut self) -> std::sync::Arc<rbitcoin_ibd::ibd::confirm::ConfirmQueueDepths> {
         use rbitcoin_ibd::ibd::confirm::spawn_confirm_engine;
         let (ev_tx, ev_rx) = std::sync::mpsc::channel();
-        let (engine, _queues) = spawn_confirm_engine(
+        let (engine, queues) = spawn_confirm_engine(
             std::sync::Arc::clone(&self.hub),
             std::sync::Arc::clone(&self.feed),
             ev_tx,
@@ -2433,6 +2434,7 @@ impl WireRig {
             std::sync::Arc::new(Default::default()),
         );
         self.engine = Some((engine, ev_rx));
+        queues
     }
 
     fn assign(&mut self) {
@@ -3096,6 +3098,206 @@ fn batched_spend_of_a_later_block_is_rejected_alone() {
     assert!(!rig.st.reorg.invalid.contains(h2.to_byte_array()));
     assert_eq!(rig.hub.tip_height(), Some(t));
     rig.finish();
+}
+
+/// tip+2 creates P and spends P:0 in the same block; tip+3 spends P:0 again.
+/// Core rejects tip+3 (`bad-txns-inputs-missingorspent`). Write is held behind
+/// tip+1 while tip+2 and tip+3 load as separate batches, so the write stage
+/// merges them. That write rejects and IBD retries one block at a time; tip+3
+/// must still be rejected on top of tip+2.
+#[test]
+fn merged_respend_of_a_same_block_spend_is_rejected_alone() {
+    use bitcoin::{Amount, ScriptBuf};
+    use rbitcoin_consensus::mine_regtest_paying;
+    use std::time::{Duration, Instant};
+
+    let mut rig = WireRig::new("merged-respend", 1);
+    let (t, cbs) = (rig.t, rig.cbs.clone());
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let p = WireRig::spend(cbs[0]);
+    let s1 = WireRig::spend(p.compute_txid());
+    let mut s2 = WireRig::spend(p.compute_txid());
+    s2.output[0].value = Amount::from_sat(48_0000_0000);
+    let b0 = mine_regtest_paying(rig.tip, rig.tip_time + 600, t + 1, spk.clone(), vec![]);
+    let b1 = mine_regtest_paying(
+        b0.block_hash(),
+        rig.tip_time + 1200,
+        t + 2,
+        spk.clone(),
+        vec![p, s1],
+    );
+    let b2 = mine_regtest_paying(b1.block_hash(), rig.tip_time + 1800, t + 3, spk, vec![s2]);
+    let (h1, h2) = (b1.block_hash(), b2.block_hash());
+    let path = [&b0, &b1, &b2];
+    rig.plant(&path);
+    let queues = rig.start_engine();
+    let hub = std::sync::Arc::clone(&rig.hub);
+    let feed = std::sync::Arc::clone(&rig.feed);
+    let commit = hub.query.lock_tip_commit().expect("tip flush");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::yield_now();
+        }
+    };
+    // Write appends tip+1 alone, then waits on the commit lock.
+    rig.give(&b0);
+    wait("Class A of tip+1", &|| {
+        hub.query.class_a_hi().is_some_and(|h| h > t)
+    });
+    // Separate load batches, both queued behind it, so the next write
+    // drains tip+2 and tip+3 as one.
+    for (i, body) in [&b1, &b2].into_iter().enumerate() {
+        rig.give(body);
+        wait("load claim", &|| {
+            feed.holds(t + 2 + i as u32) || feed.epoch() != 0
+        });
+    }
+    // Scripts counts a send after it, so write can take tip+1 first and the
+    // count keeps tip+1. Block sizes differ, so the bytes tell both apart.
+    let size = |b: &bitcoin::Block| b.total_size();
+    assert!(size(&b0) < size(&b2), "tip+1 and tip+3 sizes must differ");
+    let both = [size(&b1) + size(&b2), size(&b0) + size(&b1) + size(&b2)];
+    wait("scripts queue tip+2..=tip+3", &|| {
+        both.contains(
+            &queues
+                .write_wire_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    });
+    drop(commit);
+    let rejects = rig.pump(
+        |_, hash| {
+            path.iter()
+                .find(|b| b.block_hash() == hash)
+                .map(|b| (*b).clone())
+                .expect("planted")
+        },
+        |st, hub, _| {
+            st.halt.is_some()
+                || st.reorg.invalid.contains(h2.to_byte_array())
+                || hub.tip_hash() == Some(h2)
+        },
+    );
+    assert!(
+        rejects.iter().any(|r| r.2 > 1),
+        "tip+2 and tip+3 were not written as one batch: {rejects:?}"
+    );
+    assert_eq!(rig.st.halt, None, "{rejects:?}");
+    assert_eq!(
+        rig.hub.tip_hash(),
+        Some(h1),
+        "tip+3 re-spends P:0: tip={:?} rejects={rejects:?} last_err={:?}",
+        rig.hub.tip_height().map(|h| h - t),
+        rig.last_reject_err
+    );
+    assert!(rig.st.reorg.invalid.contains(h2.to_byte_array()));
+    rig.finish();
+}
+
+/// tip+1 (b0) is valid and empty, tip+2 (b1) spends an output that only
+/// tip+3 (b2) creates. All three are delivered before the engine starts, so
+/// lookup takes them as one wave and they write as one batch. The batch is
+/// rejected after its Class A append; b0 is retried alone from the archive
+/// and connects. b1 alone then misses its parent: Core rejects it with
+/// `bad-txns-inputs-missingorspent`, so it must be invalid, not an engine
+/// fault, and IBD must not halt.
+fn forward_spend_behind_a_valid_block(label: &str, b0_first: bool) {
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::mine_regtest_paying;
+    use rbitcoin_ibd::ibd::state::InflightReq;
+    use std::time::{Duration, Instant};
+
+    let mut rig = WireRig::new(label, 3);
+    let (t, cbs) = (rig.t, rig.cbs.clone());
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = WireRig::spend(cbs[0]);
+    let child = WireRig::spend(parent.compute_txid());
+    let b0 = mine_regtest_paying(rig.tip, rig.tip_time + 600, t + 1, spk.clone(), vec![]);
+    let b1 = mine_regtest_paying(
+        b0.block_hash(),
+        rig.tip_time + 1200,
+        t + 2,
+        spk.clone(),
+        vec![child],
+    );
+    let b2 = mine_regtest_paying(
+        b1.block_hash(),
+        rig.tip_time + 1800,
+        t + 3,
+        spk,
+        vec![parent],
+    );
+    let (h0, h1, h2) = (b0.block_hash(), b1.block_hash(), b2.block_hash());
+    rig.plant(&[&b0, &b1, &b2]);
+    let deliver = |rig: &mut WireRig, peer: usize, body: &bitcoin::Block| {
+        let hash = body.block_hash();
+        rig.st.slots[peer - 1].in_flight.insert(hash);
+        rig.st.inflight.insert(hash, InflightReq::new(peer));
+        rig.deliver(peer, body);
+    };
+    if b0_first {
+        // Control: b0 connects in its own write before b1 and b2 arrive.
+        deliver(&mut rig, 1, &b0);
+        rig.start_engine();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while rig.hub.tip_hash() != Some(h0) {
+            assert!(Instant::now() < deadline, "b0 never connected");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        deliver(&mut rig, 3, &b2);
+        deliver(&mut rig, 2, &b1);
+    } else {
+        // Top block first, so lookup takes the whole wave at once.
+        deliver(&mut rig, 3, &b2);
+        deliver(&mut rig, 2, &b1);
+        deliver(&mut rig, 1, &b0);
+        rig.start_engine();
+    }
+    let rejects = rig.pump(
+        |_, hash| {
+            if hash == h0 {
+                b0.clone()
+            } else if hash == h1 {
+                b1.clone()
+            } else {
+                b2.clone()
+            }
+        },
+        |st, _, _| st.halt.is_some() || st.reorg.invalid.contains(h1.to_byte_array()),
+    );
+    if !b0_first {
+        assert!(
+            rejects.iter().any(|r| r.2 == 3),
+            "precondition: all three blocks in one rejected write: {rejects:?}"
+        );
+        let hfk2 = rig.hub.ensure_header_fk(&b2.header).unwrap();
+        assert!(
+            rig.hub.query.store().header_txs.has_body(hfk2).unwrap(),
+            "precondition: the write rejected after its Class A append"
+        );
+    }
+    assert_eq!(
+        rig.st.halt, None,
+        "rejects={rejects:?} last={:?}",
+        rig.last_reject_err
+    );
+    assert!(rig.st.reorg.invalid.contains(h1.to_byte_array()));
+    assert!(!rig.st.reorg.invalid.contains(h2.to_byte_array()));
+    assert_eq!(rig.hub.tip_hash(), Some(h0));
+    rig.finish();
+}
+
+#[test]
+fn forward_spend_behind_a_valid_block_in_one_write_is_invalid() {
+    forward_spend_behind_a_valid_block("forward-spend-behind-valid", false);
+}
+
+/// Control: the same chain, but b0 connects in its own write first.
+#[test]
+fn forward_spend_after_a_valid_block_connected_alone_is_invalid() {
+    forward_spend_behind_a_valid_block("forward-spend-after-valid", true);
 }
 
 /// A wave whose first block spends a create from its own block and whose
