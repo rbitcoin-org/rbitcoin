@@ -568,6 +568,14 @@ impl Store {
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
         }
+        // The locator cut only names stems. A header range can still end
+        // past that count. Record it before this process loads the span
+        // and before those ranges are cleared.
+        if txs.count() != 0 || txs.bodies_allocated_past_header() {
+            if let Some(end) = Self::max_header_range_end_past(&header_txs, txs.count())? {
+                crate::spend_recheck::note_spend_recheck(&path, txs.count(), end)?;
+            }
+        }
         let cold_path = layout.is_split().then_some(seqsigwit_dir);
         let spend_recheck = crate::spend_recheck::read_spend_recheck(&path)?;
         let store = Self {
@@ -1780,6 +1788,18 @@ impl Store {
 
     /// `true` when this spender is outside every cut span, or its input still
     /// names `parent`/`vout`. A missing input does not.
+    pub fn spender_names_output(
+        &self,
+        parent: Fk,
+        vout: u32,
+        spender: Fk,
+        vin: u32,
+    ) -> Result<bool, StoreError> {
+        self.reused_spender_still_names(parent, vout, spender, vin)
+    }
+
+    /// `true` when this spender is outside every cut span, or its input still
+    /// names `parent`/`vout`. A missing input does not.
     fn reused_spender_still_names(
         &self,
         parent: Fk,
@@ -1824,6 +1844,38 @@ impl Store {
                     spending_tx_fk,
                     spending_vin,
                 });
+                Ok(true)
+            },
+        )?;
+        Ok(out)
+    }
+
+    /// Confirmed-strong spenders of one create outpoint at `tip`.
+    ///
+    /// A fk inside a covered-prefix span counts only when its stored input
+    /// still names this output. `tip` of `None` counts none.
+    pub fn strong_spenders_create(
+        &self,
+        create_tx_fk: Fk,
+        out_index: u32,
+        tip: Option<u32>,
+    ) -> Result<Vec<Fk>, StoreError> {
+        let mut out = Vec::new();
+        point_table::for_each_spender_create(
+            &self.txs,
+            &self.spenders,
+            create_tx_fk,
+            out_index,
+            |spending_tx_fk, vin| {
+                if self.output_has_confirmed_spender(
+                    create_tx_fk,
+                    out_index,
+                    spending_tx_fk,
+                    vin,
+                    tip,
+                )? {
+                    out.push(spending_tx_fk);
+                }
                 Ok(true)
             },
         )?;

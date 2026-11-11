@@ -1295,6 +1295,132 @@ fn reused_spender_fk_does_not_spend_the_parent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Locators stop at the middle create and the body headers stop at genesis.
+/// The height that spent the parent still names the next fk. The span has
+/// to include that fk, or reusing it spends the parent.
+#[test]
+fn range_past_the_locator_stays_in_the_spend_span() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, hash0) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    s.txs.flush().unwrap();
+    let tx_end = on_disk_hwm(&dir.join("txout.body"));
+    let sp_end = on_disk_hwm(&dir.join("spent.body"));
+    let in_end = on_disk_hwm(&dir.join("seqsigwit.body"));
+    let (mid, hash1) = connect_coinbase(&s, &write, 1, genesis, hash0);
+    let parent_tx = Fk(1);
+    let spender = s
+        .put_tx_full_batch_indexed(
+            &[(
+                TxRecord {
+                    txid: [2u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    parent: rbitcoin_store::tx_table::InputParent::Prevout {
+                        create_fk: parent_tx,
+                        vout: 0,
+                    },
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }],
+                vec![OutputRecord::unspent(1, vec![2])],
+            )],
+            false,
+        )
+        .unwrap()[0];
+    assert_eq!(spender, Fk(3));
+    s.put_spend_create(parent_tx, 0, spender, 0).unwrap();
+    let merkle = rbitcoin_primitives::merkle_root_from_txids(&[[2u8; 32]]);
+    let header = hdr_merkle(mid, hash1, 2, merkle);
+    let header_fk = s.put_header(&header).unwrap();
+    s.header_txs
+        .put_range(&write, header_fk, spender, 1)
+        .unwrap();
+    s.strong_tx.set_strong(&write, spender, header_fk).unwrap();
+    s.confirmed.set(&write, Height(2), header_fk).unwrap();
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    assert_eq!(s.txs.count(), 3);
+    shorten_creates(&s, 2);
+    write_hwm(&dir.join("txout.body"), tx_end);
+    write_hwm(&dir.join("spent.body"), sp_end);
+    write_hwm(&dir.join("seqsigwit.body"), in_end);
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+    assert!(
+        s.spend_recheck
+            .iter()
+            .any(|&(covered, old)| covered < 3 && old >= 3),
+        "span {:?} stops short of the dropped range",
+        s.spend_recheck
+    );
+    let other = s.put_tx_full_batch_indexed(&[coinbase(9)], false).unwrap()[0];
+    assert_eq!(other, Fk(2));
+    let other_rec = hdr(genesis, hash0, 9);
+    let other_hash = other_rec.hash;
+    let other_header = s.put_header(&other_rec).unwrap();
+    s.header_txs
+        .put_range(&write, other_header, other, 1)
+        .unwrap();
+    s.strong_tx.set_strong(&write, other, other_header).unwrap();
+    s.confirmed.set(&write, Height(1), other_header).unwrap();
+    let reused = s.put_tx_full_batch_indexed(&[coinbase(8)], false).unwrap()[0];
+    assert_eq!(reused, Fk(3));
+    let reused_header = s.put_header(&hdr(other_header, other_hash, 8)).unwrap();
+    s.header_txs
+        .put_range(&write, reused_header, reused, 1)
+        .unwrap();
+    s.strong_tx
+        .set_strong(&write, reused, reused_header)
+        .unwrap();
+    s.confirmed.set(&write, Height(2), reused_header).unwrap();
+    s.rebuild_height_fence().unwrap();
+    assert_eq!(
+        s.unspent_create_vouts(parent_tx, &[0], None).unwrap(),
+        vec![0],
+        "a reused fk above the locator is not the old spender"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The stems already agree on genesis. Later header ranges still name the
+/// dropped creates. Open records those ends before it clears the ranges.
+#[test]
+fn matched_counts_still_span_a_high_header_range() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, hash0) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let (mid, hash1) = connect_coinbase(&s, &write, 1, genesis, hash0);
+    connect_coinbase(&s, &write, 2, mid, hash1);
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    assert_eq!(s.txs.count(), 3);
+    shorten_creates(&s, 1);
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    assert!(
+        s.spend_recheck
+            .iter()
+            .any(|&(covered, old)| covered < 3 && old >= 3),
+        "span {:?} missed the range past the matched count",
+        s.spend_recheck
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Body headers name height 0. Locators and a side header still name the
 /// next create. Open shrinks to height 0, drops both ranges past that
 /// create, and the next append does not keep a second copy of height 0.

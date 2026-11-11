@@ -789,6 +789,32 @@ impl Store {
         Ok(())
     }
 
+    /// Highest `header_txs` range end past `covered`. Every range is scanned:
+    /// the clear that follows drops each of them, not only the confirmed chain.
+    pub(crate) fn max_header_range_end_past(
+        header_txs: &crate::chain::HeaderTxsTable,
+        covered: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        let n = header_txs.first.len().min(header_txs.count.len());
+        let mut max_end = None;
+        for i in 0..n {
+            let count = header_txs.count.get(i)?;
+            if count == 0 {
+                continue;
+            }
+            let first = header_txs.first.get(i)?;
+            if first == 0 {
+                continue;
+            }
+            let end = first.saturating_add(count).saturating_sub(1);
+            if end <= covered {
+                continue;
+            }
+            max_end = Some(max_end.map_or(end, |cur: u64| cur.max(end)));
+        }
+        Ok(max_end)
+    }
+
     fn strong_past_covered(&self, covered: u64) -> Result<bool, StoreError> {
         let Some(fk) = Fk::new(covered.saturating_add(1)) else {
             return Ok(false);
