@@ -124,35 +124,74 @@ fn a_served_fork_is_handed_back_and_a_withheld_one_waits() {
     let third = chain(root, 5, 300, 0);
     proofs.offer(root, 0, &headers(&third), 2, work(&third), Some(3));
     assert!(
+        proofs.is_proven(root, &headers(&light), 2),
+        "a fork with served blocks outlasts heavier ones nobody serves"
+    );
+    assert!(
         !proofs
             .wanted()
             .iter()
-            .any(|w| w.hash == light[0].block_hash()),
-        "the lightest fork made room"
+            .any(|w| w.hash == heavy[0].block_hash()),
+        "the unserved fork made room"
     );
-    assert_eq!(proofs.bytes(), 0, "its bodies went with it");
+    let fourth = chain(root, 6, 500, 0);
+    proofs.offer(root, 0, &headers(&fourth), 2, work(&fourth), Some(4));
+    assert!(proofs.is_proven(root, &headers(&light), 2));
 }
 
-/// Served bodies count against one cap until the path takes them.
+/// Kept bodies stay under one cap until the path takes them. A served block
+/// past the cap still counts toward the proof; only its body is not kept,
+/// and the path fetches it again after the switch.
 #[test]
-fn served_bodies_are_capped_and_freed_when_taken() {
+fn a_prefix_past_the_byte_cap_still_proves() {
     let root = BlockHash::all_zeros();
     let big = (MAX_BYTES / 2) as usize;
     let fork = chain(root, 3, 400, big);
     let mut proofs = ForkProofs::default();
     proofs.offer(root, 0, &headers(&fork), 3, work(&fork), Some(1));
     assert!(proofs.accept(fork[0].block_hash(), wire(&fork[0])));
-    let held = proofs.bytes();
-    assert_eq!(held, wire(&fork[0]).len() as u64);
+    assert_eq!(proofs.bytes(), wire(&fork[0]).len() as u64);
     assert!(
-        !proofs.accept(fork[1].block_hash(), wire(&fork[1])),
-        "past the cap"
+        proofs.accept(fork[1].block_hash(), wire(&fork[1])),
+        "served"
     );
-    assert!(proofs.wants(&fork[1].block_hash()), "still wanted");
+    assert!(proofs.bytes() <= MAX_BYTES, "but not kept past the cap");
+    assert!(!proofs.wants(&fork[1].block_hash()));
+    assert!(proofs.accept(fork[2].block_hash(), wire(&fork[2])));
+    assert!(proofs.is_proven(root, &headers(&fork), 3));
+    assert_eq!(
+        proofs.take_body(&fork[1].block_hash()),
+        None,
+        "fetched again"
+    );
     assert_eq!(
         proofs.take_body(&fork[0].block_hash()),
         Some(wire(&fork[0]))
     );
     assert_eq!(proofs.bytes(), 0);
-    assert!(proofs.accept(fork[1].block_hash(), wire(&fork[1])));
+}
+
+/// A fork whose long prefix nobody serves does not use up the asks a lighter
+/// fork's peers are answering.
+#[test]
+fn a_withheld_fork_does_not_starve_another_forks_asks() {
+    use rbitcoin_ibd::ibd::state::IbdWorkState;
+    let root = BlockHash::all_zeros();
+    let heavy = chain(root, 40, 600, 0);
+    let light = chain(root, 3, 700, 0);
+    let slots = vec![super::assign::dummy_slot(0), super::assign::dummy_slot(1)];
+    let mut st = IbdWorkState::new(slots, Some(root), Some(0));
+    st.reorg
+        .proofs
+        .offer(root, 0, &headers(&heavy), 40, work(&heavy), Some(0));
+    st.reorg
+        .proofs
+        .offer(root, 0, &headers(&light), 2, work(&light), Some(1));
+    rbitcoin_ibd::ibd::assign::assign_fork_proofs(&mut st);
+    for b in &light[..2] {
+        assert!(
+            st.inflight.get(&b.block_hash()).is_some_and(|r| r.holds(1)),
+            "the light fork is asked of its peer"
+        );
+    }
 }

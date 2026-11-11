@@ -5,23 +5,29 @@
 //! has that chain's blocks. Here a fork that would replace the download
 //! candidate stays headers until peers have served the shortest prefix of it
 //! whose work beats this node's chain with data above the fork point. Each
-//! body is checked against its header (hash and merkle root) and kept in RAM
-//! until the download path takes it. A fork nobody serves never moves the
-//! tip or the download path, and a peer that serves part of the prefix and
-//! then withholds leaves both where they were.
+//! body is checked against its header (hash and merkle root). Served bodies
+//! are kept in RAM, up to [`MAX_BYTES`], until the download path takes them;
+//! one served past that still counts, and the path fetches it again after the
+//! switch. A fork nobody serves never moves the tip or the download path, and
+//! a peer that serves part of the prefix and then withholds leaves both where
+//! they were.
 
 use bitcoin::block::Header;
 use bitcoin::{Block, BlockHash, Work};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-/// Forks proved at once. A third drops the lightest.
+/// Forks proved at once. A third drops a fork nobody has served a block of,
+/// the lightest first.
 pub const MAX_FORKS: usize = 2;
+/// Asks in flight for one fork, so a fork nobody serves cannot hold the asks
+/// another fork's peers are answering.
+pub const MAX_ASKS_PER_FORK: usize = 16;
 /// Longest prefix proved: the deepest rewind above the work floor
 /// ([`super::reorg::REWIND_MAX_DEPTH`]) plus the block that out-works it.
 pub const MAX_BLOCKS: usize = super::reorg::REWIND_MAX_DEPTH as usize + 1;
-/// Bodies held across every fork, beside the body queue. At least 16 full
-/// mainnet blocks.
+/// Served bodies kept across every fork, beside the body queue. At least 16
+/// full mainnet blocks.
 pub const MAX_BYTES: u64 = 64 << 20;
 /// How long catch-up waits for the walk to take a served fork it handed
 /// back before it may finish without it.
@@ -40,6 +46,9 @@ pub struct Fork {
     pub work: Work,
     /// The peer whose headers these are, when one sent them.
     pub peer: Option<usize>,
+    /// Prefix blocks a peer served, each checked against its header.
+    served: HashSet<BlockHash>,
+    /// The served bodies kept for the path.
     bodies: HashMap<BlockHash, Vec<u8>>,
     /// The headers went back through the walk once the prefix was served.
     handed: bool,
@@ -56,7 +65,11 @@ impl Fork {
     }
 
     fn proven(&self) -> bool {
-        self.need > 0 && self.prefix().all(|h| self.bodies.contains_key(&h))
+        self.need > 0 && self.prefix().all(|h| self.served.contains(&h))
+    }
+
+    fn first(&self) -> Option<BlockHash> {
+        self.headers.first().map(|h| h.block_hash())
     }
 
     fn bytes(&self) -> u64 {
@@ -72,6 +85,8 @@ pub struct Wanted {
     pub peer: Option<usize>,
     /// The fork's last header: a peer that announced it has the chain.
     pub top: Option<BlockHash>,
+    /// The fork's first header, which names it.
+    pub fork: BlockHash,
 }
 
 #[derive(Debug, Default)]
@@ -118,13 +133,16 @@ impl ForkProofs {
             need,
             work,
             peer,
+            served: HashSet::new(),
             bodies: HashMap::new(),
             handed: false,
             handed_at: None,
             taken: false,
         });
         if self.forks.len() > MAX_FORKS {
-            if let Some(i) = (0..self.forks.len()).min_by_key(|&i| self.forks[i].work) {
+            let victim = (0..self.forks.len())
+                .min_by_key(|&i| (!self.forks[i].served.is_empty(), self.forks[i].work));
+            if let Some(i) = victim {
                 let gone = self.forks.remove(i);
                 self.bytes = self.bytes.saturating_sub(gone.bytes());
             }
@@ -152,7 +170,7 @@ impl ForkProofs {
             && need <= headers.len()
             && headers[..need]
                 .iter()
-                .all(|h| f.bodies.contains_key(&h.block_hash()))
+                .all(|h| f.served.contains(&h.block_hash()))
     }
 
     /// The walk took the fork `headers` start, at `fork_hash`.
@@ -174,12 +192,14 @@ impl ForkProofs {
             .into_iter()
             .flat_map(|f| {
                 let top = f.headers.last().map(|h| h.block_hash());
+                let fork = f.first().unwrap_or(f.fork_hash);
                 f.prefix()
-                    .filter(|h| !f.bodies.contains_key(h))
+                    .filter(|h| !f.served.contains(h))
                     .map(move |hash| Wanted {
                         hash,
                         peer: f.peer,
                         top,
+                        fork,
                     })
             })
             .collect()
@@ -188,13 +208,14 @@ impl ForkProofs {
     pub fn wants(&self, hash: &BlockHash) -> bool {
         self.forks
             .iter()
-            .any(|f| !f.bodies.contains_key(hash) && f.prefix().any(|h| h == *hash))
+            .any(|f| !f.served.contains(hash) && f.prefix().any(|h| h == *hash))
     }
 
-    /// Keep `payload` when it is the prefix block `hash` names, with the
-    /// transactions its header commits to, and it fits in [`MAX_BYTES`].
+    /// Count `payload` as served when it is the prefix block `hash` names,
+    /// with the transactions its header commits to. The body is kept while
+    /// the kept bodies stay within [`MAX_BYTES`]. True when newly served.
     pub fn accept(&mut self, hash: BlockHash, payload: Vec<u8>) -> bool {
-        if !self.wants(&hash) || self.bytes.saturating_add(payload.len() as u64) > MAX_BYTES {
+        if !self.wants(&hash) {
             return false;
         }
         let Ok(block) = bitcoin::consensus::deserialize::<Block>(&payload) else {
@@ -204,15 +225,19 @@ impl ForkProofs {
             return false;
         }
         let len = payload.len() as u64;
+        let fits = self.bytes.saturating_add(len) <= MAX_BYTES;
         let Some(f) = self
             .forks
             .iter_mut()
-            .find(|f| !f.bodies.contains_key(&hash) && f.prefix().any(|h| h == hash))
+            .find(|f| !f.served.contains(&hash) && f.prefix().any(|h| h == hash))
         else {
             return false;
         };
-        f.bodies.insert(hash, payload);
-        self.bytes = self.bytes.saturating_add(len);
+        f.served.insert(hash);
+        if fits {
+            f.bodies.insert(hash, payload);
+            self.bytes = self.bytes.saturating_add(len);
+        }
         true
     }
 
@@ -234,7 +259,7 @@ impl ForkProofs {
         self.forks
             .iter()
             .filter(|f| f.proven())
-            .filter_map(|f| f.headers.first().map(|h| h.block_hash()))
+            .filter_map(|f| f.first())
             .collect()
     }
 

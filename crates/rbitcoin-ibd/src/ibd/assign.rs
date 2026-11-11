@@ -246,31 +246,29 @@ pub fn release_off_chain_requests(st: &mut IbdWorkState) {
 /// Ask for the fork blocks a proof still wants ([`super::fork_proof`]): from
 /// the peer that sent the fork, else from a peer whose chain record
 /// announced that block or the fork's last header. Never from a peer that
-/// did not announce the fork. Outstanding asks reserve the per-hash charge
-/// against [`super::fork_proof::MAX_BYTES`] beside the bodies already held.
+/// did not announce the fork. At most
+/// [`super::fork_proof::MAX_ASKS_PER_FORK`] asks per fork are in flight, so
+/// a fork nobody serves does not hold the asks of one that is served.
 pub fn assign_fork_proofs(st: &mut IbdWorkState) {
-    use super::fork_proof::MAX_BYTES;
+    use super::fork_proof::MAX_ASKS_PER_FORK;
     let wanted = st.reorg.proofs.wanted();
     if wanted.is_empty() {
         return;
     }
     let now = ibd_mono_ms();
-    let charge = intake_reserve_per_hash(st);
-    let asked = wanted
-        .iter()
-        .filter(|w| st.inflight.contains_key(&w.hash))
-        .count() as u64;
-    let mut reserved = st
-        .reorg
-        .proofs
-        .bytes()
-        .saturating_add(asked.saturating_mul(charge));
+    let mut asked: HashMap<BlockHash, usize> = HashMap::new();
+    for w in &wanted {
+        if st.inflight.contains_key(&w.hash) {
+            *asked.entry(w.fork).or_default() += 1;
+        }
+    }
     for w in wanted {
         if st.inflight.contains_key(&w.hash) {
             continue;
         }
-        if reserved.saturating_add(charge) > MAX_BYTES {
-            break;
+        let in_flight = asked.entry(w.fork).or_default();
+        if *in_flight >= MAX_ASKS_PER_FORK {
+            continue;
         }
         let announced = |s: &PeerSlot| {
             s.chain.announced_hash(&w.hash) || w.top.is_some_and(|t| s.chain.announced_hash(&t))
@@ -298,7 +296,7 @@ pub fn assign_fork_proofs(st: &mut IbdWorkState) {
             hashes: vec![w.hash],
         });
         inflight_add_peer(&mut st.inflight, w.hash, pid);
-        reserved = reserved.saturating_add(charge);
+        *in_flight += 1;
     }
 }
 

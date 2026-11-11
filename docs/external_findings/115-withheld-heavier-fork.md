@@ -25,13 +25,18 @@ When headers show a fork with more work than the download candidate, the
 walk takes it only after peers have served the shortest prefix of it whose
 work beats this node's chain with data above the fork point: its confirmed
 blocks there, then the download path's bodies already queued. Each body is
-checked against its header (block hash and merkle root) and held in RAM,
-at most 64 MiB across two forks and 1,025 blocks per fork; under the work
-floor the first 1,025 are enough. Then the walk takes the fork, the
-confirmed tip rewinds to the fork point, and the served bodies go to the
-body queue. Taking the fork never leaves the node with less work it can
-connect than before, so a peer that serves part of that prefix and then
-withholds, or leaves after serving it, cannot hold the tip down. A fork
+checked against its header (block hash and merkle root). Served bodies are
+kept in RAM, up to 64 MiB across two forks, for the switch; a block served
+past that still counts and is fetched again after it. A prefix is at most
+1,025 blocks; under the work floor the first 1,025 are enough. A third fork
+drops one nobody has served a block of, and each fork has its own 16 asks in
+flight, so a withheld fork neither evicts nor starves a served one. Then the
+walk takes the fork, the confirmed tip rewinds to the fork point, and the
+kept bodies go to the body queue. Taking the fork never leaves the node with
+less work it can connect than before, so a peer that serves part of that
+prefix and then withholds, or leaves after serving it, cannot hold the tip
+down; a block fetched again after the switch that nobody serves falls to the
+stall-window retire below. A fork
 where this node has no data above the fork point needs no proof. A fork
 nobody serves never moves the walk, the path, or the tip, however much
 later its headers come again.

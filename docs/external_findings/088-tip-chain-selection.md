@@ -82,10 +82,10 @@ one of two designs:
 
 - Tip-follow hands a deep heavier header chain to the IBD rewind. IBD
   disconnects to the LCA only after peers served the fork blocks that
-  out-work the old chain above it, held in RAM up to 64 MiB
-  ([115](./115-withheld-heavier-fork.md)), so it no longer sits on a
-  lighter chain while it downloads. A fork that needs more than that is
-  not proved.
+  out-work the old chain above it ([115](./115-withheld-heavier-fork.md)),
+  so it no longer sits on a lighter chain while it downloads. Up to 64 MiB
+  of those bodies are kept for the switch; the rest are fetched again
+  after it.
 - Unconnected side bodies are stored on disk. This is a store change.
 
 Both are design decisions, so neither is in this change.
