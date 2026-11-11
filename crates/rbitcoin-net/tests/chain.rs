@@ -345,7 +345,7 @@ fn latest_run_chain_surfaces() {
         1,
         &[store_tip, child.block_hash()],
     );
-    hub.cache.push_best(stale.clone()).unwrap();
+    hub.cache.push_best(1, stale.clone());
     let mut stale_tip = stale;
     for n in 2..=store_h {
         stale_tip = mine(
@@ -353,7 +353,7 @@ fn latest_run_chain_surfaces() {
             genesis.header.time.saturating_add(9 + n),
             n,
         );
-        hub.cache.push_best(stale_tip.clone()).unwrap();
+        hub.cache.push_best(n, stale_tip.clone());
     }
     assert_eq!(hub.cache.tip_height(), Some(store_h));
     assert_eq!(hub.query.tip_height().map(|h| h.0), Some(store_h));
@@ -373,7 +373,7 @@ fn latest_run_chain_surfaces() {
         genesis.header.time.saturating_add(40),
         store_h + 1,
     );
-    hub.cache.push_best(ahead.clone()).unwrap();
+    hub.cache.push_best(store_h + 1, ahead.clone());
     assert!(hub.cache.tip_height().unwrap() > store_h);
     assert_eq!(
         hub.tip_hash(),
@@ -1911,27 +1911,159 @@ fn confirmed_seed_does_not_restore_a_disconnected_block() {
     hub.ensure_genesis().unwrap();
     let mut prev = hub.tip_hash().unwrap();
     let mut time = hub.tip_header().unwrap().time;
+    let mut gone = Vec::new();
     for h in 1..=3u32 {
         time = time.saturating_add(1);
         let b = mine(prev, time, h);
         prev = b.block_hash();
+        gone.push(prev);
         hub.accept_block(b).unwrap();
     }
-    let gone = prev;
     hub.rewind_to_height(0).unwrap();
-    assert!(
-        !hub.has_block(&gone),
-        "rewind drops the disconnected tip from the confirmed set"
-    );
+    for (h, hash) in (1u32..).zip(&gone) {
+        assert!(
+            !hub.has_block(hash),
+            "rewind drops disconnected height {h} from the confirmed set"
+        );
+    }
     publish_confirmed_heights(&hub.query, &hub.confirmed);
-    assert!(
-        !hub.has_block(&gone),
-        "the seed copy must not put that block back"
-    );
+    for (h, hash) in (1u32..).zip(&gone) {
+        assert!(
+            !hub.has_block(hash),
+            "the seed copy must not put height {h} back"
+        );
+    }
     assert!(
         hub.has_block(&genesis_block(&hub.params).block_hash()),
         "genesis is still the header at height 0"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Drop the hub and open a new one on the same store, as a node restart does
+/// (`run.rs` sets prune on the query before the hub is built).
+fn restart_hub(dir: &rbitcoin_query::testutil::TempDir, hub: ChainHub) -> ChainHub {
+    let prune = hub.query.prune_seqsigwit();
+    hub.query.flush().unwrap();
+    drop(hub);
+    let q = rbitcoin_query::Query::open_or_create_tiny(dir.path()).unwrap();
+    q.set_prune_seqsigwit(prune).unwrap();
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    hub
+}
+
+/// Tip A1, B1+B2 reorg away from it, then the heavier A2+A3 with A1 resent
+/// by a peer. `prune` is `--prune-seqsigwit`; `restart` reopens the store
+/// before A1 arrives. True when the node ends on A3.
+fn reorg_back_reaches_a3(label: &str, prune: bool, restart: bool) -> bool {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled(label);
+    hub.query.set_prune_seqsigwit(prune).unwrap();
+    hub.ensure_genesis().unwrap();
+    let mut prev = hub.tip_hash().unwrap();
+    let mut time = hub.tip_header().unwrap().time;
+    for h in 1..=2u32 {
+        time += 1;
+        let b = mine(prev, time, h);
+        prev = b.block_hash();
+        hub.accept_block(b).unwrap();
+    }
+    let hub = if restart { restart_hub(&dir, hub) } else { hub };
+    let a1 = mine(prev, time + 1, 3);
+    let b1 = mine(prev, time + 2, 3);
+    let b2 = mine(b1.block_hash(), time + 3, 4);
+    let a2 = mine(a1.block_hash(), time + 4, 4);
+    let a3 = mine(a2.block_hash(), time + 5, 5);
+    let (a1h, a3h) = (a1.block_hash(), a3.block_hash());
+    hub.accept_received_block(a1.clone()).unwrap();
+    let _ = hub.accept_received_block(b1);
+    hub.accept_received_block(b2.clone()).unwrap();
+    assert_eq!(hub.tip_hash(), Some(b2.block_hash()), "B2 is the tip");
+    assert!(
+        !hub.already_have(a1h),
+        "a disconnected block is not one we already have"
+    );
+    let _ = hub.accept_received_block(a2);
+    let _ = hub.accept_received_block(a3);
+    if hub.tip_hash() != Some(a3h) {
+        // The archive could not rebuild A1. The node asks for it and the
+        // peer session takes the resent body.
+        assert!(prune && hub.held_missing_parents().contains(&a1h));
+        let mut follow = rbitcoin_net::peer::PeerFollowState::new();
+        follow.requested_blocks.insert(a1h);
+        hub.note_asked_block(a1h);
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(rbitcoin_net::peer::on_block(
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+            &a1,
+        ))
+        .unwrap();
+    }
+    let on_a3 = hub.tip_hash() == Some(a3h);
+    drop(hub);
+    let _ = std::fs::remove_dir_all(dir);
+    on_a3
+}
+
+/// Core keeps the last 288 bodies on a pruned node and reads A1 from disk in
+/// `ConnectTip`. A pruned node that restarted must still reorg back onto A3.
+#[test]
+fn reorg_back_pruned_after_restart_reaches_the_heavier_branch() {
+    assert!(reorg_back_reaches_a3("reorg-back-prune-reopen", true, true));
+}
+
+#[test]
+fn reorg_back_control_unpruned_after_restart() {
+    assert!(reorg_back_reaches_a3(
+        "reorg-back-noprune-reopen",
+        false,
+        true
+    ));
+}
+
+#[test]
+fn reorg_back_control_pruned_without_restart() {
+    assert!(reorg_back_reaches_a3("reorg-back-prune-fresh", true, false));
+}
+
+#[test]
+fn reorg_back_control_unpruned_without_restart() {
+    assert!(reorg_back_reaches_a3(
+        "reorg-back-noprune-fresh",
+        false,
+        false
+    ));
+}
+
+/// After a restart the RAM cache starts at the first block connected, not at
+/// genesis. A height read still returns the store's block at that height.
+#[test]
+fn block_at_height_after_restart_is_the_block_at_that_height() {
+    let (dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("bah-reopen");
+    hub.ensure_genesis().unwrap();
+    let mut hashes = vec![hub.tip_hash().unwrap()];
+    let mut time = hub.tip_header().unwrap().time;
+    for h in 1..=4u32 {
+        if h == 3 {
+            hub = restart_hub(&dir, hub);
+        }
+        time += 1;
+        let b = mine(*hashes.last().unwrap(), time, h);
+        hashes.push(b.block_hash());
+        hub.accept_block(b).unwrap();
+    }
+    for (h, want) in (0u32..).zip(&hashes) {
+        let got = hub.block_at_height(h).unwrap().map(|b| b.block_hash());
+        assert_eq!(got, Some(*want), "block_at_height({h})");
+    }
+    drop(hub);
     let _ = std::fs::remove_dir_all(dir);
 }
 

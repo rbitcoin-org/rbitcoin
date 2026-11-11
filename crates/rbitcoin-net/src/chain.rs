@@ -3727,9 +3727,6 @@ impl ChainHub {
             .map_err(|e| NetError::Store(e.to_string()))?;
         let Some(fh) = fork_height else {
             while self.query.tip_height().is_some() {
-                if let Some(th) = self.tip_hash() {
-                    self.confirmed.write().unwrap().remove(&th);
-                }
                 self.query
                     .disconnect_tip_in_commit()
                     .map_err(NetError::store)?;
@@ -4458,7 +4455,7 @@ impl ChainHub {
         self.confirmed.write().unwrap().insert(hash);
         let tx_count = block.txdata.len();
         let owned = Arc::try_unwrap(block).unwrap_or_else(|a| (*a).clone());
-        let _ = self.cache.push_best(owned);
+        self.cache.push_best(height, owned);
         // The store can serve this hash now. A staged copy would outlive
         // prune and answer getdata the archive is not allowed to serve.
         self.cache.drop_servable(&hash);
@@ -4545,14 +4542,18 @@ impl ChainHub {
             if h.0 <= keep_height {
                 break;
             }
-            if let Some(th) = self.tip_hash() {
-                self.confirmed.write().unwrap().remove(&th);
+            // Drop the block the store disconnects at `h`, by its own hash.
+            if let Some((_, rec)) = self.query.header_at_height(h).map_err(NetError::store)? {
+                self.confirmed
+                    .write()
+                    .unwrap()
+                    .remove(&BlockHash::from_byte_array(rec.hash));
             }
             self.query
                 .disconnect_tip_keep_pending_in_commit()
                 .map_err(NetError::store)?;
+            self.cache.truncate_to_height(h.0 - 1);
         }
-        self.cache.truncate_to_height(keep_height);
         if let Some(mp) = mp {
             mp.clear_recent_confirmed();
         }
