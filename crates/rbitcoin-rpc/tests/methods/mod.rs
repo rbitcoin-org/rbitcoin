@@ -8659,6 +8659,7 @@ include!("../regtest_chain_ops_journey.rs");
 mod chain;
 mod decode;
 mod mempool;
+mod submit_spent_race;
 
 /// The HTTP route runs these methods on the request task
 /// (`dispatch_tip_connect`), not through `dispatch`. Core's block count and
