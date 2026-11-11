@@ -32,7 +32,7 @@ pub fn load_resume_entries(
 }
 
 pub fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
-    let exclude: Vec<[u8; 32]> = st.reorg.invalid.iter().collect();
+    let exclude: Vec<[u8; 32]> = st.reorg.excluded().collect();
     let path = load_resume_entries(hub, &exclude);
     install_resumed_path(st, hub, &path);
 }

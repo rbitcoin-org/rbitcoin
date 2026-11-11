@@ -739,17 +739,13 @@ const PROBE_AHEAD: u32 = 4_096;
 /// Ask one block peer for headers, so block getdata follows what it holds:
 /// one that has not announced a chain (Core starts header sync with each
 /// peer), or one whose record no longer decides the next blocks. One probe
-/// at a time, never the reserved header peer, and not a peer with a walk ask
-/// open.
+/// at a time, and not a peer with a walk ask open. The reserved header peer
+/// is probed too: its record says whether a fork block no other peer serves
+/// is withheld.
 pub fn probe_unprobed_peer(st: &mut IbdWorkState, hub: &ChainHub) {
     use super::peer_io::PeerSlot;
     let walk = &st.header_walk;
-    // A record only chooses among peers. With one live peer it would only
-    // take the header lane, and its reply would not reach the walk.
-    if walk.probe.is_some()
-        || walk.probe_open.is_some()
-        || st.slots.iter().filter(|s| s.alive).count() < 2
-    {
+    if walk.probe.is_some() || walk.probe_open.is_some() {
         return;
     }
     let tip = hub.tip_height().unwrap_or(0);
@@ -768,16 +764,10 @@ pub fn probe_unprobed_peer(st: &mut IbdWorkState, hub: &ChainHub) {
     st.header_walk.probe = Some(slot.id);
 }
 
-/// The header peer, or a peer with a walk ask open or expired and not yet
-/// answered, whose late reply could be read as a probe's.
+/// A peer with a walk ask open or expired and not yet answered, whose late
+/// reply could be read as a probe's.
 fn walk_busy(walk: &HeaderWalk, peer: usize) -> bool {
-    [
-        walk.reserved,
-        walk.challenge_open,
-        walk.walk.peer,
-        walk.walk.prev_peer,
-    ]
-    .contains(&Some(peer))
+    [walk.challenge_open, walk.walk.peer, walk.walk.prev_peer].contains(&Some(peer))
         || walk.header_misses.contains_key(&peer)
 }
 
@@ -865,7 +855,8 @@ pub fn note_reservation(
 /// Whether block `hash` may be asked of `peer`. As in Core, a peer is asked
 /// only for a block its chain showed (`PeerChain::shows`), and not for one it
 /// answered `notfound`. The reserved header peer is asked only when no other
-/// peer shows the block. A single peer still does both.
+/// peer shows the block. A single peer still does both. A peer whose chain
+/// left the path below the block is not asked for it.
 pub fn may_serve(st: &IbdWorkState, peer: usize, hash: &BlockHash) -> bool {
     use super::peer_io::PeerSlot;
     let height = st.hash_height.get(hash).copied();
@@ -878,16 +869,14 @@ pub fn may_serve(st: &IbdWorkState, peer: usize, hash: &BlockHash) -> bool {
     let Some(slot) = st.slots.iter().find(|s| s.id == peer) else {
         return false;
     };
-    // With no peer that shows the block, a record can be stale: a peer whose
-    // chain has not left the path is asked, else any peer that did not answer
-    // `notfound`, the header peer too. Otherwise the header peer stays on
-    // headers while another peer can fetch the block.
+    // With no peer that shows the block, a record can be short: a peer whose
+    // chain has not left the path is asked, the header peer too. Otherwise
+    // the header peer stays on headers while another peer can fetch the
+    // block.
     let tier: &dyn Fn(&PeerSlot) -> bool = if st.slots.iter().any(&shows) {
         &shows
-    } else if st.slots.iter().any(&open) {
-        &open
     } else {
-        return askable(slot);
+        &open
     };
     tier(slot)
         && (st.header_walk.reserved != Some(peer)
@@ -1130,17 +1119,140 @@ pub fn refuse_invalid_linked(
 /// the path above its parent is dropped and every peer may be asked for
 /// headers again. A candidate built on it falls back to that parent.
 pub fn retire_invalid(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u32) {
+    retire_candidate(st, hub, hash, height, "failed");
+}
+
+/// The next block the confirmed tip needs is on the path, nothing holds or
+/// fetches its body, no live peer may serve it, and a live peer's chain is
+/// another chain at that height. As in Core, a header chain whose bodies no
+/// peer serves does not hold the tip below one whose bodies are served: the
+/// candidate is retired at that block like a failed one, but the block is
+/// not marked invalid. The addresses that announced the chain are not
+/// believed about it again, and the path is seeded again from the store
+/// without it. True when the candidate was retired.
+pub fn retire_withheld(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
+    let Some((hash, height)) = next_unserved(st, hub) else {
+        return false;
+    };
+    let path = &st.height_to_hash;
+    if !st
+        .slots
+        .iter()
+        .any(|s| s.alive && s.chain.on_other_chain(path, height))
+    {
+        return false;
+    }
+    // A live peer that shows the block may serve it, so a peer here that
+    // shows it was just dropped, and one that lacks it answered `notfound`.
+    let now = super::peer_io::ibd_mono_ms();
+    let mut by: HashSet<rbitcoin_net::NetAddr> = st
+        .slots
+        .iter()
+        .filter(|s| s.chain.shows(path, height) || s.chain.lacks(&hash, now))
+        .map(|s| s.net)
+        .collect();
+    by.extend(
+        st.header_walk
+            .checkpoints
+            .iter()
+            .filter(|c| c.height >= height)
+            .filter_map(|c| c.supplied_by),
+    );
+    if !retire_candidate(st, hub, hash, height, "withheld") {
+        return false;
+    }
+    st.reorg.mark_withheld(hash, by);
+    st.reorg.clear_explore();
+    super::path::seed_work_path_from_store(st, hub);
+    true
+}
+
+/// The path block after the confirmed tip, when nothing holds its body and
+/// no live peer may serve it. A request to a peer that may not serve it does
+/// not count.
+fn next_unserved(st: &IbdWorkState, hub: &ChainHub) -> Option<(BlockHash, u32)> {
+    let height = hub.tip_height()?.saturating_add(1);
+    let hash = *st.height_to_hash.get(&height)?;
+    if st
+        .slots
+        .iter()
+        .any(|s| s.alive && may_serve(st, s.id, &hash))
+    {
+        return None;
+    }
+    let held = st.body.is_rejected(&hash)
+        || st.body.is_pending(&hash)
+        || hub.query.block_queue_has_hash(&hash.to_byte_array());
+    (!held).then_some((hash, height))
+}
+
+pub fn refuse_withheld_batch(st: &mut IbdWorkState, peer: usize, headers: &[Header]) -> bool {
+    let linked = !headers.is_empty() && pow_linked(headers);
+    refuse_withheld_linked(st, peer, headers, linked)
+}
+
+/// Refuse a linked batch from an address that already withheld the chain
+/// it holds or builds on, and retire `peer` from the walk. The batch's last
+/// header is remembered for that address, so its next batch is refused too.
+/// Another address that announces a withheld chain is believed: every mark
+/// is dropped, and that chain may be planted and fetched again.
+pub fn refuse_withheld_linked(
+    st: &mut IbdWorkState,
+    peer: usize,
+    headers: &[Header],
+    linked: bool,
+) -> bool {
+    let (Some(first), true) = (headers.first(), linked) else {
+        return false;
+    };
+    if st.reorg.withheld.is_empty() {
+        return false;
+    }
+    let Some(addr) = peer_net(st, peer) else {
+        return false;
+    };
+    let hashes =
+        std::iter::once(first.prev_blockhash).chain(headers.iter().map(|h| h.block_hash()));
+    let marks: Vec<bool> = hashes
+        .filter_map(|hash| st.reorg.withheld.get(&hash).map(|by| by.contains(&addr)))
+        .collect();
+    if marks.is_empty() {
+        return false;
+    }
+    if !marks.contains(&true) {
+        st.reorg.withheld.clear();
+        return false;
+    }
+    if let Some(last) = headers.last() {
+        st.reorg.mark_withheld(last.block_hash(), [addr]);
+    }
+    st.header_walk.walk_quiet.insert(peer);
+    if st.header_walk.reserved == Some(peer) {
+        st.header_walk.reserved = None;
+    }
+    true
+}
+
+/// Drop the path above the parent of `hash` and walk the candidate back to
+/// that parent. False when the path does not hold `hash` at `height`.
+fn retire_candidate(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    hash: BlockHash,
+    height: u32,
+    why: &str,
+) -> bool {
     let report_epoch = hub.ibd_header_epoch();
     if !st.is_on_path(&hash, height) {
-        return;
+        return false;
     }
     let Some(parent) = hub.header_of(&hash).map(|h| h.prev_blockhash) else {
-        return;
+        return false;
     };
     let parent_h = height.saturating_sub(1);
     drop_dead_path(st, Some(hub.query.as_ref()), parent_h);
     if !st.header_walk.origin || st.header_walk.tip_height() < height {
-        return;
+        return true;
     }
     let tip = cut_back_to(st, hub, parent, parent_h);
     if st.header_walk.base_height > parent_h {
@@ -1168,10 +1280,11 @@ pub fn retire_invalid(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, he
     // chain comes back as headers that are stored and can be rewound onto.
     st.header_walk.challenger = None;
     rbitcoin_log::warn!(
-        "ibd: header candidate retired at {hash} height={height}; walk back to {parent} height={parent_h}"
+        "ibd: header candidate retired ({why}) at {hash} height={height}; walk back to {parent} height={parent_h}"
     );
     publish_work(st, hub);
     save_adopt(st, hub);
+    true
 }
 
 /// Forget the download path above `keep`: queued hashes, bodies waiting in

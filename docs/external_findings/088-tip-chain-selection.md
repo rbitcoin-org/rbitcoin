@@ -82,7 +82,8 @@ one of two designs:
 
 - Tip-follow hands a deep heavier header chain to the IBD rewind. This
   disconnects to the LCA before the new bodies arrive, so the node sits
-  on a lighter chain while it downloads.
+  on a lighter chain while it downloads. Bodies that never arrive retire
+  that chain ([114](./114-withheld-heavier-fork.md)).
 - Unconnected side bodies are stored on disk. This is a store change.
 
 Both are design decisions, so neither is in this change.

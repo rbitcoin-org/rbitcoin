@@ -319,9 +319,12 @@ pub fn on_headers_batch(
     fks: &[rbitcoin_primitives::Fk],
     work: Option<bitcoin::Work>,
 ) -> usize {
-    // A block in this batch can fail while its headers are written outside
-    // the lock. The retire already dropped that path.
-    if super::header_walk::refuse_invalid_batch(st, peer, &headers) {
+    // A block in this batch can fail, or its chain be retired as withheld,
+    // while its headers are written outside the lock. The retire already
+    // dropped that path.
+    if super::header_walk::refuse_invalid_batch(st, peer, &headers)
+        || super::header_walk::refuse_withheld_batch(st, peer, &headers)
+    {
         return 0;
     }
     let accepted = accepted_headers(&headers, fks);
@@ -564,7 +567,7 @@ pub fn run_header_batch(
         HeaderPlan::Resume => {
             let exclude: Vec<[u8; 32]> = {
                 let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-                st.reorg.invalid.iter().collect()
+                st.reorg.excluded().collect()
             };
             let path = super::path::load_resume_entries(hub, &exclude);
             let pairs: Vec<(BlockHash, rbitcoin_primitives::Fk)> = path
@@ -738,7 +741,9 @@ pub fn plan_header_reply(
     }
     let linked = super::header_walk::pow_linked(&headers);
     super::header_walk::note_header_witness(st, hub, peer, ask, &headers, linked);
-    if super::header_walk::refuse_invalid_linked(st, peer, &headers, linked) {
+    if super::header_walk::refuse_invalid_linked(st, peer, &headers, linked)
+        || super::header_walk::refuse_withheld_linked(st, peer, &headers, linked)
+    {
         return HeaderPlan::Done;
     }
     let class = super::header_walk::classify_linked(st, hub, ask, &headers, linked);
@@ -1082,23 +1087,37 @@ fn note_announcement(st: &mut IbdWorkState, peer: usize) {
 
 pub fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
     note_block_progress(&mut st.slots, peer);
-    let mut freed = Vec::new();
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
         for h in &hashes {
-            s.note_answer(h);
             s.chain.note_notfound(*h, super::peer_io::ibd_mono_ms());
-            let empty = st
-                .inflight
-                .get_mut(h)
-                .map(|e| e.remove_peer(peer))
-                .unwrap_or(false);
-            if empty {
-                st.inflight.remove(h);
-                if st.body.is_pending(h) {
-                    st.body.mark_missing(*h);
-                }
-                freed.push(*h);
+        }
+    }
+    release_requests(
+        st,
+        &hashes.into_iter().map(|h| (peer, h)).collect::<Vec<_>>(),
+    );
+}
+
+/// Each `(peer, hash)` will not be answered with a block: drop it from that
+/// peer's requests, and reopen a hash that no other peer was asked for.
+pub fn release_requests(st: &mut IbdWorkState, released: &[(usize, BlockHash)]) {
+    let mut freed = Vec::new();
+    for &(peer, h) in released {
+        let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) else {
+            continue;
+        };
+        s.note_answer(&h);
+        let empty = st
+            .inflight
+            .get_mut(&h)
+            .map(|e| e.remove_peer(peer))
+            .unwrap_or(false);
+        if empty {
+            st.inflight.remove(&h);
+            if st.body.is_pending(&h) {
+                st.body.mark_missing(h);
             }
+            freed.push(h);
         }
     }
     st.reopen_for_densify(&freed);

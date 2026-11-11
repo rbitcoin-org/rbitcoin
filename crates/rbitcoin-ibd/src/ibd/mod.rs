@@ -1086,6 +1086,9 @@ pub async fn ibd_cancellable(
                 );
                 cadence.mark_peer_slow(now);
             }
+            // Before dead slots go: a peer dropped this turn for withholding
+            // still names the chain it announced.
+            header_walk::retire_withheld(st, hub.as_ref());
             st.slots.retain(|s| s.alive);
             if redial_handle
                 .as_ref()

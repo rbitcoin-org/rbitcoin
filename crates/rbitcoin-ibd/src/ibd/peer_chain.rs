@@ -317,9 +317,15 @@ impl PeerChain {
     /// whole chain ends below it, or a rewind left its record stale there. Two
     /// chains that differ at one height differ above it.
     pub fn left_path_by(&self, path: &impl HeightOccupants, height: u32) -> bool {
-        if self.stale_from.is_some_and(|from| height >= from) {
-            return true;
-        }
+        self.stale_from.is_some_and(|from| height >= from)
+            || self.ends.is_some_and(|top| height > top)
+            || self.on_other_chain(path, height)
+    }
+
+    /// The peer showed a block other than this node's at or below `height`:
+    /// its chain is another chain there. A record that only ends below
+    /// `height`, or that a rewind left stale, is not.
+    pub fn on_other_chain(&self, path: &impl HeightOccupants, height: u32) -> bool {
         if let Some((at, hash)) = self.split {
             let differs = match path.occupant(at) {
                 Some(p) => p != hash,
@@ -328,9 +334,6 @@ impl PeerChain {
             if at <= height && differs {
                 return true;
             }
-        }
-        if self.ends.is_some_and(|top| height > top) {
-            return true;
         }
         let Some(len) = (self.announced.len() as u32).checked_sub(1) else {
             return false;

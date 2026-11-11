@@ -219,6 +219,30 @@ pub fn prune_off_path_inflight(st: &mut IbdWorkState) {
     }
 }
 
+/// A peer whose record shows another chain at a requested path block will
+/// not send it: release that request as if it had answered `notfound`, so
+/// the stall check does not drop the peer for a block it never had.
+pub fn release_off_chain_requests(st: &mut IbdWorkState) {
+    let path = &st.height_to_hash;
+    let released: Vec<(usize, BlockHash)> = st
+        .slots
+        .iter()
+        .flat_map(|s| {
+            s.in_flight
+                .iter()
+                .filter(|h| {
+                    st.hash_height
+                        .get(*h)
+                        .is_some_and(|&ht| s.chain.on_other_chain(path, ht))
+                })
+                .map(move |h| (s.id, *h))
+        })
+        .collect();
+    if !released.is_empty() {
+        super::events::release_requests(st, &released);
+    }
+}
+
 /// Record `peer` as requesting `hash` (tip-hole / park race may accumulate peers).
 pub fn inflight_add_peer(
     inflight: &mut HashMap<BlockHash, state::InflightReq>,
@@ -301,6 +325,7 @@ pub fn assign_work_ordered(
 
     prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
     prune_off_path_inflight(st);
+    release_off_chain_requests(st);
 
     let tip = hub.tip_height().unwrap_or(0);
     let path_lo = if hub.tip_height().is_none() {

@@ -185,6 +185,7 @@ tip; re-rank.
 | **Tip-follow** | Pending cap 128. Complete bodies: `accept_received_block` → hold by hash → `accept_branch`. |
 | **Resume** | `resume_work_path_after_tip`: child score = subtree header work, then depth; Class A body only tie-breaks. A greater-work sibling **rewinds to the LCA** and becomes the linear path. Body preference alone must never re-elect an archived losing fork. |
 | **Invalid heavy** | Heavier header path that fails connect does not win; re-rank remaining candidates (may adopt a third valid chain). Invalid marks are **process-local**. |
+| **Withheld heavy** | No live peer may serve the planted path's next block (none showed it, it answered `notfound`, or it was disconnected) and a live peer's chain is another chain there: retire the candidate at that block like a failed one, without an invalid mark, and seed the path again from stored headers without it. The addresses that announced it are not believed about that chain again; another address is. A peer is never asked for a block above where its chain left the path. Marks are **process-local** ([114](./external_findings/114-withheld-heavier-fork.md)). |
 
 ```text
 L = current tip, valid, work 100
@@ -197,7 +198,8 @@ Attempt M → fail; the failed block is invalid-marked. Then:
 ```
 
 IBD may disconnect on **header work** (losing bodies stay in Class A; the
-winner is confirmed through the pipeline). Tip-follow still gathers bodies
+winner is confirmed through the pipeline). A winner whose bodies no peer
+serves is retired, and the old chain is confirmed again (Withheld heavy). Tip-follow still gathers bodies
 before `accept_branch`. Orchestration only — never confirm
 lookup/load/scripts/write. Code: `most_work`, `ChainHub::rewind_to_height`,
 `accept_branch`, `ibd::reorg`.

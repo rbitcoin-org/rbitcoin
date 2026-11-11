@@ -2455,8 +2455,9 @@ fn two_peers_reserve_the_header_walk() {
         "the header peer, or a peer with no record, takes what no other peer holds"
     );
 
-    // With no peer that holds the block by what it announced, a peer that
-    // did not answer `notfound` is still asked.
+    // With no peer that holds the block by what it announced, a peer whose
+    // chain left the path below it is still not asked: it would not answer,
+    // and a stall would disconnect it for a block it never had.
     st.slots[0].chain.note_notfound(
         path[1].block_hash(),
         rbitcoin_ibd::ibd::peer_io::ibd_mono_ms(),
@@ -2469,7 +2470,7 @@ fn two_peers_reserve_the_header_walk() {
         path[1].block_hash(),
         rbitcoin_ibd::ibd::peer_io::ibd_mono_ms(),
     );
-    assert!(may_serve(&st, 6, &path[1].block_hash()));
+    assert!(!may_serve(&st, 6, &path[1].block_hash()));
 
     // A batch stored after one of its blocks failed is not planted, and does
     // not grow the candidate again.
@@ -2863,6 +2864,41 @@ fn two_peers_reserve_the_header_walk() {
         Some(24),
         "the next is the peer with no record"
     );
+}
+
+/// A withheld chain is refused from the address that withheld it, also as
+/// it grows, and is believed again when another address announces it.
+#[test]
+fn a_withheld_chain_is_refused_only_from_its_announcer() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-withheld");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let (s0, _rx0) = slot(0);
+    let (s1, _rx1) = slot(1);
+    let withholder = s0.net;
+    let mut st = IbdWorkState::new(vec![s0, s1], Some(gen), Some(0));
+    let first = mine(gen, 1);
+    let second = mine(first.block_hash(), 2);
+    let third = mine(second.block_hash(), 3);
+    assert!(
+        !refuse_withheld_batch(&mut st, 0, &[first, second]),
+        "nothing is withheld yet"
+    );
+    st.reorg.mark_withheld(first.block_hash(), [withholder]);
+    assert!(refuse_withheld_batch(&mut st, 0, &[first, second]));
+    assert!(st.header_walk.walk_quiet.contains(&0));
+    assert!(
+        refuse_withheld_batch(&mut st, 0, &[third]),
+        "the next batch builds on the refused one"
+    );
+    let excluded: Vec<[u8; 32]> = st.reorg.excluded().collect();
+    assert!(excluded.contains(&first.block_hash().to_byte_array()));
+    assert!(
+        !refuse_withheld_batch(&mut st, 1, &[first, second]),
+        "another address is believed"
+    );
+    assert!(st.reorg.withheld.is_empty());
+    assert!(!refuse_withheld_batch(&mut st, 0, &[third]));
 }
 
 /// A long chain on an invalid block stays refused past the cap on

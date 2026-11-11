@@ -34,6 +34,11 @@ pub struct IbdReorgState {
     pub explore_need: Vec<BlockHash>,
     /// Candidate tips on an exploration path (for proactive most-work apply).
     pub explore_tips: Vec<BlockHash>,
+    /// The first block of a retired candidate that no peer would serve, or
+    /// the last header of a refused batch that builds on one, with the
+    /// addresses that announced that chain. Those addresses are not believed
+    /// about it again in this process; another address may still offer it.
+    pub withheld: HashMap<BlockHash, HashSet<rbitcoin_net::NetAddr>>,
 }
 
 impl IbdReorgState {
@@ -86,6 +91,30 @@ impl IbdReorgState {
                 self.explore_tips.push(t);
             }
         }
+    }
+
+    /// Cap on [`Self::withheld`]. Past it the marks start over.
+    pub const WITHHELD_CAP: usize = 1024;
+
+    /// Remember that `by` announced the chain through `hash` and did not
+    /// serve it.
+    pub fn mark_withheld(
+        &mut self,
+        hash: BlockHash,
+        by: impl IntoIterator<Item = rbitcoin_net::NetAddr>,
+    ) {
+        if self.withheld.len() >= Self::WITHHELD_CAP && !self.withheld.contains_key(&hash) {
+            self.withheld.clear();
+        }
+        self.withheld.entry(hash).or_default().extend(by);
+    }
+
+    /// Hashes no seeded path or rewind may run through: blocks that failed,
+    /// and the first blocks of withheld chains.
+    pub fn excluded(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.invalid
+            .iter()
+            .chain(self.withheld.keys().map(|h| h.to_byte_array()))
     }
 
     pub fn explore_tips(&self) -> &[BlockHash] {
@@ -370,7 +399,7 @@ pub fn heavier_fork_candidates(
     if cands.is_empty() {
         cands.extend(unplanted_walk_tip(st, hub));
     }
-    let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
+    let invalid: HashSet<[u8; 32]> = st.reorg.excluded().collect();
     Ok((cands, invalid))
 }
 
@@ -509,7 +538,7 @@ pub fn maybe_rewind_to_best_work(
     hub: &ChainHub,
 ) -> Result<bool, NetError> {
     let cands = rewind_candidate_hashes(st, hub)?;
-    let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
+    let invalid: HashSet<[u8; 32]> = st.reorg.excluded().collect();
     let Some(path) = select_heavier_path(hub, &cands, &invalid)? else {
         return Ok(false);
     };
@@ -823,7 +852,7 @@ pub fn rewind_off_coord_lock(
     let (cands, invalid) = {
         let st = shared.lock().unwrap_or_else(|err| err.into_inner());
         let cands = rewind_candidate_hashes(&st, hub)?;
-        let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
+        let invalid: HashSet<[u8; 32]> = st.reorg.excluded().collect();
         (cands, invalid)
     };
     let Some(pairs) = apply_off_lock_rewind(shared, hub, &cands, &invalid)? else {
