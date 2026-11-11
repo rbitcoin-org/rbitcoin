@@ -3154,11 +3154,17 @@ fn merged_respend_of_a_same_block_spend_is_rejected_alone() {
             feed.holds(t + 2 + i as u32) || feed.epoch() != 0
         });
     }
+    // Scripts counts a send after it, so write can take tip+1 first and the
+    // count keeps tip+1. Block sizes differ, so the bytes tell both apart.
+    let size = |b: &bitcoin::Block| b.total_size();
+    assert!(size(&b0) < size(&b2), "tip+1 and tip+3 sizes must differ");
+    let both = [size(&b1) + size(&b2), size(&b0) + size(&b1) + size(&b2)];
     wait("scripts queue tip+2..=tip+3", &|| {
-        queues
-            .write_blocks
-            .load(std::sync::atomic::Ordering::Relaxed)
-            >= 2
+        both.contains(
+            &queues
+                .write_wire_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     });
     drop(commit);
     let rejects = rig.pump(
