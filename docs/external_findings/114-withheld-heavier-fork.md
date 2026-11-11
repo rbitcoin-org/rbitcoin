@@ -28,10 +28,13 @@ failed one, but it is not marked invalid. The download path is seeded
 again from stored headers without it, and the addresses that announced it
 and did not serve it are not believed about that chain again in this
 process. Another address that announces the chain is believed again. A
-peer whose chain left the path below a block is never asked for it, and a
-request already sent to it is released as if it had answered `notfound`.
-The reserved header peer, or a lone peer, is probed when its record is
-stale, so its record can say which chain it is on. A silent peer still holds the
+peer whose record shows another chain at or below a block is never asked
+for it, and a request already sent to it is released as if it had answered
+`notfound`. A peer that refuses a requested block twice is not asked for it
+for one stall window, even if it announces its chain again. The reserved
+header peer, or a lone peer, is probed when a rewind left its record stale
+or no peer has shown the next block, so its record can say which chain it
+is on. A silent peer still holds the
 fork for one stall window (30 s) before it is dropped.
 
 Restart keeps no withheld mark. A restart that reseeds the stored fork

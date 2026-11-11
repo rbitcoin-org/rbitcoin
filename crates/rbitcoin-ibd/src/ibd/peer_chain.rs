@@ -3,8 +3,8 @@
 //! Core asks a peer only for blocks on that peer's best known chain
 //! (`pindexBestKnownBlock`). A peer whose announced headers leave the
 //! download path is not asked for blocks above that point, and a peer that
-//! answered `notfound` for a block is not asked for it again for a while,
-//! or, after a second `notfound`, for the rest of the connection.
+//! answered `notfound` for a block is not asked for it again for a while.
+//! A second refusal of a requested block holds across announcements.
 
 use super::state::HeightOccupants;
 use bitcoin::block::Header;
@@ -29,13 +29,14 @@ const PROBE_REFRESH: Duration = Duration::from_secs(10);
 pub struct PeerChain {
     /// `notfound` hashes, with the mono ms they were answered.
     lacks: HashMap<BlockHash, u64>,
-    /// Hashes answered `notfound` at least once, kept across announcements.
-    /// A second `notfound` moves the hash to `refused`.
+    /// Requested hashes answered `notfound` at least once, kept across
+    /// announcements. A second refusal moves the hash to `refused`.
     answered_notfound: HashSet<BlockHash>,
-    /// Hashes answered `notfound` twice. The peer is not asked for them
-    /// again on this connection: re-announcing a chain it already showed
-    /// does not reopen a block it keeps refusing.
-    refused: HashSet<BlockHash>,
+    /// Requested hashes refused twice, with the mono ms of the second
+    /// refusal. They hold for one stall window across announcements:
+    /// re-announcing a chain the peer already showed does not reopen a block
+    /// it keeps refusing.
+    refused: HashMap<BlockHash, u64>,
     /// This peer's announced chain above the confirmed tip, oldest first.
     announced: VecDeque<BlockHash>,
     /// Height of `announced[0]`.
@@ -68,13 +69,25 @@ pub struct PeerChain {
 }
 
 impl PeerChain {
+    /// A `notfound` for a block this peer was asked for. Also a
+    /// [`Self::note_notfound`]. Past the cap a new hash is not remembered,
+    /// so hashes the peer was not asked for cannot push one out.
+    pub fn note_refusal(&mut self, hash: BlockHash, now_ms: u64) {
+        if self.answered_notfound.contains(&hash) {
+            if self.refused.len() >= LACKS_CAP {
+                self.refused
+                    .retain(|_, at| now_ms.saturating_sub(*at) < LACKS_TTL_MS);
+            }
+            if self.refused.len() < LACKS_CAP || self.refused.contains_key(&hash) {
+                self.refused.insert(hash, now_ms);
+            }
+        } else if self.answered_notfound.len() < LACKS_CAP {
+            self.answered_notfound.insert(hash);
+        }
+        self.note_notfound(hash, now_ms);
+    }
+
     pub fn note_notfound(&mut self, hash: BlockHash, now_ms: u64) {
-        if !self.answered_notfound.insert(hash) && self.refused.len() < LACKS_CAP {
-            self.refused.insert(hash);
-        }
-        if self.answered_notfound.len() > LACKS_CAP {
-            self.answered_notfound.clear();
-        }
         if self.lacks.len() >= LACKS_CAP {
             self.lacks
                 .retain(|_, at| now_ms.saturating_sub(*at) < LACKS_TTL_MS);
@@ -85,11 +98,8 @@ impl PeerChain {
     }
 
     pub fn lacks(&self, hash: &BlockHash, now_ms: u64) -> bool {
-        self.refused.contains(hash)
-            || self
-                .lacks
-                .get(hash)
-                .is_some_and(|at| now_ms.saturating_sub(*at) < LACKS_TTL_MS)
+        let fresh = |at: &u64| now_ms.saturating_sub(*at) < LACKS_TTL_MS;
+        self.refused.get(hash).is_some_and(fresh) || self.lacks.get(hash).is_some_and(fresh)
     }
 
     /// A headers message or a block inv: the peer may have those blocks now.

@@ -862,8 +862,8 @@ pub fn note_reservation(
 /// Whether block `hash` may be asked of `peer`. As in Core, a peer is asked
 /// only for a block its chain showed (`PeerChain::shows`), and not for one it
 /// answered `notfound`. The reserved header peer is asked only when no other
-/// peer shows the block. A single peer still does both. A peer whose chain
-/// left the path below the block is not asked for it.
+/// peer shows the block. A single peer still does both. A peer whose record
+/// shows another chain at or below the block is never asked for it.
 pub fn may_serve(st: &IbdWorkState, peer: usize, hash: &BlockHash) -> bool {
     use super::peer_io::PeerSlot;
     let height = st.hash_height.get(hash).copied();
@@ -876,14 +876,20 @@ pub fn may_serve(st: &IbdWorkState, peer: usize, hash: &BlockHash) -> bool {
     let Some(slot) = st.slots.iter().find(|s| s.id == peer) else {
         return false;
     };
-    // With no peer that shows the block, a record can be short: a peer whose
-    // chain has not left the path is asked, the header peer too. Otherwise
-    // the header peer stays on headers while another peer can fetch the
-    // block.
+    // With no peer that shows the block, a record can be stale or short: a
+    // peer whose chain has not left the path is asked, else any peer that
+    // did not answer `notfound` and has not shown another chain there, the
+    // header peer too. Otherwise the header peer stays on headers while
+    // another peer can fetch the block.
+    let behind = |s: &PeerSlot| {
+        askable(s) && !height.is_some_and(|ht| s.chain.on_other_chain(path, ht))
+    };
     let tier: &dyn Fn(&PeerSlot) -> bool = if st.slots.iter().any(&shows) {
         &shows
-    } else {
+    } else if st.slots.iter().any(&open) {
         &open
+    } else {
+        &behind
     };
     tier(slot)
         && (st.header_walk.reserved != Some(peer)

@@ -269,21 +269,33 @@ fn a_notfound_lasts_one_stall_window() {
 }
 
 /// An announcement clears a `notfound`: the peer may have the block now.
-/// A second `notfound` for the same block outlasts announcements and the
-/// stall window, so re-announcing a known chain does not reopen a block the
-/// peer keeps refusing.
+/// A second refusal of a block this peer was asked for outlasts
+/// announcements for one stall window, so re-announcing a known chain does
+/// not reopen a block the peer keeps refusing. Hashes it was not asked for
+/// do not count, and cannot push the first refusal out.
 #[test]
-fn a_second_notfound_outlasts_announcements() {
+fn a_second_refusal_outlasts_announcements() {
     let mut peer = PeerChain::default();
     let hash = BlockHash::from_byte_array([3u8; 32]);
     let other = BlockHash::from_byte_array([4u8; 32]);
-    peer.note_notfound(hash, 1_000);
+    peer.note_notfound(other, 1_000);
     peer.note_notfound(other, 1_000);
     peer.note_announcement();
-    assert!(!peer.lacks(&hash, 1_001), "the first notfound is cleared");
-    peer.note_notfound(hash, 2_000);
+    assert!(!peer.lacks(&other, 1_001), "an unasked notfound is not a refusal");
+    peer.note_refusal(hash, 1_000);
+    for i in 0..2_000u32 {
+        let mut b = [9u8; 32];
+        b[..4].copy_from_slice(&i.to_le_bytes());
+        peer.note_refusal(BlockHash::from_byte_array(b), 1_000);
+    }
     peer.note_announcement();
-    assert!(peer.lacks(&hash, 2_001));
-    assert!(peer.lacks(&hash, 2_000 + 30_000));
-    assert!(!peer.lacks(&other, 2_001));
+    assert!(!peer.lacks(&hash, 1_001), "the first refusal is cleared");
+    peer.note_refusal(hash, 2_000);
+    peer.note_announcement();
+    assert!(peer.lacks(&hash, 2_001), "a second refusal outlasts announcements");
+    assert!(peer.lacks(&hash, 2_000 + 29_999));
+    assert!(
+        !peer.lacks(&hash, 2_000 + 30_000),
+        "for one stall window: a lone peer that gets the block is asked again"
+    );
 }

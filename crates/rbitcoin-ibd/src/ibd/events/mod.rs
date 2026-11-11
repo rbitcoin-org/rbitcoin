@@ -1088,8 +1088,13 @@ fn note_announcement(st: &mut IbdWorkState, peer: usize) {
 pub fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
     note_block_progress(&mut st.slots, peer);
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
+        let now = super::peer_io::ibd_mono_ms();
         for h in &hashes {
-            s.chain.note_notfound(*h, super::peer_io::ibd_mono_ms());
+            if s.in_flight.contains(h) {
+                s.chain.note_refusal(*h, now);
+            } else {
+                s.chain.note_notfound(*h, now);
+            }
         }
     }
     release_requests(

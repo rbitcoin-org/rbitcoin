@@ -222,7 +222,11 @@ async fn serve_one(
                     write_v2_msg(&mut writer, NetworkMessage::NotFound(missing)).await?;
                     if peer.mode == Withhold::NotFoundReannounce {
                         let top = peer.chain.lock().unwrap().last().unwrap().block_hash();
-                        write_v2_msg(&mut writer, NetworkMessage::Inv(vec![Inventory::Block(top)])).await?;
+                        write_v2_msg(
+                            &mut writer,
+                            NetworkMessage::Inv(vec![Inventory::Block(top)]),
+                        )
+                        .await?;
                     }
                 }
             }

@@ -2865,6 +2865,20 @@ fn two_peers_reserve_the_header_walk() {
         Some(24),
         "the next is the peer with no record"
     );
+
+    // A record that only ends below a block is not another chain: with no
+    // peer that shows or may hold it, that peer is still asked, as it may
+    // have caught up.
+    st.slots[1].chain.note_ends_at(1_000);
+    assert!(st.slots[1].chain.left_path_by(&st.height_to_hash, 2_004));
+    assert!(!st.slots[1].chain.on_other_chain(&st.height_to_hash, 2_004));
+    st.slots[0].alive = false;
+    st.slots[2].alive = false;
+    assert!(
+        may_serve(&st, 23, &at(2_004)),
+        "a peer whose record ends below a block is asked when nobody else may hold it"
+    );
+    assert!(!may_serve(&st, 25, &at(2_004)));
 }
 
 /// A withheld chain is refused from the address that withheld it, also as
