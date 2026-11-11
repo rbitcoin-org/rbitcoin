@@ -2533,7 +2533,8 @@ fn two_peers_reserve_the_header_walk() {
         "a peer that left where this node confirmed a different block has still left"
     );
     // With no peer that holds a block by what it announced, the header peer
-    // is asked too.
+    // is still not asked: its chain left where this node confirmed a
+    // different block.
     st.slots[1].chain.note_notfound(
         taken2.block_hash(),
         rbitcoin_ibd::ibd::peer_io::ibd_mono_ms(),
@@ -2542,7 +2543,7 @@ fn two_peers_reserve_the_header_walk() {
         taken2.block_hash(),
         rbitcoin_ibd::ibd::peer_io::ibd_mono_ms(),
     );
-    assert!(may_serve(&st, 8, &taken2.block_hash()));
+    assert!(!may_serve(&st, 8, &taken2.block_hash()));
 
     // A sixth, on its own hub, because a probe must say what a peer has. It
     // asks after the path top alone, and a reply on that top shows the whole

@@ -739,9 +739,10 @@ const PROBE_AHEAD: u32 = 4_096;
 /// Ask one block peer for headers, so block getdata follows what it holds:
 /// one that has not announced a chain (Core starts header sync with each
 /// peer), or one whose record no longer decides the next blocks. One probe
-/// at a time, and not a peer with a walk ask open. The reserved header peer
-/// is probed too: its record says whether a fork block no other peer serves
-/// is withheld.
+/// at a time, and not a peer with a walk ask open. The reserved header peer,
+/// or a lone peer, is probed only while it has no record, or a rewind left
+/// its record stale: that record says whether a block no other peer serves
+/// is withheld. Its walk replies keep the record fresh otherwise.
 pub fn probe_unprobed_peer(st: &mut IbdWorkState, hub: &ChainHub) {
     use super::peer_io::PeerSlot;
     let walk = &st.header_walk;
@@ -751,8 +752,13 @@ pub fn probe_unprobed_peer(st: &mut IbdWorkState, hub: &ChainHub) {
     let tip = hub.tip_height().unwrap_or(0);
     let ahead = tip.saturating_add(PROBE_AHEAD).min(st.max_ordered_height);
     let now = Instant::now();
+    let several = st.slots.iter().filter(|s| s.alive).count() >= 2;
     let due = |s: &PeerSlot| {
-        !s.chain.probed() || (ahead > tip && s.chain.needs_refresh(&st.height_to_hash, ahead, now))
+        !s.chain.probed()
+            || (several
+                && walk.reserved != Some(s.id)
+                && ahead > tip
+                && s.chain.needs_refresh(&st.height_to_hash, ahead, now))
     };
     let Some(slot) = st
         .slots
