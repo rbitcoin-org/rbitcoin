@@ -3,7 +3,8 @@
 # reports error-severity hits on fixtures/bad (detached tokio::spawn,
 # mem::forget/Box::leak, dropped thread::spawn, dropped crate-root pub,
 # direct TcpListener::bind, direct sync_all / sync_data as a method or a
-# path call).
+# path call, a flush-skip setter named outside skip_flushes_before_main!,
+# that macro outside a tests/suite.rs).
 # Does not scan crates/.
 # Missing binary: fail in CI, skip locally.
 set -euo pipefail
@@ -73,6 +74,16 @@ assert_ok "bad fixtures report sync-direct" \
   grep -q 'sync-direct' <<<"$bad_json"
 assert_ok "bad fixtures include method and path sync_all and sync_data" \
   python3 -c 'import json,sys; d=json.load(sys.stdin); assert {e["text"] for e in d if e["ruleId"]=="sync-direct"} == {"f.sync_all()", "f.sync_data()", "std::fs::File::sync_all(f)", "std::fs::File::sync_data(f)"}' <<<"$bad_json"
+
+assert_ok "bad fixtures report skip-flushes-call" \
+  grep -q 'skip-flushes-call' <<<"$bad_json"
+assert_ok "bad fixtures include both setters by path, bare, renamed import, and use" \
+  python3 -c 'import json,sys; d=json.load(sys.stdin); assert sorted((e["range"]["start"]["line"]+1, e["text"]) for e in d if e["ruleId"]=="skip-flushes-call") == [(2, "skip_flushes_in_this_process"), (6, "skip_in_this_process"), (10, "skip_flushes_in_this_process"), (16, "skip_flushes_in_this_process"), (19, "skip_flushes_in_this_process")]' <<<"$bad_json"
+
+assert_ok "bad fixtures report skip-flushes-macro" \
+  grep -q 'skip-flushes-macro' <<<"$bad_json"
+assert_ok "bad fixtures include path and bare skip_flushes_before_main!" \
+  python3 -c 'import json,sys; d=json.load(sys.stdin); assert {e["text"] for e in d if e["ruleId"]=="skip-flushes-macro"} == {"rbitcoin_store::skip_flushes_before_main!()", "skip_flushes_before_main!()"}' <<<"$bad_json"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "ast-grep.test.sh: $PASS passed, $FAIL failed"

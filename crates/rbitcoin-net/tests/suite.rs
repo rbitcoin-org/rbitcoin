@@ -1,3 +1,5 @@
+rbitcoin_store::skip_flushes_before_main!();
+
 /// Arm the tip-accept lane permit before any test thread starts. A node
 /// binary does not link this suite, so production never takes that lock.
 #[used]

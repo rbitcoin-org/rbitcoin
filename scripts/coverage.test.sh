@@ -83,6 +83,8 @@ assert_ok "required test job excludes rbitcoin-bench" \
   grep -q 'cargo test --workspace --exclude rbitcoin-bench' "$ROOT/.github/workflows/ci.yml"
 assert_ok "required test job still pins the bench scripthash" \
   grep -q 'cargo test -p rbitcoin-bench --lib hot_corpus_includes_p2a' "$ROOT/.github/workflows/ci.yml"
+assert_ok "required test job runs the skip-flushes switch test" \
+  grep -q -- '--features skip-flushes --test suite' "$ROOT/.github/workflows/ci.yml"
 # coverage-gate.py owns the floor (FLOOR_PCT, written to gate.json). The badge
 # takes it from there; neither script carries a second copy of the number.
 assert_ok "coverage.sh reads the badge gate from gate.json, not a literal" \

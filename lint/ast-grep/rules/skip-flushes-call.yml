@@ -1,0 +1,11 @@
+id: skip-flushes-call
+language: rust
+severity: error
+message: Only skip_flushes_before_main! turns flushes off (under --features skip-flushes).
+note: The switch covers the whole process and never turns back on. A call anywhere else turns flushes off for every test in that binary (TESTING.md). The rule matches the setters' names, so a renamed import or a function pointer counts.
+rule:
+  kind: identifier
+  regex: "^(skip_flushes_in_this_process|skip_in_this_process)$"
+ignores:
+  - "crates/rbitcoin-store/src/durability.rs"
+  - "crates/rbitcoin-store/src/testutil.rs"

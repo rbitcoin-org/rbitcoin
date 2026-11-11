@@ -26,6 +26,9 @@ mutants = { version = "0.0.4", optional = true }
 [features]
 # Nightly cargo-mutants only. Off for the node build.
 mutants = ["dep:mutants"]
+# Skip file flushes in `suite` (`cargo test --workspace --features
+# skip-flushes`, TESTING.md).
+skip-flushes = []
 
 [[test]]
 name = "suite"

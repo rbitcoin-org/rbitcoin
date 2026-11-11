@@ -171,6 +171,14 @@ jobs:
       # the address-corpus pin: sha256::Hash Display is internal order.
       - name: bench scripthash pin
         run: cargo test -p rbitcoin-bench --lib hot_corpus_includes_p2a -- --quiet
+      # The suites behind --features skip-flushes (TESTING.md): the switch
+      # builds and its before-main hook turns flushes off. The full suite
+      # above still flushes.
+      - name: skip-flushes switch
+        run: >-
+          cargo test -p rbitcoin-query -p rbitcoin-net -p rbitcoin-rpc
+          -p rbitcoin-ibd -p rbitcoin-test --features skip-flushes --test suite
+          -- --quiet flushes_skipped_matches_the_skip_flushes_feature
 
   # Windows IOCP store + mmap fuse + query confirm + --smoke. Required. Not a CRT-static snapshot.
   windows:

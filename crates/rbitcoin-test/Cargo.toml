@@ -47,6 +47,9 @@ path = "tests/suite.rs"
 
 [features]
 mutants = []
+# Skip file flushes in `suite` (`cargo test --workspace --features
+# skip-flushes`, TESTING.md).
+skip-flushes = []
 # Live private-mesh journeys. Default `cargo test` stays fake SOCKS/SAM/control.
 overlay = []
 

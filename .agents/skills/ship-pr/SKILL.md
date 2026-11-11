@@ -65,6 +65,9 @@ cargo test --workspace --quiet
 ./scripts/ci-os-smoke.sh
 ```
 
+On macOS add `--features skip-flushes` to the workspace test, or flush
+contention times suites out ([`TESTING.md`](../../../TESTING.md)).
+
 If the slice changed `flake.nix`, `nix/`, or the NixOS module, also
 `nix build .#checks.x86_64-linux.nixos-module-eval --no-link`. Label the PR
 `nixos-module-runtime` when systemd deps, users/groups, firewall, or the VM

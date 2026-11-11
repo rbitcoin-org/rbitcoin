@@ -208,6 +208,29 @@ process. `RBTC_TEST_AS_MB=0` leaves the caller's limit. `windows` and
 `macos` stay on real disk. Local opt-in: export the same variable with an
 absolute path. Keep default-tier fixtures small: on tmpfs, test bytes are RAM.
 
+**Skip flushes (opt-in):** every `sync_all` / `sync_data` goes through
+`rbitcoin_store::durability`. On macOS a flush is `F_FULLFSYNC`, which waits
+on the whole drive, so suites that run many stores at once queue behind each
+other and miss their wall clocks. `cargo test --workspace --features
+skip-flushes` turns flushes off before any test runs in the query, net, rpc,
+ibd, and `rbitcoin-test` suites (`-p <crate> --features skip-flushes` for
+one). On one Mac those five took 1962 s with 24 failures, and 272 s with one
+failure that does not involve flushes.
+
+A suite opts in with `skip-flushes = []` in its `Cargo.toml` and
+`rbitcoin_store::skip_flushes_before_main!();` at the top of
+`tests/suite.rs`. The macro also adds a test that the switch matches the
+feature and that a flush through `Durable` reaches the OS only without it
+(`durability::flushes_issued`). Other tests cannot see a skipped flush, and
+the `arm_fail_sync` and fsynced-dir hooks still run. The switch covers the
+whole test process, never turns back on, and exists only in debug builds. A
+process the test starts, such as the `journey-node` in `asmap_journey`,
+still flushes. A test that needs a real flush belongs in a suite that does
+not call the macro, such as `rbitcoin-store`'s. The `skip-flushes-call` and
+`skip-flushes-macro` ast-grep rules refuse the switch anywhere else. CI's
+`test` job runs each suite's switch test with the flag. Without the flag,
+and in `ci-os-smoke.sh`, flushes still run.
+
 ### Suite speed budgets (default tier)
 
 **Target:** warm default suite wall **≤3 min** (stretch **&lt;2 min**) on a Linux host comparable to CI / agent VM with a warm `target/`.
