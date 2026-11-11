@@ -759,22 +759,10 @@ assert_fail_msg "-signetchallenge rejects non-hex" "Error: -signetchallenge must
 assert_fail_msg "-signetchallenge rejects duplicates" "Error: -signetchallenge cannot be multiple values." \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -signetchallenge=51 -signetchallenge=51
 
-# Core names a custom signet's datadir signet_<message start>. The default
-# challenge, given or not, stays signet. An explicit empty challenge is custom.
-message_start() {
-  python3 - "$1" <<'PY'
-import hashlib, sys
-r = bytes.fromhex(sys.argv[1])
-n = len(r)
-if n < 0xFD:
-    size = bytes([n])
-elif n <= 0xFFFF:
-    size = b"\xfd" + n.to_bytes(2, "little")
-else:
-    size = b"\xfe" + n.to_bytes(4, "little")
-print(hashlib.sha256(hashlib.sha256(size + r).digest()).digest()[:4].hex())
-PY
-}
+# This branch pins Bitcoin Core v32.1. That harness reads
+# `<datadir>/signet/.cookie` and `debug.log` for every signet, including a
+# custom `-signetchallenge`. A later Core puts a custom signet under
+# `signet_<message start>`; this pin does not.
 SIGNET_DEFAULT_CHALLENGE="512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae"
 SIGDIR_DD="$WORKDIR/signet-dirs"
 mkdir -p "$SIGDIR_DD"
@@ -794,31 +782,30 @@ signet_dir_case() {
   fi
 }
 signet_dir_case "default signet datadir is signet" "$SIGDIR_DD/signet" ""
-signet_dir_case "custom -signetchallenge datadir is signet_<magic>" \
-  "$SIGDIR_DD/signet_$(message_start 51)" "--signet-challenge=51( |$)" -signetchallenge=51
-signet_dir_case "explicit default -signetchallenge datadir is signet" \
+signet_dir_case "custom -signetchallenge stays in signet" \
+  "$SIGDIR_DD/signet" "--signet-challenge=51( |$)" -signetchallenge=51
+signet_dir_case "explicit default -signetchallenge stays in signet" \
   "$SIGDIR_DD/signet" "" -signetchallenge="$SIGNET_DEFAULT_CHALLENGE"
-signet_dir_case "empty -signetchallenge= datadir is signet_<magic>" \
-  "$SIGDIR_DD/signet_$(message_start '')" "--signet-challenge=( |$)" -signetchallenge=
-# Core's GetSignetMessageStart takes a full CompactSize length prefix.
+signet_dir_case "empty -signetchallenge= stays in signet" \
+  "$SIGDIR_DD/signet" "--signet-challenge=( |$)" -signetchallenge=
 LONG253="$(printf '51%.0s' $(seq 253))"
 LONG300="$(printf '51%.0s' $(seq 300))"
-signet_dir_case "253-byte -signetchallenge datadir uses a CompactSize prefix" \
-  "$SIGDIR_DD/signet_$(message_start "$LONG253")" "--signet-challenge=$LONG253( |$)" \
+signet_dir_case "253-byte -signetchallenge stays in signet" \
+  "$SIGDIR_DD/signet" "--signet-challenge=$LONG253( |$)" \
   -signetchallenge="$LONG253"
-signet_dir_case "300-byte -signetchallenge datadir uses a CompactSize prefix" \
-  "$SIGDIR_DD/signet_$(message_start "$LONG300")" "--signet-challenge=$LONG300( |$)" \
+signet_dir_case "300-byte -signetchallenge stays in signet" \
+  "$SIGDIR_DD/signet" "--signet-challenge=$LONG300( |$)" \
   -signetchallenge="$LONG300"
 # TryParseHex skips whitespace between bytes; the node gets plain hex.
 signet_dir_case "-signetchallenge skips whitespace between bytes like TryParseHex" \
-  "$SIGDIR_DD/signet_$(message_start 5151)" "--signet-challenge=5151( |$)" \
+  "$SIGDIR_DD/signet" "--signet-challenge=5151( |$)" \
   "-signetchallenge= 51 51 "
 assert_fail_msg "-signetchallenge rejects whitespace inside a byte" \
   "Error: -signetchallenge must be hex, not '5 1'." \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$SIGDIR_DD" "-signetchallenge=5 1"
 
-# bitcoin-cli looks for the cookie in the same signet directory, honors
-# -rpccookiefile, and hints at -signetchallenge when auth fails on signet.
+# bitcoin-cli reads `<datadir>/signet/.cookie` for a custom challenge too,
+# honors -rpccookiefile, and hints at -signetchallenge when auth fails.
 CLI="$ROOT/scripts/core-functional/bitcoin-cli"
 AUTH_PORT_FILE="$WORKDIR/auth-port"
 python3 - "$AUTH_PORT_FILE" <<'PY' &
@@ -846,9 +833,8 @@ PY
 AUTH_PID=$!
 for _ in $(seq 50); do [[ -s "$AUTH_PORT_FILE" ]] && break; sleep 0.1; done
 AUTH_PORT="$(cat "$AUTH_PORT_FILE")"
-CUSTOM_DIR="$SIGDIR_DD/signet_$(message_start 51)"
-mkdir -p "$CUSTOM_DIR" "$SIGDIR_DD/signet"
-printf '__cookie__:custom\n' >"$CUSTOM_DIR/.cookie"
+mkdir -p "$SIGDIR_DD/signet_deadbeef" "$SIGDIR_DD/signet"
+printf '__cookie__:custom\n' >"$SIGDIR_DD/signet_deadbeef/.cookie"
 printf '__cookie__:default\n' >"$SIGDIR_DD/signet/.cookie"
 printf '__cookie__:override\n' >"$WORKDIR/override.cookie"
 cli_case() {
@@ -865,9 +851,12 @@ cli_case() {
   fi
 }
 cli_case "bitcoin-cli reads the default signet cookie" '"__cookie__:default"'
-cli_case "bitcoin-cli reads the signet_<magic> cookie" '"__cookie__:custom"' -signetchallenge=51
+cli_case "bitcoin-cli reads the signet cookie for a custom challenge" '"__cookie__:default"' -signetchallenge=51
 cli_case "bitcoin-cli honors -rpccookiefile" '"__cookie__:override"' \
   -rpccookiefile="$WORKDIR/override.cookie"
+# The cases above need `<datadir>/signet/.cookie`. This one must miss it,
+# and must also miss the datadir-wide fallback cookie.
+rm -f "$SIGDIR_DD/signet/.cookie" "$SIGDIR_DD/.cookie"
 cli_case "bitcoin-cli hints -signetchallenge on a missing cookie" \
   "Is your -signetchallenge correct for custom signets?" \
   -signetchallenge=52

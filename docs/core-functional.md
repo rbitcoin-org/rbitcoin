@@ -37,10 +37,11 @@ never calls this.
 
 `scripts/core-functional/bitcoind` is the TestNode binary: `-datadir=DIR`
 → `--datadir DIR/regtest` (`bitcoind.pid` under `DIR/regtest`). On signet
-it is Core's `DIR/signet`, or `DIR/signet_<message start>` for a custom
-`-signetchallenge` (an explicit empty one included); `bitcoin-cli` reads the
-cookie from the same directory. The node itself never derives that name,
-and refuses a datadir recorded for another signet.
+it is `DIR/signet` for every `-signetchallenge`, including an explicit
+empty one. This pin is Bitcoin Core v32.1, and that harness reads
+`<datadir>/signet/.cookie` and `debug.log`. `bitcoin-cli` reads the cookie
+from the same directory. The node itself never derives that name, and
+refuses a datadir recorded for another signet.
 `-rpcport`/`-port`/`bitcoin.conf` → `--rpc-listen` / `--listen` on
 127.0.0.1, `--no-seeds`. It adds `--sh-index` only when the datadir parent
 is `{script}_{n}` for a run test that reads address or scripthash history

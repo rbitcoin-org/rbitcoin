@@ -3,8 +3,9 @@
 
 `mining_template_verification.py` calls `node.cli.getblocktemplate(...)` in
 parallel. Core's TestNodeCLI shells out to this binary. The cookie is read
-from the same `regtest` / `signet` / `signet_<magic>` directory the bitcoind
-shim hands the node.
+from the same `regtest` or `signet` directory the bitcoind shim hands the
+node. A custom `-signetchallenge` does not change that directory on this
+v32.1 pin.
 """
 
 from __future__ import annotations
@@ -15,8 +16,6 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-
-from signet_datadir import chain_dir
 
 SIGNET_HINT = "Is your -signetchallenge correct for custom signets?"
 
@@ -79,7 +78,6 @@ def main(argv: list[str]) -> int:
     datadir: Path | None = None
     rpcport: int | None = None
     network: str | None = None
-    challenge: str | None = None
     cookiefile: str | None = None
     named = False
     use_stdin = False
@@ -109,8 +107,6 @@ def main(argv: list[str]) -> int:
                 network = k
             elif k == "chain" and v:
                 network = v
-            elif k == "signetchallenge":
-                challenge = v or ""
             elif k == "rpccookiefile" and v:
                 cookiefile = v
             i += 1
@@ -163,7 +159,7 @@ def main(argv: list[str]) -> int:
 
     if network is None:
         network = "signet" if is_on(conf_value(datadir, "signet") or "0") else "regtest"
-    cookie = cookie_auth(datadir, chain_dir(network, challenge), cookiefile)
+    cookie = cookie_auth(datadir, network, cookiefile)
     cookie_read = cookie is not None
     password = False
     if cookie is None:
