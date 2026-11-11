@@ -148,17 +148,17 @@ impl Input {
             count: AtomicU64::new(full),
             body_end: AtomicU64::new(body_len),
         };
-        // Refuse a short body before any header write. A matching checkpoint
-        // still has to be checked: the body can move on its own.
-        let new_body = opened.body_end_if_durable(count)?;
-        if count < full {
-            opened.truncate_to_count(count)?;
+        // A short body header is the prefix that landed. The locator can
+        // still name later creates. Keep the largest count this header covers.
+        let durable = opened.count_body_covers(count)?;
+        if durable < full {
+            opened.truncate_to_count(durable)?;
         } else {
             let need = FILE_HEADER_LEN as u64 + n_win * OFF_SLOT;
             if opened.off.logical_len() > need {
                 opened.off.set_logical_len(need)?;
             }
-            opened.shrink_body_to(new_body)?;
+            opened.shrink_body_to(opened.body_end_for_count(count)?)?;
         }
         Ok(opened)
     }
@@ -341,6 +341,34 @@ impl Input {
         }
         self.count.store(new_count, Ordering::Release);
         Ok(())
+    }
+
+    /// Largest count `<= count` whose inputs this body header still names.
+    ///
+    /// `body_end_for_count` grows with the count. A body that passed the
+    /// record-size check always covers count 0.
+    fn count_body_covers(&self, count: u64) -> Result<u64, StoreError> {
+        if self.body_end_for_count(count)? <= self.body.logical_len() {
+            return Ok(count);
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+        let mut lo = 0u64;
+        let mut hi = count - 1;
+        let mut best = 0u64;
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.body_end_for_count(mid)? <= self.body.logical_len() {
+                best = mid;
+                lo = mid.saturating_add(1);
+            } else if mid == 0 {
+                break;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        Ok(best)
     }
 
     /// `new_count`'s body end when that many inputs are already in the body.

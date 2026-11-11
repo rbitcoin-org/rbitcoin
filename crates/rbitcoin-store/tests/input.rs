@@ -190,10 +190,10 @@ fn reopen_after_short_body_keeps_the_prefix_inputs() {
     assert_eq!(t.edges(Fk(1023)).unwrap(), kept);
 }
 
-/// The locator names creates whose inputs were not written. Open refuses
-/// that datadir instead of publishing a body end over the spare bytes.
+/// The checkpoint still names 1023 creates. The body header names 1000
+/// inputs. Open keeps that covered count.
 #[test]
-fn open_refuses_a_body_short_of_the_kept_prefix() {
+fn open_keeps_a_body_short_of_the_checkpoint_prefix() {
     let dir = TempDir::labeled("input-short-of-prefix").unwrap();
     let t = Input::create(dir.path()).unwrap();
     let batch = vec![vec![edge(1, 0)]; 1050];
@@ -204,11 +204,10 @@ fn open_refuses_a_body_short_of_the_kept_prefix() {
     let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
     write_hwm(&path.join("input.off"), header);
     write_hwm(&path.join("input.body"), header + 1000 * REC_LEN);
-    match Input::open(&path) {
-        Err(StoreError::Corrupt("invariant: input.body truncate")) => {}
-        Err(err) => panic!("{err}"),
-        Ok(_) => panic!("open kept a body short of the prefix"),
-    }
+    let t = Input::open(&path).expect("a short body under the checkpoint truncates");
+    assert_eq!(t.count(), 1000);
+    assert_eq!(t.edges(Fk(1000)).unwrap().unwrap(), vec![edge(1, 0)]);
+    assert!(t.edges(Fk(1001)).is_err());
 }
 
 /// The locator header was shortened and the body was not. Open cuts the
@@ -232,10 +231,29 @@ fn long_body_reopen_cuts_back_to_the_locator_prefix() {
     assert_eq!(t.edges(Fk(1024)).unwrap().unwrap(), vec![edge(9, 4)]);
 }
 
-/// The locator and the checkpoint still name 1024 creates. The body header
-/// was already shortened. Open refuses that datadir.
+/// The locator still names every create. The body header names fewer
+/// inputs. Open keeps the creates that header still covers.
 #[test]
-fn open_refuses_a_short_body_when_the_headers_agree() {
+fn open_keeps_creates_a_short_body_header_still_names() {
+    let dir = TempDir::labeled("input-short-body-truncates").unwrap();
+    let t = Input::create(dir.path()).unwrap();
+    let batch = vec![vec![edge(1, 0)]; 200];
+    t.append(&batch).unwrap();
+    let path = dir.path().to_path_buf();
+    drop(t);
+
+    let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
+    write_hwm(&path.join("input.body"), header + 80 * REC_LEN);
+    let t = Input::open(&path).expect("a short body header truncates the locator");
+    assert_eq!(t.count(), 80);
+    assert_eq!(t.edges(Fk(80)).unwrap().unwrap(), vec![edge(1, 0)]);
+    assert!(t.edges(Fk(81)).is_err());
+}
+
+/// The locator and the checkpoint still name 1024 creates. The body header
+/// names 100 inputs. Open cuts the locator to that prefix.
+#[test]
+fn open_cuts_the_locator_when_the_body_header_is_short() {
     let dir = TempDir::labeled("input-headers-agree-short-body").unwrap();
     let t = Input::create(dir.path()).unwrap();
     let batch = vec![vec![edge(1, 0)]; 1024];
@@ -245,11 +263,10 @@ fn open_refuses_a_short_body_when_the_headers_agree() {
 
     let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
     write_hwm(&path.join("input.body"), header + 100 * REC_LEN);
-    match Input::open(&path) {
-        Err(StoreError::Corrupt("invariant: input.body truncate")) => {}
-        Err(err) => panic!("{err}"),
-        Ok(_) => panic!("open kept a short body behind a long locator"),
-    }
+    let t = Input::open(&path).expect("a short body header truncates the locator");
+    assert_eq!(t.count(), 100);
+    assert_eq!(t.edges(Fk(100)).unwrap().unwrap(), vec![edge(1, 0)]);
+    assert!(t.edges(Fk(101)).is_err());
 }
 
 /// The locator was shortened inside a window, so the checkpoint did not
