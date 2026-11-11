@@ -439,12 +439,17 @@ async fn run(shape: Shape, mode: Withhold) -> (bool, String) {
             report.push(format!("phase1 rewound to the fork point {rewound:?}"));
             honest.send(Cmd::ReleaseHeld);
         }
-        let got = rig.reach(N, honest_tip, Duration::from_secs(90)).await;
-        reached = got.is_some();
-        if reached {
-            // A rewind may still come after the honest tip connects.
+        // The honest tip, held for 2 s. Fork headers that land after it
+        // connects rewind it again until the fork is retired.
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut got = None;
+        while !reached && Instant::now() < deadline {
+            got = rig.reach(N, honest_tip, deadline.saturating_duration_since(Instant::now())).await;
+            if got.is_none() {
+                break;
+            }
             rig.idle(Duration::from_secs(2)).await;
-            reached = rig.node.tip_height() == Some(N);
+            reached = rig.node.hub.tip_hash() == Some(honest_tip);
         }
         let attacker_top = attacker_blocks[(N + 3) as usize]
             .block_hash()

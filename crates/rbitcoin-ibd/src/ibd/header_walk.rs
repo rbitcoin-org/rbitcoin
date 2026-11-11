@@ -881,9 +881,8 @@ pub fn may_serve(st: &IbdWorkState, peer: usize, hash: &BlockHash) -> bool {
     // did not answer `notfound` and has not shown another chain there, the
     // header peer too. Otherwise the header peer stays on headers while
     // another peer can fetch the block.
-    let behind = |s: &PeerSlot| {
-        askable(s) && !height.is_some_and(|ht| s.chain.on_other_chain(path, ht))
-    };
+    let behind =
+        |s: &PeerSlot| askable(s) && !height.is_some_and(|ht| s.chain.on_other_chain(path, ht));
     let tier: &dyn Fn(&PeerSlot) -> bool = if st.slots.iter().any(&shows) {
         &shows
     } else if st.slots.iter().any(&open) {

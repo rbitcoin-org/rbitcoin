@@ -30,8 +30,10 @@ pub struct PeerChain {
     /// `notfound` hashes, with the mono ms they were answered.
     lacks: HashMap<BlockHash, u64>,
     /// Requested hashes answered `notfound` at least once, kept across
-    /// announcements. A second refusal moves the hash to `refused`.
+    /// announcements, newest last. A second refusal moves the hash to
+    /// `refused`. Past the cap the oldest gives way.
     answered_notfound: HashSet<BlockHash>,
+    answered_order: VecDeque<BlockHash>,
     /// Requested hashes refused twice, with the mono ms of the second
     /// refusal. They hold for one stall window across announcements:
     /// re-announcing a chain the peer already showed does not reopen a block
@@ -70,8 +72,9 @@ pub struct PeerChain {
 
 impl PeerChain {
     /// A `notfound` for a block this peer was asked for. Also a
-    /// [`Self::note_notfound`]. Past the cap a new hash is not remembered,
-    /// so hashes the peer was not asked for cannot push one out.
+    /// [`Self::note_notfound`]. Only asked-for hashes enter the history, and
+    /// a peer has few requests at a time, so it cannot push out a refusal
+    /// between two asks for the same block.
     pub fn note_refusal(&mut self, hash: BlockHash, now_ms: u64) {
         if self.answered_notfound.contains(&hash) {
             if self.refused.len() >= LACKS_CAP {
@@ -81,8 +84,14 @@ impl PeerChain {
             if self.refused.len() < LACKS_CAP || self.refused.contains_key(&hash) {
                 self.refused.insert(hash, now_ms);
             }
-        } else if self.answered_notfound.len() < LACKS_CAP {
+        } else {
+            if self.answered_order.len() >= LACKS_CAP {
+                if let Some(oldest) = self.answered_order.pop_front() {
+                    self.answered_notfound.remove(&oldest);
+                }
+            }
             self.answered_notfound.insert(hash);
+            self.answered_order.push_back(hash);
         }
         self.note_notfound(hash, now_ms);
     }
