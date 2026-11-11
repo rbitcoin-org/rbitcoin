@@ -1,5 +1,6 @@
 //! Frigate `blockchain.silentpayments.subscribe` (session-only scan key).
 
+use bitcoin::bech32::{Bech32m, ByteIterExt, Fe32, Fe32IterExt, Hrp};
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin::Network;
 use rbitcoin_consensus::silent_payments::labeled_spend_key;
@@ -142,13 +143,14 @@ pub fn encode_sp_address(network: Network, scan_sk: &SecretKey, spend: &PublicKe
     let mut data = Vec::with_capacity(66);
     data.extend_from_slice(&scan_pk.serialize());
     data.extend_from_slice(&spend.serialize());
-    match bitcoin::bech32::encode::<bitcoin::bech32::Bech32m>(
-        bitcoin::bech32::Hrp::parse_unchecked(hrp),
-        &data,
-    ) {
-        Ok(s) => s,
-        Err(_) => format!("{hrp}1{}", rbitcoin_primitives::hex_encode(&data)),
-    }
+    // BIP-352: the data part starts with the version character (`q` is v0).
+    data.iter()
+        .copied()
+        .bytes_to_fes()
+        .with_checksum::<Bech32m>(&Hrp::parse_unchecked(hrp))
+        .with_witness_version(Fe32::Q)
+        .chars()
+        .collect()
 }
 
 #[doc(hidden)]

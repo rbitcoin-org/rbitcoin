@@ -149,7 +149,11 @@ fn parse_sub_labels_start_and_networks() {
     .unwrap();
     assert_eq!(sub.start, 12);
     assert_eq!(sub.labels, vec![0, 1]);
-    assert!(sub.address.starts_with("sp1"), "{}", sub.address);
+    // BIP-352 send-and-receive vector 0: version `q`, then the two keys.
+    assert_eq!(
+        sub.address,
+        "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv"
+    );
     let tsp = parse_sub(&json!([scan, spend]), Network::Signet, Some(3)).unwrap();
     assert!(tsp.address.starts_with("tsp1"), "{}", tsp.address);
     let t4 = parse_sub(&json!([scan, spend]), Network::Testnet4, Some(3)).unwrap();
