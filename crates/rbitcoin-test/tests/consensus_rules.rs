@@ -1339,8 +1339,8 @@ fn merged_write(
             carried_header_hashes: Vec::new(),
         };
         let mat = confirm_wire_load_phase_pipelined(
-            &q,
-            &params,
+            q,
+            params,
             Milestone::NONE,
             slice,
             &none,

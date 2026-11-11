@@ -3135,30 +3135,31 @@ fn merged_respend_of_a_same_block_spend_is_rejected_alone() {
     let feed = std::sync::Arc::clone(&rig.feed);
     let commit = hub.query.lock_tip_commit().expect("tip flush");
     let deadline = Instant::now() + Duration::from_secs(20);
-    for (i, body) in path.iter().enumerate() {
-        rig.give(body);
-        while !feed.holds(t + 1 + i as u32) && feed.epoch() == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "load did not claim {}",
-                t + 1 + i as u32
-            );
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
             std::thread::yield_now();
         }
+    };
+    // Write appends tip+1 alone, then waits on the commit lock.
+    rig.give(&b0);
+    wait("Class A of tip+1", &|| {
+        hub.query.class_a_hi().is_some_and(|h| h > t)
+    });
+    // Separate load batches, both queued behind it, so the next write
+    // drains tip+2 and tip+3 as one.
+    for (i, body) in [&b1, &b2].into_iter().enumerate() {
+        rig.give(body);
+        wait("load claim", &|| {
+            feed.holds(t + 2 + i as u32) || feed.epoch() != 0
+        });
     }
-    // Write holds tip+1 behind the commit lock until scripts queue tip+2
-    // and tip+3 for it, so the next write drains both.
-    while queues
-        .write_blocks
-        .load(std::sync::atomic::Ordering::Relaxed)
-        < 2
-    {
-        assert!(
-            Instant::now() < deadline,
-            "scripts did not queue tip+2..=tip+3"
-        );
-        std::thread::yield_now();
-    }
+    wait("scripts queue tip+2..=tip+3", &|| {
+        queues
+            .write_blocks
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 2
+    });
     drop(commit);
     let rejects = rig.pump(
         |_, hash| {
