@@ -1206,6 +1206,41 @@ fn unstrong_orphan_at_the_cut_still_shrinks_the_tip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The tail ranges were flushed away before the tip shrink landed. The
+/// create just past the prefix is an unstrong orphan, so that strong bit
+/// does not name the cut. Reopen still drops the confirmed tip.
+#[test]
+fn cleared_tail_with_an_unstrong_orphan_still_shrinks_the_tip() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let side_fk = put_coinbase(&s, 9);
+    assert_eq!(side_fk, Fk(2));
+    let side = s.put_header(&hdr(genesis, parent, 9)).unwrap();
+    s.header_txs.put_range(&write, side, side_fk, 1).unwrap();
+    let (tail, tail_hash) = connect_coinbase(&s, &write, 1, genesis, parent);
+    let (tip, _) = connect_coinbase(&s, &write, 2, tail, tail_hash);
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    s.header_txs.flush().unwrap();
+    shorten_creates(&s, 1);
+    s.header_txs.clear_body(&write, tail).unwrap();
+    s.header_txs.clear_body(&write, tip).unwrap();
+    s.header_txs.flush().unwrap();
+    assert_eq!(s.confirmed.tip_height(), Some(Height(2)));
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+    assert!(s.header_txs.has_body(genesis).unwrap());
+    assert!(!s.header_txs.has_body(tail).unwrap());
+    assert!(!s.header_txs.has_body(tip).unwrap());
+    assert!(!s.header_txs.has_body(side).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A cut leaves the old tx.head slot. The next create reuses that fk.
 /// When the new txid lands on the same probe slot, the old fingerprint
 /// must not make get_by_txid miss the body.
