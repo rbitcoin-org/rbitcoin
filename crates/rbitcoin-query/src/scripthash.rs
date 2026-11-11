@@ -1188,19 +1188,23 @@ impl Query {
             let Some(mi) = abs_at[i] else {
                 continue;
             };
-            let Some((field, flags, _vin)) = metas.get(mi).copied().flatten() else {
+            let Some((field, flags, vin)) = metas.get(mi).copied().flatten() else {
                 continue;
             };
             if field.is_null() {
                 continue;
             }
             if flags & output_flags::MULTI_SPENDER != 0 {
-                for fk in self.store.spenders_create(c.create_tx_fk, c.vout)? {
-                    if self.confirmed_strong_in(fk, view)? {
-                        per_out[i].push(fk);
-                    }
-                }
-            } else if self.confirmed_strong_in(field, view)? {
+                per_out[i] = self.store.strong_spenders_create(
+                    c.create_tx_fk,
+                    c.vout,
+                    Some(view.height.0),
+                )?;
+            } else if self.confirmed_strong_in(field, view)?
+                && self
+                    .store
+                    .spender_names_output(c.create_tx_fk, c.vout, field, vin)?
+            {
                 per_out[i].push(field);
             }
         }

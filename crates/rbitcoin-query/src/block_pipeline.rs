@@ -1224,6 +1224,14 @@ pub fn structural_apply_one_meta(
     if !strong {
         return Ok(0);
     }
+    // The meta vin is the stored spender's input. The job vin is the new spend.
+    let names = query
+        .store()
+        .spender_names_output(rbitcoin_primitives::Fk(id), vout, field, field_vin)
+        .map_err(ConfirmError::from)?;
+    if !names {
+        return Ok(0);
+    }
     let create_h = scratch.height_by_id.get(&id).copied();
     let spend_h = field
         .get()
