@@ -43,9 +43,11 @@ record can say which chain it is on.
 Open: a withholder that stays connected keeps its own record of the chain,
 so after ten minutes it can make the node rewind onto it again and wait one
 more stall window. Ending that needs proof that a peer serves the first
-block before the rewind, a side fetch that the height-keyed body queue
-does not host today. That is the other direction in
-[088](./088-tip-chain-selection.md) F3, and a maintainer decision.
+block before the rewind: fetching it while the old chain stays confirmed.
+The height-keyed body queue does not hold such a side body, and the reader
+keeps unrequested bodies off the coordinator channel. Storing side bodies
+is one of the designs [088](./088-tip-chain-selection.md) F3 lists for deep
+tip-follow reorgs. Either is a maintainer decision.
 
 A retired chain is process-local. A restart that reseeds the stored fork
 retires it again one window after a peer's record shows its own chain.
