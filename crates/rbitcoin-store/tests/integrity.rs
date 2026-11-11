@@ -896,7 +896,7 @@ fn pruned_short_input_skips_the_witness_locator() {
         txstat: &s.txs.txstat,
         input: &s.txs.input,
     };
-    rbitcoin_store::tx_table::repair_class_a_count_skew(stems, true, true).unwrap();
+    rbitcoin_store::tx_table::repair_class_a_count_skew(stems, true, true, None).unwrap();
     drop(disarm);
     assert_eq!(s.txs.count(), 1, "repair stops at the short input");
     assert_eq!(s.txs.input.count(), 1);
@@ -1110,6 +1110,68 @@ fn cleared_tail_range_still_drops_the_sealed_tip() {
     assert!(s.header_txs.has_body(genesis).unwrap());
     assert!(!s.header_txs.has_body(tail).unwrap());
     assert_eq!(s.txs.count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+thread_local! {
+    static SPEND_CUT_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+    static SAW_SPEND_SPAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn snap_spend_span_before_truncate(count: u64) {
+    let dir = SPEND_CUT_DIR.with(|cell| cell.borrow().clone().expect("cut dir"));
+    let bytes = std::fs::read(dir.join("spend.recheck")).expect("span before the truncate");
+    assert_eq!(bytes.len(), 16);
+    let covered = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let old = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    assert!(covered < old);
+    assert_eq!(
+        count, old,
+        "the create locator still names the dropped creates"
+    );
+    SAW_SPEND_SPAN.with(|cell| cell.set(true));
+}
+
+/// The cut span is durable while the locator still names the dropped
+/// creates. A crash after the header pwrite and before this file leaves
+/// the next open with nothing to recheck.
+#[test]
+fn spend_recheck_span_lands_before_the_truncate() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    s.txs.flush().unwrap();
+    let tx_end = on_disk_hwm(&dir.join("txout.body"));
+    let sp_end = on_disk_hwm(&dir.join("spent.body"));
+    let in_end = on_disk_hwm(&dir.join("seqsigwit.body"));
+    connect_coinbase(&s, &write, 1, genesis, parent);
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    let old = s.txs.count();
+    assert!(old > 1);
+    write_hwm(&dir.join("txout.body"), tx_end);
+    write_hwm(&dir.join("spent.body"), sp_end);
+    write_hwm(&dir.join("seqsigwit.body"), in_end);
+    drop(s);
+
+    SPEND_CUT_DIR.with(|cell| *cell.borrow_mut() = Some(dir.clone()));
+    SAW_SPEND_SPAN.with(|cell| cell.set(false));
+    rbitcoin_store::tx_table::set_spend_recheck_before_truncate_for_test(Some(
+        snap_spend_span_before_truncate,
+    ));
+    let s = Store::open_tiny(&dir).unwrap();
+    rbitcoin_store::tx_table::set_spend_recheck_before_truncate_for_test(None);
+    assert!(
+        SAW_SPEND_SPAN.with(|cell| cell.get()),
+        "the truncate hook did not run"
+    );
+    assert_eq!(s.txs.count(), 1);
+    let bytes = std::fs::read(dir.join("spend.recheck")).unwrap();
+    assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 1);
+    assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), old);
+    assert_eq!(s.spend_recheck, vec![(1, old)]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

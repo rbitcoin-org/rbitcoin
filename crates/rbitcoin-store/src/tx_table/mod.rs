@@ -1216,6 +1216,7 @@ pub fn repair_class_a_count_skew(
     stems: ClassASkewStems<'_>,
     prune_seqsigwit_mode: bool,
     input_existed: bool,
+    spend_recheck_dir: Option<&Path>,
 ) -> Result<bool, StoreError> {
     let n_loc = stems.create_loc.count();
     let n_txids = stems.txids.count();
@@ -1255,6 +1256,19 @@ pub fn repair_class_a_count_skew(
         "store: Class A count skew loc={n_loc} seqsigwit.loc={n_seqsigwit_loc} \
          txid.body={n_txids} input={n_input} — truncating to {n}"
     );
+    // Sync the span before the locator header moves. A crash after that
+    // header and before this file reopens with equal counts and forgets
+    // the cut. A crash after the file retries the same span.
+    let dropped_from = n_loc.max(n_txids);
+    if n < dropped_from {
+        if let Some(dir) = spend_recheck_dir {
+            crate::spend_recheck::note_spend_recheck(dir, n, dropped_from)?;
+        }
+    }
+    #[cfg(debug_assertions)]
+    if let Some(hook) = spend_recheck_before_truncate_hook() {
+        hook(stems.create_loc.count());
+    }
     class_a_skew_apply_truncate(
         &stems,
         n,
@@ -1266,6 +1280,24 @@ pub fn repair_class_a_count_skew(
     )?;
     class_a_skew_assert_aligned(&stems, prune_seqsigwit_mode)?;
     Ok(true)
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SPEND_RECHECK_BEFORE_TRUNCATE: std::cell::Cell<Option<fn(u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+fn spend_recheck_before_truncate_hook() -> Option<fn(u64)> {
+    SPEND_RECHECK_BEFORE_TRUNCATE.with(|cell| cell.take())
+}
+
+/// One-shot hook while the create locator still names the dropped prefix.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_spend_recheck_before_truncate_for_test(hook: Option<fn(u64)>) {
+    SPEND_RECHECK_BEFORE_TRUNCATE.with(|cell| cell.set(hook));
 }
 
 fn file_header_behind(file: &crate::file::TableFile) -> bool {
@@ -1604,7 +1636,6 @@ impl TxTable {
             }
         }
         let txstat = crate::txstat::TxStat::open(seqsigwit_dir)?;
-        let creates_before = create_loc.count().max(txids.count());
         let input_existed = seqsigwit_dir.join("input.loc").exists();
         let input = if input_existed {
             crate::input::Input::open(seqsigwit_dir)?
@@ -1628,11 +1659,8 @@ impl TxTable {
             },
             repair_keeps_short_witness,
             input_existed,
+            Some(dir),
         )?;
-        let creates_after = create_loc.count();
-        if creates_after < creates_before {
-            crate::spend_recheck::note_spend_recheck(dir, creates_after, creates_before)?;
-        }
         let witness_named = seqsigwit_loc.count();
         let witness_through = create_loc.count();
         if repair_keeps_short_witness {

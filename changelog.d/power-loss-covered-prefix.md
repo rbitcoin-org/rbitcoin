@@ -7,7 +7,8 @@ Fixed
   probe runs only after that fit, and only when the next row is still inside
   the fitted count. Open shrinks the tip to match,
   then clears `header_txs` ranges past that prefix. A cut that drops
-  creates records `(covered, old]` in `spend.recheck`. A spender number
+  creates syncs `(covered, old]` in `spend.recheck` before the Class A
+  truncate. A spender number
   inside one of those spans counts only when that create's input at the
   stored vin still names the parent and vout. An unstrong orphan at
   that cut does not keep later confirmed blocks, including when those
