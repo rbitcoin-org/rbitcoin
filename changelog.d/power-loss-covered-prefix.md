@@ -8,9 +8,11 @@ Fixed
   the fitted count. Open shrinks the tip to match,
   then clears `header_txs` ranges past that prefix. A cut that drops
   creates syncs `(covered, old]` in `spend.recheck` before the Class A
-  truncate. A spender number
+  truncate. `old` is also the highest `header_txs` range end still past
+  the kept count, noted before those ranges are cleared. A spender number
   inside one of those spans counts only when that create's input at the
-  stored vin still names the parent and vout. An unstrong orphan at
+  stored vin still names the parent and vout. Block validation and the
+  Electrum spend join use that same check. An unstrong orphan at
   that cut does not keep later confirmed blocks, including when those
   ranges were already cleared. A Class C array torn
   mid-record opens at the last whole row.
@@ -27,7 +29,9 @@ Fixed
   inode, before the name is published.
 - **The next block after a torn witness locator keeps its own witness.**
   Open appends an empty witness row for each create a short, non-zero
-  locator did not name. A locator already cut to zero stays empty, so the
+  locator did not name. A witness body that does not cover the last named
+  row is cut back to the last row it still covers before that fill. Open
+  refuses when the body covers no witness row. A locator already cut to zero stays empty, so the
   keep-window rewrite is not handed those rows. A 0-byte prune file with
   a positive locator is only that torn marker, so the following append
   still writes the witness stem. A 0-byte file whose locator is already 0
@@ -76,4 +80,7 @@ Fixed
   shorten an Esplora page. That number also stays out of a height touch,
   a subscription status, and the join create count. With no recheck span,
   that count stays the packed counter. A shard offset past its file rebuilds once. A
+  page read past that file's logical end schedules the same rebuild on either
+  read backend. A history read of a stale slab does not. Repair of that mismatch
+  still does. A
   floor that already matches the count does not.
