@@ -507,8 +507,21 @@ fn seed_rewinds_tip_to_lca_on_heavier_sibling() {
     seed_work_path_from_store(&mut st, &hub);
     assert_eq!(
         hub.tip_hash(),
+        Some(lose.block_hash()),
+        "stored headers alone do not move the tip"
+    );
+    for block in [&win, &ext] {
+        assert!(st.reorg.proofs.wants(&block.block_hash()));
+        assert!(st.reorg.proofs.accept(
+            block.block_hash(),
+            bitcoin::consensus::encode::serialize(block)
+        ));
+    }
+    seed_work_path_from_store(&mut st, &hub);
+    assert_eq!(
+        hub.tip_hash(),
         Some(gen),
-        "must disconnect the loser so the winner is a linear tip+1"
+        "served, it must disconnect the loser so the winner is a linear tip+1"
     );
     assert_eq!(hub.tip_height(), Some(0));
     assert_eq!(st.height_to_hash.get(&1), Some(&win.block_hash()));

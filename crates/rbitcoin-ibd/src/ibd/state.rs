@@ -207,6 +207,9 @@ pub struct IbdWorkState {
     /// Mono ms of last relative-slow disconnect (`0` = never).
     pub relative_slow_last_kick_ms: u64,
     /// Process-local invalid apply marks for most-work reorg (IBD run only).
+    /// Fork blocks a proof still wants. Peer readers pass these on even
+    /// when they were not asked for ([`super::fork_proof`]).
+    pub proof_wanted: super::peer_io::ProofWanted,
     pub reorg: IbdReorgState,
     /// First height ≥ path_lo densify should walk (filled prefix skip).
     pub densify_scan_lo: u32,
@@ -331,6 +334,7 @@ impl IbdWorkState {
             relative_slow_suspect: None,
             relative_slow_last_kick_ms: 0,
             reorg: IbdReorgState::new(),
+            proof_wanted: Default::default(),
             densify_scan_lo: 0,
             assign_path_lo: 0,
             engine_fault_seen: HashSet::new(),
@@ -415,23 +419,13 @@ impl IbdWorkState {
         true
     }
 
-    /// Hashes no seeded path or rewind may run through at node-clock `now`:
-    /// blocks that failed, and the first blocks of withheld chains.
-    pub fn excluded(&self, now: u64) -> Vec<[u8; 32]> {
-        let live_announced = |h: &BlockHash| {
-            self.slots
-                .iter()
-                .any(|s| s.alive && s.chain.announced_hash(h))
-        };
+    /// Hashes no seeded path or rewind may run through: blocks that failed,
+    /// and the first blocks of withheld chains no peer has served since.
+    pub fn excluded(&self) -> Vec<[u8; 32]> {
         self.reorg
             .invalid
             .iter()
-            .chain(
-                self.reorg
-                    .withheld
-                    .excluded(now, live_announced)
-                    .map(|h| h.to_byte_array()),
-            )
+            .chain(self.reorg.withheld.excluded().map(|h| h.to_byte_array()))
             .collect()
     }
 

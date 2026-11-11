@@ -80,10 +80,12 @@ process-resident body cache ([`ibd-memory.md`](../ibd-memory.md)). Core
 keeps the old chain active until the new bodies are on disk. A fix needs
 one of two designs:
 
-- Tip-follow hands a deep heavier header chain to the IBD rewind. This
-  disconnects to the LCA before the new bodies arrive, so the node sits
-  on a lighter chain while it downloads. Bodies that never arrive retire
-  that chain ([115](./115-withheld-heavier-fork.md)).
+- Tip-follow hands a deep heavier header chain to the IBD rewind. IBD
+  disconnects to the LCA only after peers served the fork blocks that
+  out-work the old chain above it, held in RAM up to 64 MiB
+  ([115](./115-withheld-heavier-fork.md)), so it no longer sits on a
+  lighter chain while it downloads. A fork that needs more than that is
+  not proved.
 - Unconnected side bodies are stored on disk. This is a store change.
 
 Both are design decisions, so neither is in this change.

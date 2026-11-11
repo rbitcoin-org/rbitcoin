@@ -8,6 +8,7 @@ mod confirm;
 mod dial;
 mod events;
 mod exit;
+mod fork_proof;
 mod header_walk;
 mod manual_stall;
 mod path;

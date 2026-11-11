@@ -31,10 +31,54 @@ pub fn load_resume_entries(
     }
 }
 
+/// A stored fork set aside until served is a seed candidate again once its
+/// prefix was served.
+fn release_served(st: &mut IbdWorkState) {
+    for root in st.reorg.proofs.proven_roots() {
+        st.reorg.withheld.release(&root);
+    }
+}
+
 pub fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
-    let exclude: Vec<[u8; 32]> = st.excluded(hub.clock.now_secs());
-    let path = load_resume_entries(hub, &exclude);
-    install_resumed_path(st, hub, &path);
+    release_served(st);
+    // A stored fork nobody has served is set aside by the install; seed
+    // again so the confirmed tip's own chain is planted.
+    for _ in 0..2 {
+        let exclude: Vec<[u8; 32]> = st.excluded();
+        let path = load_resume_entries(hub, &exclude);
+        install_resumed_path(st, hub, &path);
+        if st.excluded().len() == exclude.len() {
+            break;
+        }
+    }
+}
+
+/// [`seed_work_path_from_store`] for the header thread: the store walk runs
+/// with `shared` down, and the most-work rewind is left to the caller.
+/// Returns the staged hashes with their header fks.
+pub fn stage_from_store(
+    shared: &std::sync::Mutex<IbdWorkState>,
+    hub: &ChainHub,
+) -> Vec<(BlockHash, rbitcoin_primitives::Fk)> {
+    let mut pairs = Vec::new();
+    for _ in 0..2 {
+        let exclude: Vec<[u8; 32]> = {
+            let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
+            release_served(&mut st);
+            st.excluded()
+        };
+        let path = load_resume_entries(hub, &exclude);
+        pairs.extend(
+            path.iter()
+                .map(|e| (BlockHash::from_byte_array(e.hash), e.header_fk)),
+        );
+        let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
+        stage_resumed_path(&mut st, hub, &path);
+        if st.excluded().len() == exclude.len() {
+            break;
+        }
+    }
+    pairs
 }
 
 pub fn install_resumed_path(
@@ -93,6 +137,10 @@ pub fn install_resume(
         } else if explore_is_sibling_fork && !e.has_body && explore_need.len() < 4 {
             explore_need.push(hash);
         }
+    }
+    if explore_is_sibling_fork && !sibling_served(st, hub, path) {
+        info!("ibd: resume seed keeps the tip: a heavier stored fork has no served blocks");
+        explore_is_sibling_fork = false;
     }
     if explore_is_sibling_fork {
         let explore_tip = path
@@ -161,6 +209,49 @@ pub fn install_resume(
     // The anchor was restored before these rows were queued. Note the linked
     // prefix so script checks turn back off.
     super::header_walk::renote_stored_path(st, hub);
+}
+
+/// A stored fork beside the confirmed chain is rewound onto only when the
+/// prefix that out-works this node's data above its fork point
+/// ([`super::header_walk::proof_need`]) is in Class A, or peers have served
+/// it. Otherwise it is held for proof and set aside like a withheld chain
+/// until then: a header chain nobody serves never moves the tip, also after
+/// a restart.
+fn sibling_served(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    path: &[rbitcoin_query::ResumeWorkEntry],
+) -> bool {
+    let Some(first) = path.first() else {
+        return true;
+    };
+    let lca = BlockHash::from_byte_array(first.prev_hash);
+    let lca_h = first.height.saturating_sub(1);
+    let Ok(parent) = hub.work_through_height(lca_h) else {
+        return false;
+    };
+    let headers: Vec<bitcoin::block::Header> = path
+        .iter()
+        .take(super::fork_proof::MAX_BLOCKS)
+        .map_while(|e| hub.header_of(&BlockHash::from_byte_array(e.hash)))
+        .collect();
+    let Some(need) = super::header_walk::proof_need(st, hub, lca_h, parent, &headers) else {
+        return false;
+    };
+    if need == 0
+        || path.iter().take(need).all(|e| e.has_body)
+        || st.reorg.proofs.is_proven(lca, &headers, need)
+    {
+        return true;
+    }
+    let work = super::header_walk::chain_work_after(parent, &headers);
+    st.reorg
+        .proofs
+        .offer(lca, lca_h, &headers, need, work, None);
+    st.reorg
+        .withheld
+        .retire(BlockHash::from_byte_array(first.hash));
+    false
 }
 
 /// If tip+1 is missing or invalid, plant a known valid sibling/child of tip.

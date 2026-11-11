@@ -951,6 +951,8 @@ fn dial_batch_empty_count_or_book() {
         ctrl: ctrl_tx,
 
         header_fks: rbitcoin_ibd::ibd::peer_io::empty_header_fk_bus(),
+
+        proof_wanted: Default::default(),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1014,6 +1016,7 @@ async fn ibd_dial_refuses_a_discouraged_net() {
         body: body_tx,
         ctrl: ctrl_tx,
         header_fks: rbitcoin_ibd::ibd::peer_io::empty_header_fk_bus(),
+        proof_wanted: Default::default(),
     };
     let result = tokio::time::timeout(
         Duration::from_millis(200),

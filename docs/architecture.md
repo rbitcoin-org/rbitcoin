@@ -153,9 +153,10 @@ blocking pool.
 
 ```text
 # IBD
-headers prove heavier branch
+headers show a heavier branch
+    → peers serve its blocks that out-work ours above the LCA   (fork_proof, RAM)
     → rewind_to_height(LCA)   (DisconnectTip per dropped block)
-    → plant winning hashes as the linear work path
+    → plant winning hashes as the linear work path; served bodies → body queue
     → lookup → load → scripts → write (normal confirm)
 
 # Tip-follow
@@ -181,11 +182,11 @@ tip; re-rank.
 
 | Path | Behavior |
 |------|----------|
-| **IBD** | Up to 1,024 blocks (`REWIND_MAX_DEPTH`) once the confirmed tip has proved minimum chain work. While the header walk is unproved, confirm may follow a second peer's matched headers by 65,536 blocks or 1 GiB of Class A above that match; those caps lift when the walk proves work. While the confirmed tip is still under the floor, even after the header candidate is proved, a rewind may drop 65,536 blocks; the abandoned blocks stay on disk. When headers prove a **strictly heavier** branch, **rewind** the confirmed tip to the LCA (`ChainHub::rewind_to_height`) and plant that branch as the linear work path. The shipped lookup→load→scripts→write pipeline then confirms it — no side-channel gather, no `HELD_CAP` apply, no `accept_branch` of 40 mid bodies. Resume seed does this before confirm starts. BadPrev / competing tip+1 is the same helper (backstop). Work-path slots stay **first-wins and prev-anchored**. Offer will not stamp tip+1 unless `prev ==` store tip. Do **not** `mark_missing` the winning-path hash. `lookup_taken_hi` rewinds to the LCA. |
+| **IBD** | Up to 1,024 blocks (`REWIND_MAX_DEPTH`) once the confirmed tip has proved minimum chain work. While the header walk is unproved, confirm may follow a second peer's matched headers by 65,536 blocks or 1 GiB of Class A above that match; those caps lift when the walk proves work. While the confirmed tip is still under the floor, even after the header candidate is proved, a rewind may drop 65,536 blocks; the abandoned blocks stay on disk. When headers show a **strictly heavier** branch, peers must first serve the shortest prefix of it whose work beats this node's chain with data above the LCA (confirmed blocks, then path bodies already queued): each body is checked against its header (hash, merkle root) and held in RAM (`fork_proof`, 64 MiB across two forks, 1,025 blocks per fork; under the floor the first 1,025 are enough). Only then does the walk take the branch, **rewind** the confirmed tip to the LCA (`ChainHub::rewind_to_height`) and plant it as the linear work path; the served bodies go to the body queue. A branch where this node has no data above the fork point needs no proof. A branch nobody serves never moves the walk, the path or the tip. Its blocks are asked only of the peer that sent it or a peer that announced it; a reader passes such a block on even unrequested, charged to its rate window. The shipped lookup→load→scripts→write pipeline then confirms it — no side-channel gather, no `HELD_CAP` apply, no `accept_branch` of 40 mid bodies. Resume seed does this before confirm starts. BadPrev / competing tip+1 is the same helper (backstop). Work-path slots stay **first-wins and prev-anchored**. Offer will not stamp tip+1 unless `prev ==` store tip. Do **not** `mark_missing` the winning-path hash. `lookup_taken_hi` rewinds to the LCA. |
 | **Tip-follow** | Pending cap 128. Complete bodies: `accept_received_block` → hold by hash → `accept_branch`. |
-| **Resume** | `resume_work_path_after_tip`: child score = subtree header work, then depth; Class A body only tie-breaks. A greater-work sibling **rewinds to the LCA** and becomes the linear path. Body preference alone must never re-elect an archived losing fork. |
+| **Resume** | `resume_work_path_after_tip`: child score = subtree header work, then depth; Class A body only tie-breaks. A greater-work sibling **rewinds to the LCA** and becomes the linear path once the prefix that out-works this node's data is in Class A or served; until then it is held for proof and the confirmed tip's own chain is seeded. Body preference alone must never re-elect an archived losing fork. |
 | **Invalid heavy** | Heavier header path that fails connect does not win; re-rank remaining candidates (may adopt a third valid chain). Invalid marks are **process-local**. |
-| **Withheld heavy** | No live peer has been able to serve the planted path's next block for one stall window (30 s, node clock): none showed it, it answered `notfound`, or it was disconnected; a paused `--connect` peer that showed it still serves. If a live peer's chain is another chain there, retire the candidate at that block like a failed one, without an invalid mark, and seed the path from stored headers without it. For 10 minutes that chain is not seeded, rewound onto, or taken from headers from any address; after that, only once a live peer has announced its first block. A requested body for that block ends the retirement at once. A peer whose record shows another chain at or below a block is never asked for it. Process-local ([115](./external_findings/115-withheld-heavier-fork.md)). |
+| **Withheld heavy** | A candidate the walk took without a fork offer (the first header peer's chain) can still go unserved. When no live peer has been able to serve the planted path's next block for one stall window (30 s, node clock; a paused `--connect` peer that showed it still serves) and a live peer's chain is another chain there, retire the candidate at that block like a failed one, without an invalid mark, and seed the path from stored headers without it. That chain then comes back only through the proof above: no timer and no header record re-admits it. A peer whose record shows another chain at or below a block is never asked for it. Process-local ([115](./external_findings/115-withheld-heavier-fork.md)). |
 
 ```text
 L = current tip, valid, work 100
@@ -197,9 +198,9 @@ Attempt M → fail; the failed block is invalid-marked. Then:
   M's valid prefix at 100 ≤ L → restore L → re-rank → tip = N
 ```
 
-IBD may disconnect on **header work** (losing bodies stay in Class A; the
-winner is confirmed through the pipeline). A winner whose bodies no peer
-serves is retired, and the old chain is confirmed again (Withheld heavy). Tip-follow still gathers bodies
+IBD disconnects for a heavier branch only after peers served the blocks
+that out-work this node's chain above the fork point (losing bodies stay in
+Class A; the winner is confirmed through the pipeline). Tip-follow still gathers bodies
 before `accept_branch`. Orchestration only — never confirm
 lookup/load/scripts/write. Code: `most_work`, `ChainHub::rewind_to_height`,
 `accept_branch`, `ibd::reorg`.

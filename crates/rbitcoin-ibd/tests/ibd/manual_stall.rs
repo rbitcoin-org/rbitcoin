@@ -274,6 +274,7 @@ fn reader_of(st: &IbdWorkState, id: usize) -> (IbdReadCtx, mpsc::UnboundedReceiv
             body: body_tx,
             ctrl: ctrl_tx,
             header_fks: rbitcoin_ibd::ibd::peer_io::empty_header_fk_bus(),
+            proof_wanted: Default::default(),
         },
         requested: std::sync::Arc::clone(&slot.requested),
         solicited_bytes: std::sync::Arc::clone(&slot.solicited_bytes),
@@ -795,6 +796,7 @@ async fn ibd_dial_of_a_connect_target_is_manual() {
         body: body_tx,
         ctrl: ctrl_tx,
         header_fks: rbitcoin_ibd::ibd::peer_io::empty_header_fk_bus(),
+        proof_wanted: Default::default(),
     };
     let clock = rbitcoin_consensus::NodeClock::new();
     for (connect, want, label) in [
@@ -842,4 +844,37 @@ async fn ibd_dial_of_a_connect_target_is_manual() {
     }
     seed.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A fork block a proof wants is passed on even when it was not requested,
+/// still charged to the reader's rate window; any other unrequested block
+/// stays off the coordinator channel.
+#[test]
+fn an_unrequested_block_a_fork_proof_wants_reaches_the_coordinator() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let (slots, _wire) = wired_slots(1);
+    let mut st = IbdWorkState::new(slots, hub.tip_hash(), hub.tip_height());
+    let blocks = real_path(&hub, &mut st);
+    let frame = |b: &bitcoin::Block| FramedMessage {
+        magic: bitcoin::p2p::Magic::from(bitcoin::Network::Regtest),
+        command: *b"block\0\0\0\0\0\0\0",
+        payload: bitcoin::consensus::encode::serialize(b),
+    };
+    let (mut ctx, mut body_rx) = reader_of(&st, 0);
+    assert!(!ctx.handle(Ok(frame(&blocks[0]))));
+    assert!(
+        body_rx.try_recv().is_err(),
+        "an unrequested block is dropped"
+    );
+    ctx.sinks
+        .proof_wanted
+        .lock()
+        .unwrap()
+        .insert(blocks[1].block_hash());
+    assert!(!ctx.handle(Ok(frame(&blocks[1]))));
+    let passed = framed_body(body_rx.try_recv().expect("the wanted block is passed on"));
+    assert_eq!(passed.hash, blocks[1].block_hash());
+    assert!(body_rx.try_recv().is_err());
+    let _ = std::fs::remove_dir_all(dir);
 }

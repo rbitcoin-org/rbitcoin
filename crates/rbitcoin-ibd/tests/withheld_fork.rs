@@ -36,10 +36,17 @@ enum Withhold {
     NotFoundOnce,
     /// Close the connection after the fork headers go out, and stay gone.
     Disconnect,
+    /// Serve the fork's first block, then nothing.
+    ServesFirst,
+    /// Serve the fork's first two blocks, which out-work the confirmed
+    /// chain above the fork point, then close and stay gone.
+    ProvesThenLeaves,
 }
 
 enum Cmd {
     Headers(Vec<Header>),
+    /// Send these bodies unrequested.
+    Blocks(Vec<Block>),
     ReleaseHeld,
     Close,
 }
@@ -64,6 +71,12 @@ struct Peer {
     connects: AtomicUsize,
     getheaders: AtomicUsize,
     refused_once: AtomicBool,
+    /// After its first connection drops it stays gone, as the cooldown on a
+    /// stall-kicked address keeps it out in production.
+    one_connection: AtomicBool,
+    /// First height of this peer's own fork (u32::MAX: none).
+    fork_from: u32,
+    fork_sent: AtomicUsize,
 }
 
 impl Peer {
@@ -91,6 +104,13 @@ impl Peer {
             connects: AtomicUsize::new(0),
             getheaders: AtomicUsize::new(0),
             refused_once: AtomicBool::new(false),
+            one_connection: AtomicBool::new(false),
+            fork_from: match mode {
+                Withhold::ServesFirst => withhold_from.saturating_sub(1),
+                Withhold::ProvesThenLeaves => withhold_from.saturating_sub(2),
+                _ => withhold_from,
+            },
+            fork_sent: AtomicUsize::new(0),
         })
     }
 
@@ -142,12 +162,36 @@ async fn serve_one(
     let mut pending: VecDeque<Block> = VecDeque::new();
     let mut parked: Vec<Block> = Vec::new();
     let mut sends = tokio::time::interval(Duration::from_millis(5));
+    let mut reannounce_at: Option<tokio::time::Instant> = None;
     loop {
         let frame = tokio::select! {
+            _ = tokio::time::sleep_until(reannounce_at.unwrap_or_else(tokio::time::Instant::now)), if reannounce_at.is_some() => {
+                reannounce_at = None;
+                let fork: Vec<Header> = peer.chain.lock().unwrap()[peer.fork_from as usize..]
+                    .iter()
+                    .map(|b| b.header)
+                    .collect();
+                write_v2_msg(&mut writer, NetworkMessage::Headers(fork)).await?;
+                continue;
+            }
             _ = sends.tick(), if !pending.is_empty() => {
                 let block = pending.pop_front().unwrap();
+                let fork_block = {
+                    let chain = peer.chain.lock().unwrap();
+                    chain
+                        .iter()
+                        .position(|b| b.block_hash() == block.block_hash())
+                        .is_some_and(|h| h as u32 >= peer.fork_from)
+                };
                 write_v2_msg(&mut writer, NetworkMessage::Block(block)).await?;
                 peer.bodies.fetch_add(1, Ordering::SeqCst);
+                if fork_block
+                    && peer.fork_sent.fetch_add(1, Ordering::SeqCst) + 1 == 2
+                    && peer.mode == Withhold::ProvesThenLeaves
+                {
+                    peer.gone.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
                 continue;
             }
             _ = peer.notify.notified() => {
@@ -161,6 +205,11 @@ async fn serve_one(
                         Cmd::ReleaseHeld => {
                             peer.hold.store(u32::MAX, Ordering::SeqCst);
                             pending.extend(parked.drain(..));
+                        }
+                        Cmd::Blocks(blocks) => {
+                            for block in blocks {
+                                write_v2_msg(&mut writer, NetworkMessage::Block(block)).await?;
+                            }
                         }
                         Cmd::Close => {
                             peer.gone.store(true, Ordering::SeqCst);
@@ -193,45 +242,7 @@ async fn serve_one(
                 write_v2_msg(&mut writer, NetworkMessage::Headers(headers)).await?;
             }
             NetworkMessage::GetData(inventory) => {
-                let mut missing = Vec::new();
-                for item in inventory {
-                    let (Inventory::Block(hash) | Inventory::WitnessBlock(hash)) = item else {
-                        continue;
-                    };
-                    let found = {
-                        let chain = peer.chain.lock().unwrap();
-                        chain
-                            .iter()
-                            .position(|b| b.block_hash() == *hash)
-                            .map(|h| (h as u32, chain[h].clone()))
-                    };
-                    let Some((height, block)) = found else {
-                        // Core sends nothing for a block it does not have.
-                        peer.unknown_asks.fetch_add(1, Ordering::SeqCst);
-                        continue;
-                    };
-                    let once = peer.mode == Withhold::NotFoundOnce;
-                    if height >= peer.withhold_from
-                        && (!once || !peer.refused_once.swap(true, Ordering::SeqCst))
-                    {
-                        peer.withheld_asks.fetch_add(1, Ordering::SeqCst);
-                        if matches!(
-                            peer.mode,
-                            Withhold::NotFound
-                                | Withhold::NotFoundReannounce
-                                | Withhold::NotFoundOnce
-                        ) {
-                            missing.push(*item);
-                        }
-                        continue;
-                    }
-                    if height == peer.hold.load(Ordering::SeqCst) {
-                        peer.parked.fetch_add(1, Ordering::SeqCst);
-                        parked.push(block);
-                        continue;
-                    }
-                    pending.push_back(block);
-                }
+                let missing = answer_getdata(peer, inventory, &mut pending, &mut parked);
                 if !missing.is_empty() {
                     write_v2_msg(&mut writer, NetworkMessage::NotFound(missing)).await?;
                     if peer.mode == Withhold::NotFoundReannounce {
@@ -245,12 +256,8 @@ async fn serve_one(
                     if peer.mode == Withhold::NotFoundOnce {
                         // It gets the block a little later and announces
                         // its chain again.
-                        let top = peer.chain.lock().unwrap().last().unwrap().header;
-                        let later = Arc::clone(peer);
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                            later.send(Cmd::Headers(vec![top]));
-                        });
+                        reannounce_at =
+                            Some(tokio::time::Instant::now() + Duration::from_millis(200));
                     }
                 }
             }
@@ -262,11 +269,64 @@ async fn serve_one(
     }
 }
 
+/// Queue, park, or refuse each block a getdata names. Returns the hashes to
+/// answer `notfound`.
+fn answer_getdata(
+    peer: &Peer,
+    inventory: &[Inventory],
+    pending: &mut VecDeque<Block>,
+    parked: &mut Vec<Block>,
+) -> Vec<Inventory> {
+    let mut missing = Vec::new();
+    for item in inventory {
+        let (Inventory::Block(hash) | Inventory::WitnessBlock(hash)) = item else {
+            continue;
+        };
+        let found = {
+            let chain = peer.chain.lock().unwrap();
+            chain
+                .iter()
+                .position(|b| b.block_hash() == *hash)
+                .map(|h| (h as u32, chain[h].clone()))
+        };
+        let Some((height, block)) = found else {
+            // Core sends nothing for a block it does not have.
+            peer.unknown_asks.fetch_add(1, Ordering::SeqCst);
+            continue;
+        };
+        let once = peer.mode == Withhold::NotFoundOnce;
+        if height >= peer.withhold_from
+            && (!once || !peer.refused_once.swap(true, Ordering::SeqCst))
+        {
+            peer.withheld_asks.fetch_add(1, Ordering::SeqCst);
+            if matches!(
+                peer.mode,
+                Withhold::NotFound | Withhold::NotFoundReannounce | Withhold::NotFoundOnce
+            ) {
+                missing.push(*item);
+            }
+            continue;
+        }
+        if height == peer.hold.load(Ordering::SeqCst) {
+            peer.parked.fetch_add(1, Ordering::SeqCst);
+            parked.push(block);
+            continue;
+        }
+        pending.push_back(block);
+    }
+    missing
+}
+
 fn spawn_peer(listener: TcpListener, peer: Arc<Peer>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while !peer.gone.load(Ordering::SeqCst) {
             if let Err(e) = serve_one(&listener, &peer).await {
                 eprintln!("{} connection ended: {e}", peer.name);
+            }
+            if peer.one_connection.load(Ordering::SeqCst)
+                && peer.connects.load(Ordering::SeqCst) > 0
+            {
+                peer.gone.store(true, Ordering::SeqCst);
             }
         }
         // Dropping the listener refuses every redial.
@@ -306,8 +366,8 @@ struct Rig {
     trace: Mutex<Vec<(u128, Option<u32>)>>,
     t0: Instant,
     /// While waiting in `reach`, move the node clock one withheld window
-    /// every half second, at most four times, so a retire does not wait out
-    /// real time.
+    /// every half second, so a retire does not wait out real time. Nothing
+    /// re-admits a withheld chain on a timer.
     fast_clock: AtomicBool,
 }
 
@@ -330,21 +390,16 @@ impl Rig {
     ) -> Option<Duration> {
         let start = Instant::now();
         let mut bumped = Instant::now();
-        // A few windows at most, far below a retirement, so one cannot end
-        // inside this wait.
-        let mut bumps = 0;
         while start.elapsed() < budget {
             if self.note() == Some(height) && self.node.hub.tip_hash() == Some(hash) {
                 return Some(start.elapsed());
             }
             if self.fast_clock.load(Ordering::SeqCst)
-                && bumps < 4
                 && bumped.elapsed() >= Duration::from_millis(500)
             {
                 let clock = &self.node.hub.clock;
                 clock.set_mock((clock.now_secs() + WITHHELD_WINDOW_SECS) as i64);
                 bumped = Instant::now();
-                bumps += 1;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -419,7 +474,10 @@ async fn run(shape: Shape, mode: Withhold) -> (bool, String) {
     let rig = start_node(dir).await;
     // A silent withholder is dropped by the real stall floor, and a peer
     // that serves after one notfound must not need a moved clock.
-    let fast = !matches!(mode, Withhold::Silent | Withhold::NotFoundOnce);
+    // A withholder that is the first header peer is a candidate no fork
+    // offer replaces: it is retired one stall window after nobody can serve
+    // its next block, on a node clock this test moves.
+    let fast = matches!(shape, Shape::ForkFromStart);
     rig.fast_clock.store(fast, Ordering::SeqCst);
     let honest_blocks = honest_chain(N);
     let (fork_at, attacker_cap) = match shape {
@@ -439,11 +497,18 @@ async fn run(shape: Shape, mode: Withhold) -> (bool, String) {
         "attacker",
         attacker_blocks.clone(),
         attacker_cap,
-        fork_at + 1,
+        match mode {
+            Withhold::ServesFirst => fork_at + 2,
+            Withhold::ProvesThenLeaves => fork_at + 3,
+            _ => fork_at + 1,
+        },
         mode,
     );
     if matches!(shape, Shape::RewindUnsolicited) {
         honest.hold.store(N, Ordering::SeqCst);
+    }
+    if matches!(shape, Shape::ForkFromStart) {
+        attacker.one_connection.store(true, Ordering::SeqCst);
     }
     let hl = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let al = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -455,10 +520,10 @@ async fn run(shape: Shape, mode: Withhold) -> (bool, String) {
     let mut report = Vec::new();
     let mut reached = false;
     let control = async {
-        let (target_h, target) = if mode == Withhold::NotFoundOnce {
-            (N + 3, attacker_blocks[(N + 3) as usize].block_hash())
-        } else {
-            (N, honest_blocks[N as usize].block_hash())
+        let (target_h, target) = match mode {
+            Withhold::NotFoundOnce => (N + 3, attacker_blocks[(N + 3) as usize].block_hash()),
+            Withhold::ProvesThenLeaves => (N, attacker_blocks[N as usize].block_hash()),
+            _ => (N, honest_blocks[N as usize].block_hash()),
         };
         if matches!(shape, Shape::RewindUnsolicited) {
             let ok = rig
@@ -484,10 +549,28 @@ async fn run(shape: Shape, mode: Withhold) -> (bool, String) {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 attacker.send(Cmd::Close);
             }
-            // The fork headers rewind the tip to the fork point first.
-            let fork_tip = honest_blocks[fork_at as usize].block_hash();
-            let rewound = rig.reach(fork_at, fork_tip, Duration::from_secs(10)).await;
-            report.push(format!("phase1 rewound to the fork point {rewound:?}"));
+            // The fork's blocks are asked for; the tip stays until they
+            // are served.
+            let asked = Instant::now();
+            while attacker.withheld_asks.load(Ordering::SeqCst) == 0
+                && attacker.fork_sent.load(Ordering::SeqCst) < 2
+                && !attacker.gone.load(Ordering::SeqCst)
+                && asked.elapsed() < Duration::from_secs(3)
+            {
+                rig.note();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            report.push(format!(
+                "phase1 fork asked after {:?}, tip={:?}",
+                asked.elapsed(),
+                rig.node.tip_height()
+            ));
+            // A served fork is taken while the honest body is still held,
+            // so catch-up has not finished on the honest chain.
+            if matches!(mode, Withhold::ProvesThenLeaves | Withhold::NotFoundOnce) {
+                let taken = rig.reach(target_h, target, Duration::from_secs(10)).await;
+                report.push(format!("served fork taken {taken:?}"));
+            }
             honest.send(Cmd::ReleaseHeld);
         }
         // The expected tip, held for 500 ms. Fork headers that land after
@@ -541,7 +624,6 @@ async fn run(shape: Shape, mode: Withhold) -> (bool, String) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "waits the real 30 s stall floor; a_withheld_chain_is_retired_after_one_window covers the dropped-peer path"]
 async fn withheld_fork_rewind_silent() {
     let (reached, report) = run(Shape::RewindUnsolicited, Withhold::Silent).await;
     assert!(reached, "IBD did not reach the honest tip\n{report}");
@@ -566,7 +648,6 @@ async fn withheld_fork_rewind_disconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "waits the real 30 s stall floor; a_withheld_chain_is_retired_after_one_window covers the dropped-peer path"]
 async fn withheld_fork_from_start_silent() {
     let (reached, report) = run(Shape::ForkFromStart, Withhold::Silent).await;
     assert!(reached, "IBD did not reach the honest tip\n{report}");
@@ -593,9 +674,9 @@ async fn withheld_fork_extends_honest_tip() {
     assert!(reached, "IBD did not reach the honest tip\n{report}");
 }
 
-/// Rewind the node to N-2 with the rewind shape, stop it while the fork's
-/// headers are stored and its bodies are not, reopen the same store, and run
-/// catch-up again.
+/// Confirm through N-1 with the fork's headers stored and none of its
+/// bodies, stop, reopen the same store, and run catch-up again: the resume
+/// seed must not rewind onto the stored fork.
 async fn run_restart(with_attacker: bool) -> (bool, String) {
     let dir = rbitcoin_store::testutil::TempDir::labeled("withheld-fork-restart").unwrap();
     let rig = start_node(dir).await;
@@ -643,11 +724,21 @@ async fn run_restart(with_attacker: bool) -> (bool, String) {
                     .map(|b| b.header)
                     .collect(),
             ));
-            let fork_tip = honest_blocks[(N - 2) as usize].block_hash();
-            let rewound = rig.reach(N - 2, fork_tip, Duration::from_secs(10)).await;
+            rig.idle(Duration::from_millis(300)).await;
+            // Leave the fork's headers in the store, as tip-follow or an
+            // older node would have, with none of its bodies.
+            let fork_headers: Vec<Header> = attacker_blocks[(N - 1) as usize..]
+                .iter()
+                .map(|b| b.header)
+                .collect();
+            let stored = rig
+                .node
+                .hub
+                .ensure_headers_batch(&fork_headers)
+                .map(|f| f.len());
             honest.send(Cmd::ReleaseHeld);
             report.push(format!(
-                "first run: rewound {rewound:?} tip={:?}",
+                "first run: fork headers stored {stored:?} tip={:?}",
                 rig.node.tip_height()
             ));
             cancel.store(true, Ordering::SeqCst);
@@ -723,4 +814,178 @@ async fn withheld_fork_restart_both_peers() {
         reached,
         "restarted IBD did not reach the honest tip\n{report}"
     );
+}
+
+/// The rewind shape: the node confirms through N-1 with the honest body N
+/// held back, then the attacker announces N-1'..N+3' (fork at N-2) and
+/// withholds every fork body. `then` runs with the node, the peers and both
+/// chains once the attacker's headers are out.
+async fn rewind_scene<F, Fut>(label: &str, then: F) -> String
+where
+    F: FnOnce(Arc<Rig>, Arc<Peer>, Arc<Peer>, Vec<Block>, Vec<Block>) -> Fut,
+    Fut: std::future::Future<Output = Vec<String>>,
+{
+    let dir = rbitcoin_store::testutil::TempDir::labeled(label).unwrap();
+    let rig = Arc::new(start_node(dir).await);
+    let honest_blocks = honest_chain(N);
+    let attacker_blocks = fork_chain(&honest_blocks, N - 2, N + 3);
+    let honest = Peer::new(
+        "honest",
+        honest_blocks.clone(),
+        u32::MAX,
+        u32::MAX,
+        Withhold::Silent,
+    );
+    let attacker = Peer::new(
+        "attacker",
+        attacker_blocks.clone(),
+        N - 2,
+        N - 1,
+        Withhold::Silent,
+    );
+    honest.hold.store(N, Ordering::SeqCst);
+    let hl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let al = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addrs = [hl.local_addr().unwrap(), al.local_addr().unwrap()].map(rbitcoin_net::NetAddr::Ip);
+    let hs = spawn_peer(hl, honest.clone());
+    let at = spawn_peer(al, attacker.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let sync = rbitcoin_ibd::sync_cancellable(&rig.node, &addrs, cfg(), Some(cancel.clone()));
+    let control = async {
+        let mut report = Vec::new();
+        let ok = rig
+            .reach(
+                N - 1,
+                honest_blocks[(N - 1) as usize].block_hash(),
+                Duration::from_secs(30),
+            )
+            .await;
+        report.push(format!("confirmed N-1 {ok:?}"));
+        while honest.parked.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        attacker.header_cap.store(N + 3, Ordering::SeqCst);
+        attacker.send(Cmd::Headers(
+            attacker_blocks[(N - 1) as usize..]
+                .iter()
+                .map(|b| b.header)
+                .collect(),
+        ));
+        report.extend(
+            then(
+                Arc::clone(&rig),
+                Arc::clone(&honest),
+                Arc::clone(&attacker),
+                honest_blocks.clone(),
+                attacker_blocks.clone(),
+            )
+            .await,
+        );
+        report.push(format!("{} | {}", honest.stats(), attacker.stats()));
+        report.push(format!("trace {}", rig.trace()));
+        cancel.store(true, Ordering::SeqCst);
+        report
+    };
+    let (_, report) = tokio::join!(sync, control);
+    hs.abort();
+    at.abort();
+    let Ok(rig) = Arc::try_unwrap(rig) else {
+        panic!("the scene still holds the node");
+    };
+    rig.node.shutdown().await;
+    let report = format!("{label}\n  {}", report.join("\n  "));
+    eprintln!("{report}");
+    report
+}
+
+/// Header records alone never move the tip: long after the attacker's
+/// headers, with the node clock past any hold, the attacker announces its
+/// fork again and the tip stays on the honest chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn withheld_fork_reannounced_much_later_does_not_rewind() {
+    let report = rewind_scene(
+        "withheld-fork-later",
+        |rig, honest, attacker, hb, ab| async move {
+            let mut report = Vec::new();
+            // The fork headers land before the honest body does.
+            rig.idle(Duration::from_secs(1)).await;
+            report.push(format!(
+                "1 s after the fork headers tip={:?}",
+                rig.node.tip_height()
+            ));
+            rig.fast_clock.store(true, Ordering::SeqCst);
+            honest.send(Cmd::ReleaseHeld);
+            let honest_tip = hb[N as usize].block_hash();
+            let got = rig.reach(N, honest_tip, Duration::from_secs(60)).await;
+            report.push(format!("honest tip {got:?}"));
+            let clock = &rig.node.hub.clock;
+            clock.set_mock((clock.now_secs() + 700) as i64);
+            attacker.send(Cmd::Headers(
+                ab[(N - 1) as usize..].iter().map(|b| b.header).collect(),
+            ));
+            rig.idle(Duration::from_millis(1500)).await;
+            report.push(format!(
+                "after +700 s and the re-announce: tip={:?} honest={}",
+                rig.node.tip_height(),
+                rig.node.hub.tip_hash() == Some(honest_tip)
+            ));
+            report.push(if rig.node.hub.tip_hash() == Some(honest_tip) {
+                "STAYED".into()
+            } else {
+                "MOVED".into()
+            });
+            report
+        },
+    )
+    .await;
+    assert!(
+        report.contains("STAYED"),
+        "the fork moved the tip\n{report}"
+    );
+}
+
+/// A peer that has the fork's blocks and sends them unrequested proves the
+/// fork: it out-works the confirmed chain with those blocks, so the tip moves
+/// onto it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unrequested_fork_blocks_prove_the_fork() {
+    let report = rewind_scene(
+        "withheld-fork-pushed",
+        |rig, honest, _attacker, _hb, ab| async move {
+            let mut report = Vec::new();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            honest.send(Cmd::Blocks(ab[(N - 1) as usize..=N as usize].to_vec()));
+            let fork_tip = ab[N as usize].block_hash();
+            let got = rig.reach(N, fork_tip, Duration::from_secs(20)).await;
+            report.push(if got.is_some() {
+                "PROVED".into()
+            } else {
+                format!("not proved, tip={:?}", rig.node.tip_height())
+            });
+            report
+        },
+    )
+    .await;
+    assert!(
+        report.contains("PROVED"),
+        "the pushed fork blocks did not move the tip\n{report}"
+    );
+}
+
+/// A peer that serves the fork's first block and then withholds does not
+/// move the tip: one block does not out-work the confirmed chain above the
+/// fork point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn withheld_fork_after_its_first_block_does_not_rewind() {
+    let (reached, report) = run(Shape::RewindUnsolicited, Withhold::ServesFirst).await;
+    assert!(reached, "IBD did not reach the honest tip\n{report}");
+}
+
+/// A peer that serves the blocks that out-work the confirmed chain and then
+/// leaves still gets its fork taken: the served bodies are held, so the
+/// rewind and confirm do not need it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn served_fork_is_taken_after_its_peer_leaves() {
+    let (reached, report) = run(Shape::RewindUnsolicited, Withhold::ProvesThenLeaves).await;
+    assert!(reached, "IBD did not reach the served fork\n{report}");
 }

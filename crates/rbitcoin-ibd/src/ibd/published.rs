@@ -3,10 +3,7 @@
 
 use super::events::run_header_batch;
 use super::header_walk::{install_origin, load_origin, origin_input, send_getheaders};
-use super::path::{load_resume_entries, stage_resumed_path};
 use super::state::{HeaderCmd, IbdWorkState};
-use bitcoin::hashes::Hash;
-use bitcoin::BlockHash;
 use rbitcoin_net::chain::ChainHub;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -51,19 +48,7 @@ pub fn spawn_header_thread(
                         }
                     }
                     HeaderCmd::Reseed => {
-                        let exclude: Vec<[u8; 32]> = {
-                            let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-                            st.excluded(hub.clock.now_secs())
-                        };
-                        let path = load_resume_entries(hub.as_ref(), &exclude);
-                        let pairs: Vec<(BlockHash, rbitcoin_primitives::Fk)> = path
-                            .iter()
-                            .map(|e| (BlockHash::from_byte_array(e.hash), e.header_fk))
-                            .collect();
-                        {
-                            let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
-                            stage_resumed_path(&mut st, hub.as_ref(), &path);
-                        }
+                        let pairs = super::path::stage_from_store(&shared, hub.as_ref());
                         super::peer_io::publish_header_fks(&header_fks, &pairs);
                         if let Err(e) = super::reorg::rewind_off_coord_lock(
                             &shared,

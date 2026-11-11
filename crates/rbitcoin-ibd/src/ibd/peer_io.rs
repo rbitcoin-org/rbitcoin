@@ -113,6 +113,12 @@ pub fn publish_header_fks(bus: &HeaderFkBus, rows: &[(BlockHash, rbitcoin_primit
     }
 }
 
+/// Fork blocks a proof still wants ([`super::fork_proof`]). A reader passes
+/// one on even when it was not asked for. Only those hashes, at most the
+/// prefixes of [`super::fork_proof::MAX_FORKS`] forks; each body still costs
+/// its bytes in the reader's rate window, as any unrequested body does.
+pub type ProofWanted = Arc<Mutex<std::collections::HashSet<BlockHash>>>;
+
 /// Dual fan-out so body delivery is never stuck behind header floods on one FIFO.
 ///
 /// - **body**: `BlockFramed` / fail / `NotFound` / `Dead` — drain first
@@ -122,6 +128,7 @@ pub struct PeerEventSinks {
     pub body: mpsc::UnboundedSender<PeerEvent>,
     pub ctrl: mpsc::UnboundedSender<PeerEvent>,
     pub header_fks: HeaderFkBus,
+    pub proof_wanted: ProofWanted,
 }
 
 impl PeerEventSinks {
@@ -919,8 +926,26 @@ impl IbdReadCtx {
                         header_fk,
                     });
                     false
+                } else if self.score_overflow(n) {
+                    true
                 } else {
-                    self.score_overflow(n)
+                    // A fork block a proof wants is passed on, charged as
+                    // an unrequested body.
+                    let wanted = self
+                        .sinks
+                        .proof_wanted
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .contains(&hash);
+                    if wanted {
+                        self.sinks.send_body(PeerEvent::BlockFramed {
+                            peer: self.id,
+                            hash,
+                            payload: frame.payload,
+                            header_fk: None,
+                        });
+                    }
+                    false
                 }
             }
             // Re-request when a hash is known but the header bytes are short.

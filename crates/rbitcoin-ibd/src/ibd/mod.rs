@@ -33,6 +33,8 @@ pub mod events;
 #[doc(hidden)]
 pub mod exit;
 #[doc(hidden)]
+pub mod fork_proof;
+#[doc(hidden)]
 pub mod header_walk;
 #[doc(hidden)]
 pub mod path;
@@ -594,10 +596,12 @@ pub async fn ibd_cancellable(
     let (body_tx, mut body_rx) = mpsc::unbounded_channel::<PeerEvent>();
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<PeerEvent>();
     let header_fks = empty_header_fk_bus();
+    let proof_wanted = peer_io::ProofWanted::default();
     let sinks = PeerEventSinks {
         body: body_tx,
         ctrl: ctrl_tx,
         header_fks: Arc::clone(&header_fks),
+        proof_wanted: Arc::clone(&proof_wanted),
     };
 
     // Nested `ibd-net` runtime panicked on SIGINT (`Cannot drop a runtime in an
@@ -726,6 +730,7 @@ pub async fn ibd_cancellable(
     let window = cfg.window;
 
     let mut st = IbdWorkState::new(initial_slots, hub.tip_hash(), hub.tip_height());
+    st.proof_wanted = proof_wanted;
     for hash in hub.invalid_blocks() {
         st.reorg
             .invalid
@@ -1089,6 +1094,7 @@ pub async fn ibd_cancellable(
             // Before dead slots go: a peer dropped this turn for withholding
             // still names the chain it announced.
             header_walk::retire_withheld(st, hub.as_ref());
+            header_walk::advance_fork_proofs(st, hub.as_ref());
             st.slots.retain(|s| s.alive);
             if redial_handle
                 .as_ref()

@@ -565,19 +565,7 @@ pub fn run_header_batch(
     match plan {
         HeaderPlan::Done => {}
         HeaderPlan::Resume => {
-            let exclude: Vec<[u8; 32]> = {
-                let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-                st.excluded(hub.clock.now_secs())
-            };
-            let path = super::path::load_resume_entries(hub, &exclude);
-            let pairs: Vec<(BlockHash, rbitcoin_primitives::Fk)> = path
-                .iter()
-                .map(|e| (BlockHash::from_byte_array(e.hash), e.header_fk))
-                .collect();
-            {
-                let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
-                super::path::stage_resumed_path(&mut st, hub, &path);
-            }
+            let pairs = super::path::stage_from_store(shared, hub);
             super::peer_io::publish_header_fks(bus, &pairs);
             let rewound = match super::reorg::rewind_off_coord_lock(shared, hub, Some(bus)) {
                 Ok(rewound) => rewound,
@@ -856,11 +844,19 @@ pub fn apply_block_framed(
         header_fk,
     } = body;
     let wire_bytes = payload.len();
-    // That block shows a peer serves a withheld chain, also as a late
-    // answer to a withdrawn request. The reader keeps unsolicited bodies
-    // off this channel.
-    if st.reorg.withheld.is_root(&hash) && is_block(&payload, &hash) {
-        st.reorg.withheld.delivered(&hash);
+    // A fork block a proof wants, asked for or passed on unrequested by the
+    // reader: kept by the proof when it is that block, never queued here.
+    if st.reorg.proofs.wants(&hash) {
+        let _ = st
+            .slots
+            .iter_mut()
+            .find(|s| s.id == peer)
+            .map(|s| s.note_answer(&hash));
+        clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+        if st.reorg.proofs.accept(hash, payload) {
+            note_block_rx(&mut st.slots, peer, wire_bytes);
+        }
+        return;
     }
     // Unsolicited wire is not a body we asked for. Drop it before any copy
     // and before it can move this peer's progress clock. An answer to a
@@ -1089,13 +1085,6 @@ fn note_announcement(st: &mut IbdWorkState, peer: usize) {
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
         s.chain.note_announcement();
     }
-}
-
-/// `payload` is the block `hash` names, with the transactions its header
-/// commits to.
-fn is_block(payload: &[u8], hash: &BlockHash) -> bool {
-    bitcoin::consensus::deserialize::<bitcoin::Block>(payload)
-        .is_ok_and(|block| block.block_hash() == *hash && block.check_merkle_root())
 }
 
 pub fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {

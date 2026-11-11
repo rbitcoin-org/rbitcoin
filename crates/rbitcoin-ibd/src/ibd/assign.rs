@@ -203,7 +203,7 @@ pub fn prune_off_path_inflight(st: &mut IbdWorkState) {
         .keys()
         .copied()
         .filter(|h| {
-            if st.ordered_set.contains(h) {
+            if st.ordered_set.contains(h) || st.reorg.proofs.wants(h) {
                 return false;
             }
             if let Some(&ht) = st.hash_height.get(h) {
@@ -240,6 +240,65 @@ pub fn release_off_chain_requests(st: &mut IbdWorkState) {
         .collect();
     if !released.is_empty() {
         super::events::release_requests(st, &released);
+    }
+}
+
+/// Ask for the fork blocks a proof still wants ([`super::fork_proof`]): from
+/// the peer that sent the fork, else from a peer whose chain record
+/// announced that block or the fork's last header. Never from a peer that
+/// did not announce the fork. Outstanding asks reserve the per-hash charge
+/// against [`super::fork_proof::MAX_BYTES`] beside the bodies already held.
+pub fn assign_fork_proofs(st: &mut IbdWorkState) {
+    use super::fork_proof::MAX_BYTES;
+    let wanted = st.reorg.proofs.wanted();
+    if wanted.is_empty() {
+        return;
+    }
+    let now = ibd_mono_ms();
+    let charge = intake_reserve_per_hash(st);
+    let asked = wanted
+        .iter()
+        .filter(|w| st.inflight.contains_key(&w.hash))
+        .count() as u64;
+    let mut reserved = st
+        .reorg
+        .proofs
+        .bytes()
+        .saturating_add(asked.saturating_mul(charge));
+    for w in wanted {
+        if st.inflight.contains_key(&w.hash) {
+            continue;
+        }
+        if reserved.saturating_add(charge) > MAX_BYTES {
+            break;
+        }
+        let announced = |s: &PeerSlot| {
+            s.chain.announced_hash(&w.hash) || w.top.is_some_and(|t| s.chain.announced_hash(&t))
+        };
+        let pick = st
+            .slots
+            .iter()
+            .filter(|s| s.may_take_block(&w.hash, now))
+            .find(|s| Some(s.id) == w.peer)
+            .or_else(|| {
+                st.slots
+                    .iter()
+                    .find(|s| s.may_take_block(&w.hash, now) && announced(s))
+            })
+            .map(|s| s.id);
+        let Some(pid) = pick else {
+            continue;
+        };
+        let Some(idx) = st.slots.iter().position(|s| s.id == pid) else {
+            continue;
+        };
+        st.slots[idx].track_insert(w.hash);
+        st.slots[idx].getdata_wire.queue(1);
+        let _ = st.slots[idx].cmd_tx.send(PeerCmd::GetData {
+            hashes: vec![w.hash],
+        });
+        inflight_add_peer(&mut st.inflight, w.hash, pid);
+        reserved = reserved.saturating_add(charge);
     }
 }
 
