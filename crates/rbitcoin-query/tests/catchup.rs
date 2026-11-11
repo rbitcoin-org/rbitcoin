@@ -595,6 +595,55 @@ fn reused_cut_fk_stays_out_of_windowed_history() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A second lost-tail span is its own record. History still drops a reused
+/// create that sits only in that later span.
+#[test]
+fn later_recheck_span_drops_its_own_reused_create() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-recheck-span");
+    q.enter_direct_index_mode().unwrap();
+    let script_s = [0x51u8, 0xab];
+    let script_o = [0x51u8, 0xee];
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    for (h, spk) in [
+        script_s.as_slice(),
+        script_s.as_slice(),
+        script_o.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fk = connect_spk(&q, h as u32, prev, parent, spk);
+        parent = Some(q.get_header(fk).unwrap().hash);
+        prev = fk;
+    }
+    q.finalize_sh_runs().unwrap();
+    let sh = rbitcoin_store::script_hash(&script_s);
+    q.store
+        .scripthash
+        .put_create_batch_append(&[ScriptHashRecord::from_fk(sh, Fk(3))])
+        .unwrap();
+    let mut mark = [0u8; 32];
+    mark[0..8].copy_from_slice(&0u64.to_le_bytes());
+    mark[8..16].copy_from_slice(&1u64.to_le_bytes());
+    mark[16..24].copy_from_slice(&2u64.to_le_bytes());
+    mark[24..32].copy_from_slice(&3u64.to_le_bytes());
+    std::fs::write(q.store.path().join("scripthash.recheck"), mark).unwrap();
+    let bad = txid_at(2);
+    let hist = q
+        .scripthash_history_filtered(
+            &sh,
+            &rbitcoin_query::HistoryFilter::esplora_chain_page(None),
+        )
+        .unwrap();
+    assert!(
+        hist.rows.iter().all(|row| row.txid != bad),
+        "the later span still returned the reused create: {:?}",
+        hist.rows.iter().map(|row| row.tx_fk).collect::<Vec<_>>()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn snap_recheck_before_watermark(q: &Query) {
     let path = q.store.path().join("scripthash.recheck");
     let bytes = std::fs::read(&path).expect("recheck marker before the watermark moves");

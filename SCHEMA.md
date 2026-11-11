@@ -252,7 +252,7 @@ itself changed.
     scripthash.ovf/NNNNNN[.fuse8][.idx]                  # L0 SHSR pack8
     scripthash.ovf/NNNNNN.mphf|.val|.fuse8               # L1 promoted ovf (at most one)
     scripthash.runs              # leftover catalog (key_len=40); discarded at tip
-    scripthash.recheck           # optional: u64 LE covered ‖ u64 LE old inclusion watermark. History checks creates in (covered, old] against Class A. Length other than 16, or covered >= old, is corrupt. Missing = none
+    scripthash.recheck           # optional: one or more (u64 LE covered ‖ u64 LE old inclusion watermark). History checks creates in each (covered, old] against Class A. Spans are sorted, do not overlap, and a gap stays its own record. Empty, a length that is not a multiple of 16, covered >= old, or an overlap is corrupt. Missing = none
     scripthash.unsorted/keys/NN/  # pass 1 dir of SHKSP01 spills (000000…); merge identity-map fold + one walk to head+multi fuse, unlinks; DONE.keys=SHKEYS02 last_fk marker
     scripthash.unsorted/multi/NN.fuse8  # throwaway fuse8 of 0xFFFF keys for pass 2
     scripthash.unsorted/post/NN/  # pass 2 dir of SHPST01 spills (000000…); pack folds to one map then slot_for_key16 + 2+ body; DONE.post=SHPOST02 last_fk; unlinked after pack

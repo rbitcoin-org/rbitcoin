@@ -56,6 +56,8 @@ Fixed
   file is replaced with the covered count. The packed head stays. A crash
   between those two writes still has the high watermark, so the next start
   tries again. That repair records the cut span before the watermark moves.
+  A later cut that does not meet that span stays its own record. A full
+  rebuild removes the file.
   A later append stores a create at or below the live count when the row
   still ends past that count, and also when the live count has already
   passed the stale end. Creates past the live count drop off the row. The

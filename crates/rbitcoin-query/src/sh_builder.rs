@@ -140,6 +140,7 @@ impl ShRunBuilder {
         self.wipe_catalog_and_seal()?;
         Self::clear_cold_progress_and_hwm(store);
         store.scripthash.reinit_empty_for_cold_materialize()?;
+        rbitcoin_store::scripthash::clear_sh_recheck(store.path())?;
         Ok(())
     }
 

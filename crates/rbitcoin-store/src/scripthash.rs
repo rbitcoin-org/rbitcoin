@@ -173,70 +173,112 @@ pub fn replace_include_hwm(store_dir: &Path, max_create_fk: u64) -> Result<(), S
     crate::file::write_synced_tmp_rename(&p, &max_create_fk.to_le_bytes())
 }
 
-type ShRecheckSpan = Option<(u64, u64)>;
-type ShRecheckMap = HashMap<PathBuf, ShRecheckSpan>;
+type ShRecheckMap = HashMap<PathBuf, Vec<(u64, u64)>>;
 
 fn recheck_cache() -> &'static Mutex<ShRecheckMap> {
     static CACHE: std::sync::OnceLock<Mutex<ShRecheckMap>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn read_sh_recheck(dir: &Path) -> Result<Option<(u64, u64)>, StoreError> {
+fn read_sh_recheck(dir: &Path) -> Result<Vec<(u64, u64)>, StoreError> {
     let path = dir.join(SH_RECHECK_NAME);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(StoreError::io(&path, e)),
     };
-    if bytes.len() != 16 {
+    if bytes.is_empty() || bytes.len() % 16 != 0 {
         return Err(StoreError::Corrupt("scripthash.recheck"));
     }
-    let covered = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let old_hwm = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    if covered >= old_hwm {
-        return Err(StoreError::Corrupt("scripthash.recheck"));
-    }
-    Ok(Some((covered, old_hwm)))
-}
-
-/// Span of create numbers a lost tail may have left on a scripthash row.
-///
-/// Missing file means there is nothing to recheck. The result is cached for
-/// this process so a history lookup does not stat the file every time.
-pub fn sh_recheck_span(dir: &Path) -> Result<Option<(u64, u64)>, StoreError> {
-    {
-        let cache = recheck_cache().lock().unwrap();
-        if let Some(hit) = cache.get(dir) {
-            return Ok(*hit);
+    let mut spans = Vec::with_capacity(bytes.len() / 16);
+    let mut prev_end = 0u64;
+    for chunk in bytes.chunks_exact(16) {
+        let covered = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let old_hwm = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+        if covered >= old_hwm || covered < prev_end {
+            return Err(StoreError::Corrupt("scripthash.recheck"));
         }
+        prev_end = old_hwm;
+        spans.push((covered, old_hwm));
     }
-    let span = read_sh_recheck(dir)?;
-    recheck_cache()
-        .lock()
-        .unwrap()
-        .insert(dir.to_path_buf(), span);
-    Ok(span)
+    Ok(spans)
 }
 
-/// Remember that creates in `(covered, old_hwm]` were indexed and then cut.
-///
-/// A later call widens the span. The hot path does not write this file.
-pub fn note_sh_recheck(dir: &Path, covered: u64, old_hwm: u64) -> Result<(), StoreError> {
-    if old_hwm <= covered {
-        return Ok(());
+fn write_sh_recheck(dir: &Path, spans: &[(u64, u64)]) -> Result<(), StoreError> {
+    let mut bytes = Vec::with_capacity(spans.len() * 16);
+    for &(covered, old_hwm) in spans {
+        bytes.extend_from_slice(&covered.to_le_bytes());
+        bytes.extend_from_slice(&old_hwm.to_le_bytes());
     }
-    let (covered, old_hwm) = match read_sh_recheck(dir)? {
-        Some((prev_covered, prev_hwm)) => (covered.min(prev_covered), old_hwm.max(prev_hwm)),
-        None => (covered, old_hwm),
-    };
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&covered.to_le_bytes());
-    bytes[8..].copy_from_slice(&old_hwm.to_le_bytes());
     crate::file::write_synced_tmp_rename(&dir.join(SH_RECHECK_NAME), &bytes)?;
     recheck_cache()
         .lock()
         .unwrap()
-        .insert(dir.to_path_buf(), Some((covered, old_hwm)));
+        .insert(dir.to_path_buf(), spans.to_vec());
+    Ok(())
+}
+
+/// Overlap and a shared endpoint become one span. A gap stays two spans.
+fn merge_sh_recheck(spans: &mut Vec<(u64, u64)>, covered: u64, old_hwm: u64) {
+    spans.push((covered, old_hwm));
+    spans.sort_by_key(|span| (span.0, span.1));
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+    for (covered, old_hwm) in spans.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            if covered <= last.1 {
+                last.1 = last.1.max(old_hwm);
+                continue;
+            }
+        }
+        merged.push((covered, old_hwm));
+    }
+    *spans = merged;
+}
+
+/// Spans of create numbers a lost tail may have left on a scripthash row.
+///
+/// Missing file means there is nothing to recheck. The result is cached for
+/// this process so a history lookup does not stat the file every time.
+pub fn sh_recheck_spans(dir: &Path) -> Result<Vec<(u64, u64)>, StoreError> {
+    {
+        let cache = recheck_cache().lock().unwrap();
+        if let Some(hit) = cache.get(dir) {
+            return Ok(hit.clone());
+        }
+    }
+    let spans = read_sh_recheck(dir)?;
+    recheck_cache()
+        .lock()
+        .unwrap()
+        .insert(dir.to_path_buf(), spans.clone());
+    Ok(spans)
+}
+
+/// Remember that creates in `(covered, old_hwm]` were indexed and then cut.
+///
+/// A later call merges only when the new span overlaps or touches an older
+/// one. A gap stays its own span. The hot path does not write this file.
+pub fn note_sh_recheck(dir: &Path, covered: u64, old_hwm: u64) -> Result<(), StoreError> {
+    if old_hwm <= covered {
+        return Ok(());
+    }
+    let mut spans = read_sh_recheck(dir)?;
+    merge_sh_recheck(&mut spans, covered, old_hwm);
+    write_sh_recheck(dir, &spans)
+}
+
+/// Drop the recheck file. A full rebuild has no stale rows left to check.
+pub fn clear_sh_recheck(dir: &Path) -> Result<(), StoreError> {
+    let path = dir.join(SH_RECHECK_NAME);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(StoreError::io(&path, e)),
+    }
+    recheck_cache()
+        .lock()
+        .unwrap()
+        .insert(dir.to_path_buf(), Vec::new());
     Ok(())
 }
 
