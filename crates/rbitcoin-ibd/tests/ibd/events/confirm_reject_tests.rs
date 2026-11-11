@@ -2422,10 +2422,11 @@ impl WireRig {
         );
     }
 
-    fn start_engine(&mut self) {
+    /// Start the confirm engine. Returns its stage queue depths.
+    fn start_engine(&mut self) -> std::sync::Arc<rbitcoin_ibd::ibd::confirm::ConfirmQueueDepths> {
         use rbitcoin_ibd::ibd::confirm::spawn_confirm_engine;
         let (ev_tx, ev_rx) = std::sync::mpsc::channel();
-        let (engine, _queues) = spawn_confirm_engine(
+        let (engine, queues) = spawn_confirm_engine(
             std::sync::Arc::clone(&self.hub),
             std::sync::Arc::clone(&self.feed),
             ev_tx,
@@ -2433,6 +2434,7 @@ impl WireRig {
             std::sync::Arc::new(Default::default()),
         );
         self.engine = Some((engine, ev_rx));
+        queues
     }
 
     fn assign(&mut self) {
@@ -3095,6 +3097,95 @@ fn batched_spend_of_a_later_block_is_rejected_alone() {
     assert!(!rig.st.engine_fault_seen.contains(&h1));
     assert!(!rig.st.reorg.invalid.contains(h2.to_byte_array()));
     assert_eq!(rig.hub.tip_height(), Some(t));
+    rig.finish();
+}
+
+/// tip+2 creates P and spends P:0 in the same block; tip+3 spends P:0 again.
+/// Core rejects tip+3 (`bad-txns-inputs-missingorspent`). Write is held behind
+/// tip+1 while tip+2 and tip+3 load as separate batches, so the write stage
+/// merges them. That write rejects and IBD retries one block at a time; tip+3
+/// must still be rejected on top of tip+2.
+#[test]
+fn merged_respend_of_a_same_block_spend_is_rejected_alone() {
+    use bitcoin::{Amount, ScriptBuf};
+    use rbitcoin_consensus::mine_regtest_paying;
+    use std::time::{Duration, Instant};
+
+    let mut rig = WireRig::new("merged-respend", 1);
+    let (t, cbs) = (rig.t, rig.cbs.clone());
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let p = WireRig::spend(cbs[0]);
+    let s1 = WireRig::spend(p.compute_txid());
+    let mut s2 = WireRig::spend(p.compute_txid());
+    s2.output[0].value = Amount::from_sat(48_0000_0000);
+    let b0 = mine_regtest_paying(rig.tip, rig.tip_time + 600, t + 1, spk.clone(), vec![]);
+    let b1 = mine_regtest_paying(
+        b0.block_hash(),
+        rig.tip_time + 1200,
+        t + 2,
+        spk.clone(),
+        vec![p, s1],
+    );
+    let b2 = mine_regtest_paying(b1.block_hash(), rig.tip_time + 1800, t + 3, spk, vec![s2]);
+    let (h1, h2) = (b1.block_hash(), b2.block_hash());
+    let path = [&b0, &b1, &b2];
+    rig.plant(&path);
+    let queues = rig.start_engine();
+    let hub = std::sync::Arc::clone(&rig.hub);
+    let feed = std::sync::Arc::clone(&rig.feed);
+    let commit = hub.query.lock_tip_commit().expect("tip flush");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    for (i, body) in path.iter().enumerate() {
+        rig.give(body);
+        while !feed.holds(t + 1 + i as u32) && feed.epoch() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "load did not claim {}",
+                t + 1 + i as u32
+            );
+            std::thread::yield_now();
+        }
+    }
+    // Write holds tip+1 behind the commit lock until scripts queue tip+2
+    // and tip+3 for it, so the next write drains both.
+    while queues
+        .write_blocks
+        .load(std::sync::atomic::Ordering::Relaxed)
+        < 2
+    {
+        assert!(
+            Instant::now() < deadline,
+            "scripts did not queue tip+2..=tip+3"
+        );
+        std::thread::yield_now();
+    }
+    drop(commit);
+    let rejects = rig.pump(
+        |_, hash| {
+            path.iter()
+                .find(|b| b.block_hash() == hash)
+                .map(|b| (*b).clone())
+                .expect("planted")
+        },
+        |st, hub, _| {
+            st.halt.is_some()
+                || st.reorg.invalid.contains(h2.to_byte_array())
+                || hub.tip_hash() == Some(h2)
+        },
+    );
+    assert!(
+        rejects.iter().any(|r| r.2 > 1),
+        "tip+2 and tip+3 were not written as one batch: {rejects:?}"
+    );
+    assert_eq!(rig.st.halt, None, "{rejects:?}");
+    assert_eq!(
+        rig.hub.tip_hash(),
+        Some(h1),
+        "tip+3 re-spends P:0: tip={:?} rejects={rejects:?} last_err={:?}",
+        rig.hub.tip_height().map(|h| h - t),
+        rig.last_reject_err
+    );
+    assert!(rig.st.reorg.invalid.contains(h2.to_byte_array()));
     rig.finish();
 }
 

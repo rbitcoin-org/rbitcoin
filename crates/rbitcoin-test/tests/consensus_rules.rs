@@ -1063,6 +1063,105 @@ fn respend_of_a_same_block_spend_rejects_in_any_split() {
     }
 }
 
+/// IBD merges load batches into one write. When that write rejects h103,
+/// Class A for 1..=103 stays and IBD retries one block at a time on that
+/// store. Core 31.1 still rejects h103 (`bad-txns-inputs-missingorspent`), and
+/// any later re-spend of P:0. `fill` same-block txs between P and S1 move the
+/// spender fks, so either spender can be the overlay's last entry for P:0.
+#[test]
+fn respend_of_a_same_block_spend_rejects_on_single_block_retry() {
+    let x = pre_bip34_x();
+    let spent = |e: &str| {
+        ["PrevoutSpent", "double spend"]
+            .iter()
+            .any(|w| e.contains(w))
+    };
+    let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+    // (prefix connected before the merged write, load cuts, fill)
+    let runs: &[(usize, &[usize], u64)] = &[
+        (0, &[102], 0),
+        (0, &[54, 102], 0),
+        (0, &[1, 102], 0),
+        (0, &[101, 102], 0),
+        (101, &[102], 0),
+        (101, &[102], 5),
+        (101, &[102], 7),
+        (101, &[102], 21),
+    ];
+    for &(prefix, cuts, fill) in runs {
+        let p = rbitcoin_test::mine::split_anyone_can_spend(
+            x.compute_txid(),
+            0,
+            &[
+                Amount::from_sat(12_0000_0000),
+                Amount::from_sat(11_0000_0000),
+            ],
+        );
+        let mut filler = Vec::new();
+        let mut prev = (p.compute_txid(), 1u32);
+        for i in 0..fill {
+            let t = spend_anyone_can_spend(prev.0, prev.1, Amount::from_sat(10_0000_0000 - i));
+            prev = (t.compute_txid(), 0);
+            filler.push(t);
+        }
+        let chain = repeat_chain(103, &x, &[1], |h| match h {
+            102 => [
+                vec![p.clone()],
+                filler.clone(),
+                vec![spend_of(&p, 1_0000_0000)],
+            ]
+            .concat(),
+            103 => vec![spend_of(&p, 2_0000_0000)],
+            _ => vec![],
+        });
+        let b102 = &chain[101].1;
+        let other103 = rbitcoin_consensus::mine_regtest_paying(
+            b102.block_hash(),
+            b102.header.time + 700,
+            103,
+            op_true.clone(),
+            vec![spend_of(&p, 3_0000_0000)],
+        );
+        for last in [&chain[102].1, &other103] {
+            let run = format!(
+                "prefix {prefix}, cuts {cuts:?}, fill {fill}, h103 {}",
+                last.block_hash()
+            );
+            let (_td, q, mut params) = regtest_q();
+            params.apply_test_activation_height("bip34", 1_000).unwrap();
+            connect_genesis(&q, &params);
+            if prefix > 0 {
+                confirm_wire_run(&q, &params, Milestone::NONE, &chain[..prefix]).unwrap();
+            }
+            let rel: Vec<usize> = cuts.iter().map(|c| c - prefix).collect();
+            let merged = merged_write(&q, &params, &chain[prefix..], &rel);
+            assert!(
+                matches!(&merged, Err(e) if spent(e)),
+                "{run}: merged {merged:?}"
+            );
+            // Blocks below h102 have no spend of P; h102 and h103 retry alone.
+            for part in [&chain[prefix..101], &chain[101..102]] {
+                if part.is_empty() {
+                    continue;
+                }
+                let got = confirm_wire_run(&q, &params, Milestone::NONE, part);
+                assert!(
+                    got.is_ok(),
+                    "{run}: retry to h{}: {got:?}",
+                    part[part.len() - 1].0 .0
+                );
+            }
+            let got =
+                confirm_wire_run(&q, &params, Milestone::NONE, &[(Height(103), last.clone())]);
+            assert!(
+                matches!(&got, Err(e) if spent(&format!("{e:?}"))),
+                "{run}: retry h103 got {got:?}"
+            );
+            assert_eq!(q.tip_height(), Some(Height(102)), "{run}");
+        }
+    }
+}
+
 /// h102 spends X:0 by T and T:0 by U in the same block, h103 mines X again,
 /// h204 repeats T, h205 spends the new T:0. Core 31.1 accepts to 205: the
 /// first T was spent inside its own block.
@@ -1194,15 +1293,26 @@ fn connect_merged(
     load_cuts: &[usize],
     bip34_height: u32,
 ) -> Result<Option<Height>, String> {
-    use rbitcoin_query::{
-        confirm_scripts_phase, confirm_wire_load_phase_pipelined, confirm_write_phase, InFlight,
-        ScriptPreverified, WireLoadPipeline,
-    };
     let (_td, q, mut params) = regtest_q();
     params
         .apply_test_activation_height("bip34", bip34_height)
         .unwrap();
     connect_genesis(&q, &params);
+    merged_write(&q, &params, chain, load_cuts)?;
+    Ok(q.tip_height())
+}
+
+/// [`connect_merged`]'s load, scripts, merge, and one write, on a caller's store.
+fn merged_write(
+    q: &Query,
+    params: &ChainParams,
+    chain: &[(Height, bitcoin::Block)],
+    load_cuts: &[usize],
+) -> Result<(), String> {
+    use rbitcoin_query::{
+        confirm_scripts_phase, confirm_wire_load_phase_pipelined, confirm_write_phase, InFlight,
+        ScriptPreverified, WireLoadPipeline,
+    };
     q.enter_direct_index_mode().unwrap();
     let none = ScriptPreverified::new();
     let mut inflight = InFlight::new();
@@ -1258,9 +1368,9 @@ fn connect_merged(
         });
         lo = hi;
     }
-    confirm_write_phase(&q, &params, Milestone::NONE, merged.expect("one slice"))
+    confirm_write_phase(q, params, Milestone::NONE, merged.expect("one slice"))
         .map_err(|e| format!("write: {e:?}"))?;
-    Ok(q.tip_height())
+    Ok(())
 }
 
 #[test]

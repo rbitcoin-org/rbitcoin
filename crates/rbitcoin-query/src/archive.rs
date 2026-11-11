@@ -722,6 +722,11 @@ impl ArchiveWritePlan {
     ///
     /// Coinbase / external parents are omitted — those slots stay zero until
     /// annotate after tip.
+    ///
+    /// One entry per `vout`: the lowest `spend_fk`, which is the first spender
+    /// in chain order (plans append in height order). A later spender of the
+    /// same output is a double spend that structural rejects, and the
+    /// rejected write keeps this Class A. The slot must still name the first.
     pub fn same_batch_spent_overlay(&self) -> Vec<Vec<(u32, Fk, u32)>> {
         let mut overlay: Vec<Vec<(u32, Fk, u32)>> = vec![Vec::new(); self.packed.len()];
         if overlay.is_empty() {
@@ -743,6 +748,10 @@ impl ArchiveWritePlan {
                 };
                 overlay[i].push((e.vout, e.spend_fk, e.vin));
             }
+        }
+        for row in overlay.iter_mut().filter(|r| r.len() > 1) {
+            row.sort_unstable_by_key(|&(vout, fk, _)| (vout, fk.0));
+            row.dedup_by_key(|&mut (vout, _, _)| vout);
         }
         overlay
     }
