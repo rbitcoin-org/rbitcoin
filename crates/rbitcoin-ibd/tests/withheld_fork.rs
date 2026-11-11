@@ -444,7 +444,13 @@ async fn run(shape: Shape, mode: Withhold) -> (bool, String) {
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut got = None;
         while !reached && Instant::now() < deadline {
-            got = rig.reach(N, honest_tip, deadline.saturating_duration_since(Instant::now())).await;
+            got = rig
+                .reach(
+                    N,
+                    honest_tip,
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .await;
             if got.is_none() {
                 break;
             }
