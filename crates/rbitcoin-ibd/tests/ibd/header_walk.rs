@@ -2896,7 +2896,8 @@ fn a_withheld_chain_is_retired_after_one_window() {
     let (other_peer, _rx1) = slot(1);
     let mut st = IbdWorkState::new(vec![fork_peer, other_peer], Some(gen), Some(0));
     assert!(send_getheaders(&mut st, &hub).unwrap());
-    let f1 = mine(gen, 1);
+    let f1_block = mine_block(gen, 1);
+    let f1 = f1_block.header;
     let f2 = mine(f1.block_hash(), 2);
     apply(&mut st, &hub, 0, vec![f1, f2]);
     assert_eq!(st.height_to_hash.get(&1), Some(&f1.block_hash()));
@@ -2932,20 +2933,32 @@ fn a_withheld_chain_is_retired_after_one_window() {
         refuse_withheld_batch(&mut st, &hub, 1, &[f1, f2]),
         "no address brings it back while it is retired"
     );
-    // A body for that block, answering a request, drops the retirement.
+    // An answer that is not that block does not end the retirement. The
+    // block itself does, also after its request was withdrawn.
+    let deliver = |st: &mut IbdWorkState, payload: Vec<u8>| {
+        rbitcoin_ibd::ibd::events::apply_block_framed(
+            st,
+            &hub,
+            &AtomicU32::new(0),
+            None,
+            rbitcoin_ibd::ibd::events::FramedBody {
+                peer: 1,
+                hash: f1.block_hash(),
+                payload,
+                header_fk: None,
+            },
+        );
+    };
     rbitcoin_ibd::ibd::assign::inflight_add_peer(&mut st.inflight, f1.block_hash(), 1);
-    rbitcoin_ibd::ibd::events::apply_block_framed(
-        &mut st,
-        &hub,
-        &AtomicU32::new(0),
-        None,
-        rbitcoin_ibd::ibd::events::FramedBody {
-            peer: 1,
-            hash: f1.block_hash(),
-            payload: Vec::new(),
-            header_fk: None,
-        },
+    deliver(&mut st, Vec::new());
+    let mut wrong = f1_block.clone();
+    wrong.txdata[0].lock_time = bitcoin::absolute::LockTime::from_consensus(1);
+    deliver(&mut st, bitcoin::consensus::encode::serialize(&wrong));
+    assert!(
+        refuse_withheld_batch(&mut st, &hub, 1, &[f1, f2]),
+        "not that block"
     );
+    deliver(&mut st, bitcoin::consensus::encode::serialize(&f1_block));
     assert!(!refuse_withheld_batch(&mut st, &hub, 1, &[f1, f2]));
 }
 

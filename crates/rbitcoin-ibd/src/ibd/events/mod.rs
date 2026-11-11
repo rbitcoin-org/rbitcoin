@@ -856,6 +856,12 @@ pub fn apply_block_framed(
         header_fk,
     } = body;
     let wire_bytes = payload.len();
+    // That block shows a peer serves a withheld chain, also as a late
+    // answer to a withdrawn request. The reader keeps unsolicited bodies
+    // off this channel.
+    if st.reorg.withheld.is_root(&hash) && is_block(&payload, &hash) {
+        st.reorg.withheld.delivered(&hash);
+    }
     // Unsolicited wire is not a body we asked for. Drop it before any copy
     // and before it can move this peer's progress clock. An answer to a
     // getdata that was withdrawn from this peer is a body, as in Core.
@@ -870,7 +876,6 @@ pub fn apply_block_framed(
     note_block_rx(&mut st.slots, peer, wire_bytes);
     super::assign::note_block_len(st, wire_bytes);
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-    st.reorg.withheld.delivered(&hash);
     if st.body.is_rejected(&hash) || hub.has_block(&hash) {
         return;
     }
@@ -1084,6 +1089,13 @@ fn note_announcement(st: &mut IbdWorkState, peer: usize) {
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
         s.chain.note_announcement();
     }
+}
+
+/// `payload` is the block `hash` names, with the transactions its header
+/// commits to.
+fn is_block(payload: &[u8], hash: &BlockHash) -> bool {
+    bitcoin::consensus::deserialize::<bitcoin::Block>(payload)
+        .is_ok_and(|block| block.block_hash() == *hash && block.check_merkle_root())
 }
 
 pub fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {

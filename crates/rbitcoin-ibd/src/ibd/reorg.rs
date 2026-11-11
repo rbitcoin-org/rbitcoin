@@ -127,7 +127,11 @@ impl Withheld {
             .map(|(h, _)| *h)
     }
 
-    /// A body for `hash` arrived: if it is a root, a peer serves that chain.
+    pub fn is_root(&self, hash: &BlockHash) -> bool {
+        self.roots.contains_key(hash)
+    }
+
+    /// The block `hash` arrived: if it is a root, a peer serves that chain.
     pub fn delivered(&mut self, hash: &BlockHash) {
         if self.roots.remove(hash).is_some() {
             self.order.retain(|r| r != hash);
