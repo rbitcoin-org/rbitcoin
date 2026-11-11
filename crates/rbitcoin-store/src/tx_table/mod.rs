@@ -1222,13 +1222,8 @@ pub fn repair_class_a_count_skew(
     let n_seqsigwit_loc = stems.seqsigwit_loc.count();
     // Fit the body headers before the short-input probe. That probe reads
     // the next seqsigwit row, which is past a header that does not cover it.
-    let skewed = class_a_skew_target_count(
-        n_loc,
-        n_txids,
-        n_seqsigwit_loc,
-        prune_seqsigwit_mode,
-        None,
-    );
+    let skewed =
+        class_a_skew_target_count(n_loc, n_txids, n_seqsigwit_loc, prune_seqsigwit_mode, None);
     let n_target = skewed.unwrap_or(n_loc);
     let (mut n, mut tx_end, mut sp_end, mut in_end) =
         fit_covered_to_body_headers(&stems, n_target, prune_seqsigwit_mode)?;
@@ -1609,6 +1604,7 @@ impl TxTable {
             }
         }
         let txstat = crate::txstat::TxStat::open(seqsigwit_dir)?;
+        let creates_before = create_loc.count().max(txids.count());
         let input_existed = seqsigwit_dir.join("input.loc").exists();
         let input = if input_existed {
             crate::input::Input::open(seqsigwit_dir)?
@@ -1633,6 +1629,10 @@ impl TxTable {
             repair_keeps_short_witness,
             input_existed,
         )?;
+        let creates_after = create_loc.count();
+        if creates_after < creates_before {
+            crate::spend_recheck::note_spend_recheck(dir, creates_after, creates_before)?;
+        }
         let witness_named = seqsigwit_loc.count();
         let witness_through = create_loc.count();
         if repair_keeps_short_witness {

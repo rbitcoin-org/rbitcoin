@@ -241,6 +241,24 @@ impl Input {
         )
     }
 
+    /// One parent edge, or `None` when that input was not stamped.
+    ///
+    /// `NotFound` when `fk` is past the create count.
+    pub fn edge_at(&self, fk: Fk, vin: u32) -> Result<Option<InputEdge>, StoreError> {
+        let Some(n) = self.n_in(fk)? else {
+            return Ok(None);
+        };
+        if vin >= n {
+            return Ok(None);
+        }
+        let id = self.checked_id(fk)?;
+        let abs = self.body_abs(id)?;
+        let mut raw = [0u8; REC_LEN as usize];
+        self.body
+            .read_at(abs + u64::from(vin) * REC_LEN, &mut raw)?;
+        Ok(Some(InputEdge::unpack(raw)?))
+    }
+
     /// Parent edges in vin order. `None` when unstamped.
     pub fn edges(&self, fk: Fk) -> Result<Option<Vec<InputEdge>>, StoreError> {
         let Some(n) = self.n_in(fk)? else {

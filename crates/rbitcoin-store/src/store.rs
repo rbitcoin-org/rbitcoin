@@ -345,6 +345,9 @@ pub struct Store {
     pub utxo_view: crate::sync::atomic::AtomicU64,
     /// One publisher at a time. Overlapping holds would make the stamp look even.
     utxo_publish: std::sync::Mutex<()>,
+    /// Create spans `(covered, old]` a covered-prefix cut dropped.
+    /// A spender fk inside one counts only when its input still names that output.
+    pub spend_recheck: Vec<(u64, u64)>,
     /// Confirm readers wait here while a `--datadir-hdd` write holds the spindle.
     /// Flag off never locks, so [`Self::spindle_wait`] returns immediately.
     pub spindle: Spindle,
@@ -512,6 +515,7 @@ impl Store {
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             utxo_view: crate::sync::atomic::AtomicU64::new(0),
             utxo_publish: std::sync::Mutex::new(()),
+            spend_recheck: Vec::new(),
             spend_marker: std::sync::Mutex::new(()),
             spindle: Spindle::new(),
             datadir_bytes_cache: std::sync::Mutex::new(None),
@@ -565,6 +569,7 @@ impl Store {
             write_seqsigwit_reloc(&path)?;
         }
         let cold_path = layout.is_split().then_some(seqsigwit_dir);
+        let spend_recheck = crate::spend_recheck::read_spend_recheck(&path)?;
         let store = Self {
             headers: HeaderTable::open_with_scale(&path, layout.head_scale)?,
             txs,
@@ -580,6 +585,7 @@ impl Store {
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             utxo_view: crate::sync::atomic::AtomicU64::new(0),
             utxo_publish: std::sync::Mutex::new(()),
+            spend_recheck,
             spend_marker: std::sync::Mutex::new(()),
             spindle: Spindle::new(),
             datadir_bytes_cache: std::sync::Mutex::new(None),
@@ -1518,7 +1524,7 @@ impl Store {
         body_range: Option<(u64, u64)>,
         tip: Option<u32>,
     ) -> Result<bool, StoreError> {
-        let (multi, field, _vin) = match body_range {
+        let (multi, field, vin) = match body_range {
             Some((off, len)) => self.txs.get_output_spender_meta_at(off, len, out_index)?,
             None => self.txs.get_output_spender_meta(create_tx_fk, out_index)?,
         };
@@ -1526,7 +1532,7 @@ impl Store {
             return Ok(false);
         }
         if !multi {
-            return self.is_confirmed_strong_at(field, tip);
+            return self.output_has_confirmed_spender(create_tx_fk, out_index, field, vin, tip);
         }
         let mut found = false;
         point_table::for_each_spender_create(
@@ -1534,8 +1540,14 @@ impl Store {
             &self.spenders,
             create_tx_fk,
             out_index,
-            |spending_tx_fk, _vin| {
-                if self.is_confirmed_strong_at(spending_tx_fk, tip)? {
+            |spending_tx_fk, vin| {
+                if self.output_has_confirmed_spender(
+                    create_tx_fk,
+                    out_index,
+                    spending_tx_fk,
+                    vin,
+                    tip,
+                )? {
                     found = true;
                     return Ok(false);
                 }
@@ -1568,18 +1580,18 @@ impl Store {
             }
         };
         let mut unspent = Vec::with_capacity(metas.len());
-        for (v, multi, field, _vin) in metas {
+        for (v, multi, field, vin) in metas {
             if field.is_null() {
                 unspent.push(v);
                 continue;
             }
             if !multi {
-                if !self.is_confirmed_strong_at(field, tip)? {
+                if !self.output_has_confirmed_spender(create_tx_fk, v, field, vin, tip)? {
                     unspent.push(v);
                 }
                 continue;
             }
-            if !self.has_confirmed_strong_spender_create(create_tx_fk, v, body_range)? {
+            if !self.has_confirmed_strong_spender_create_at(create_tx_fk, v, body_range, tip)? {
                 unspent.push(v);
             }
         }
@@ -1680,8 +1692,14 @@ impl Store {
             &self.spenders,
             create_fk,
             out_index,
-            |spending_tx_fk, _vin| {
-                if self.is_confirmed_strong_at(spending_tx_fk, tip)? {
+            |spending_tx_fk, vin| {
+                if self.output_has_confirmed_spender(
+                    create_fk,
+                    out_index,
+                    spending_tx_fk,
+                    vin,
+                    tip,
+                )? {
                     found = true;
                     return Ok(false);
                 }
@@ -1708,13 +1726,79 @@ impl Store {
         out_index: u32,
         tip: Option<u32>,
     ) -> Result<Vec<PointRecord>, StoreError> {
+        let raw = self.spenders_raw(out_txid, out_index)?;
         let mut out = Vec::new();
-        for rec in self.spenders_raw(out_txid, out_index)? {
-            if self.is_confirmed_strong_at(rec.spending_tx_fk, tip)? {
-                out.push(rec);
+        let mut parent = None;
+        for rec in raw {
+            if !self.is_confirmed_strong_at(rec.spending_tx_fk, tip)? {
+                continue;
             }
+            if self.spend_fk_in_recheck(rec.spending_tx_fk) {
+                if parent.is_none() {
+                    parent = Some(self.get_fk_by_txid_tip(out_txid)?.unwrap_or(Fk::NULL));
+                }
+                let create_fk = parent.unwrap_or(Fk::NULL);
+                if create_fk.is_null()
+                    || !self.reused_spender_still_names(
+                        create_fk,
+                        out_index,
+                        rec.spending_tx_fk,
+                        rec.spending_vin,
+                    )?
+                {
+                    continue;
+                }
+            }
+            out.push(rec);
         }
         Ok(out)
+    }
+
+    fn spend_fk_in_recheck(&self, fk: Fk) -> bool {
+        let Some(id) = fk.get() else {
+            return false;
+        };
+        self.spend_recheck
+            .iter()
+            .any(|&(covered, old)| id > covered && id <= old)
+    }
+
+    /// A strong spender counts. Inside a cut span it also has to name this output.
+    fn output_has_confirmed_spender(
+        &self,
+        parent: Fk,
+        vout: u32,
+        spender: Fk,
+        vin: u32,
+        tip: Option<u32>,
+    ) -> Result<bool, StoreError> {
+        if !self.is_confirmed_strong_at(spender, tip)? {
+            return Ok(false);
+        }
+        self.reused_spender_still_names(parent, vout, spender, vin)
+    }
+
+    /// `true` when this spender is outside every cut span, or its input still
+    /// names `parent`/`vout`. A missing input does not.
+    fn reused_spender_still_names(
+        &self,
+        parent: Fk,
+        vout: u32,
+        spender: Fk,
+        vin: u32,
+    ) -> Result<bool, StoreError> {
+        if !self.spend_fk_in_recheck(spender) {
+            return Ok(true);
+        }
+        let edge = match self.txs.input.edge_at(spender, vin) {
+            Ok(edge) => edge,
+            Err(StoreError::NotFound) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        let Some(edge) = edge else {
+            return Ok(false);
+        };
+        Ok(edge.parent == parent && edge.vout == vout)
     }
 
     /// All annotated spenders on the connected create (including non-strong /

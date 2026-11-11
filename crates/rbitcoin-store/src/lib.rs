@@ -101,6 +101,7 @@ pub mod sp_tweaks_uring;
 pub mod spend_annotate_uring;
 #[doc(hidden)]
 pub mod spend_durable;
+mod spend_recheck;
 #[doc(hidden)]
 pub mod spend_page_log;
 #[doc(hidden)]

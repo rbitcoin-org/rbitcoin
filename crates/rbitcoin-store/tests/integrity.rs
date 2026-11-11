@@ -1113,6 +1113,126 @@ fn cleared_tail_range_still_drops_the_sealed_tip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A cut inside the chain reuses the dropped spender's fk. The parent
+/// slot still names that fk. A different transaction confirmed there
+/// does not make the parent spent. The real spender does, once it confirms.
+#[test]
+fn reused_spender_fk_does_not_spend_the_parent() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent_hash) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    s.txs.flush().unwrap();
+    let tx_end = on_disk_hwm(&dir.join("txout.body"));
+    let sp_end = on_disk_hwm(&dir.join("spent.body"));
+    let in_end = on_disk_hwm(&dir.join("seqsigwit.body"));
+    let parent_tx = Fk(1);
+    let spender = s
+        .put_tx_full_batch_indexed(
+            &[(
+                TxRecord {
+                    txid: [2u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    parent: rbitcoin_store::tx_table::InputParent::Prevout {
+                        create_fk: parent_tx,
+                        vout: 0,
+                    },
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }],
+                vec![OutputRecord::unspent(1, vec![2])],
+            )],
+            false,
+        )
+        .unwrap()[0];
+    assert_eq!(spender, Fk(2));
+    s.put_spend_create(parent_tx, 0, spender, 0).unwrap();
+    let merkle = rbitcoin_primitives::merkle_root_from_txids(&[[2u8; 32]]);
+    let header = hdr_merkle(genesis, parent_hash, 1, merkle);
+    let header_fk = s.put_header(&header).unwrap();
+    s.header_txs
+        .put_range(&write, header_fk, spender, 1)
+        .unwrap();
+    s.strong_tx.set_strong(&write, spender, header_fk).unwrap();
+    s.confirmed.set(&write, Height(1), header_fk).unwrap();
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    write_hwm(&dir.join("txout.body"), tx_end);
+    write_hwm(&dir.join("spent.body"), sp_end);
+    write_hwm(&dir.join("seqsigwit.body"), in_end);
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+    let other = s.put_tx_full_batch_indexed(&[coinbase(9)], false).unwrap()[0];
+    assert_eq!(other, Fk(2));
+    let other_rec = hdr(genesis, parent_hash, 9);
+    let other_hash = other_rec.hash;
+    let other_header = s.put_header(&other_rec).unwrap();
+    s.header_txs
+        .put_range(&write, other_header, other, 1)
+        .unwrap();
+    s.strong_tx.set_strong(&write, other, other_header).unwrap();
+    s.confirmed.set(&write, Height(1), other_header).unwrap();
+    s.rebuild_height_fence().unwrap();
+    assert!(
+        !s.has_confirmed_strong_spender(&[0u8; 32], 0).unwrap(),
+        "a reused fk is not the old spender"
+    );
+    assert_eq!(
+        s.unspent_create_vouts(parent_tx, &[0], None).unwrap(),
+        vec![0]
+    );
+
+    let real = s
+        .put_tx_full_batch_indexed(
+            &[(
+                TxRecord {
+                    txid: [3u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    parent: rbitcoin_store::tx_table::InputParent::Prevout {
+                        create_fk: parent_tx,
+                        vout: 0,
+                    },
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }],
+                vec![OutputRecord::unspent(1, vec![3])],
+            )],
+            false,
+        )
+        .unwrap()[0];
+    s.put_spend_create(parent_tx, 0, real, 0).unwrap();
+    let real_header = s.put_header(&hdr(other_header, other_hash, 3)).unwrap();
+    s.header_txs
+        .put_range(&write, real_header, real, 1)
+        .unwrap();
+    s.strong_tx.set_strong(&write, real, real_header).unwrap();
+    s.confirmed.set(&write, Height(2), real_header).unwrap();
+    s.rebuild_height_fence().unwrap();
+    assert!(s.has_confirmed_strong_spender(&[0u8; 32], 0).unwrap());
+    assert!(s
+        .unspent_create_vouts(parent_tx, &[0], None)
+        .unwrap()
+        .is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Body headers name height 0. Locators and a side header still name the
 /// next create. Open shrinks to height 0, drops both ranges past that
 /// create, and the next append does not keep a second copy of height 0.
