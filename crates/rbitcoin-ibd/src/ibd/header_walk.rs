@@ -1148,10 +1148,12 @@ pub const WITHHELD_WINDOW_SECS: u64 = 30;
 /// is another chain at that height. As in Core, a header chain whose bodies
 /// no peer serves does not hold the tip below one whose bodies are served:
 /// the candidate is retired at that block like a failed one, but the block
-/// is not marked invalid. For [`super::reorg::Withheld::RETIRED_SECS`] that
-/// chain is not seeded, rewound onto, or taken from headers, and the path is
-/// seeded again from the store without it. True when the candidate was
-/// retired.
+/// is not marked invalid. That chain is not seeded, rewound onto, or taken
+/// from headers until peers serve its first blocks
+/// ([`super::fork_proof`]), and the path is seeded again from the store
+/// without it. This is for a candidate the walk took without a fork offer
+/// (the first header peer's chain); a fork offer is proved before it is
+/// taken. True when the candidate was retired.
 pub fn retire_withheld(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
     let now = hub.clock.now_secs();
     let next = hub
