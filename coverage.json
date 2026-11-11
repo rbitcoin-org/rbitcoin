@@ -1,14 +1,14 @@
 {
   "schemaVersion": 1,
   "label": "coverage",
-  "message": "92.11%",
+  "message": "92.12%",
   "color": "brightgreen",
-  "pct": 92.11,
-  "lh": 115173,
+  "pct": 92.12,
+  "lh": 115177,
   "lf": 125033,
   "gate": 91,
   "scope": "production",
-  "sha": "d35b7e811fa7",
+  "sha": "548001ac7722",
   "date": "2026-11-11",
   "crates": [
     {
@@ -19,9 +19,9 @@
     },
     {
       "name": "rbitcoin-consensus",
-      "lh": 6486,
+      "lh": 6490,
       "lf": 6632,
-      "pct": 97.8
+      "pct": 97.86
     },
     {
       "name": "rbitcoin-electrum",
@@ -37,9 +37,9 @@
     },
     {
       "name": "rbitcoin-ibd",
-      "lh": 13684,
+      "lh": 13681,
       "lf": 14780,
-      "pct": 92.58
+      "pct": 92.56
     },
     {
       "name": "rbitcoin-log",
@@ -55,15 +55,15 @@
     },
     {
       "name": "rbitcoin-net",
-      "lh": 25046,
+      "lh": 25045,
       "lf": 26988,
       "pct": 92.8
     },
     {
       "name": "rbitcoin-node",
-      "lh": 5126,
+      "lh": 5128,
       "lf": 6042,
-      "pct": 84.84
+      "pct": 84.87
     },
     {
       "name": "rbitcoin-primitives",
@@ -85,9 +85,9 @@
     },
     {
       "name": "rbitcoin-store",
-      "lh": 25828,
+      "lh": 25830,
       "lf": 28382,
-      "pct": 91.0
+      "pct": 91.01
     },
     {
       "name": "rbitcoin-sv2",
