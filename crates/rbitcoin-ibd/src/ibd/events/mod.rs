@@ -567,7 +567,7 @@ pub fn run_header_batch(
         HeaderPlan::Resume => {
             let exclude: Vec<[u8; 32]> = {
                 let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-                st.reorg.excluded(hub.clock.now_secs()).collect()
+                st.excluded(hub.clock.now_secs())
             };
             let path = super::path::load_resume_entries(hub, &exclude);
             let pairs: Vec<(BlockHash, rbitcoin_primitives::Fk)> = path
@@ -870,6 +870,7 @@ pub fn apply_block_framed(
     note_block_rx(&mut st.slots, peer, wire_bytes);
     super::assign::note_block_len(st, wire_bytes);
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+    st.reorg.withheld.delivered(&hash);
     if st.body.is_rejected(&hash) || hub.has_block(&hash) {
         return;
     }

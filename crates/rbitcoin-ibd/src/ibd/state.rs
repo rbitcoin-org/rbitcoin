@@ -14,6 +14,7 @@
 use super::assign_plan::compact_ordered;
 use super::body::{BodyPresence, BodyPresenceSizes};
 use super::reorg::IbdReorgState;
+use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use rbitcoin_net::NetAddr;
 use rbitcoin_primitives::Fk;
@@ -412,6 +413,26 @@ impl IbdWorkState {
         }
         self.height_to_hash.insert(ht, hash);
         true
+    }
+
+    /// Hashes no seeded path or rewind may run through at node-clock `now`:
+    /// blocks that failed, and the first blocks of withheld chains.
+    pub fn excluded(&self, now: u64) -> Vec<[u8; 32]> {
+        let live_announced = |h: &BlockHash| {
+            self.slots
+                .iter()
+                .any(|s| s.alive && s.chain.announced_hash(h))
+        };
+        self.reorg
+            .invalid
+            .iter()
+            .chain(
+                self.reorg
+                    .withheld
+                    .excluded(now, live_announced)
+                    .map(|h| h.to_byte_array()),
+            )
+            .collect()
     }
 
     pub fn is_on_path(&self, hash: &BlockHash, ht: u32) -> bool {

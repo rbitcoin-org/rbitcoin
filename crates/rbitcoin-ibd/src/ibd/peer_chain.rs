@@ -120,6 +120,12 @@ impl PeerChain {
         self.probed
     }
 
+    /// The peer announced `hash`: it is in the kept run, or it is where
+    /// the peer's chain left this node's.
+    pub fn announced_hash(&self, hash: &BlockHash) -> bool {
+        self.announced.contains(hash) || self.split.is_some_and(|(_, h)| h == *hash)
+    }
+
     /// A rewind left this record stale until the peer answers again.
     pub fn stale(&self) -> bool {
         self.stale_from.is_some()

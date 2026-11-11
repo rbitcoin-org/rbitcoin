@@ -29,8 +29,10 @@ failed one, but it is not marked invalid. A `--connect` peer paused for
 stalling still counts as serving a block it showed. For ten minutes, the
 first stall-kick cooldown, the branch is not seeded, rewound onto, or
 taken from headers, whoever announces it, so a rotation of addresses gets
-one stall window per ten minutes. The download path is seeded again from
-stored headers without it. A peer whose record shows another chain at or
+one stall window per ten minutes. After that it is seeded and rewound onto
+again only once a live peer has announced its first block. A body for that
+block, answering a request, ends the retirement at once. The download path
+is seeded again from stored headers without it. A peer whose record shows another chain at or
 below a block is never asked for it, and a request already sent to it is
 released as if it had answered `notfound`. A peer that refuses a requested
 block twice is not asked for it for one stall window, even if it announces

@@ -2926,16 +2926,32 @@ fn a_withheld_chain_is_retired_after_one_window() {
     at(11 * WITHHELD_WINDOW_SECS);
     assert!(retire_withheld(&mut st, &hub));
     assert_ne!(st.height_to_hash.get(&1), Some(&f1.block_hash()));
-    let excluded: Vec<[u8; 32]> = st.reorg.excluded(hub.clock.now_secs()).collect();
+    let excluded: Vec<[u8; 32]> = st.excluded(hub.clock.now_secs());
     assert!(excluded.contains(&f1.block_hash().to_byte_array()));
     assert!(
         refuse_withheld_batch(&mut st, &hub, 1, &[f1, f2]),
         "no address brings it back while it is retired"
     );
+    // A body for that block, answering a request, drops the retirement.
+    rbitcoin_ibd::ibd::assign::inflight_add_peer(&mut st.inflight, f1.block_hash(), 1);
+    rbitcoin_ibd::ibd::events::apply_block_framed(
+        &mut st,
+        &hub,
+        &AtomicU32::new(0),
+        None,
+        rbitcoin_ibd::ibd::events::FramedBody {
+            peer: 1,
+            hash: f1.block_hash(),
+            payload: Vec::new(),
+            header_fk: None,
+        },
+    );
+    assert!(!refuse_withheld_batch(&mut st, &hub, 1, &[f1, f2]));
 }
 
 /// A retired chain is refused from every address, also as it grows, until
-/// its retirement ends.
+/// its retirement ends. After that it is seeded or rewound onto only once a
+/// live peer announces it, and a delivered body drops it at once.
 #[test]
 fn a_retired_chain_is_refused_until_its_retirement_ends() {
     use rbitcoin_ibd::ibd::reorg::Withheld;
@@ -2950,8 +2966,7 @@ fn a_retired_chain_is_refused_until_its_retirement_ends() {
     let first = mine(gen, 1);
     let second = mine(first.block_hash(), 2);
     let third = mine(second.block_hash(), 3);
-    let excluded =
-        |st: &IbdWorkState| -> Vec<[u8; 32]> { st.reorg.excluded(hub.clock.now_secs()).collect() };
+    let excluded = |st: &IbdWorkState| -> Vec<[u8; 32]> { st.excluded(hub.clock.now_secs()) };
     assert!(
         !refuse_withheld_batch(&mut st, &hub, 0, &[first, second]),
         "nothing is retired yet"
@@ -2968,8 +2983,25 @@ fn a_retired_chain_is_refused_until_its_retirement_ends() {
         .set_mock((now + Withheld::RETIRED_SECS - 1) as i64);
     assert!(refuse_withheld_batch(&mut st, &hub, 1, &[first]));
     hub.clock.set_mock((now + Withheld::RETIRED_SECS) as i64);
-    assert!(excluded(&st).is_empty(), "the retirement ends");
-    assert!(!refuse_withheld_batch(&mut st, &hub, 0, &[third]));
+    assert!(
+        !excluded(&st).is_empty(),
+        "after the retirement it still needs a live peer that announced it"
+    );
+    assert!(!refuse_withheld_batch(&mut st, &hub, 0, &[first, second]));
+    apply(&mut st, &hub, 1, vec![first, second]);
+    assert!(st.slots[1].chain.announced_hash(&first.block_hash()));
+    assert!(excluded(&st).is_empty(), "a live peer announced it");
+
+    st.reorg
+        .withheld
+        .retire(first.block_hash(), now + Withheld::RETIRED_SECS);
+    assert!(refuse_withheld_batch(&mut st, &hub, 0, &[first]));
+    st.reorg.withheld.delivered(&first.block_hash());
+    assert!(
+        excluded(&st).is_empty(),
+        "a body for it drops the retirement"
+    );
+    assert!(!refuse_withheld_batch(&mut st, &hub, 0, &[first]));
 }
 
 /// A long chain on an invalid block stays refused past the cap on

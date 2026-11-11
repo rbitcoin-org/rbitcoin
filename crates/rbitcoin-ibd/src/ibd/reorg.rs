@@ -42,7 +42,9 @@ pub struct IbdReorgState {
 /// by their first block past the fork point, with the node-clock second
 /// they stop being retired. While retired, a chain is not seeded, rewound
 /// onto, or adopted from headers, whoever announces it: a rotation of
-/// addresses gets one stall window per [`Self::RETIRED_SECS`]. Node-clock
+/// addresses gets one stall window per [`Self::RETIRED_SECS`]. After that it
+/// is seeded and rewound onto again only once a live peer has announced its
+/// first block. A body for that block drops the root at once. Node-clock
 /// seconds, so `setmocktime` moves them.
 #[derive(Debug, Default)]
 pub struct Withheld {
@@ -67,10 +69,6 @@ impl Withheld {
 
     /// Retire the chain from `root`.
     pub fn retire(&mut self, root: BlockHash, now: u64) {
-        self.roots.retain(|_, until| *until > now);
-        self.order.retain(|r| self.roots.contains_key(r));
-        self.tips.retain(|_, r| self.roots.contains_key(r));
-        self.tip_order.retain(|t| self.tips.contains_key(t));
         if !self.roots.contains_key(&root) {
             if self.order.len() >= Self::CAP {
                 if let Some(oldest) = self.order.pop_front() {
@@ -116,12 +114,26 @@ impl Withheld {
         true
     }
 
-    /// Roots no seeded path or rewind may run through at `now`.
-    pub fn excluded(&self, now: u64) -> impl Iterator<Item = BlockHash> + '_ {
+    /// Roots no seeded path or rewind may run through at `now`: still
+    /// retired, or retired before and not announced by a live peer since.
+    pub fn excluded<'a>(
+        &'a self,
+        now: u64,
+        live_announced: impl Fn(&BlockHash) -> bool + 'a,
+    ) -> impl Iterator<Item = BlockHash> + 'a {
         self.roots
             .iter()
-            .filter(move |(_, until)| **until > now)
+            .filter(move |(h, until)| **until > now || !live_announced(h))
             .map(|(h, _)| *h)
+    }
+
+    /// A body for `hash` arrived: if it is a root, a peer serves that chain.
+    pub fn delivered(&mut self, hash: &BlockHash) {
+        if self.roots.remove(hash).is_some() {
+            self.order.retain(|r| r != hash);
+            self.tips.retain(|_, r| r != hash);
+            self.tip_order.retain(|t| self.tips.contains_key(t));
+        }
     }
 
     /// The confirmed tip needs `next`, and `unserved` says no live peer may
@@ -201,14 +213,6 @@ impl IbdReorgState {
                 self.explore_tips.push(t);
             }
         }
-    }
-
-    /// Hashes no seeded path or rewind may run through at node-clock `now`:
-    /// blocks that failed, and the first blocks of withheld chains.
-    pub fn excluded(&self, now: u64) -> impl Iterator<Item = [u8; 32]> + '_ {
-        self.invalid
-            .iter()
-            .chain(self.withheld.excluded(now).map(|h| h.to_byte_array()))
     }
 
     pub fn explore_tips(&self) -> &[BlockHash] {
@@ -493,7 +497,7 @@ pub fn heavier_fork_candidates(
     if cands.is_empty() {
         cands.extend(unplanted_walk_tip(st, hub));
     }
-    let invalid: HashSet<[u8; 32]> = st.reorg.excluded(hub.clock.now_secs()).collect();
+    let invalid: HashSet<[u8; 32]> = st.excluded(hub.clock.now_secs()).into_iter().collect();
     Ok((cands, invalid))
 }
 
@@ -632,7 +636,7 @@ pub fn maybe_rewind_to_best_work(
     hub: &ChainHub,
 ) -> Result<bool, NetError> {
     let cands = rewind_candidate_hashes(st, hub)?;
-    let invalid: HashSet<[u8; 32]> = st.reorg.excluded(hub.clock.now_secs()).collect();
+    let invalid: HashSet<[u8; 32]> = st.excluded(hub.clock.now_secs()).into_iter().collect();
     let Some(path) = select_heavier_path(hub, &cands, &invalid)? else {
         return Ok(false);
     };
@@ -946,7 +950,7 @@ pub fn rewind_off_coord_lock(
     let (cands, invalid) = {
         let st = shared.lock().unwrap_or_else(|err| err.into_inner());
         let cands = rewind_candidate_hashes(&st, hub)?;
-        let invalid: HashSet<[u8; 32]> = st.reorg.excluded(hub.clock.now_secs()).collect();
+        let invalid: HashSet<[u8; 32]> = st.excluded(hub.clock.now_secs()).into_iter().collect();
         (cands, invalid)
     };
     let Some(pairs) = apply_off_lock_rewind(shared, hub, &cands, &invalid)? else {
