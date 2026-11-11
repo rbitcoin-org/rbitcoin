@@ -2067,6 +2067,39 @@ fn block_at_height_after_restart_is_the_block_at_that_height() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A disconnect that fails after the store tip dropped still trims the cache
+/// to the store tip, so the block it took off is not "already have".
+#[test]
+fn failed_disconnect_after_the_tip_drops_trims_the_cache() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let mut prev = hub.tip_hash().unwrap();
+    let mut time = hub.tip_header().unwrap().time;
+    for h in 1..=3u32 {
+        time += 1;
+        let b = mine(prev, time, h);
+        prev = b.block_hash();
+        hub.accept_block(b).unwrap();
+    }
+    let top = prev;
+    hub.query
+        .store()
+        .confirmed
+        .set_raw_for_test(&rbitcoin_store::ClassCWrite::for_test(), Height(2), 0)
+        .unwrap();
+    let err = hub.rewind_to_height(1).unwrap_err();
+    assert!(err.to_string().contains("no header"), "{err}");
+    assert_eq!(
+        hub.query.tip_height(),
+        Some(Height(2)),
+        "the store tip dropped"
+    );
+    assert_eq!(hub.cache.tip_height(), Some(2));
+    assert_ne!(hub.tip_hash(), Some(top));
+    assert!(!hub.already_have(top));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn unrequested_header_below_minwork_is_anti_dos() {
     let (dir, hub) = tmp_hub();

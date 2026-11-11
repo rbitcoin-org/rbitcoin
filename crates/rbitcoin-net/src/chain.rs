@@ -4542,17 +4542,20 @@ impl ChainHub {
             if h.0 <= keep_height {
                 break;
             }
-            // Drop the block the store disconnects at `h`, by its own hash.
-            if let Some((_, rec)) = self.query.header_at_height(h).map_err(NetError::store)? {
-                self.confirmed
-                    .write()
-                    .unwrap()
-                    .remove(&BlockHash::from_byte_array(rec.hash));
+            let gone = self.query.header_at_height(h).map_err(NetError::store)?;
+            let res = self.query.disconnect_tip_keep_pending_in_commit();
+            // A failed disconnect can still have lowered the store tip.
+            let now = self.query.tip_height().map_or(0, |t| t.0);
+            if now < h.0 {
+                if let Some((_, rec)) = gone {
+                    self.confirmed
+                        .write()
+                        .unwrap()
+                        .remove(&BlockHash::from_byte_array(rec.hash));
+                }
             }
-            self.query
-                .disconnect_tip_keep_pending_in_commit()
-                .map_err(NetError::store)?;
-            self.cache.truncate_to_height(h.0 - 1);
+            self.cache.truncate_to_height(now);
+            res.map_err(NetError::store)?;
         }
         if let Some(mp) = mp {
             mp.clear_recent_confirmed();
