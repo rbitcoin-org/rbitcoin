@@ -635,6 +635,68 @@ fn reused_cut_fk_stays_out_of_windowed_history() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The same reused create is not a height touch, a subscription status,
+/// or a join-cap create. A create outside the span still counts, including
+/// a pending copy of a real one and a null fk that no span covers.
+#[test]
+fn reused_cut_fk_stays_out_of_touch_and_create_count() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-reused-touch");
+    q.enter_direct_index_mode().unwrap();
+    let script_s = [0x51u8, 0xab];
+    let script_o = [0x51u8, 0xee];
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    for (h, spk) in [
+        script_s.as_slice(),
+        script_s.as_slice(),
+        script_o.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fk = connect_spk(&q, h as u32, prev, parent, spk);
+        parent = Some(q.get_header(fk).unwrap().hash);
+        prev = fk;
+    }
+    q.finalize_sh_runs().unwrap();
+    let sh = rbitcoin_store::script_hash(&script_s);
+    let only = [0x99u8; 32];
+    q.store
+        .scripthash
+        .put_create_batch_append(&[
+            ScriptHashRecord::from_fk(sh, Fk(3)),
+            ScriptHashRecord::from_fk(only, Fk(3)),
+        ])
+        .unwrap();
+    q.sh.ram_head
+        .lock()
+        .unwrap()
+        .insert(sh, vec![Fk(1), Fk(3), Fk(4), Fk::NULL]);
+    let mut mark = [0u8; 16];
+    mark[..8].copy_from_slice(&2u64.to_le_bytes());
+    mark[8..].copy_from_slice(&3u64.to_le_bytes());
+    std::fs::write(q.store.path().join("scripthash.recheck"), mark).unwrap();
+    assert!(
+        q.scripthash_tx_fks_at_height(&sh, Height(2))
+            .unwrap()
+            .is_empty(),
+        "height 2 still reports the reused create"
+    );
+    assert!(!q.scripthash_touched_at_height(&sh, Height(2)).unwrap());
+    let touch = q.block_touch(Height(2)).unwrap();
+    assert!(!q.scripthash_touched_by(&sh, &touch).unwrap());
+    assert!(!q.scripthash_touched_by(&only, &touch).unwrap());
+    assert!(!q.scripthash_has_postings(&only).unwrap());
+    assert_eq!(q.scripthash_create_count(&only).unwrap(), 0);
+    assert!(q.scripthash_has_postings(&sh).unwrap());
+    let at_real = q.scripthash_tx_fks_at_height(&sh, Height(0)).unwrap();
+    assert_eq!(at_real, vec![Fk(1)]);
+    assert!(q.scripthash_touched_at_height(&sh, Height(0)).unwrap());
+    // Durable 1 and 2, plus pending 1, 4, and null. Pending 3 is the cut.
+    assert_eq!(q.scripthash_create_count(&sh).unwrap(), 5);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A second lost-tail span is its own record. History still drops a reused
 /// create that sits only in that later span.
 #[test]

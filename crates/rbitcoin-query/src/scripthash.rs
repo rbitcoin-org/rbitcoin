@@ -1970,9 +1970,16 @@ impl Query {
         scripthash: &[u8; 32],
         height: Height,
     ) -> Result<Vec<Fk>, QueryError> {
+        let suspect = rbitcoin_store::scripthash::sh_recheck_spans(self.store.path())?;
         let entries = self.store.scripthash.create_fks(scripthash)?;
-        let mut posting: Vec<u64> = entries.iter().filter_map(|fk| fk.get()).collect();
-        for fk in self.pending_sh_create_fks(scripthash) {
+        let mut posting = Vec::new();
+        for fk in entries
+            .into_iter()
+            .chain(self.pending_sh_create_fks(scripthash))
+        {
+            if self.reused_cut_fk(scripthash, fk, &suspect)? {
+                continue;
+            }
             if let Some(id) = fk.get() {
                 posting.push(id);
             }
@@ -2041,15 +2048,30 @@ impl Query {
         Ok(BlockTouch { ids })
     }
 
-    /// Whether `scripthash` has any posting at all (durable or pending).
+    /// Whether `scripthash` has any posting a lost-tail span did not cut.
     ///
-    /// The cheap test that lets callers skip [`Self::block_touch`] when no
-    /// subscribed hash could possibly be touched.
+    /// With no span this is any durable or pending fk. The cheap test that
+    /// lets callers skip [`Self::block_touch`] when no subscribed hash could
+    /// possibly be touched.
     pub fn scripthash_has_postings(&self, scripthash: &[u8; 32]) -> Result<bool, QueryError> {
-        if !self.store.scripthash.create_fks(scripthash)?.is_empty() {
-            return Ok(true);
+        let suspect = rbitcoin_store::scripthash::sh_recheck_spans(self.store.path())?;
+        if suspect.is_empty() {
+            if !self.store.scripthash.create_fks(scripthash)?.is_empty() {
+                return Ok(true);
+            }
+            return Ok(!self.pending_sh_create_fks(scripthash).is_empty());
         }
-        Ok(!self.pending_sh_create_fks(scripthash).is_empty())
+        for fk in self.store.scripthash.create_fks(scripthash)? {
+            if !self.reused_cut_fk(scripthash, fk, &suspect)? {
+                return Ok(true);
+            }
+        }
+        for fk in self.pending_sh_create_fks(scripthash) {
+            if !self.reused_cut_fk(scripthash, fk, &suspect)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// [`Self::scripthash_touched_at_height`] against a prebuilt [`BlockTouch`].
@@ -2061,13 +2083,22 @@ impl Query {
         if touch.ids.is_empty() {
             return Ok(false);
         }
+        let suspect = rbitcoin_store::scripthash::sh_recheck_spans(self.store.path())?;
         let entries = self.store.scripthash.create_fks(scripthash)?;
-        let hit = entries
+        for fk in entries
             .iter()
             .chain(self.pending_sh_create_fks(scripthash).iter())
-            .filter_map(|fk| fk.get())
-            .any(|id| touch.ids.contains(&id));
-        Ok(hit)
+        {
+            if self.reused_cut_fk(scripthash, *fk, &suspect)? {
+                continue;
+            }
+            if let Some(id) = fk.get() {
+                if touch.ids.contains(&id) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Confirmed balance for a scripthash.
@@ -2231,10 +2262,29 @@ impl Query {
     }
 
     /// Durable SH create count plus pending write-behind for this key.
+    ///
+    /// A lost-tail span walks the rows and skips a create that no longer
+    /// pays this script. Pending and durable copies of one fk both count.
+    /// With no span this stays the packed counter.
     pub fn scripthash_create_count(&self, scripthash: &[u8; 32]) -> Result<u32, QueryError> {
-        let durable = self.store.scripthash.create_count(scripthash)?;
-        let pending = self.pending_sh_create_fks(scripthash).len() as u32;
-        Ok(durable.saturating_add(pending))
+        let suspect = rbitcoin_store::scripthash::sh_recheck_spans(self.store.path())?;
+        let pending = self.pending_sh_create_fks(scripthash);
+        if suspect.is_empty() {
+            let durable = self.store.scripthash.create_count(scripthash)?;
+            return Ok(durable.saturating_add(pending.len() as u32));
+        }
+        let mut n = 0u32;
+        for fk in self.store.scripthash.create_fks(scripthash)? {
+            if !self.reused_cut_fk(scripthash, fk, &suspect)? {
+                n = n.saturating_add(1);
+            }
+        }
+        for fk in pending {
+            if !self.reused_cut_fk(scripthash, fk, &suspect)? {
+                n = n.saturating_add(1);
+            }
+        }
+        Ok(n)
     }
 
     /// Confirmed chain_stats for Esplora address/scripthash routes.

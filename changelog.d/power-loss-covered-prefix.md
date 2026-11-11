@@ -73,5 +73,7 @@ Fixed
   passed the stale end. Creates past the live count drop off the row. The
   new head is synced before the old slab is freed. A reused cut number that
   no longer pays the script stays out of windowed history and does not
-  shorten an Esplora page. A shard offset past its file rebuilds once. A
+  shorten an Esplora page. That number also stays out of a height touch,
+  a subscription status, and the join create count. With no recheck span,
+  that count stays the packed counter. A shard offset past its file rebuilds once. A
   floor that already matches the count does not.
