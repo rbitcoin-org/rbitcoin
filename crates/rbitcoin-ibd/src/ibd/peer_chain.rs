@@ -3,12 +3,13 @@
 //! Core asks a peer only for blocks on that peer's best known chain
 //! (`pindexBestKnownBlock`). A peer whose announced headers leave the
 //! download path is not asked for blocks above that point, and a peer that
-//! answered `notfound` for a block is not asked for it again for a while.
+//! answered `notfound` for a block is not asked for it again for a while,
+//! or, after a second `notfound`, for the rest of the connection.
 
 use super::state::HeightOccupants;
 use bitcoin::block::Header;
 use bitcoin::BlockHash;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// `notfound` hashes kept per peer. Past the cap a peer may be asked again.
@@ -28,6 +29,13 @@ const PROBE_REFRESH: Duration = Duration::from_secs(10);
 pub struct PeerChain {
     /// `notfound` hashes, with the mono ms they were answered.
     lacks: HashMap<BlockHash, u64>,
+    /// Hashes answered `notfound` at least once, kept across announcements.
+    /// A second `notfound` moves the hash to `refused`.
+    answered_notfound: HashSet<BlockHash>,
+    /// Hashes answered `notfound` twice. The peer is not asked for them
+    /// again on this connection: re-announcing a chain it already showed
+    /// does not reopen a block it keeps refusing.
+    refused: HashSet<BlockHash>,
     /// This peer's announced chain above the confirmed tip, oldest first.
     announced: VecDeque<BlockHash>,
     /// Height of `announced[0]`.
@@ -61,6 +69,12 @@ pub struct PeerChain {
 
 impl PeerChain {
     pub fn note_notfound(&mut self, hash: BlockHash, now_ms: u64) {
+        if !self.answered_notfound.insert(hash) && self.refused.len() < LACKS_CAP {
+            self.refused.insert(hash);
+        }
+        if self.answered_notfound.len() > LACKS_CAP {
+            self.answered_notfound.clear();
+        }
         if self.lacks.len() >= LACKS_CAP {
             self.lacks
                 .retain(|_, at| now_ms.saturating_sub(*at) < LACKS_TTL_MS);
@@ -71,9 +85,11 @@ impl PeerChain {
     }
 
     pub fn lacks(&self, hash: &BlockHash, now_ms: u64) -> bool {
-        self.lacks
-            .get(hash)
-            .is_some_and(|at| now_ms.saturating_sub(*at) < LACKS_TTL_MS)
+        self.refused.contains(hash)
+            || self
+                .lacks
+                .get(hash)
+                .is_some_and(|at| now_ms.saturating_sub(*at) < LACKS_TTL_MS)
     }
 
     /// A headers message or a block inv: the peer may have those blocks now.
@@ -83,6 +99,11 @@ impl PeerChain {
 
     pub fn probed(&self) -> bool {
         self.probed
+    }
+
+    /// A rewind left this record stale until the peer answers again.
+    pub fn stale(&self) -> bool {
+        self.stale_from.is_some()
     }
 
     /// Whether the next probe asks from the confirmed tip.

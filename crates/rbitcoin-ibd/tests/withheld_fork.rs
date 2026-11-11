@@ -27,6 +27,9 @@ enum Withhold {
     Silent,
     /// `notfound` for a withheld block.
     NotFound,
+    /// `notfound`, then an `inv` for the top of the chain it already
+    /// announced, so the refusal looks stale.
+    NotFoundReannounce,
     /// Close the connection after the fork headers go out, and stay gone.
     Disconnect,
 }
@@ -203,7 +206,7 @@ async fn serve_one(
                     };
                     if height >= peer.withhold_from {
                         peer.withheld_asks.fetch_add(1, Ordering::SeqCst);
-                        if peer.mode == Withhold::NotFound {
+                        if matches!(peer.mode, Withhold::NotFound | Withhold::NotFoundReannounce) {
                             missing.push(*item);
                         }
                         continue;
@@ -217,6 +220,10 @@ async fn serve_one(
                 }
                 if !missing.is_empty() {
                     write_v2_msg(&mut writer, NetworkMessage::NotFound(missing)).await?;
+                    if peer.mode == Withhold::NotFoundReannounce {
+                        let top = peer.chain.lock().unwrap().last().unwrap().block_hash();
+                        write_v2_msg(&mut writer, NetworkMessage::Inv(vec![Inventory::Block(top)])).await?;
+                    }
                 }
             }
             NetworkMessage::Ping(nonce) => {
@@ -476,6 +483,12 @@ async fn withheld_fork_rewind_silent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn withheld_fork_rewind_notfound() {
     let (reached, report) = run(Shape::RewindUnsolicited, Withhold::NotFound).await;
+    assert!(reached, "IBD did not reach the honest tip\n{report}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn withheld_fork_rewind_notfound_reannounced() {
+    let (reached, report) = run(Shape::RewindUnsolicited, Withhold::NotFoundReannounce).await;
     assert!(reached, "IBD did not reach the honest tip\n{report}");
 }
 

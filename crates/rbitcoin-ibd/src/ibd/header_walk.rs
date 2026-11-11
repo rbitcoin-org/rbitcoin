@@ -740,9 +740,9 @@ const PROBE_AHEAD: u32 = 4_096;
 /// one that has not announced a chain (Core starts header sync with each
 /// peer), or one whose record no longer decides the next blocks. One probe
 /// at a time, and not a peer with a walk ask open. The reserved header peer,
-/// or a lone peer, is probed only while it has no record, or a rewind left
-/// its record stale: that record says whether a block no other peer serves
-/// is withheld. Its walk replies keep the record fresh otherwise.
+/// or a lone peer, is probed only when a rewind left its record stale or no
+/// live peer has shown the next block: its record then says whether that
+/// block is withheld. Its walk replies keep the record fresh otherwise.
 pub fn probe_unprobed_peer(st: &mut IbdWorkState, hub: &ChainHub) {
     use super::peer_io::PeerSlot;
     let walk = &st.header_walk;
@@ -753,12 +753,13 @@ pub fn probe_unprobed_peer(st: &mut IbdWorkState, hub: &ChainHub) {
     let ahead = tip.saturating_add(PROBE_AHEAD).min(st.max_ordered_height);
     let now = Instant::now();
     let several = st.slots.iter().filter(|s| s.alive).count() >= 2;
+    let unshown = next_unshown(st, hub);
     let due = |s: &PeerSlot| {
-        !s.chain.probed()
-            || (several
-                && walk.reserved != Some(s.id)
-                && ahead > tip
-                && s.chain.needs_refresh(&st.height_to_hash, ahead, now))
+        let header_peer = !several || walk.reserved == Some(s.id);
+        if header_peer {
+            return !s.chain.probed() && (s.chain.stale() || unshown);
+        }
+        !s.chain.probed() || (ahead > tip && s.chain.needs_refresh(&st.height_to_hash, ahead, now))
     };
     let Some(slot) = st
         .slots
@@ -1186,10 +1187,29 @@ fn next_unserved(st: &IbdWorkState, hub: &ChainHub) -> Option<(BlockHash, u32)> 
     {
         return None;
     }
-    let held = st.body.is_rejected(&hash)
-        || st.body.is_pending(&hash)
-        || hub.query.block_queue_has_hash(&hash.to_byte_array());
-    (!held).then_some((hash, height))
+    (!body_held(st, hub, &hash)).then_some((hash, height))
+}
+
+/// The path block after the confirmed tip is needed and no live peer has
+/// shown it.
+fn next_unshown(st: &IbdWorkState, hub: &ChainHub) -> bool {
+    let Some(height) = hub.tip_height().map(|h| h.saturating_add(1)) else {
+        return false;
+    };
+    let Some(hash) = st.height_to_hash.get(&height) else {
+        return false;
+    };
+    let path = &st.height_to_hash;
+    !st.slots
+        .iter()
+        .any(|s| s.alive && s.chain.shows(path, height))
+        && !body_held(st, hub, hash)
+}
+
+fn body_held(st: &IbdWorkState, hub: &ChainHub, hash: &BlockHash) -> bool {
+    st.body.is_rejected(hash)
+        || st.body.is_pending(hash)
+        || hub.query.block_queue_has_hash(&hash.to_byte_array())
 }
 
 pub fn refuse_withheld_batch(st: &mut IbdWorkState, peer: usize, headers: &[Header]) -> bool {
