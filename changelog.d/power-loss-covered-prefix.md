@@ -60,7 +60,10 @@ Fixed
 - **Scripthash inclusion stays inside the covered create count.** A watermark
   just above that count unlinks the tail when the outputs are still there.
   When those outputs are already gone, the seal falls first and the watermark
-  file is replaced with the covered count. The packed head stays. A crash
+  file is replaced with the covered count. A missing include file copies
+  SEAL into that watermark before the check, so a seal within a million
+  creates of the stem unlinks on this open. A seal farther ahead stays.
+  The packed head stays. A crash
   between those two writes still has the high watermark, so the next start
   tries again. That repair records the cut span before the watermark moves.
   A later cut that does not meet that span stays its own record. A full

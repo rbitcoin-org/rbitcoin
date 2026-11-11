@@ -343,6 +343,19 @@ impl Query {
         let rebuild = self.sh_force_rebuild()
             || rbitcoin_store::scripthash::sh_rebuild_marked(self.store.path())
             || self.store.scripthash.shard_offset_past_file()?;
+        // A legacy head keeps the floor in SEAL. Copy it before the
+        // lost-tail check so a seal within a million creates unlinks on
+        // this open. A seal farther ahead is not that tail.
+        if !rebuild
+            && self.sh_use_writebehind()
+            && self.store.scripthash.unsealed_main_shards().is_empty()
+        {
+            self.sh_run.refresh_seal();
+            let seal = self.sh_run.sealed_max_create_fk();
+            if self.store.scripthash.include_hwm() == 0 && seal > 0 {
+                self.store.scripthash.note_include_hwm(seal)?;
+            }
+        }
         if !rebuild
             && Self::sh_lost_tail(self.store.scripthash.include_hwm(), self.store.txs.count())
         {
@@ -361,12 +374,6 @@ impl Query {
                         "node: scripthash durable head — discarding {residual} leftover run(s); \
                      gap uses write-behind (no Class A recollect / WarmOnly)"
                     );
-                }
-                // Legacy head without include_hwm: SEAL is the inclusion floor.
-                self.sh_run.refresh_seal();
-                let seal = self.sh_run.sealed_max_create_fk();
-                if self.store.scripthash.include_hwm() == 0 && seal > 0 {
-                    self.store.scripthash.note_include_hwm(seal)?;
                 }
                 self.sync_sh_seal_from_include_hwm()?;
                 if self.sh_is_tip_ready() {

@@ -151,6 +151,46 @@ fn finalize_sh_runs_durable_head_missing_hwm_keeps_seal() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A legacy head has no include file. A SEAL within a million creates of
+/// the stem is the lost tail, and this open unlinks it. The next restart
+/// is not what records the span.
+#[test]
+fn missing_hwm_unlinks_a_nearby_seal_on_this_open() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-seal-tail");
+    q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    let old = q.store.scripthash.include_hwm();
+    assert!(old > 1);
+    assert!(old - 1 <= 1_000_000);
+    q.sh_run.refresh_seal();
+    assert_eq!(q.sh_run.sealed_max_create_fk(), old);
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(1, end).unwrap();
+    assert_eq!(q.store.txs.count(), 1);
+    std::fs::remove_file(dir.join(rbitcoin_store::INCLUDE_HWM_NAME)).unwrap();
+    assert_eq!(q.store.scripthash.include_hwm(), 0);
+    let cut = rbitcoin_store::script_hash(&[0x51, 1]);
+    let before = q.store.scripthash.entries(&cut).unwrap();
+    assert!(
+        before.iter().any(|(fk, _)| fk.0 > 1),
+        "tail create must be indexed before repair: {before:?}"
+    );
+    q.finalize_sh_runs().unwrap();
+    let after = q.store.scripthash.entries(&cut).unwrap();
+    assert!(
+        after.iter().all(|(fk, _)| fk.0 <= 1),
+        "this open left a create past the stem: {after:?}"
+    );
+    assert_eq!(q.store.scripthash.include_hwm(), 1);
+    assert!(q.sh_run.sealed_max_create_fk() <= 1);
+    assert!(q.sh_is_tip_ready());
+    let bytes = std::fs::read(dir.join("scripthash.recheck")).unwrap();
+    assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 1);
+    assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), old);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `include_hwm` above the create count is not tip-ready. Open drops that
 /// tail with the disconnect unlink. A second open does not rebuild.
 #[test]
