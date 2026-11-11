@@ -746,12 +746,15 @@ impl ArchiveWritePlan {
                 let Some(&i) = idx.get(&cid) else {
                     continue;
                 };
-                overlay[i].push((e.vout, e.spend_fk, e.vin));
+                let row = &mut overlay[i];
+                if let Some(pos) = row.iter().position(|&(v, _, _)| v == e.vout) {
+                    if e.spend_fk.0 < row[pos].1 .0 {
+                        row[pos] = (e.vout, e.spend_fk, e.vin);
+                    }
+                    continue;
+                }
+                row.push((e.vout, e.spend_fk, e.vin));
             }
-        }
-        for row in overlay.iter_mut().filter(|r| r.len() > 1) {
-            row.sort_unstable_by_key(|&(vout, fk, _)| (vout, fk.0));
-            row.dedup_by_key(|&mut (vout, _, _)| vout);
         }
         overlay
     }
