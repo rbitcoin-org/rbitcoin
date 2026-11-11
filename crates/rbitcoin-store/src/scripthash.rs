@@ -888,14 +888,14 @@ pub fn read_sh_page_bytes(body: &TableFile, off: u64, buf: &mut [u8]) -> Result<
     if buf.is_empty() {
         return Ok(());
     }
+    let end = off.saturating_add(buf.len() as u64);
+    if end > body.logical_len() {
+        note_sh_framing_near(body);
+        return Err(StoreError::Corrupt("pread past logical end"));
+    }
     match crate::io_backend::read_io_backend() {
         ReadIoBackend::Pread => body.pread_at(off, buf),
         ReadIoBackend::Uring => {
-            let end = off.saturating_add(buf.len() as u64);
-            if end > body.logical_len() {
-                note_sh_framing_near(body);
-                return Err(StoreError::Corrupt("pread past logical end"));
-            }
             use crate::bulk_io::{self, ReadOp};
             let fd = body.read_fd();
             let mut ops = [ReadOp {

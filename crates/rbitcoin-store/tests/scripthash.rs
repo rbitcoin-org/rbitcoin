@@ -689,6 +689,84 @@ fn page_append_preserves_prefix_and_order() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A history read can hold the head from before an in-place append.
+/// That mismatch is not a framing fault, so it does not schedule a rebuild.
+/// Repair of the same mismatch still does.
+#[test]
+fn stale_slab_read_does_not_mark_rebuild() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0x11]);
+    let first: Vec<_> = (1..=5u32).map(|v| rec(sh, u64::from(v), v)).collect();
+    t.put_create_batch_append(&first).unwrap();
+    let stale = t.head_value(&sh).unwrap().unwrap();
+    let home = t.key_home(&sh).unwrap();
+    let more: Vec<_> = (6..=7u32).map(|v| rec(sh, u64::from(v), v)).collect();
+    t.put_create_batch_append(&more).unwrap();
+    let err = t
+        .collect_entries_from(t.body_for(&sh, home), &stale)
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt(msg) if msg.contains("slab used")),
+        "{err}"
+    );
+    assert!(
+        !sh_rebuild_marked(&dir),
+        "a stale history read must not schedule scripthash.rebuild"
+    );
+
+    let (class, off, used) = match t.head_value(&sh).unwrap().unwrap() {
+        ShHeadValue::Slab { class, off, used } => (class, off, used),
+        other => panic!("expected slab, got {other:?}"),
+    };
+    assert!(used > 1);
+    t.apply_head_upserts(
+        &[(
+            sh,
+            ShHeadValue::Slab {
+                class,
+                off,
+                used: used - 1,
+            },
+            home,
+        )],
+        false,
+    )
+    .unwrap();
+    let again = rec(sh, 3, 3);
+    let err = t
+        .put_create_batch_append_through(std::slice::from_ref(&again), 4)
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt(msg) if msg.contains("slab used")),
+        "{err}"
+    );
+    assert!(
+        sh_rebuild_marked(&dir),
+        "repair of a stale slab still schedules scripthash.rebuild"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A page read past the logical end is a framing fault on either backend.
+#[test]
+fn page_read_past_logical_end_marks_rebuild() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let body = t.ovf_file();
+    let mut buf = [0u8; 16];
+    let err = read_sh_page_bytes(body, body.logical_len(), &mut buf).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt("pread past logical end")),
+        "{err}"
+    );
+    assert!(
+        sh_rebuild_marked(&dir),
+        "a past-end page read must schedule scripthash.rebuild"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn extent_span_over_cap_still_unlinks() {
     let dir = tmp();
