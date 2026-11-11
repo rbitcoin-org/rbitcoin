@@ -20,26 +20,25 @@ stays in the block index and is never a candidate tip until its data is
 complete (`FindMostWorkChain`, `BLOCK_HAVE_DATA`), and a peer is asked
 only for blocks on its own best known chain.
 
-**Fix:** IBD keeps rewinding on header work. When the confirmed tip has
-needed the planted branch's next block for one stall window (30 s on the
-node clock) and no live peer may serve it (no peer showed it, the one that
-did answered `notfound`, or it was disconnected), while a live peer's
-chain is another chain at that height, the branch is retired at that
-block like a failed one, but it is not marked invalid. A `--connect` peer
-paused for stalling still counts as serving a block it showed. The
-download path is seeded again from stored headers without the branch for
-ten minutes, the first stall-kick cooldown. The addresses that announced
-it are not believed about it for that long. Another address that
-announces it reopens it without clearing those marks, and a retire past
-the cap drops only the oldest chain. A peer whose record shows another
-chain at or below a block is never asked for it, and a request already
-sent to it is released as if it had answered `notfound`. A peer that
-refuses a requested block twice is not asked for it for one stall window,
-even if it announces its chain again. The reserved header peer, or a lone
-peer, is probed when a rewind left its record stale or no peer has shown
-the next block, so its record can say which chain it is on.
+**Fix:** IBD keeps rewinding on header work. When no live peer has been
+able to serve the planted branch's next block for one stall window (30 s
+on the node clock) — no peer showed it, the one that did answered
+`notfound`, or it was disconnected — while a live peer's chain is
+another chain at that height, the branch is retired at that block like a
+failed one, but it is not marked invalid. A `--connect` peer paused for
+stalling still counts as serving a block it showed. For ten minutes, the
+first stall-kick cooldown, the branch is not seeded, rewound onto, or
+taken from headers, whoever announces it, so a rotation of addresses gets
+one stall window per ten minutes. The download path is seeded again from
+stored headers without it. A peer whose record shows another chain at or
+below a block is never asked for it, and a request already sent to it is
+released as if it had answered `notfound`. A peer that refuses a requested
+block twice is not asked for it for one stall window, even if it announces
+its chain again. The reserved header peer, or a lone peer, is probed when
+a rewind left its record stale or no peer has shown the next block, so its
+record can say which chain it is on.
 
-Restart keeps no withheld mark. A restart that reseeds the stored fork
+A retired chain is process-local. A restart that reseeds the stored fork
 retires it again one window after a peer's record shows its own chain.
 
 **Regression:** `rbitcoin-ibd` `withheld_fork::withheld_fork_rewind_notfound`,
@@ -49,7 +48,7 @@ retires it again one window after a peer's record shows its own chain.
 fork that only extends the honest tip is still harmless),
 `heavier_fork_served_after_one_notfound_is_adopted`,
 `ibd::header_walk::a_withheld_chain_is_retired_after_one_window`,
-`a_withheld_chain_is_refused_only_from_its_announcer`,
+`a_retired_chain_is_refused_until_its_retirement_ends`,
 `ibd::peer_chain::a_second_refusal_outlasts_announcements`. The silent
 journeys `withheld_fork_rewind_silent` and `withheld_fork_from_start_silent`
 are ignored: they wait out the real 30 s stall floor.

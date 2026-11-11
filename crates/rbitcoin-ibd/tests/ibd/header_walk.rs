@@ -2882,9 +2882,10 @@ fn two_peers_reserve_the_header_walk() {
 }
 
 /// The planted chain's next block has no peer to serve it while another
-/// peer is on a different chain: it is retired only after one stall window
-/// on the node clock, not while a paused `--connect` peer still shows it,
-/// and then its first block is kept out of seeding and rewinds.
+/// peer is on a different chain: it is retired one stall window on the node
+/// clock after nobody could serve it, not while a paused `--connect` peer
+/// still shows it, and then its first block is kept out of seeding and
+/// rewinds.
 #[test]
 fn a_withheld_chain_is_retired_after_one_window() {
     use rbitcoin_ibd::ibd::header_walk::{retire_withheld, WITHHELD_WINDOW_SECS};
@@ -2902,43 +2903,47 @@ fn a_withheld_chain_is_retired_after_one_window() {
     apply(&mut st, &hub, 1, vec![mine(gen, 3)]);
     assert!(st.slots[1].chain.on_other_chain(&st.height_to_hash, 1));
     let t0 = 2_000_000u64;
-    hub.clock.set_mock(t0 as i64);
+    let at = |secs: u64| hub.clock.set_mock((t0 + secs) as i64);
+    at(0);
     // The fork peer is paused, not gone: it is asked again after the pause.
     st.slots[0].block_download_paused_until = Some(u64::MAX);
-    assert!(!retire_withheld(&mut st, &hub), "the window starts");
-    hub.clock.set_mock((t0 + WITHHELD_WINDOW_SECS) as i64);
+    assert!(!retire_withheld(&mut st, &hub));
+    at(10 * WITHHELD_WINDOW_SECS);
     assert!(
         !retire_withheld(&mut st, &hub),
         "a paused peer that shows it still serves it"
     );
-    // Dropped for withholding: the stall kick leaves the slot dead.
+    // Dropped for withholding: the stall kick leaves the slot dead. The
+    // window starts now, not when the block was first needed.
     st.slots[0].block_download_paused_until = None;
     st.slots[0].alive = false;
-    hub.clock.set_mock((t0 + WITHHELD_WINDOW_SECS - 1) as i64);
+    assert!(
+        !retire_withheld(&mut st, &hub),
+        "the window starts when nobody can serve it"
+    );
+    at(11 * WITHHELD_WINDOW_SECS - 1);
     assert!(!retire_withheld(&mut st, &hub), "not before one window");
-    hub.clock.set_mock((t0 + WITHHELD_WINDOW_SECS) as i64);
+    at(11 * WITHHELD_WINDOW_SECS);
     assert!(retire_withheld(&mut st, &hub));
     assert_ne!(st.height_to_hash.get(&1), Some(&f1.block_hash()));
     let excluded: Vec<[u8; 32]> = st.reorg.excluded(hub.clock.now_secs()).collect();
     assert!(excluded.contains(&f1.block_hash().to_byte_array()));
     assert!(
-        refuse_withheld_batch(&mut st, &hub, 0, &[f1, f2]),
-        "the dropped announcer is marked"
+        refuse_withheld_batch(&mut st, &hub, 1, &[f1, f2]),
+        "no address brings it back while it is retired"
     );
 }
 
-/// A withheld chain is refused from the address that withheld it, also as
-/// it grows, until that mark ends. Another address reopens it without
-/// clearing the first address's mark.
+/// A retired chain is refused from every address, also as it grows, until
+/// its retirement ends.
 #[test]
-fn a_withheld_chain_is_refused_only_from_its_announcer() {
+fn a_retired_chain_is_refused_until_its_retirement_ends() {
     use rbitcoin_ibd::ibd::reorg::Withheld;
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-withheld");
     hub.ensure_genesis().unwrap();
     let gen = hub.tip_hash().unwrap();
     let (s0, _rx0) = slot(0);
     let (s1, _rx1) = slot(1);
-    let withholder = s0.net;
     let mut st = IbdWorkState::new(vec![s0, s1], Some(gen), Some(0));
     let now = 1_000_000;
     hub.clock.set_mock(now as i64);
@@ -2949,33 +2954,21 @@ fn a_withheld_chain_is_refused_only_from_its_announcer() {
         |st: &IbdWorkState| -> Vec<[u8; 32]> { st.reorg.excluded(hub.clock.now_secs()).collect() };
     assert!(
         !refuse_withheld_batch(&mut st, &hub, 0, &[first, second]),
-        "nothing is withheld yet"
+        "nothing is retired yet"
     );
-    st.reorg
-        .withheld
-        .mark(first.block_hash(), [withholder], now);
+    st.reorg.withheld.retire(first.block_hash(), now);
     assert!(excluded(&st).contains(&first.block_hash().to_byte_array()));
     assert!(refuse_withheld_batch(&mut st, &hub, 0, &[first, second]));
     assert!(st.header_walk.walk_quiet.contains(&0));
     assert!(
-        refuse_withheld_batch(&mut st, &hub, 0, &[third]),
-        "the next batch builds on the refused one"
+        refuse_withheld_batch(&mut st, &hub, 1, &[third]),
+        "another address, on the next batch of that chain"
     );
-    assert!(
-        !refuse_withheld_batch(&mut st, &hub, 1, &[first, second]),
-        "another address is believed"
-    );
-    assert!(excluded(&st).is_empty(), "and reopens the chain");
-    assert!(
-        refuse_withheld_batch(&mut st, &hub, 0, &[third]),
-        "the withholder's mark stays"
-    );
-    st.reorg
-        .withheld
-        .mark(first.block_hash(), [st.slots[1].net], now);
-    assert!(!excluded(&st).is_empty(), "a new retire closes it again");
-    hub.clock.set_mock((now + Withheld::MARK_SECS) as i64);
-    assert!(excluded(&st).is_empty(), "marks end");
+    hub.clock
+        .set_mock((now + Withheld::RETIRED_SECS - 1) as i64);
+    assert!(refuse_withheld_batch(&mut st, &hub, 1, &[first]));
+    hub.clock.set_mock((now + Withheld::RETIRED_SECS) as i64);
+    assert!(excluded(&st).is_empty(), "the retirement ends");
     assert!(!refuse_withheld_batch(&mut st, &hub, 0, &[third]));
 }
 

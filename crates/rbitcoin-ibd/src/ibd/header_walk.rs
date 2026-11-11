@@ -1134,33 +1134,40 @@ pub fn retire_invalid(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, he
     retire_candidate(st, hub, hash, height, "failed");
 }
 
-/// How long the confirmed tip may need its next block with no peer to
-/// serve it before the chain is retired: one stall window, the floor
+/// How long the confirmed tip's next block may have no peer to serve it
+/// before the chain is retired: one stall window, the floor
 /// `disconnect_stalled_block_peers` waits on a silent peer. A peer that has
 /// the header and not the body yet has that long to get it.
 pub const WITHHELD_WINDOW_SECS: u64 = 30;
 
-/// The confirmed tip has needed the next path block for
-/// [`WITHHELD_WINDOW_SECS`], nothing holds its body, no live peer may serve
-/// it, and a live peer's chain is another chain at that height. As in Core,
-/// a header chain whose bodies no peer serves does not hold the tip below
-/// one whose bodies are served: the candidate is retired at that block like
-/// a failed one, but the block is not marked invalid. The addresses that
-/// announced the chain are not believed about it for
-/// [`super::reorg::Withheld::MARK_SECS`], and the path is seeded again from
-/// the store without it. True when the candidate was retired.
+/// No live peer has been able to serve the next path block for
+/// [`WITHHELD_WINDOW_SECS`], nothing holds its body, and a live peer's chain
+/// is another chain at that height. As in Core, a header chain whose bodies
+/// no peer serves does not hold the tip below one whose bodies are served:
+/// the candidate is retired at that block like a failed one, but the block
+/// is not marked invalid. For [`super::reorg::Withheld::RETIRED_SECS`] that
+/// chain is not seeded, rewound onto, or taken from headers, and the path is
+/// seeded again from the store without it. True when the candidate was
+/// retired.
 pub fn retire_withheld(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
     let now = hub.clock.now_secs();
     let next = hub
         .tip_height()
         .and_then(|tip| st.height_to_hash.get(&tip.saturating_add(1)).copied());
-    let since = st.reorg.withheld.needed_since(next, now);
+    let unserved = next_unserved(st, hub);
+    let Some(since) = st
+        .reorg
+        .withheld
+        .unserved_since(next, unserved.is_some(), now)
+    else {
+        return false;
+    };
+    let Some((hash, height)) = unserved else {
+        return false;
+    };
     if now.saturating_sub(since) < WITHHELD_WINDOW_SECS {
         return false;
     }
-    let Some((hash, height)) = next_unserved(st, hub) else {
-        return false;
-    };
     let path = &st.height_to_hash;
     if !st
         .slots
@@ -1169,26 +1176,10 @@ pub fn retire_withheld(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
     {
         return false;
     }
-    // A live peer that shows the block may serve it, so a peer here that
-    // shows it was just dropped, and one that lacks it answered `notfound`.
-    let mono = super::peer_io::ibd_mono_ms();
-    let mut by: HashSet<rbitcoin_net::NetAddr> = st
-        .slots
-        .iter()
-        .filter(|s| s.chain.shows(path, height) || s.chain.lacks(&hash, mono))
-        .map(|s| s.net)
-        .collect();
-    by.extend(
-        st.header_walk
-            .checkpoints
-            .iter()
-            .filter(|c| c.height >= height)
-            .filter_map(|c| c.supplied_by),
-    );
     if !retire_candidate(st, hub, hash, height, "withheld") {
         return false;
     }
-    st.reorg.withheld.mark(hash, by, now);
+    st.reorg.withheld.retire(hash, now);
     st.reorg.clear_explore();
     super::path::seed_work_path_from_store(st, hub);
     true
@@ -1247,10 +1238,9 @@ pub fn refuse_withheld_batch(
     refuse_withheld_linked(st, hub, peer, headers, linked)
 }
 
-/// Refuse a linked batch from an address still marked on the withheld
-/// chain it holds or builds on, and retire `peer` from the walk. The batch's
-/// last header is remembered for that chain, so the next batch is refused
-/// too. A batch from any other address reopens that chain.
+/// Refuse a linked batch that holds or builds on a retired chain, and
+/// retire `peer` from the walk. The batch's last header is remembered for
+/// that chain, so the next batch is refused too.
 pub fn refuse_withheld_linked(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -1261,17 +1251,10 @@ pub fn refuse_withheld_linked(
     let (Some(first), Some(last), true) = (headers.first(), headers.last(), linked) else {
         return false;
     };
-    let Some(addr) = peer_net(st, peer) else {
-        return false;
-    };
     let hashes =
         std::iter::once(first.prev_blockhash).chain(headers.iter().map(|h| h.block_hash()));
     let now = hub.clock.now_secs();
-    if !st
-        .reorg
-        .withheld
-        .refuses(addr, hashes, last.block_hash(), now)
-    {
+    if !st.reorg.withheld.refuses(hashes, last.block_hash(), now) {
         return false;
     }
     st.header_walk.walk_quiet.insert(peer);

@@ -306,7 +306,8 @@ struct Rig {
     trace: Mutex<Vec<(u128, Option<u32>)>>,
     t0: Instant,
     /// While waiting in `reach`, move the node clock one withheld window
-    /// every half second, so a retire does not wait out real time.
+    /// every half second, at most four times, so a retire does not wait out
+    /// real time.
     fast_clock: AtomicBool,
 }
 
@@ -329,16 +330,21 @@ impl Rig {
     ) -> Option<Duration> {
         let start = Instant::now();
         let mut bumped = Instant::now();
+        // A few windows at most, far below a retirement, so one cannot end
+        // inside this wait.
+        let mut bumps = 0;
         while start.elapsed() < budget {
             if self.note() == Some(height) && self.node.hub.tip_hash() == Some(hash) {
                 return Some(start.elapsed());
             }
             if self.fast_clock.load(Ordering::SeqCst)
+                && bumps < 4
                 && bumped.elapsed() >= Duration::from_millis(500)
             {
                 let clock = &self.node.hub.clock;
                 clock.set_mock((clock.now_secs() + WITHHELD_WINDOW_SECS) as i64);
                 bumped = Instant::now();
+                bumps += 1;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
