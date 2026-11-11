@@ -1256,3 +1256,5 @@ MISSED   crates/rbitcoin-consensus/src/block/facts.rs:256:23: delete ! in requir
 MISSED   crates/rbitcoin-consensus/src/block/facts.rs:358:20: replace == with != in reject_bits in 8s build + 84s test
 MISSED   crates/rbitcoin-consensus/src/script/interpreter.rs:806:45: replace - with / in eval_script in 88s build + 84s test
 MISSED   crates/rbitcoin-consensus/src/script/interpreter.rs:1018:17: replace | with ^ in csv_locktime_mask in 9s build + 83s test
+# 42978063895 1 74c7b8a63b1c8e90440b4851e07bba592f0cec59
+MISSED   crates/rbitcoin-consensus/src/script/mod.rs:66:12: delete ! in verify_job_all_inputs in 114s build + 98s test
