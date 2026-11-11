@@ -3196,6 +3196,110 @@ fn merged_respend_of_a_same_block_spend_is_rejected_alone() {
     rig.finish();
 }
 
+/// tip+1 (b0) is valid and empty, tip+2 (b1) spends an output that only
+/// tip+3 (b2) creates. All three are delivered before the engine starts, so
+/// lookup takes them as one wave and they write as one batch. The batch is
+/// rejected after its Class A append; b0 is retried alone from the archive
+/// and connects. b1 alone then misses its parent: Core rejects it with
+/// `bad-txns-inputs-missingorspent`, so it must be invalid, not an engine
+/// fault, and IBD must not halt.
+fn forward_spend_behind_a_valid_block(label: &str, b0_first: bool) {
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::mine_regtest_paying;
+    use rbitcoin_ibd::ibd::state::InflightReq;
+    use std::time::{Duration, Instant};
+
+    let mut rig = WireRig::new(label, 3);
+    let (t, cbs) = (rig.t, rig.cbs.clone());
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = WireRig::spend(cbs[0]);
+    let child = WireRig::spend(parent.compute_txid());
+    let b0 = mine_regtest_paying(rig.tip, rig.tip_time + 600, t + 1, spk.clone(), vec![]);
+    let b1 = mine_regtest_paying(
+        b0.block_hash(),
+        rig.tip_time + 1200,
+        t + 2,
+        spk.clone(),
+        vec![child],
+    );
+    let b2 = mine_regtest_paying(
+        b1.block_hash(),
+        rig.tip_time + 1800,
+        t + 3,
+        spk,
+        vec![parent],
+    );
+    let (h0, h1, h2) = (b0.block_hash(), b1.block_hash(), b2.block_hash());
+    rig.plant(&[&b0, &b1, &b2]);
+    let deliver = |rig: &mut WireRig, peer: usize, body: &bitcoin::Block| {
+        let hash = body.block_hash();
+        rig.st.slots[peer - 1].in_flight.insert(hash);
+        rig.st.inflight.insert(hash, InflightReq::new(peer));
+        rig.deliver(peer, body);
+    };
+    if b0_first {
+        // Control: b0 connects in its own write before b1 and b2 arrive.
+        deliver(&mut rig, 1, &b0);
+        rig.start_engine();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while rig.hub.tip_hash() != Some(h0) {
+            assert!(Instant::now() < deadline, "b0 never connected");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        deliver(&mut rig, 3, &b2);
+        deliver(&mut rig, 2, &b1);
+    } else {
+        // Top block first, so lookup takes the whole wave at once.
+        deliver(&mut rig, 3, &b2);
+        deliver(&mut rig, 2, &b1);
+        deliver(&mut rig, 1, &b0);
+        rig.start_engine();
+    }
+    let rejects = rig.pump(
+        |_, hash| {
+            if hash == h0 {
+                b0.clone()
+            } else if hash == h1 {
+                b1.clone()
+            } else {
+                b2.clone()
+            }
+        },
+        |st, _, _| st.halt.is_some() || st.reorg.invalid.contains(h1.to_byte_array()),
+    );
+    if !b0_first {
+        assert!(
+            rejects.iter().any(|r| r.2 == 3),
+            "precondition: all three blocks in one rejected write: {rejects:?}"
+        );
+        let hfk2 = rig.hub.ensure_header_fk(&b2.header).unwrap();
+        assert!(
+            rig.hub.query.store().header_txs.has_body(hfk2).unwrap(),
+            "precondition: the write rejected after its Class A append"
+        );
+    }
+    assert_eq!(
+        rig.st.halt, None,
+        "rejects={rejects:?} last={:?}",
+        rig.last_reject_err
+    );
+    assert!(rig.st.reorg.invalid.contains(h1.to_byte_array()));
+    assert!(!rig.st.reorg.invalid.contains(h2.to_byte_array()));
+    assert_eq!(rig.hub.tip_hash(), Some(h0));
+    rig.finish();
+}
+
+#[test]
+fn forward_spend_behind_a_valid_block_in_one_write_is_invalid() {
+    forward_spend_behind_a_valid_block("forward-spend-behind-valid", false);
+}
+
+/// Control: the same chain, but b0 connects in its own write first.
+#[test]
+fn forward_spend_after_a_valid_block_connected_alone_is_invalid() {
+    forward_spend_behind_a_valid_block("forward-spend-after-valid", true);
+}
+
 /// A wave whose first block spends a create from its own block and whose
 /// second block is invalid at write. The cascade retries the first block from
 /// the archive, and that retry must still pin the same-block parent.

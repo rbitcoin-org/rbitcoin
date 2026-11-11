@@ -363,6 +363,68 @@ fn coinbase_maturity_holds_inside_one_confirm_batch() {
     }
 }
 
+/// A batch b0 (valid), b1 (spends a create of b2), b2 is rejected at write
+/// after its Class A append and `tx.head` insert. b0 retried alone from the
+/// archive queues no insert. `tx.head` must still count as holding every
+/// connected create, or the missing-parent verdict for b1 alone cannot run.
+#[test]
+fn archived_retry_after_a_rejected_write_keeps_head_covering_the_fence() {
+    let (_td, q) = open_empty_snap(EmptySnap::H100);
+    let params = ChainParams::regtest();
+    let tip_blk = q.reconstruct_block_at_height(Height(100)).unwrap();
+    let (tip, time) = (tip_blk.block_hash(), tip_blk.header.time);
+    let b1 = q.reconstruct_block_at_height(Height(1)).unwrap();
+    let parent = spend_anyone_can_spend(
+        b1.txdata[0].compute_txid(),
+        0,
+        Amount::from_sat(49_0000_0000),
+    );
+    let child = spend_anyone_can_spend(parent.compute_txid(), 0, Amount::from_sat(48_0000_0000));
+    let b0 = mine_regtest_block(tip, time + 600, 101, vec![]);
+    let child_first = mine_regtest_block(b0.block_hash(), time + 1200, 102, vec![child]);
+    let parent_second =
+        mine_regtest_block(child_first.block_hash(), time + 1800, 103, vec![parent]);
+    assert!(q.head_covers_fence());
+    let creates = q.store().txs.count();
+    let err = confirm_wire_run(
+        &q,
+        &params,
+        Milestone::NONE,
+        &[
+            (Height(101), b0.clone()),
+            (Height(102), child_first),
+            (Height(103), parent_second),
+        ],
+    );
+    assert!(
+        matches!(
+            err,
+            Err(ConfirmError::Rules(ConsensusError::MissingPrevout))
+        ),
+        "{err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(100)));
+    assert_eq!(
+        q.store().txs.count(),
+        creates + 5,
+        "precondition: the reject came after the Class A append"
+    );
+    confirm_wire_run(&q, &params, Milestone::NONE, &[(Height(101), b0)])
+        .expect("b0 alone from the archive");
+    assert_eq!(q.tip_height(), Some(Height(101)));
+    assert_eq!(
+        q.store().txs.count(),
+        creates + 5,
+        "b0 was not appended again"
+    );
+    assert!(
+        q.head_covers_fence(),
+        "drain {} fence {}",
+        q.head_drain_fk(),
+        q.store().fence_max_connected_fk()
+    );
+}
+
 /// Core connects a run one block at a time, so a parent created in a later
 /// block of the same confirm batch is a missing input
 /// (`bad-txns-inputs-missingorspent`), not a batch pin hit.
