@@ -6,6 +6,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::p2p::{message::NetworkMessage, message_blockdata::Inventory, Magic};
 use bitcoin::Block;
 use rbitcoin_consensus::{ChainParams, Milestone};
+use rbitcoin_ibd::ibd::header_walk::WITHHELD_WINDOW_SECS;
 use rbitcoin_ibd::ibd::IbdConfig;
 use rbitcoin_net::peer::{connect_and_handshake_timed, HandshakePolicy};
 use rbitcoin_net::service::P2PNode;
@@ -30,6 +31,9 @@ enum Withhold {
     /// `notfound`, then an `inv` for the top of the chain it already
     /// announced, so the refusal looks stale.
     NotFoundReannounce,
+    /// An honest heavier peer that did not have the first block yet:
+    /// `notfound` and an `inv` of its top once, then it serves every block.
+    NotFoundOnce,
     /// Close the connection after the fork headers go out, and stay gone.
     Disconnect,
 }
@@ -59,6 +63,7 @@ struct Peer {
     unknown_asks: AtomicUsize,
     connects: AtomicUsize,
     getheaders: AtomicUsize,
+    refused_once: AtomicBool,
 }
 
 impl Peer {
@@ -85,6 +90,7 @@ impl Peer {
             unknown_asks: AtomicUsize::new(0),
             connects: AtomicUsize::new(0),
             getheaders: AtomicUsize::new(0),
+            refused_once: AtomicBool::new(false),
         })
     }
 
@@ -204,9 +210,17 @@ async fn serve_one(
                         peer.unknown_asks.fetch_add(1, Ordering::SeqCst);
                         continue;
                     };
-                    if height >= peer.withhold_from {
+                    let once = peer.mode == Withhold::NotFoundOnce;
+                    if height >= peer.withhold_from
+                        && (!once || !peer.refused_once.swap(true, Ordering::SeqCst))
+                    {
                         peer.withheld_asks.fetch_add(1, Ordering::SeqCst);
-                        if matches!(peer.mode, Withhold::NotFound | Withhold::NotFoundReannounce) {
+                        if matches!(
+                            peer.mode,
+                            Withhold::NotFound
+                                | Withhold::NotFoundReannounce
+                                | Withhold::NotFoundOnce
+                        ) {
                             missing.push(*item);
                         }
                         continue;
@@ -227,6 +241,16 @@ async fn serve_one(
                             NetworkMessage::Inv(vec![Inventory::Block(top)]),
                         )
                         .await?;
+                    }
+                    if peer.mode == Withhold::NotFoundOnce {
+                        // It gets the block a little later and announces
+                        // its chain again.
+                        let top = peer.chain.lock().unwrap().last().unwrap().header;
+                        let later = Arc::clone(peer);
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            later.send(Cmd::Headers(vec![top]));
+                        });
                     }
                 }
             }
@@ -281,6 +305,9 @@ struct Rig {
     _dir: rbitcoin_store::testutil::TempDir,
     trace: Mutex<Vec<(u128, Option<u32>)>>,
     t0: Instant,
+    /// While waiting in `reach`, move the node clock one withheld window
+    /// every half second, so a retire does not wait out real time.
+    fast_clock: AtomicBool,
 }
 
 impl Rig {
@@ -301,9 +328,17 @@ impl Rig {
         budget: Duration,
     ) -> Option<Duration> {
         let start = Instant::now();
+        let mut bumped = Instant::now();
         while start.elapsed() < budget {
             if self.note() == Some(height) && self.node.hub.tip_hash() == Some(hash) {
                 return Some(start.elapsed());
+            }
+            if self.fast_clock.load(Ordering::SeqCst)
+                && bumped.elapsed() >= Duration::from_millis(500)
+            {
+                let clock = &self.node.hub.clock;
+                clock.set_mock((clock.now_secs() + WITHHELD_WINDOW_SECS) as i64);
+                bumped = Instant::now();
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -344,6 +379,7 @@ async fn start_node(dir: rbitcoin_store::testutil::TempDir) -> Rig {
         _dir: dir,
         trace: Mutex::new(Vec::new()),
         t0: Instant::now(),
+        fast_clock: AtomicBool::new(false),
     }
 }
 
@@ -370,10 +406,15 @@ enum Shape {
     ExtendsHonestTip,
 }
 
-/// Returns (reached honest N and stayed there, report).
+/// Returns (reached the expected tip and stayed there, report): the honest
+/// tip N, or the fork's top for a peer that serves it.
 async fn run(shape: Shape, mode: Withhold) -> (bool, String) {
     let dir = rbitcoin_store::testutil::TempDir::labeled("withheld-fork").unwrap();
     let rig = start_node(dir).await;
+    // A silent withholder is dropped by the real stall floor, and a peer
+    // that serves after one notfound must not need a moved clock.
+    let fast = !matches!(mode, Withhold::Silent | Withhold::NotFoundOnce);
+    rig.fast_clock.store(fast, Ordering::SeqCst);
     let honest_blocks = honest_chain(N);
     let (fork_at, attacker_cap) = match shape {
         Shape::RewindUnsolicited => (N - 2, N - 2),
@@ -408,7 +449,11 @@ async fn run(shape: Shape, mode: Withhold) -> (bool, String) {
     let mut report = Vec::new();
     let mut reached = false;
     let control = async {
-        let honest_tip = honest_blocks[N as usize].block_hash();
+        let (target_h, target) = if mode == Withhold::NotFoundOnce {
+            (N + 3, attacker_blocks[(N + 3) as usize].block_hash())
+        } else {
+            (N, honest_blocks[N as usize].block_hash())
+        };
         if matches!(shape, Shape::RewindUnsolicited) {
             let ok = rig
                 .reach(
@@ -439,23 +484,23 @@ async fn run(shape: Shape, mode: Withhold) -> (bool, String) {
             report.push(format!("phase1 rewound to the fork point {rewound:?}"));
             honest.send(Cmd::ReleaseHeld);
         }
-        // The honest tip, held for 2 s. Fork headers that land after it
-        // connects rewind it again until the fork is retired.
+        // The expected tip, held for 500 ms. Fork headers that land after
+        // the honest tip connects rewind it again until the fork is retired.
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut got = None;
         while !reached && Instant::now() < deadline {
             got = rig
                 .reach(
-                    N,
-                    honest_tip,
+                    target_h,
+                    target,
                     deadline.saturating_duration_since(Instant::now()),
                 )
                 .await;
             if got.is_none() {
                 break;
             }
-            rig.idle(Duration::from_secs(2)).await;
-            reached = rig.node.hub.tip_hash() == Some(honest_tip);
+            rig.idle(Duration::from_millis(500)).await;
+            reached = rig.node.hub.tip_hash() == Some(target);
         }
         let attacker_top = attacker_blocks[(N + 3) as usize]
             .block_hash()
@@ -490,6 +535,7 @@ async fn run(shape: Shape, mode: Withhold) -> (bool, String) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "waits the real 30 s stall floor; a_withheld_chain_is_retired_after_one_window covers the dropped-peer path"]
 async fn withheld_fork_rewind_silent() {
     let (reached, report) = run(Shape::RewindUnsolicited, Withhold::Silent).await;
     assert!(reached, "IBD did not reach the honest tip\n{report}");
@@ -514,6 +560,7 @@ async fn withheld_fork_rewind_disconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "waits the real 30 s stall floor; a_withheld_chain_is_retired_after_one_window covers the dropped-peer path"]
 async fn withheld_fork_from_start_silent() {
     let (reached, report) = run(Shape::ForkFromStart, Withhold::Silent).await;
     assert!(reached, "IBD did not reach the honest tip\n{report}");
@@ -523,6 +570,15 @@ async fn withheld_fork_from_start_silent() {
 async fn withheld_fork_from_start_notfound() {
     let (reached, report) = run(Shape::ForkFromStart, Withhold::NotFound).await;
     assert!(reached, "IBD did not reach the honest tip\n{report}");
+}
+
+/// A heavier chain whose peer answers `notfound` once, because it has the
+/// header and not the body yet, and then serves it, is still adopted while
+/// a peer on the old chain is connected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heavier_fork_served_after_one_notfound_is_adopted() {
+    let (reached, report) = run(Shape::RewindUnsolicited, Withhold::NotFoundOnce).await;
+    assert!(reached, "IBD did not reach the heavier tip\n{report}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -551,7 +607,7 @@ async fn run_restart(with_attacker: bool) -> (bool, String) {
         attacker_blocks.clone(),
         N - 2,
         N - 1,
-        Withhold::Silent,
+        Withhold::NotFound,
     );
     honest.hold.store(N, Ordering::SeqCst);
     let hl = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -602,6 +658,7 @@ async fn run_restart(with_attacker: bool) -> (bool, String) {
         at.abort();
     }
     let rig = start_node(dir).await;
+    rig.fast_clock.store(true, Ordering::SeqCst);
     report.push(format!("reopened tip={:?}", rig.node.tip_height()));
     let addrs2: Vec<rbitcoin_net::NetAddr> = if with_attacker {
         addrs.to_vec()

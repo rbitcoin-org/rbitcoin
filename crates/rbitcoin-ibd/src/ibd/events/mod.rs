@@ -323,7 +323,7 @@ pub fn on_headers_batch(
     // while its headers are written outside the lock. The retire already
     // dropped that path.
     if super::header_walk::refuse_invalid_batch(st, peer, &headers)
-        || super::header_walk::refuse_withheld_batch(st, peer, &headers)
+        || super::header_walk::refuse_withheld_batch(st, hub, peer, &headers)
     {
         return 0;
     }
@@ -567,7 +567,7 @@ pub fn run_header_batch(
         HeaderPlan::Resume => {
             let exclude: Vec<[u8; 32]> = {
                 let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-                st.reorg.excluded().collect()
+                st.reorg.excluded(hub.clock.now_secs()).collect()
             };
             let path = super::path::load_resume_entries(hub, &exclude);
             let pairs: Vec<(BlockHash, rbitcoin_primitives::Fk)> = path
@@ -742,7 +742,7 @@ pub fn plan_header_reply(
     let linked = super::header_walk::pow_linked(&headers);
     super::header_walk::note_header_witness(st, hub, peer, ask, &headers, linked);
     if super::header_walk::refuse_invalid_linked(st, peer, &headers, linked)
-        || super::header_walk::refuse_withheld_linked(st, peer, &headers, linked)
+        || super::header_walk::refuse_withheld_linked(st, hub, peer, &headers, linked)
     {
         return HeaderPlan::Done;
     }

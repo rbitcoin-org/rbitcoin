@@ -9,7 +9,7 @@ use rbitcoin_net::chain::ChainHub;
 use rbitcoin_net::error::NetError;
 use rbitcoin_net::most_work::{sum_work, work_better, InvalidHashSet};
 use rbitcoin_primitives::{Fk, Height};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::thread::ThreadId;
 
@@ -34,11 +34,135 @@ pub struct IbdReorgState {
     pub explore_need: Vec<BlockHash>,
     /// Candidate tips on an exploration path (for proactive most-work apply).
     pub explore_tips: Vec<BlockHash>,
-    /// The first block of a retired candidate that no peer would serve, or
-    /// the last header of a refused batch that builds on one, with the
-    /// addresses that announced that chain. Those addresses are not believed
-    /// about it again in this process; another address may still offer it.
-    pub withheld: HashMap<BlockHash, HashSet<rbitcoin_net::NetAddr>>,
+    /// Chains retired because no peer served their next block.
+    pub withheld: Withheld,
+}
+
+/// Chains whose next block no peer served for a stall window, keyed by
+/// their first block past the fork point. Each keeps the addresses that
+/// announced it and when their marks end. A marked address is not believed
+/// about that chain until its mark ends. Another address that announces it
+/// reopens it: it may be seeded and rewound onto again, and a new retire
+/// marks that address too. Node-clock seconds, so `setmocktime` moves them.
+#[derive(Debug, Default)]
+pub struct Withheld {
+    roots: HashMap<BlockHash, WithheldRoot>,
+    /// Roots, oldest first. Past the cap the oldest gives way.
+    order: VecDeque<BlockHash>,
+    /// The last header of a refused batch, to its root, so the next batch
+    /// of that chain from a marked address is refused too.
+    tips: HashMap<BlockHash, BlockHash>,
+    tip_order: VecDeque<BlockHash>,
+    /// The block the confirmed tip needs next, and since when.
+    needed: Option<(BlockHash, u64)>,
+}
+
+#[derive(Debug, Default)]
+struct WithheldRoot {
+    /// Address to the second its mark ends.
+    by: HashMap<rbitcoin_net::NetAddr, u64>,
+    /// When the last retire stops keeping the chain out of seeding and
+    /// rewinds. A restart may know no address that announced it.
+    until: u64,
+    /// An unmarked address announced the chain after the last retire.
+    open: bool,
+}
+
+impl Withheld {
+    /// Roots, and refused-batch tips, kept.
+    pub const CAP: usize = 1024;
+    /// How long a mark lasts: the first stall-kick cooldown
+    /// (`record_stall_kick`).
+    pub const MARK_SECS: u64 = 600;
+
+    /// `by` announced the chain from `root` and none of them served its
+    /// next block.
+    pub fn mark(
+        &mut self,
+        root: BlockHash,
+        by: impl IntoIterator<Item = rbitcoin_net::NetAddr>,
+        now: u64,
+    ) {
+        if !self.roots.contains_key(&root) {
+            if self.order.len() >= Self::CAP {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.roots.remove(&oldest);
+                    self.tips.retain(|_, r| *r != oldest);
+                }
+            }
+            self.order.push_back(root);
+        }
+        let entry = self.roots.entry(root).or_default();
+        entry.open = false;
+        let end = now.saturating_add(Self::MARK_SECS);
+        entry.until = end;
+        for addr in by {
+            entry.by.insert(addr, end);
+        }
+    }
+
+    /// A linked batch from `addr` that holds or builds on a withheld chain:
+    /// true when `addr` is still marked on it, and its last header is then
+    /// remembered for that chain. Otherwise that chain is reopened.
+    pub fn refuses(
+        &mut self,
+        addr: rbitcoin_net::NetAddr,
+        hashes: impl IntoIterator<Item = BlockHash>,
+        last: BlockHash,
+        now: u64,
+    ) -> bool {
+        let Some(root) = hashes.into_iter().find_map(|h| {
+            if self.roots.contains_key(&h) {
+                Some(h)
+            } else {
+                self.tips.get(&h).copied()
+            }
+        }) else {
+            return false;
+        };
+        let Some(entry) = self.roots.get_mut(&root) else {
+            return false;
+        };
+        if entry.by.get(&addr).is_none_or(|end| *end <= now) {
+            entry.open = true;
+            return false;
+        }
+        if !self.tips.contains_key(&last) {
+            if self.tip_order.len() >= Self::CAP {
+                if let Some(oldest) = self.tip_order.pop_front() {
+                    self.tips.remove(&oldest);
+                }
+            }
+            self.tip_order.push_back(last);
+        }
+        self.tips.insert(last, root);
+        true
+    }
+
+    /// Roots no seeded path or rewind may run through at `now`: retired
+    /// within [`Self::MARK_SECS`] and not reopened since.
+    pub fn excluded(&self, now: u64) -> impl Iterator<Item = BlockHash> + '_ {
+        self.roots
+            .iter()
+            .filter(move |(_, r)| !r.open && r.until > now)
+            .map(|(h, _)| *h)
+    }
+
+    /// When the confirmed tip started needing `hash`: `now` unless it was
+    /// already the needed block.
+    pub fn needed_since(&mut self, hash: Option<BlockHash>, now: u64) -> u64 {
+        match (hash, self.needed) {
+            (Some(h), Some((was, since))) if h == was => since,
+            (Some(h), _) => {
+                self.needed = Some((h, now));
+                now
+            }
+            (None, _) => {
+                self.needed = None;
+                now
+            }
+        }
+    }
 }
 
 impl IbdReorgState {
@@ -93,28 +217,12 @@ impl IbdReorgState {
         }
     }
 
-    /// Cap on [`Self::withheld`]. Past it the marks start over.
-    pub const WITHHELD_CAP: usize = 1024;
-
-    /// Remember that `by` announced the chain through `hash` and did not
-    /// serve it.
-    pub fn mark_withheld(
-        &mut self,
-        hash: BlockHash,
-        by: impl IntoIterator<Item = rbitcoin_net::NetAddr>,
-    ) {
-        if self.withheld.len() >= Self::WITHHELD_CAP && !self.withheld.contains_key(&hash) {
-            self.withheld.clear();
-        }
-        self.withheld.entry(hash).or_default().extend(by);
-    }
-
-    /// Hashes no seeded path or rewind may run through: blocks that failed,
-    /// and the first blocks of withheld chains.
-    pub fn excluded(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+    /// Hashes no seeded path or rewind may run through at node-clock `now`:
+    /// blocks that failed, and the first blocks of withheld chains.
+    pub fn excluded(&self, now: u64) -> impl Iterator<Item = [u8; 32]> + '_ {
         self.invalid
             .iter()
-            .chain(self.withheld.keys().map(|h| h.to_byte_array()))
+            .chain(self.withheld.excluded(now).map(|h| h.to_byte_array()))
     }
 
     pub fn explore_tips(&self) -> &[BlockHash] {
@@ -399,7 +507,7 @@ pub fn heavier_fork_candidates(
     if cands.is_empty() {
         cands.extend(unplanted_walk_tip(st, hub));
     }
-    let invalid: HashSet<[u8; 32]> = st.reorg.excluded().collect();
+    let invalid: HashSet<[u8; 32]> = st.reorg.excluded(hub.clock.now_secs()).collect();
     Ok((cands, invalid))
 }
 
@@ -538,7 +646,7 @@ pub fn maybe_rewind_to_best_work(
     hub: &ChainHub,
 ) -> Result<bool, NetError> {
     let cands = rewind_candidate_hashes(st, hub)?;
-    let invalid: HashSet<[u8; 32]> = st.reorg.excluded().collect();
+    let invalid: HashSet<[u8; 32]> = st.reorg.excluded(hub.clock.now_secs()).collect();
     let Some(path) = select_heavier_path(hub, &cands, &invalid)? else {
         return Ok(false);
     };
@@ -852,7 +960,7 @@ pub fn rewind_off_coord_lock(
     let (cands, invalid) = {
         let st = shared.lock().unwrap_or_else(|err| err.into_inner());
         let cands = rewind_candidate_hashes(&st, hub)?;
-        let invalid: HashSet<[u8; 32]> = st.reorg.excluded().collect();
+        let invalid: HashSet<[u8; 32]> = st.reorg.excluded(hub.clock.now_secs()).collect();
         (cands, invalid)
     };
     let Some(pairs) = apply_off_lock_rewind(shared, hub, &cands, &invalid)? else {

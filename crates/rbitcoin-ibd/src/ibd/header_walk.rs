@@ -1134,15 +1134,30 @@ pub fn retire_invalid(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, he
     retire_candidate(st, hub, hash, height, "failed");
 }
 
-/// The next block the confirmed tip needs is on the path, nothing holds or
-/// fetches its body, no live peer may serve it, and a live peer's chain is
-/// another chain at that height. As in Core, a header chain whose bodies no
-/// peer serves does not hold the tip below one whose bodies are served: the
-/// candidate is retired at that block like a failed one, but the block is
-/// not marked invalid. The addresses that announced the chain are not
-/// believed about it again, and the path is seeded again from the store
-/// without it. True when the candidate was retired.
+/// How long the confirmed tip may need its next block with no peer to
+/// serve it before the chain is retired: one stall window, the floor
+/// `disconnect_stalled_block_peers` waits on a silent peer. A peer that has
+/// the header and not the body yet has that long to get it.
+pub const WITHHELD_WINDOW_SECS: u64 = 30;
+
+/// The confirmed tip has needed the next path block for
+/// [`WITHHELD_WINDOW_SECS`], nothing holds its body, no live peer may serve
+/// it, and a live peer's chain is another chain at that height. As in Core,
+/// a header chain whose bodies no peer serves does not hold the tip below
+/// one whose bodies are served: the candidate is retired at that block like
+/// a failed one, but the block is not marked invalid. The addresses that
+/// announced the chain are not believed about it for
+/// [`super::reorg::Withheld::MARK_SECS`], and the path is seeded again from
+/// the store without it. True when the candidate was retired.
 pub fn retire_withheld(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
+    let now = hub.clock.now_secs();
+    let next = hub
+        .tip_height()
+        .and_then(|tip| st.height_to_hash.get(&tip.saturating_add(1)).copied());
+    let since = st.reorg.withheld.needed_since(next, now);
+    if now.saturating_sub(since) < WITHHELD_WINDOW_SECS {
+        return false;
+    }
     let Some((hash, height)) = next_unserved(st, hub) else {
         return false;
     };
@@ -1156,11 +1171,11 @@ pub fn retire_withheld(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
     }
     // A live peer that shows the block may serve it, so a peer here that
     // shows it was just dropped, and one that lacks it answered `notfound`.
-    let now = super::peer_io::ibd_mono_ms();
+    let mono = super::peer_io::ibd_mono_ms();
     let mut by: HashSet<rbitcoin_net::NetAddr> = st
         .slots
         .iter()
-        .filter(|s| s.chain.shows(path, height) || s.chain.lacks(&hash, now))
+        .filter(|s| s.chain.shows(path, height) || s.chain.lacks(&hash, mono))
         .map(|s| s.net)
         .collect();
     by.extend(
@@ -1173,7 +1188,7 @@ pub fn retire_withheld(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
     if !retire_candidate(st, hub, hash, height, "withheld") {
         return false;
     }
-    st.reorg.mark_withheld(hash, by);
+    st.reorg.withheld.mark(hash, by, now);
     st.reorg.clear_explore();
     super::path::seed_work_path_from_store(st, hub);
     true
@@ -1181,14 +1196,19 @@ pub fn retire_withheld(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
 
 /// The path block after the confirmed tip, when nothing holds its body and
 /// no live peer may serve it. A request to a peer that may not serve it does
-/// not count.
+/// not count. A `--connect` peer paused for stalling still counts while it
+/// shows the block: it is asked again when the pause ends.
 fn next_unserved(st: &IbdWorkState, hub: &ChainHub) -> Option<(BlockHash, u32)> {
     let height = hub.tip_height()?.saturating_add(1);
     let hash = *st.height_to_hash.get(&height)?;
+    let path = &st.height_to_hash;
+    let paused_shows = |s: &super::peer_io::PeerSlot| {
+        s.block_download_paused_until.is_some() && s.chain.shows(path, height)
+    };
     if st
         .slots
         .iter()
-        .any(|s| s.alive && may_serve(st, s.id, &hash))
+        .any(|s| s.alive && (may_serve(st, s.id, &hash) || paused_shows(s)))
     {
         return None;
     }
@@ -1217,45 +1237,42 @@ fn body_held(st: &IbdWorkState, hub: &ChainHub, hash: &BlockHash) -> bool {
         || hub.query.block_queue_has_hash(&hash.to_byte_array())
 }
 
-pub fn refuse_withheld_batch(st: &mut IbdWorkState, peer: usize, headers: &[Header]) -> bool {
+pub fn refuse_withheld_batch(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    peer: usize,
+    headers: &[Header],
+) -> bool {
     let linked = !headers.is_empty() && pow_linked(headers);
-    refuse_withheld_linked(st, peer, headers, linked)
+    refuse_withheld_linked(st, hub, peer, headers, linked)
 }
 
-/// Refuse a linked batch from an address that already withheld the chain
-/// it holds or builds on, and retire `peer` from the walk. The batch's last
-/// header is remembered for that address, so its next batch is refused too.
-/// Another address that announces a withheld chain is believed: every mark
-/// is dropped, and that chain may be planted and fetched again.
+/// Refuse a linked batch from an address still marked on the withheld
+/// chain it holds or builds on, and retire `peer` from the walk. The batch's
+/// last header is remembered for that chain, so the next batch is refused
+/// too. A batch from any other address reopens that chain.
 pub fn refuse_withheld_linked(
     st: &mut IbdWorkState,
+    hub: &ChainHub,
     peer: usize,
     headers: &[Header],
     linked: bool,
 ) -> bool {
-    let (Some(first), true) = (headers.first(), linked) else {
+    let (Some(first), Some(last), true) = (headers.first(), headers.last(), linked) else {
         return false;
     };
-    if st.reorg.withheld.is_empty() {
-        return false;
-    }
     let Some(addr) = peer_net(st, peer) else {
         return false;
     };
     let hashes =
         std::iter::once(first.prev_blockhash).chain(headers.iter().map(|h| h.block_hash()));
-    let marks: Vec<bool> = hashes
-        .filter_map(|hash| st.reorg.withheld.get(&hash).map(|by| by.contains(&addr)))
-        .collect();
-    if marks.is_empty() {
+    let now = hub.clock.now_secs();
+    if !st
+        .reorg
+        .withheld
+        .refuses(addr, hashes, last.block_hash(), now)
+    {
         return false;
-    }
-    if !marks.contains(&true) {
-        st.reorg.withheld.clear();
-        return false;
-    }
-    if let Some(last) = headers.last() {
-        st.reorg.mark_withheld(last.block_hash(), [addr]);
     }
     st.header_walk.walk_quiet.insert(peer);
     if st.header_walk.reserved == Some(peer) {
