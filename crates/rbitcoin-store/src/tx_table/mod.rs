@@ -1100,6 +1100,25 @@ fn witness_body_end(loc: &crate::delta_loc::DeltaLoc, creates: u64) -> Result<u6
     Ok(off.saturating_add(len))
 }
 
+/// Largest `k` in `0..=named` whose witness row still ends inside `body_len`.
+fn witness_rows_body_covers(
+    loc: &crate::delta_loc::DeltaLoc,
+    named: u64,
+    body_len: u64,
+) -> Result<u64, StoreError> {
+    let mut lo = 0u64;
+    let mut hi = named;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if witness_body_end(loc, mid)? <= body_len {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(lo)
+}
+
 /// A span past the covered create count would mark the next append's fk empty.
 fn clamp_witness_gap_to_count(dir: &Path, creates: u64) -> Result<(), StoreError> {
     let saved = load_witness_gap(dir)?;
@@ -1153,7 +1172,9 @@ fn coalesce_witness_gaps(spans: &mut Vec<(u64, u64)>) {
 /// so the next append's fk is the new create. A locator of 0 is the finished
 /// stem cut: those empty rows are not a witness, and the keep-window rewrite
 /// stops the cut from finishing. A locator ahead of the covered create count
-/// still names dropped creates, so it is cut back to that count.
+/// still names dropped creates, so it is cut back to that count. A body that
+/// does not cover the last named row is cut to the last row it does cover,
+/// then filled from there. No covered row refuses the open.
 fn align_short_witness_locator(
     seqsigwit: &VarTable,
     loc: &crate::delta_loc::DeltaLoc,
@@ -1188,11 +1209,22 @@ fn align_short_witness_locator(
             "invariant: seqsigwit.loc range for gap",
         ))?;
     let end = off.saturating_add(len);
-    if seqsigwit.body_logical_len() < end {
-        return Ok(false);
-    }
-    seqsigwit.truncate_body_to(named, end)?;
-    let n = usize::try_from(through - named)
+    let body_len = seqsigwit.body_logical_len();
+    let fill_from = if body_len < end {
+        let covered = witness_rows_body_covers(loc, named, body_len)?;
+        if covered == 0 {
+            return Err(StoreError::Corrupt(
+                "invariant: seqsigwit body covers no witness row",
+            ));
+        }
+        cut_witness_body_to(seqsigwit, loc, covered)?;
+        loc.truncate_to_count(covered)?;
+        covered
+    } else {
+        seqsigwit.truncate_body_to(named, end)?;
+        named
+    };
+    let n = usize::try_from(through - fill_from)
         .map_err(|_| StoreError::Corrupt("invariant: seqsigwit gap"))?;
     let Some(prep) = seqsigwit.prepare_batch_encode(n, n.saturating_mul(8), |_i, _buf| {})? else {
         return Ok(false);
@@ -1204,7 +1236,7 @@ fn align_short_witness_locator(
     // The locator header is what the next open counts. Record the gap
     // first, or that open reads these empty rows as a witness and drops
     // the tip.
-    let spans = merge_witness_gap(&load_witness_gap(gap_dir)?, named, through);
+    let spans = merge_witness_gap(&load_witness_gap(gap_dir)?, fill_from, through);
     store_witness_gap(gap_dir, &spans)?;
     let (_fks, durable) = publish_prepared_body(seqsigwit, prep, true)?;
     let _ = loc.commit_staged(staged, durable);

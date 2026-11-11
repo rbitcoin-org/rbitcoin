@@ -742,3 +742,55 @@ fn ovf_header_miss_does_not_seal_the_create() {
     assert_eq!(outs(&t, 1).len(), 256);
     assert!(t.get_meta_and_outputs(rbitcoin_primitives::Fk(2)).is_err());
 }
+
+/// The torn marker kept the creates. The witness body only covers the first
+/// row the locator names. Open cuts the locator to that row, fills the gap,
+/// and the next append does not fail the stem check.
+#[test]
+fn torn_prune_short_witness_body_fills_from_the_covered_row() {
+    let dir = super::tempfile_dir("torn-short-witness-body");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let seq_end = on_disk_hwm(&t.seqsigwit.body);
+    t.put_full_batch_indexed(&[one(2), one(3)], false).unwrap();
+    t.flush().unwrap();
+    t.seqsigwit_loc.truncate_to_count(2).unwrap();
+    set_disk_hwm(&t.seqsigwit.body, seq_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 3);
+    assert_eq!(t.seqsigwit_loc.count(), 3);
+    assert_eq!(t.seqsigwit.count(), 3);
+    assert!(!t.witness_row_is_gap(1));
+    assert!(t.witness_row_is_gap(2));
+    assert!(t.witness_row_is_gap(3));
+    t.put_full_batch_indexed(&[one(4)], false)
+        .expect("the next append must not fail the stem check");
+    assert_eq!(t.count(), 4);
+    assert_eq!(t.seqsigwit.count(), 4);
+}
+
+/// A torn marker and a witness body that covers no row cannot be filled.
+/// Open refuses instead of leaving a store whose next append fails.
+#[test]
+fn torn_prune_with_no_witness_row_refuses_open() {
+    let dir = super::tempfile_dir("torn-no-witness-row");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1), one(2), one(3)], false)
+        .unwrap();
+    t.flush().unwrap();
+    t.seqsigwit_loc.truncate_to_count(2).unwrap();
+    set_disk_hwm(&t.seqsigwit.body, FILE_HEADER_LEN as u64);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let msg = match TxTable::open_tiny(&dir) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("open kept a witness body that covers no row"),
+    };
+    assert!(
+        msg.contains("seqsigwit body covers no witness row"),
+        "{msg}"
+    );
+}
