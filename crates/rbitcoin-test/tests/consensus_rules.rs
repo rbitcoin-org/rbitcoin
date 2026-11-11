@@ -1151,6 +1151,28 @@ fn respend_of_a_same_block_spend_rejects_on_single_block_retry() {
                     part[part.len() - 1].0 .0
                 );
             }
+            // The retry does not annotate S1 (a same-block spend), so P:0's
+            // slot is still the one the rejected write appended. It must
+            // name S1 alone, not h103's spender and not a spender list.
+            let (hfk, _) = q.header_at_height(Height(102)).unwrap().expect("h102");
+            let txs = q
+                .store()
+                .header_txs
+                .get_list(hfk)
+                .unwrap()
+                .expect("h102 txs");
+            let (p_fk, s1_fk) = (txs[1], txs[txs.len() - 1]);
+            let (off, _) = q.store().tx_spent_range(p_fk).unwrap();
+            let slot = q
+                .store()
+                .txs
+                .get_spender_meta_at_abs_batch(&[rbitcoin_store::spent_abs(off, 0)])
+                .unwrap()[0];
+            assert_eq!(
+                slot,
+                Some((s1_fk, 0, 0)),
+                "{run}: P:0 slot after the h102 retry"
+            );
             let got =
                 confirm_wire_run(&q, &params, Milestone::NONE, &[(Height(103), last.clone())]);
             assert!(

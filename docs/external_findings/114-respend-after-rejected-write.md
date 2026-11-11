@@ -38,5 +38,6 @@ serve a block with valid proof of work that double-spends, on the best
 header chain, during IBD.
 
 **Regression:** consensus matrix row C38;
+`rbitcoin-query` `archive::spent_overlay_names_the_first_spender_of_a_vout`;
 `rbitcoin-test` `consensus_rules::respend_of_a_same_block_spend_rejects_on_single_block_retry`;
 `rbitcoin-ibd` `ibd::events::confirm_reject_tests::merged_respend_of_a_same_block_spend_is_rejected_alone`
