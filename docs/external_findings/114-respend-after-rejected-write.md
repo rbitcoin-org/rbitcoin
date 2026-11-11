@@ -12,9 +12,10 @@ Repro on regtest: block 102 creates `P` and spends `P:0` in the same
 block (`S1`). Block 103 spends `P:0` again (`S2`). IBD loads 102 and 103
 as separate load batches and the write stage merges them into one write.
 That write rejects 103 (`PrevoutSpent`) and IBD retries one block at a
-time. 102 connected, and 103 alone then connected too. After that, any
-later re-spend of `P:0` connected, and `gettxout`, Electrum, Esplora and
-mempool admission read `P:0` as unspent.
+time. 102 connected, and 103 alone then connected too. With 103 on the
+chain, `S2` is strong and `P:0` reads spent by `S2`. Once 103 is
+disconnected, `P:0` reads unspent although 102 spent it, and another
+block that re-spends it connects.
 
 A same-block spend has no annotate slot. Its only record is the Class A
 spent slot that the write fills from the plan's spend edges
@@ -22,7 +23,9 @@ spent slot that the write fills from the plan's spend edges
 edges for `P:0`. The edges map iterates in hash order and the slot
 encoder keeps the last entry for a vout, so the slot usually named `S2`.
 The rejected write keeps its Class A, and the retry does not append it
-again. `S2` never became strong, so `P:0` read as unspent.
+again, and the retry of 102 does not annotate `S1`: a same-block spend
+has no create fk, so structural queues no slot for it. `S2` was not
+strong, so `P:0` read as unspent.
 
 **Fix:** the overlay keeps one entry per vout, the lowest spender fk.
 Plans append in height order, so that is the first spender in chain
