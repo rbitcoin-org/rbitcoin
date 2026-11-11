@@ -11,4 +11,4 @@ Fixed
   not believed about that fork again in this process. A peer whose chain
   is known to differ at a block is no longer asked for it, so the honest
   peer is not disconnected for blocks it never had. Finding
-  [114](docs/external_findings/114-withheld-heavier-fork.md).
+  [115](docs/external_findings/115-withheld-heavier-fork.md).

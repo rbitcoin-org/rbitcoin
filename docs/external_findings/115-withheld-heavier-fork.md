@@ -1,4 +1,4 @@
-# 114 — IBD stayed below a heavier fork whose bodies were never served
+# 115 — IBD stayed below a heavier fork whose bodies were never served
 
 **Severity:** high (IBD and restart catch-up stop below the honest tip)
 **Status:** fixed
