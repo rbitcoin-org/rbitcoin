@@ -65,6 +65,28 @@ fn numbered(n: u16) -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
     )
 }
 
+/// Input is short of the creates, and the seqsigwit body header does not
+/// cover the next row. Open fits the body headers before that probe, so
+/// startup truncates instead of refusing.
+#[test]
+fn short_input_and_a_short_seqsigwit_header_reopen_at_the_prefix() {
+    let dir = super::tempfile_dir("short-input-short-seqsigwit");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let seq_end = on_disk_hwm(&t.seqsigwit.body);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    assert!(on_disk_hwm(&t.seqsigwit.body) > seq_end);
+    let header = FILE_HEADER_LEN as u64;
+    set_disk_hwm(&t.input.loc, header + 2);
+    set_disk_hwm(&t.seqsigwit.body, seq_end);
+    drop(t);
+
+    let t = TxTable::open_tiny(&dir).expect("open truncates instead of refusing");
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.input.count(), 1);
+    assert_eq!(outs(&t, 1)[0].script, vec![1]);
+}
+
 /// A body header short of the locator count is the covered prefix.
 /// Open keeps that create and drops the locator tail.
 #[test]

@@ -3,7 +3,9 @@ Fixed
 - **Open keeps the covered Class A prefix after power loss.** A body header
   shorter than the locator count used to refuse startup. Open now truncates
   to the last create those headers still name. A short `input.body` header
-  cuts `input.loc` to the creates that header still names. Open shrinks the tip to match,
+  cuts `input.loc` to the creates that header still names. The short-input
+  probe runs only after that fit, and only when the next row is still inside
+  the fitted count. Open shrinks the tip to match,
   then clears `header_txs` ranges past that prefix. An unstrong orphan at
   that cut does not keep later confirmed blocks, including when those
   ranges were already cleared. A Class C array torn

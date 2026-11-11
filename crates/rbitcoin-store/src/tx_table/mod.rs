@@ -826,23 +826,21 @@ pub fn create_prevout_on_inputs(stems: &ClassASkewStems<'_>, fk: Fk) -> Result<b
 
 /// A short `input` that already existed, whose next create is new-layout.
 ///
-/// Legacy inline prevouts stay out of this floor so open can still backfill
-/// them. A fresh `Input::create` this open is not a power-loss tail.
+/// `ceiling` is the count the body headers already cover. The probe reads
+/// the next seqsigwit row, so it does not run past that count. Legacy
+/// inline prevouts stay out of this floor so open can still backfill them.
+/// A fresh `Input::create` this open is not a power-loss tail.
 #[doc(hidden)]
 pub fn short_new_layout_input(
     stems: &ClassASkewStems<'_>,
-    n_loc: u64,
-    n_txids: u64,
-    n_seqsigwit_loc: u64,
-    prune_seqsigwit_mode: bool,
+    ceiling: u64,
     input_existed: bool,
 ) -> Result<Option<u64>, StoreError> {
-    if !input_existed {
+    if !input_existed || ceiling == 0 {
         return Ok(None);
     }
     let n_in = stems.input.count();
-    let stem = stem_min(n_loc, n_txids, n_seqsigwit_loc, prune_seqsigwit_mode);
-    if n_in >= stem || stem == 0 {
+    if n_in >= ceiling {
         return Ok(None);
     }
     let next = Fk(n_in.saturating_add(1));
@@ -1222,7 +1220,19 @@ pub fn repair_class_a_count_skew(
     let n_loc = stems.create_loc.count();
     let n_txids = stems.txids.count();
     let n_seqsigwit_loc = stems.seqsigwit_loc.count();
-    let short_input = match pruned_uncovered_input_floor(
+    // Fit the body headers before the short-input probe. That probe reads
+    // the next seqsigwit row, which is past a header that does not cover it.
+    let skewed = class_a_skew_target_count(
+        n_loc,
+        n_txids,
+        n_seqsigwit_loc,
+        prune_seqsigwit_mode,
+        None,
+    );
+    let n_target = skewed.unwrap_or(n_loc);
+    let (mut n, mut tx_end, mut sp_end, mut in_end) =
+        fit_covered_to_body_headers(&stems, n_target, prune_seqsigwit_mode)?;
+    let floor = match pruned_uncovered_input_floor(
         &stems,
         n_loc,
         n_txids,
@@ -1230,26 +1240,15 @@ pub fn repair_class_a_count_skew(
         prune_seqsigwit_mode,
         input_existed,
     ) {
-        Some(n) => Some(n),
-        None => short_new_layout_input(
-            &stems,
-            n_loc,
-            n_txids,
-            n_seqsigwit_loc,
-            prune_seqsigwit_mode,
-            input_existed,
-        )?,
+        Some(floor) => Some(floor),
+        None => short_new_layout_input(&stems, n, input_existed)?,
     };
-    let skewed = class_a_skew_target_count(
-        n_loc,
-        n_txids,
-        n_seqsigwit_loc,
-        prune_seqsigwit_mode,
-        short_input,
-    );
-    let n_target = skewed.unwrap_or(n_loc);
-    let (n, tx_end, sp_end, in_end) =
-        fit_covered_to_body_headers(&stems, n_target, prune_seqsigwit_mode)?;
+    if let Some(floor) = floor {
+        if floor < n {
+            n = floor;
+            (tx_end, sp_end, in_end) = class_a_skew_stem_ends(&stems, n, prune_seqsigwit_mode)?;
+        }
+    }
     let ahead = stems.body.body_logical_len() > tx_end
         || stems.spent.body_logical_len() > sp_end
         || (!prune_seqsigwit_mode && stems.seqsigwit.body_logical_len() > in_end);
