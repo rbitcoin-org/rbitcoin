@@ -343,19 +343,7 @@ impl Query {
         let rebuild = self.sh_force_rebuild()
             || rbitcoin_store::scripthash::sh_rebuild_marked(self.store.path())
             || self.store.scripthash.shard_offset_past_file()?;
-        // A legacy head keeps the floor in SEAL. Copy it before the
-        // lost-tail check so a seal within a million creates unlinks on
-        // this open. A seal farther ahead is not that tail.
-        if !rebuild
-            && self.sh_use_writebehind()
-            && self.store.scripthash.unsealed_main_shards().is_empty()
-        {
-            self.sh_run.refresh_seal();
-            let seal = self.sh_run.sealed_max_create_fk();
-            if self.store.scripthash.include_hwm() == 0 && seal > 0 {
-                self.store.scripthash.note_include_hwm(seal)?;
-            }
-        }
+        self.copy_legacy_seal_before_lost_tail(rebuild)?;
         if !rebuild
             && Self::sh_lost_tail(self.store.scripthash.include_hwm(), self.store.txs.count())
         {
@@ -365,49 +353,78 @@ impl Query {
             rbitcoin_store::scripthash::mark_sh_rebuild(self.store.path())?;
             self.sh_run.prepare_force_full_rebuild(&self.store)?;
         }
-        if !rebuild && !self.sh_force_rebuild() && self.sh_use_writebehind() {
-            if self.store.scripthash.unsealed_main_shards().is_empty() {
-                let residual = self.sh_run.on_disk_run_count();
-                self.sh_run.discard_residual_runs();
-                if residual > 0 {
-                    rbitcoin_log::info!(
-                        "node: scripthash durable head — discarding {residual} leftover run(s); \
-                     gap uses write-behind (no Class A recollect / WarmOnly)"
-                    );
-                }
-                self.sync_sh_seal_from_include_hwm()?;
-                if self.sh_is_tip_ready() {
-                    rbitcoin_log::info!(
-                        "node: scripthash already tip-ready (durable head covers tip) — \
-                     skip Class A recollect and bulk materialize"
-                    );
-                    self.mark_sh_indexed_through_tip();
-                } else if self.index_mode()?.is_direct() {
-                    rbitcoin_log::info!(
-                        "node: scripthash durable head with HWM/SEAL lag while Direct — \
-                     Class A tail backfill (write-behind no-ops until Tip)"
-                    );
-                    self.backfill_until_sh_tip_ready(
-                        "scripthash Class A tail backfill left include_hwm short of tip",
-                    )?;
-                    self.mark_sh_indexed_through_tip();
-                } else {
-                    rbitcoin_log::info!(
-                        "node: scripthash durable head with HWM/SEAL lag — skip collect; \
-                     recover/write-behind fills the height gap"
-                    );
-                }
-                return Ok(0);
-            }
-            rbitcoin_log::info!(
-                "node: scripthash unsorted-shards resume unsealed={} (partial sealed head)",
-                self.store.scripthash.unsealed_main_shards().len()
-            );
+        if let Some(done) = self.resume_sealed_writebehind_head(rebuild)? {
+            return Ok(done);
         }
 
         let n = self.finalize_sh_unsorted_cancellable(cancel)?;
         rbitcoin_store::scripthash::clear_sh_rebuild(self.store.path())?;
         Ok(n)
+    }
+
+    /// A legacy head keeps the floor in SEAL. Copy it before the
+    /// lost-tail check so a seal within a million creates unlinks on
+    /// this open. A seal farther ahead is not that tail.
+    fn copy_legacy_seal_before_lost_tail(&self, rebuild: bool) -> Result<(), QueryError> {
+        if rebuild
+            || !self.sh_use_writebehind()
+            || !self.store.scripthash.unsealed_main_shards().is_empty()
+        {
+            return Ok(());
+        }
+        self.sh_run.refresh_seal();
+        let seal = self.sh_run.sealed_max_create_fk();
+        if self.store.scripthash.include_hwm() == 0 && seal > 0 {
+            self.store.scripthash.note_include_hwm(seal)?;
+        }
+        Ok(())
+    }
+
+    /// A sealed write-behind head discards leftover runs, then stays
+    /// tip-ready or backfills. An unsealed shard returns to the unsorted
+    /// materialize. Any other open does too.
+    fn resume_sealed_writebehind_head(&self, rebuild: bool) -> Result<Option<u64>, QueryError> {
+        if rebuild || self.sh_force_rebuild() || !self.sh_use_writebehind() {
+            return Ok(None);
+        }
+        if !self.store.scripthash.unsealed_main_shards().is_empty() {
+            rbitcoin_log::info!(
+                "node: scripthash unsorted-shards resume unsealed={} (partial sealed head)",
+                self.store.scripthash.unsealed_main_shards().len()
+            );
+            return Ok(None);
+        }
+        let residual = self.sh_run.on_disk_run_count();
+        self.sh_run.discard_residual_runs();
+        if residual > 0 {
+            rbitcoin_log::info!(
+                "node: scripthash durable head — discarding {residual} leftover run(s); \
+                     gap uses write-behind (no Class A recollect / WarmOnly)"
+            );
+        }
+        self.sync_sh_seal_from_include_hwm()?;
+        if self.sh_is_tip_ready() {
+            rbitcoin_log::info!(
+                "node: scripthash already tip-ready (durable head covers tip) — \
+                     skip Class A recollect and bulk materialize"
+            );
+            self.mark_sh_indexed_through_tip();
+        } else if self.index_mode()?.is_direct() {
+            rbitcoin_log::info!(
+                "node: scripthash durable head with HWM/SEAL lag while Direct — \
+                     Class A tail backfill (write-behind no-ops until Tip)"
+            );
+            self.backfill_until_sh_tip_ready(
+                "scripthash Class A tail backfill left include_hwm short of tip",
+            )?;
+            self.mark_sh_indexed_through_tip();
+        } else {
+            rbitcoin_log::info!(
+                "node: scripthash durable head with HWM/SEAL lag — skip collect; \
+                     recover/write-behind fills the height gap"
+            );
+        }
+        Ok(Some(0))
     }
 
     #[doc(hidden)]
