@@ -1960,10 +1960,12 @@ impl TxTable {
 
     /// Witness locator no longer names every create. Seal and skew ignore it.
     ///
-    /// The torn 0-byte marker counts here. Prune mode does not: that flag
-    /// is the 4-byte height, and it is what stops a later append.
+    /// A torn 0-byte marker counts. A finished cut does too: prune mode and
+    /// locator 0. A 4-byte height whose locator still names a prefix does not.
     fn seqsigwit_stem_retired(&self) -> bool {
-        self.witness_stem_may_lag() && self.seqsigwit_loc.count() < self.count()
+        let loc = self.seqsigwit_loc.count();
+        loc < self.count()
+            && (self.witness_stem_may_lag() || (self.prune_seqsigwit_mode() && loc == 0))
     }
 
     pub fn set_prune_seqsigwit_mode(&self, on: bool) {

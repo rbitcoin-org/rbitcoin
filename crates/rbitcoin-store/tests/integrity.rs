@@ -809,6 +809,33 @@ fn withheld_create_overflow_header_does_not_seal_when_pruned() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A finished stem cut leaves the witness locator at 0 in this process.
+/// A body header that still names every create must not pull the durable
+/// count to 0, or the tip flush skips for the rest of the process.
+#[test]
+fn finished_cut_seals_the_tip_when_a_body_header_lags() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (_prev, _parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    assert_eq!(s.flush_class_c_tip().unwrap(), Some(Height(0)));
+    s.set_prune_seqsigwit_mode(true);
+    s.txs.cut_seqsigwit_stem_to_header().unwrap();
+    assert_eq!(s.txs.seqsigwit_loc.count(), 0);
+    assert!(s.txs.count() > 0);
+    let end = s.txs.body.body.logical_len();
+    assert!(
+        !s.txs.body.body.publish_end(end.saturating_add(8), false),
+        "the lagging header has to stay behind the RAM length"
+    );
+    assert_eq!(
+        s.flush_class_c_tip().unwrap(),
+        Some(Height(0)),
+        "a finished cut made the durable create count 0"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn connect_fat_witness(
     s: &Store,
     write: &rbitcoin_store::ClassCWrite,
