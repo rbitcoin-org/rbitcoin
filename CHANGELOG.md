@@ -9,6 +9,166 @@ before 1.0).
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-11-12
+
+### Highlights
+
+- **A datadir that already connected the bad re-spend needs a re-sync.**
+  IBD could connect a block that spent an output a lower block in the
+  same write had already spent. After a disconnect, that output read as
+  unspent. 0.9.2 does not connect that block. A store that already did
+  keeps the wrong spent slot. Schema stays 27, so a 0.9.1 directory
+  opens in place.
+- **IBD no longer stops on a spend of a later block's transaction.** A
+  valid block in front of that spend used to halt with "engine fault
+  repeated" until restart. The bad block is marked invalid and IBD
+  continues.
+- **`submitblock` no longer caches a valid block as invalid when a
+  sibling connects mid-check.** The check reads one tip. A competing
+  block that lands during the check no longer leaves the submission
+  `bad-txns-inputs-missingorspent` until restart.
+- **A restarted `--prune-seqsigwit` node can reorg back.** It used to
+  drop the block a peer sent and stay on the lighter branch until the
+  next restart.
+- **Silent-payment subscribe addresses decode.** The address includes
+  the BIP-352 version: `sp1q` on mainnet and `tsp1q` on test networks,
+  including regtest.
+- **A signet datadir is recorded on first start.** `{datadir}/network`
+  stores the network and its message start. A later start with another
+  challenge refuses before the store opens. A 0.9.1 datadir has no
+  marker. Start it once with its original `--signet-challenge`, or that
+  first start is the one it keeps.
+- **RPC auth schemes match in any case.** A crash can no longer leave
+  an empty `rpc.token` that blocks the next start.
+- **An I2P SAM reply with a non-ASCII character no longer panics the
+  node at startup.**
+- **`getindexinfo` lists the basic block filter index** when
+  `--block-filter-index` is on.
+- **`submitpackage` reports `other-wtxid`** when the txid is already in
+  the mempool under another witness.
+- **A lost outbound onion or I2P peer is replaced.** Stale-tip rotation
+  no longer treats every overlay peer as one network group.
+
+Thanks to @niteshbalusu11, @erskingardner, @w3irdrobot, @SovereignTechnology for changes in this release.
+
+### Fixed
+
+
+- **A datadir created for one signet no longer opens under another.** Every
+  signet shares one genesis block, so the stored-genesis check let a datadir
+  open under a different `--signet-challenge`, or under the default one.
+  `{datadir}/network` now records the network and its P2P message start on
+  the first start, and logs `datadir: no network marker in …; adopting …`.
+  Once it exists, a start on another network or challenge refuses with
+  `Wrong datadir for network?` before the store opens, before any peer, and
+  before RPC serves.
+- **Upgrade note for signet:** a datadir from before this release has no
+  `network` file. Its first start after the upgrade records whatever
+  network that start uses. A signet datadir can't be told apart by its
+  genesis, so start it once with its original `--signet-challenge`.
+  Started with another challenge first, it keeps that one and refuses the
+  original from then on.
+
+
+- **`getindexinfo` lists the block filter index.** With `--block-filter-index`, it
+  now reports `basic block filter index` beside `txindex`, as Core does with
+  `-blockfilterindex`: `synced` once the committed filters reach the tip, and
+  `best_block_height` the last filtered height. `getindexinfo "basic block filter
+  index"` answers that entry alone. Clients that check it before using
+  `getblockfilter` or BIP157 peers no longer see the index as missing.
+
+
+- **Consensus: IBD no longer halts on a spend of a later block's
+  transaction behind a valid block.** When one write held a valid block
+  and then a block spending a transaction that only a later block
+  creates, the write was rejected, the valid block connected on its own
+  retry, and the invalid block then halted IBD with "engine fault
+  repeated" until a restart. Bitcoin Core rejects that block with
+  `bad-txns-inputs-missingorspent` and carries on. The rejected write had
+  already inserted its transactions into `tx.head` but did not record
+  that, so the missing-parent check could not tell the index had caught
+  up. A write now records its `tx.head` insert whether or not it is
+  rejected, and the block is marked invalid
+  ([089](docs/external_findings/089-missing-parent-verdict.md)).
+
+
+- **A pruned node reorgs back onto a block it left.** With
+  `--prune-seqsigwit`, a node that had restarted and then reorged away from
+  a block kept saying it already had that block. It dropped the body a peer
+  sent back and stayed on the lighter branch until the next restart. Core
+  keeps the last 288 blocks on a pruned node and completes that reorg. The
+  in-memory block cache now records the real height of each block, so a
+  disconnect removes exactly the blocks it took off the chain, and a later
+  connect no longer leaves the cache stuck on the old branch. Each
+  disconnected block also leaves the set of best-chain hashes, not only the
+  old tip.
+
+
+- **A lost outbound onion or I2P peer is replaced.** The refill after a drop
+  and the stale-tip rotation each dial one peer, and that one dial always went
+  to clearnet. It now goes to an onion or I2P address when no outbound onion
+  or I2P peer is live. While one is live, it stays on clearnet as before.
+- **Stale-tip rotation no longer drops onion and I2P peers first.** It counted
+  every onion and I2P peer as one network group, so with two of them it chose
+  one of those before any clearnet peer. Each network now has its own groups,
+  split by the first four address bits as in Bitcoin Core.
+
+
+- **IBD no longer connects a block that re-spends a same-block spend after
+  a rejected write.** When IBD merged two load batches into one write and
+  that write rejected a block that spent an output a lower block in the
+  write had already spent in its own block, the one-block retry connected
+  the bad block. If that block was later disconnected, the output read as
+  unspent (`gettxout`, Electrum, Esplora, mempool admission) and another
+  re-spend connected. The archive's spent slot for an output spent inside
+  the write now names the first spender in chain order, not whichever map
+  entry came last. A store that already connected such a block keeps the
+  wrong slot; re-sync it.
+
+
+- **RPC auth schemes match in any case.** `Authorization: BEARER …` and
+  `basic …` are accepted, since RFC 9110 makes auth schemes
+  case-insensitive. Before, only `Bearer`/`bearer` and `Basic`/`basic`
+  passed.
+- **An empty RPC token file no longer blocks start.** A crash between
+  creating and writing `rpc.token` left a zero-length file, and every later
+  start failed with "empty". The node now replaces a zero-length
+  `rpc.token` with a new token. A new token is written whole to a
+  sibling file, synced, and renamed into place, so a crash can no longer
+  leave a partial token that later starts accept.
+
+
+- **An I2P SAM reply with a non-ASCII character no longer panics the node.**
+  The SAM key-value parser sliced a reply token at the key's byte length, so a
+  multi-byte UTF-8 character across that index panicked at startup. It now
+  skips that token (#1361).
+
+
+- **`blockchain.silentpayments.subscribe` returns a valid address.** The
+  `address` in the result left out the BIP-352 version character, so it
+  was one character short and did not decode. It now starts `sp1q` on
+  mainnet and `tsp1q` on every test network. Regtest used `sprt`, which
+  is not a BIP-352 prefix.
+
+
+- **`submitblock` no longer marks a valid block invalid when a competing
+  block connects during its input check.** The check read spentness at the
+  live tip on every input. A sibling from a peer that connected mid-check
+  and spent one of the same coins made the submitted block
+  `bad-txns-inputs-missingorspent`, cached invalid until restart or
+  `reconsiderblock`, and its children were `bad-prevblk`. The check now
+  reads the tip once and reads every input at that height. Its reject
+  stands only if the tip is unchanged and no block was disconnected while
+  it ran (a reorg undone before it finished counts). Otherwise the block
+  takes the serialized accept path, and an equal-work sibling is
+  `inconclusive`, as in Core.
+
+
+- **`submitpackage` reports `other-wtxid`.** A member whose txid is already
+  in the mempool under another witness now returns Core's
+  `{"txid", "other-wtxid"}` entry naming the live wtxid, instead of fee and
+  size fields.
+
 ## [0.9.1] — 2026-11-10
 
 ### Highlights
