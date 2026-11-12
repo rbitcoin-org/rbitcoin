@@ -218,11 +218,25 @@ the first page; dirty/singleflight; not FIFO/LRU). RAM: [`docs/ibd-memory.md`](.
 | Tip / blocks | tip height/hash; `/blocks[/:start_height]` (10 summaries); `/block/:hash` JSON + **raw** + status; compact `/block/:hash/txs/summary` (dialect; [`COMPAT.md`](../../COMPAT.md)) |
 | Tx | full JSON, hex, **raw**, status, Electrum merkle-proof, **BIP37 merkleblock-proof**, outspends |
 | Address / scripthash | chain_stats, utxo, `/txs` + `/txs/chain` + `/txs/mempool`, compact `/txs/summary` (dialect; [`COMPAT.md`](../../COMPAT.md)); complete after SH tip finalize |
-| Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`; `POST /tx` and **`POST /txs/package`** when hub open |
-| Without mempool | mempool routes empty/safe; POST broadcast → **503** |
+| Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/mempool/events` (long-poll; dialect), `/fee-estimates`; `POST /tx` and **`POST /txs/package`** when hub open |
+| Without mempool | mempool routes empty/safe; POST broadcast and `/mempool/events` → **503** |
 | Unknown / non-goal | **404** (address-prefix; Liquid; mempool.space `/ws` / `/v1/ws`). `GET /block-template` is 404 unless `--esplora-block-template`. `/internal/*` **unix listen only** (TCP 404): [`COMPAT.md`](../../COMPAT.md) |
 
 **Large responses:** `GET /block/:hash/raw` may be multi‑MB; concurrency/timeout from `ServeLimits` still apply.
+**Following the mempool:** `GET /mempool/events?from=<seq>&wait=<ms>&limit=<n>`
+returns numbered adds and removals (with the removal reason) in commit order.
+To join it to a snapshot with no gap:
+
+1. `GET /mempool/events` (no `from`) and keep `epoch`.
+2. RPC `getrawmempool false true`: the txids and `mempool_sequence` S.
+3. Poll `GET /mempool/events?from=S&wait=20000`. Apply each `added` and
+   `removed` in order. Pass the answer's `next` as the next `from`.
+4. On **410**, or an `epoch` different from step 1, start again at step 1.
+
+`wait` is capped at 25 s and at half the request timeout (the idle timeout
+above). The node keeps the newest 65,536 changes. A parked poll holds a
+listener slot; at most half of `--esplora-max-inflight` may park, and a poll
+over that is **503** with `Retry-After: 1`. Answers are capped at 5,000 events.
 **Package broadcast:** body is a JSON array of tx hex (max 25); uses the same libre-relay mempool policy as single `POST /tx`.
 
 ### mempool.space

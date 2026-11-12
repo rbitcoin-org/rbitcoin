@@ -23,8 +23,8 @@ info:
     `/scripthashes/*` stamp the scripthash-index watermark, so the JSON matches
     the join that produced it, except `/address/{address}/txs/mempool` and
     `/scripthash/{scripthash}/txs/mempool`, which are not stamped. With `?asof=`,
-    the stamp is the as-of block. Public `/mempool`, `/mempool/txids`, and
-    `/mempool/recent` are not stamped. `/mempool/txids/page` and
+    the stamp is the as-of block. Public `/mempool`, `/mempool/txids`,
+    `/mempool/recent`, and `/mempool/events` are not stamped. `/mempool/txids/page` and
     `/mempool/txids/page/{last_txid}` are, because the unstamped check is only
     `/mempool` and `/mempool/{one segment}`. `/fee-estimates`, `POST /tx`, and
     `POST /txs/package` are not stamped. `/internal/mempool/*` is stamped.
@@ -735,6 +735,81 @@ paths:
                     fee: { type: integer, description: sats }
                     vsize: { type: integer }
                     value: { type: integer, description: total output value in sats }
+  /mempool/events:
+    get:
+      tags: [mempool]
+      summary: Numbered mempool adds and removals (long-poll; dialect)
+      description: |
+        Not in Blockstream Esplora. Every add to and removal from the mempool
+        takes the next sequence number, in commit order. The sequence is the
+        one `getrawmempool false true` returns as `mempool_sequence`: it
+        starts at 1 and is the number the next change will take.
+
+        Join: read `epoch` from a call without `from`. Take
+        `getrawmempool false true` (txids and S). Poll with `from=S`, and pass
+        each answer's `next` as the next `from`. Apply `added` and `removed`
+        in order. On a 410, or an `epoch` that differs from the first one
+        seen, start over with a new snapshot.
+
+        The node keeps the newest 65,536 changes. `epoch` is random per
+        process, so a restart is a new epoch.
+      parameters:
+        - name: from
+          in: query
+          required: false
+          description: First sequence wanted. Omitted, the answer is at once and has no events.
+          schema: { type: integer, minimum: 0 }
+        - name: wait
+          in: query
+          required: false
+          description: |
+            Milliseconds to wait when no event with `seq >= from` exists yet.
+            Default 0 (answer at once). Capped at 25,000 and at half the
+            listener's request timeout. The answer may have no events.
+          schema: { type: integer, minimum: 0 }
+        - name: limit
+          in: query
+          required: false
+          description: Most events in one answer. Default and cap 5,000.
+          schema: { type: integer, minimum: 1, maximum: 5000 }
+      responses:
+        "200":
+          description: Events from `from`, in order, with consecutive sequences
+          headers: { X-Powered-By: { $ref: "#/components/headers/PoweredBy" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MempoolEvents" }
+              example:
+                epoch: 5b1e9c0a7d3344f2
+                next: 1204
+                events:
+                  - { seq: 1201, type: added, txid: 0f3c2a1e5d6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f, fee: 1234, weight: 561, vsize: 141, time: 1794950000 }
+                  - { seq: 1202, type: removed, txid: 1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091, reason: replaced, by: 0f3c2a1e5d6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f }
+                  - { seq: 1203, type: removed, txid: 2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2, reason: block }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "410":
+          description: |
+            `from` is older than the oldest change kept, or greater than
+            `next` (a cursor from before a restart). Take a new snapshot.
+          headers: { X-Powered-By: { $ref: "#/components/headers/PoweredBy" } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [epoch, oldest, next]
+                properties:
+                  epoch: { type: string, description: 16 hex digits }
+                  oldest: { type: integer, description: oldest sequence kept }
+                  next: { type: integer, description: sequence the next change will take }
+        "503":
+          description: |
+            No mempool on this node, or too many parked polls. The second
+            carries `Retry-After: 1`. At most half the listener's in-flight
+            limit may be parked.
+          headers:
+            X-Powered-By: { $ref: "#/components/headers/PoweredBy" }
+            Retry-After: { schema: { type: integer }, description: Seconds. Set when the parked-poll cap is full. }
+          content: { text/plain: { schema: { type: string } } }
   /fee-estimates:
     get:
       tags: [mempool]
@@ -1210,6 +1285,38 @@ components:
         fee_histogram:
           type: array
           items: { type: array, prefixItems: [{ type: number }, { type: integer }], minItems: 2, maxItems: 2 }
+    MempoolEvents:
+      type: object
+      required: [epoch, next, events]
+      properties:
+        epoch: { type: string, description: 16 hex digits, random per process }
+        next:
+          type: integer
+          description: |
+            The `from` for the next call: one past the last event in this
+            answer, or `from` when there is none. Without `from`, the
+            sequence the next change will take.
+        events: { type: array, items: { $ref: "#/components/schemas/MempoolEvent" } }
+    MempoolEvent:
+      type: object
+      required: [seq, type, txid]
+      properties:
+        seq: { type: integer }
+        type: { type: string, enum: [added, removed] }
+        txid: { $ref: "#/components/schemas/Hash" }
+        fee: { type: integer, description: "`added`: base fee in sats" }
+        weight: { type: integer, description: "`added`: BIP141 weight" }
+        vsize: { type: integer, description: "`added`: sigop-adjusted virtual size, as `getmempoolentry` reports it" }
+        time: { type: integer, description: "`added`: accept time, Unix seconds (`setmocktime` on regtest)" }
+        reason:
+          type: string
+          enum: [expiry, sizelimit, reorg, block, conflict, replaced, rollback]
+          description: |
+            `removed`: Core's removal reasons, plus `rollback` when a package,
+            a one-parent-one-child pair, or a multi-transaction
+            `testmempoolaccept` takes back what it admitted. A descendant
+            removed with its parent carries the parent's reason.
+        by: { $ref: "#/components/schemas/Hash", description: "`replaced`: the txid that replaced it" }
     TestAcceptResult:
       type: object
       required: [txid, wtxid, allowed]
