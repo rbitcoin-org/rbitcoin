@@ -94,6 +94,8 @@ Fixed
   floor that already matches the count does not. A fault writes
   `scripthash.rebuild` as a wipe request. That open wipes once, then
   rewrites the file as a resume mark. The next open keeps sealed shards
-  while the resume mark is still there. A fault mark, including one
+  while the resume mark is still there. A nearby lost tail still comes
+  down under that mark, so the high watermark does not stick and the
+  next finalize can clear the mark. A fault mark, including one
   written again during the rebuild, wipes once more. An explicit force
   rebuild still wipes.

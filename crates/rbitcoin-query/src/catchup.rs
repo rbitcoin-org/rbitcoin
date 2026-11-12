@@ -384,10 +384,19 @@ impl Query {
     /// [`FarSealCopy::NearbyOnly`]. Copying that far seal first would make
     /// catch-up appends skip their flush. A nearby seal is still copied,
     /// then unlinked.
+    ///
+    /// Resume byte `2` keeps sealed shards. It is not a wipe, so a lost
+    /// tail still comes down. Leaving the high watermark makes the next
+    /// finalize report a create gap and never clear the marker. A wipe
+    /// request still skips the unlink, because that head is replaced.
     pub(super) fn repair_lost_sh_tail(&self, far_seal: FarSealCopy) -> Result<bool, QueryError> {
-        let rebuild = self.sh_force_rebuild()
-            || rbitcoin_store::scripthash::sh_rebuild_marked(self.store.path())
-            || self.store.scripthash.shard_offset_past_file()?;
+        let path = self.store.path();
+        let force = self.sh_force_rebuild();
+        let marked = rbitcoin_store::scripthash::sh_rebuild_marked(path);
+        let resume = rbitcoin_store::scripthash::sh_rebuild_resume(path);
+        let shard_past = self.store.scripthash.shard_offset_past_file()?;
+        let will_wipe = force || ((marked || shard_past) && !resume);
+        let rebuild = force || marked || shard_past;
         if far_seal == FarSealCopy::NearbyOnly && self.store.scripthash.include_hwm() == 0 {
             self.sh_run.refresh_seal();
             let seal = self.sh_run.sealed_max_create_fk();
@@ -395,8 +404,8 @@ impl Query {
                 return Ok(rebuild);
             }
         }
-        self.copy_legacy_seal_before_lost_tail(rebuild)?;
-        if !rebuild
+        self.copy_legacy_seal_before_lost_tail(will_wipe)?;
+        if !will_wipe
             && Self::sh_lost_tail(self.store.scripthash.include_hwm(), self.store.txs.count())
         {
             self.unlink_sh_tail(self.store.txs.count())?;
@@ -407,8 +416,11 @@ impl Query {
     /// A legacy head keeps the floor in SEAL. Copy it before the
     /// lost-tail check so a seal within a million creates unlinks on
     /// this open. A seal farther ahead is not that tail.
-    fn copy_legacy_seal_before_lost_tail(&self, rebuild: bool) -> Result<(), QueryError> {
-        if rebuild
+    ///
+    /// `will_wipe` skips the copy. The head is about to be replaced, and
+    /// a resume mark is not that wipe.
+    fn copy_legacy_seal_before_lost_tail(&self, will_wipe: bool) -> Result<(), QueryError> {
+        if will_wipe
             || !self.sh_use_writebehind()
             || !self.store.scripthash.unsealed_main_shards().is_empty()
         {

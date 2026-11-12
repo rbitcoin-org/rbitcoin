@@ -709,25 +709,103 @@ fn fault_rebuild_marker_wipes_the_inclusion_mark() {
 
 /// The resume byte means the wipe already finished. Wiping the inclusion
 /// mark and the recheck span would throw away a head the last attempt
-/// had already sealed.
+/// had already sealed. A mark that matches the create count is not a lost tail.
 #[test]
 fn interrupted_rebuild_keeps_the_inclusion_mark() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-rebuild-resume");
     q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    let hwm = q.store.scripthash.include_hwm();
+    assert!(hwm > 0);
+    assert_eq!(hwm, q.store.txs.count());
     rbitcoin_store::scripthash::mark_sh_rebuild_resume(q.store.path()).unwrap();
-    rbitcoin_store::scripthash::store_include_hwm(q.store.path(), 5).unwrap();
     let mut mark = [0u8; 16];
     mark[..8].copy_from_slice(&1u64.to_le_bytes());
-    mark[8..].copy_from_slice(&4u64.to_le_bytes());
+    mark[8..].copy_from_slice(&hwm.to_le_bytes());
     std::fs::write(q.store.path().join("scripthash.recheck"), mark).unwrap();
     q.finalize_sh_runs().unwrap();
     assert_eq!(
         q.store.scripthash.include_hwm(),
-        5,
+        hwm,
         "the resume wiped the inclusion mark"
     );
     let got = std::fs::read(q.store.path().join("scripthash.recheck")).expect("scripthash.recheck");
     assert_eq!(got, mark);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Resume byte `2` keeps sealed shards. It must not keep an inclusion
+/// mark above the covered count. Finalize then reports a create gap and
+/// never clears the marker, so the next start fails the same way.
+#[test]
+fn resume_marker_still_lowers_a_lost_tail() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-resume-tail");
+    q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    let old = q.store.scripthash.include_hwm();
+    assert!(old > 1);
+    rbitcoin_store::scripthash::mark_sh_rebuild_resume(q.store.path()).unwrap();
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(1, end).unwrap();
+    q.store.txs.create_loc.truncate_to_count(1).unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    let covered = q.store.txs.count();
+    assert!(covered < old, "reopen kept the pre-cut count {covered}");
+    assert!(
+        rbitcoin_store::scripthash::sh_rebuild_resume(q.store.path()),
+        "open cleared a resume that has not finished"
+    );
+    assert_eq!(
+        q.store.scripthash.include_hwm(),
+        covered,
+        "the resume mark left the pre-cut watermark {old}"
+    );
+    let spans = rbitcoin_store::scripthash::sh_recheck_spans(q.store.path()).unwrap();
+    assert!(
+        spans.iter().any(|(lo, hi)| *lo == covered && *hi >= old),
+        "the cut span was not on disk: {spans:?} old={old}"
+    );
+    q.finalize_sh_runs()
+        .expect("finalize must not stick on the create gap");
+    assert_eq!(q.store.scripthash.include_hwm(), covered);
+    assert!(
+        !rbitcoin_store::scripthash::sh_rebuild_marked(q.store.path()),
+        "a finished finalize left the resume mark"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A resume mark with no include file still has to copy a nearby SEAL
+/// and then unlink it. Skipping that copy leaves the seal above the stem
+/// and the next finalize never lowers it.
+#[test]
+fn resume_marker_unlinks_a_nearby_seal_when_the_include_file_is_missing() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-resume-seal");
+    q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    let old = q.store.scripthash.include_hwm();
+    assert!(old > 1);
+    q.sh_run.refresh_seal();
+    assert_eq!(q.sh_run.sealed_max_create_fk(), old);
+    std::fs::remove_file(dir.join(rbitcoin_store::INCLUDE_HWM_NAME)).unwrap();
+    rbitcoin_store::scripthash::mark_sh_rebuild_resume(q.store.path()).unwrap();
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(1, end).unwrap();
+    q.store.txs.create_loc.truncate_to_count(1).unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    let covered = q.store.txs.count();
+    assert!(covered < old);
+    assert_eq!(
+        q.store.scripthash.include_hwm(),
+        covered,
+        "the resume mark left the nearby seal above the stem"
+    );
+    assert!(q.sh_run.sealed_max_create_fk() <= covered);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
