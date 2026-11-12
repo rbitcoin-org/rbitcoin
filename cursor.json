@@ -1,14 +1,14 @@
 {
   "new_base": "8e62e4ce4d60c30abc851cb0893e4b80149ac9e4",
   "new_skip": 808,
-  "old_index": 2575,
-  "old_name": "crates/rbitcoin-esplora/src/handlers.rs:2013:5: replace address_txs_mempool -> Response with Default::default()",
+  "old_index": 3246,
+  "old_name": "crates/rbitcoin-ibd/src/ibd/assign.rs:781:52: replace * with /",
   "new_cap_used": true,
   "run_id": "43066405893",
   "new_len": 6735,
   "new_remaining": 5927,
   "old_len": 28820,
-  "old_remaining": 28018,
-  "completed_new": 429,
-  "completed_old": 802
+  "old_remaining": 28149,
+  "completed_new": 0,
+  "completed_old": 671
 }
