@@ -1496,3 +1496,4 @@ async fn block_template_does_not_lock_the_cache_across_template_prev() {
 include!("esplora_sh_journey.rs");
 include!("esplora_http_journey.rs");
 include!("blindbit_journey.rs");
+include!("mempool_events_journey.rs");

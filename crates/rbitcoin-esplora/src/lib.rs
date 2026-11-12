@@ -15,6 +15,8 @@ pub mod handlers;
 #[doc(hidden)]
 pub mod internal;
 #[doc(hidden)]
+pub mod mempool_events;
+#[doc(hidden)]
 pub mod script_fields;
 #[doc(hidden)]
 pub mod server;

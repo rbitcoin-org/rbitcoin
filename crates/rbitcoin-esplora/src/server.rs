@@ -584,6 +584,9 @@ pub struct EsploraHandle {
     /// `/blindbit/v1/` permit gate, mounted only while tweaks are on.
     #[doc(hidden)]
     pub blindbit: Arc<crate::blindbit::BlindbitLimit>,
+    /// `/mempool/events` parked polls. Tests wait on `parked`.
+    #[doc(hidden)]
+    pub events_park: Arc<crate::mempool_events::EventPark>,
     pub task: JoinHandle<()>,
 }
 
@@ -1144,6 +1147,7 @@ pub async fn run_esplora(
         gbt_cache: Arc::new(Mutex::new(None)),
     };
 
+    let events_park = crate::mempool_events::EventPark::new(max_conn, timeout);
     // axum 0.8 path params use `{name}` (not `:name`).
     let rest = Router::new()
         .route("/block-template", get(handlers::block_template))
@@ -1259,6 +1263,11 @@ pub async fn run_esplora(
         )
         .route("/mempool/txids", get(handlers::mempool_txids))
         .route("/mempool/recent", get(handlers::mempool_recent))
+        .route(
+            "/mempool/events",
+            get(crate::mempool_events::mempool_events)
+                .layer(axum::Extension(Arc::clone(&events_park))),
+        )
         .route("/fee-estimates", get(handlers::fee_estimates));
     #[cfg(unix)]
     let rest = if matches!(config.listen, EsploraListen::Unix(_)) {
@@ -1327,6 +1336,7 @@ pub async fn run_esplora(
                 shutdown,
                 admit: Arc::clone(&admit),
                 blindbit: Arc::clone(&blindbit_limit),
+                events_park: Arc::clone(&events_park),
                 task,
             })
         }
@@ -1352,6 +1362,7 @@ pub async fn run_esplora(
                 shutdown,
                 admit: Arc::clone(&admit),
                 blindbit: Arc::clone(&blindbit_limit),
+                events_park: Arc::clone(&events_park),
                 task,
             })
         }
