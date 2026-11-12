@@ -56,14 +56,34 @@ pub const SH_RECHECK_NAME: &str = "scripthash.recheck";
 pub const SH_THROUGH_NAME: &str = "scripthash.through";
 
 /// Present while a framing fault still has to be rebuilt from Class A.
+///
+/// `1` asks the next finalize to wipe. A past-end page read and a slab-used
+/// repair write that before any wipe. `2` means this finalize already wiped,
+/// so a crash during the rebuild keeps sealed shards.
 pub const SH_REBUILD_NAME: &str = "scripthash.rebuild";
+
+const SH_REBUILD_WIPE: &[u8] = b"1";
+const SH_REBUILD_RESUME: &[u8] = b"2";
 
 pub fn sh_rebuild_marked(store_dir: &Path) -> bool {
     store_dir.join(SH_REBUILD_NAME).is_file()
 }
 
+/// The wipe for this marker already finished. Any other contents still wipe.
+pub fn sh_rebuild_resume(store_dir: &Path) -> bool {
+    std::fs::read(store_dir.join(SH_REBUILD_NAME))
+        .ok()
+        .as_deref()
+        == Some(SH_REBUILD_RESUME)
+}
+
 pub fn mark_sh_rebuild(store_dir: &Path) -> Result<(), StoreError> {
-    crate::file::write_synced_tmp_rename(&store_dir.join(SH_REBUILD_NAME), b"1")
+    crate::file::write_synced_tmp_rename(&store_dir.join(SH_REBUILD_NAME), SH_REBUILD_WIPE)
+}
+
+/// Record that the wipe finished. A later fault overwrites this with `1`.
+pub fn mark_sh_rebuild_resume(store_dir: &Path) -> Result<(), StoreError> {
+    crate::file::write_synced_tmp_rename(&store_dir.join(SH_REBUILD_NAME), SH_REBUILD_RESUME)
 }
 
 pub fn clear_sh_rebuild(store_dir: &Path) -> Result<(), StoreError> {

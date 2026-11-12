@@ -681,14 +681,40 @@ fn force_rebuild_clears_the_flushed_tail_mark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `scripthash.rebuild` is already on disk, so this open is a resume.
-/// Wiping the inclusion mark and the recheck span would throw away a head
-/// the last attempt had already sealed.
+/// A past-end read or a slab repair writes `scripthash.rebuild` before any
+/// wipe. That marker still has to wipe. Keeping the inclusion mark would
+/// leave the sealed corrupt head tip-ready and then delete the marker.
+#[test]
+fn fault_rebuild_marker_wipes_the_inclusion_mark() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-rebuild-fault");
+    q.enter_direct_index_mode().unwrap();
+    rbitcoin_store::scripthash::mark_sh_rebuild(q.store.path()).unwrap();
+    rbitcoin_store::scripthash::store_include_hwm(q.store.path(), 5).unwrap();
+    let mut mark = [0u8; 16];
+    mark[..8].copy_from_slice(&1u64.to_le_bytes());
+    mark[8..].copy_from_slice(&4u64.to_le_bytes());
+    std::fs::write(q.store.path().join("scripthash.recheck"), mark).unwrap();
+    q.finalize_sh_runs().unwrap();
+    assert_eq!(
+        q.store.scripthash.include_hwm(),
+        0,
+        "a fault marker left the inclusion mark"
+    );
+    assert!(
+        !q.store.path().join("scripthash.recheck").exists(),
+        "a fault marker left the recheck span"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The resume byte means the wipe already finished. Wiping the inclusion
+/// mark and the recheck span would throw away a head the last attempt
+/// had already sealed.
 #[test]
 fn interrupted_rebuild_keeps_the_inclusion_mark() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-rebuild-resume");
     q.enter_direct_index_mode().unwrap();
-    rbitcoin_store::scripthash::mark_sh_rebuild(q.store.path()).unwrap();
+    rbitcoin_store::scripthash::mark_sh_rebuild_resume(q.store.path()).unwrap();
     rbitcoin_store::scripthash::store_include_hwm(q.store.path(), 5).unwrap();
     let mut mark = [0u8; 16];
     mark[..8].copy_from_slice(&1u64.to_le_bytes());
