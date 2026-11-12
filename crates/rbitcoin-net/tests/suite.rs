@@ -26,6 +26,7 @@ mod fee_history;
 mod fee_history_file;
 mod i2p_sam;
 mod listen;
+mod mempool_events;
 mod most_work;
 mod msg_decode;
 mod net_permissions;

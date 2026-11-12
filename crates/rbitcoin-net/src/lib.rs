@@ -24,6 +24,7 @@ pub mod fee_history_file;
 pub mod i2p_sam;
 #[doc(hidden)]
 pub mod listen;
+pub mod mempool_events;
 #[doc(hidden)]
 pub mod most_work;
 #[doc(hidden)]

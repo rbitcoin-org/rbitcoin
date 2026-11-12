@@ -8,6 +8,7 @@
 
 use crate::fee_history::{FeeHistory, HistoricalFeeBlock};
 use crate::fee_history_file;
+use crate::mempool_events::MempoolEventLog;
 use crate::perf_meter::{PerfCounter, PerfMax};
 use arc_swap::ArcSwap;
 use bitcoin::hashes::Hash;
@@ -1066,7 +1067,8 @@ fn isolated_resend_delay_secs() -> u64 {
 
 /// Shared mempool + relay gate used by peer sessions and tip confirm.
 pub struct MempoolHub {
-    pub inner: RwLock<ActiveMempool>,
+    /// Written only through [`PoolWrite`], so every change is numbered.
+    inner: RwLock<ActiveMempool>,
     pub query: Arc<Query>,
     /// When false, peers' tx inv/tx are ignored (IBD / catch-up).
     pub relay_enabled: AtomicBool,
@@ -1216,6 +1218,8 @@ pub struct MempoolHub {
     pub tip_ctx: Mutex<Option<(Fk, ChainTipCtx)>>,
     /// TxRequestTracker-shaped missing-parent GETDATA.
     pub parent_req: Mutex<parent_req::ParentTracker>,
+    /// Numbered pool changes. Filled before each write lock is released.
+    events: MempoolEventLog,
 }
 
 #[doc(hidden)]
@@ -1340,6 +1344,34 @@ impl Drop for TemplateHold<'_> {
     }
 }
 
+/// The pool held for write. Drop numbers the pool's journal into the event
+/// log before the write lock is released, so event order is commit order.
+#[doc(hidden)]
+pub struct PoolWrite<'a> {
+    pool: std::sync::RwLockWriteGuard<'a, ActiveMempool>,
+    events: &'a MempoolEventLog,
+}
+
+impl std::ops::Deref for PoolWrite<'_> {
+    type Target = ActiveMempool;
+
+    fn deref(&self) -> &ActiveMempool {
+        &self.pool
+    }
+}
+
+impl std::ops::DerefMut for PoolWrite<'_> {
+    fn deref_mut(&mut self) -> &mut ActiveMempool {
+        &mut self.pool
+    }
+}
+
+impl Drop for PoolWrite<'_> {
+    fn drop(&mut self) {
+        self.events.record(self.pool.drain_journal());
+    }
+}
+
 /// One isolated-broadcast lap the loop can name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
@@ -1375,9 +1407,21 @@ impl MempoolHub {
     }
 
     #[doc(hidden)]
-    pub fn lock_write(&self) -> std::sync::RwLockWriteGuard<'_, ActiveMempool> {
+    pub fn lock_write(&self) -> PoolWrite<'_> {
         crate::reactor::assert_not_reactor("mempool inner write");
-        self.inner.write().unwrap()
+        PoolWrite {
+            pool: self.inner.write().unwrap(),
+            events: &self.events,
+        }
+    }
+
+    /// [`Self::lock_write`] without waiting. Safe on the reactor.
+    fn try_lock_write(&self) -> Option<PoolWrite<'_>> {
+        let pool = self.inner.try_write().ok()?;
+        Some(PoolWrite {
+            pool,
+            events: &self.events,
+        })
     }
 
     pub fn open(dir: impl AsRef<Path>, query: Arc<Query>) -> Result<Arc<Self>, String> {
@@ -1422,6 +1466,13 @@ impl MempoolHub {
             mp.discard_trust_marks()
                 .map_err(|e| format!("mempool open: {e}"))?;
         }
+        let mock_now = Arc::new(AtomicU64::new(0));
+        mp.set_node_clock(Arc::clone(&mock_now));
+        // Schema ≤ 2 records carry no sigop cost: fill (or evict) before serving.
+        mp.recompute_missing_sigops(&QueryUtxoProvider::new(&query));
+        let loaded = mp.take_loaded_accept_times();
+        // What the pool did before the hub owns it is not a change a client saw.
+        mp.drain_journal();
         let (announce, _) = broadcast::channel(256);
         let (inv_flush, _) = broadcast::channel(16);
         let unbroadcast = if persist {
@@ -1498,7 +1549,7 @@ impl MempoolHub {
             wtxid_by_txid: Mutex::new(HashMap::new()),
             next_relay_seq: AtomicU64::new(1),
             immediate_relay: AtomicBool::new(false),
-            mock_now: Arc::new(AtomicU64::new(0)),
+            mock_now,
             accept_at: Mutex::new(HashMap::new()),
             next_accept_gen: AtomicU64::new(1),
             accept_gen: Mutex::new(HashMap::new()),
@@ -1521,13 +1572,7 @@ impl MempoolHub {
             min_live_accept_at: AtomicU64::new(u64::MAX),
             tip_ctx: Mutex::new(None),
             parent_req: Mutex::new(parent_req::ParentTracker::new()),
-        };
-        // Schema ≤ 2 records carry no sigop cost: fill (or evict) before serving.
-        let loaded = {
-            let mut g = hub.lock_write();
-            g.set_node_clock(Arc::clone(&hub.mock_now));
-            g.recompute_missing_sigops(&QueryUtxoProvider::new(&hub.query));
-            g.take_loaded_accept_times()
+            events: MempoolEventLog::new(),
         };
         // Stored accept times feed expiry and `getmempoolentry.time`. A loaded
         // tx is not queued for INV. Like Core's load, it takes a fresh entry
@@ -5412,7 +5457,7 @@ impl MempoolHub {
     /// Handshake/INV/disconnect run on the reactor. Prefer `try_write`; wait only off-reactor.
     #[doc(hidden)]
     pub fn orphan_write<R>(&self, f: impl FnOnce(&mut ActiveMempool) -> R) -> Option<R> {
-        if let Ok(mut g) = self.inner.try_write() {
+        if let Some(mut g) = self.try_lock_write() {
             return Some(f(&mut g));
         }
         if crate::reactor::on_tokio_worker() && !crate::reactor::in_blocking_region() {
@@ -5895,6 +5940,19 @@ impl MempoolHub {
             .unwrap_or(0)
     }
 
+    /// Numbered pool changes.
+    pub fn events(&self) -> &MempoolEventLog {
+        &self.events
+    }
+
+    /// Live txids and the next event sequence, read under one pool guard.
+    /// That listing plus every event from that sequence on is the pool.
+    pub fn live_txids_at_event_seq(&self) -> (Vec<Txid>, u64) {
+        let g = self.lock_read();
+        let txids = g.graph.iter().map(|(t, _)| *t).collect();
+        (txids, self.events.next())
+    }
+
     /// Snapshot of live txs (for Electrum / RPC) — clones bodies.
     pub fn list_live(&self) -> Vec<(Txid, u64, u64, Transaction)> {
         self.meter_list_live.fetch_add(1, Ordering::Relaxed);
@@ -6097,7 +6155,7 @@ impl MempoolHub {
         &self,
         txs: impl IntoIterator<Item = &'a Transaction>,
     ) -> bool {
-        let Ok(mut g) = self.inner.try_write() else {
+        let Some(mut g) = self.try_lock_write() else {
             return false;
         };
         for tx in txs {
