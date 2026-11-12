@@ -249,7 +249,11 @@ pub fn plan_unsorted_collect(
 ) -> UnsortedCollectAction {
     match done_last {
         None => UnsortedCollectAction::Full,
-        Some(d) if d >= class_a_last => UnsortedCollectAction::Skip,
+        // Equal means this collect already scanned the live count.
+        Some(d) if d == class_a_last => UnsortedCollectAction::Skip,
+        // Above the live count is a covered-prefix cut. Skip would pack the
+        // old spills and publish that last as the inclusion watermark.
+        Some(d) if d > class_a_last => UnsortedCollectAction::Full,
         Some(_) if any_sealed_shards => UnsortedCollectAction::Skip,
         Some(_) if !keys_present => UnsortedCollectAction::Full,
         Some(d) => UnsortedCollectAction::Append {
@@ -335,6 +339,51 @@ pub fn read_phase_done(
 
 pub fn unsorted_done_last_fk(dir: &Path, n_shards: usize) -> Option<u64> {
     read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards).map(|d| d.last_fk)
+}
+
+fn unsorted_phase_last(dir: &Path, n_shards: usize) -> Option<u64> {
+    let keys = read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards).map(|d| d.last_fk);
+    let posts = read_phase_done(dir, POST_DONE_NAME, POST_DONE_MAGIC, n_shards).map(|d| d.last_fk);
+    keys.max(posts)
+}
+
+/// A phase marker above the live count names creates this open already
+/// dropped. Record it before the collect clears the spills, and before
+/// the first shard sync, so the next open still has the cut span.
+fn note_unsorted_done_above_count(
+    store: &Store,
+    dir: &Path,
+    n_shards: usize,
+) -> Result<(), StoreError> {
+    let covered = store.txs.count();
+    let Some(old) =
+        unsorted_phase_last(dir, n_shards).filter(|old| *old > covered && *old != u64::MAX)
+    else {
+        return Ok(());
+    };
+    crate::scripthash::note_sh_through(store.path(), old)?;
+    crate::scripthash::note_sh_recheck(store.path(), covered, old)
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static BEFORE_UNSORTED_PACK: std::cell::Cell<Option<fn(u64)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+fn fire_before_unsorted_pack(store_dir: &Path) {
+    let Some(hook) = BEFORE_UNSORTED_PACK.with(|c| c.take()) else {
+        return;
+    };
+    hook(crate::scripthash::load_sh_through(store_dir));
+}
+
+/// One-shot hook immediately before the first unsorted shard sync.
+/// Tests check that `scripthash.through` already names the collect.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_before_unsorted_pack_for_test(hook: Option<fn(u64)>) {
+    BEFORE_UNSORTED_PACK.with(|c| c.set(hook));
 }
 
 #[doc(hidden)]
@@ -2175,6 +2224,7 @@ pub fn materialize_sh_unsorted_from_class_a(
     }
 
     let any_sealed = unsealed.len() < n_shards;
+    note_unsorted_done_above_count(store, &dir, n_shards)?;
     let collected = collect_unsorted_covering_class_a(
         store,
         &dir,
@@ -2183,6 +2233,11 @@ pub fn materialize_sh_unsorted_from_class_a(
         any_sealed,
         cancel,
     )?;
+    // The fks about to be packed. A lower note does not move a cut marker
+    // that already names the dropped tail.
+    if collected.last_fk > 0 {
+        crate::scripthash::note_sh_through(store.path(), collected.last_fk)?;
+    }
     let mut mat = materialize_sh_from_unsorted_from_txs(
         table,
         &store.txs,
@@ -2208,6 +2263,8 @@ pub fn materialize_sh_from_unsorted_from_txs(
     pack_workers: usize,
     cancel: Option<&AtomicBool>,
 ) -> Result<ShShardMaterialize, StoreError> {
+    #[cfg(debug_assertions)]
+    fire_before_unsorted_pack(table.store_dir());
     let n_shards = table.head_shard_count().max(1);
     seal_mphf_from_keys(table, unsorted_dir, n_shards, cancel)?;
     let any_sealed = table.unsealed_main_shards().len() < n_shards;

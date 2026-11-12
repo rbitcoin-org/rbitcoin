@@ -362,6 +362,14 @@ fn plan_unsorted_collect_appends_only_when_no_shards() {
         UnsortedCollectAction::Skip
     ));
     assert!(matches!(
+        plan_unsorted_collect(Some(11), 10, false, true),
+        UnsortedCollectAction::Full
+    ));
+    assert!(matches!(
+        plan_unsorted_collect(Some(11), 10, true, true),
+        UnsortedCollectAction::Full
+    ));
+    assert!(matches!(
         plan_unsorted_collect(Some(4), 10, false, true),
         UnsortedCollectAction::Append { first: 5, last: 10 }
     ));

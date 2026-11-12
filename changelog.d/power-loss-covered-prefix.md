@@ -73,9 +73,12 @@ Fixed
   farther ahead stays out of the inclusion file until tip finalize.
   The packed head stays. A crash
   between those two writes still has the high watermark, so the next start
-  tries again. The write-behind advance, the Class A tail backfill, and
-  the unsorted seal each record `scripthash.through` before a wave can
-  seal the ingest head, and again before the body sync.
+  tries again. The write-behind advance and the Class A tail backfill each
+  record `scripthash.through` before a wave can seal the ingest head, and
+  again before the body sync. The unsorted collect records that marker
+  before the first shard pack. A `DONE` last above the create count collects
+  the covered prefix again, leaves `include_hwm` at that count, and records
+  the dropped numbers in `scripthash.recheck`.
   Open records `(covered, through]` in `scripthash.recheck` when
   that value is past the create count, including when `include_hwm` is not.
   That repair records the cut span before the watermark moves.

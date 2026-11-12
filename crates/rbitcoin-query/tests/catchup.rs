@@ -1339,6 +1339,62 @@ fn finalize_sh_appends_unsorted_when_done_lags_before_any_shard() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A crash can pack one shard, then the next open can cut Class A under
+/// the `DONE` last. That last must not become `include_hwm`, and the
+/// spills past the cut must not stay in the index.
+#[test]
+fn unsorted_done_above_the_count_does_not_publish_that_watermark() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-done-above");
+    seed_direct_chain(&q, 3);
+    let n_shards = q.store.scripthash.head_shard_count();
+    let udir = rbitcoin_store::unsorted_shard_dir(q.store.path());
+    rbitcoin_store::collect_unsorted_shard_files(&q.store, &udir, n_shards, 1, None).unwrap();
+    let old = rbitcoin_store::unsorted_done_last_fk(&udir, n_shards).unwrap();
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(1, end).unwrap();
+    q.store.txs.create_loc.truncate_to_count(1).unwrap();
+    let covered = q.store.txs.count();
+    assert_eq!(covered, 1);
+    assert!(
+        old > covered,
+        "planted DONE last {old} is not above the cut"
+    );
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_pack_for_test(Some(
+        snap_through_before_unsorted_pack,
+    ));
+    let result = q.finalize_sh_runs();
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_pack_for_test(None);
+    result.unwrap();
+    let seen = THROUGH_BEFORE_PACK.with(|c| c.get());
+    assert!(
+        seen >= old,
+        "through was {seen} before the first pack, DONE last was {old}"
+    );
+    assert_eq!(
+        q.store.scripthash.include_hwm(),
+        covered,
+        "DONE last {old} was published as include_hwm"
+    );
+    let dropped = rbitcoin_store::script_hash(&[0x51, 1]);
+    let kept = rbitcoin_store::script_hash(&[0x51, 0]);
+    let stale = q.store.scripthash.entries(&dropped).unwrap();
+    assert!(
+        stale.iter().all(|(fk, _)| fk.0 <= covered),
+        "a create past the cut stayed in the index: {stale:?}"
+    );
+    assert!(
+        !q.store.scripthash.entries(&kept).unwrap().is_empty(),
+        "the covered create was not indexed"
+    );
+    let spans = rbitcoin_store::scripthash::sh_recheck_spans(q.store.path()).unwrap();
+    assert!(
+        spans.iter().any(|(lo, hi)| *lo == covered && *hi >= old),
+        "the cut span was not on disk: {spans:?} old={old}"
+    );
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn finalize_sh_backfills_class_a_tail_when_shards_already_sealed() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-shard-lag");
@@ -1396,6 +1452,14 @@ thread_local! {
 fn snap_through_at_sample(q: &Query) {
     let through = rbitcoin_store::scripthash::load_sh_through(q.store.path());
     BACKFILL_THROUGH_AT_SAMPLE.with(|c| c.set(through));
+}
+
+thread_local! {
+    static THROUGH_BEFORE_PACK: Cell<u64> = const { Cell::new(0) };
+}
+
+fn snap_through_before_unsorted_pack(through: u64) {
+    THROUGH_BEFORE_PACK.with(|c| c.set(through));
 }
 
 /// A wave can seal the ingest head before the flush. The through marker
