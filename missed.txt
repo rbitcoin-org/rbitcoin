@@ -1535,3 +1535,58 @@ MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:645:33: replace < with == in rewi
 MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:645:33: replace < with > in rewind_densify_scan_lo in 1s build + 15s test
 MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:645:33: replace < with <= in rewind_densify_scan_lo in 1s build + 15s test
 MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:734:9: replace || with && in need_hash_at in 1s build + 15s test
+# 43177771634 1 7286c3662b40aff4e5e4c92e290eb1efde66712e
+MISSED   crates/rbitcoin-electrum/src/server.rs:2412:18: replace > with == in decode_broadcast_tx in 95s build + 24s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:2412:18: replace > with >= in decode_broadcast_tx in 3s build + 25s test
+MISSED   crates/rbitcoin-esplora/src/blindbit.rs:40:5: replace default_max_inflight -> usize with 0 in 95s build + 22s test
+MISSED   crates/rbitcoin-esplora/src/blindbit.rs:40:5: replace default_max_inflight -> usize with 1 in 3s build + 22s test
+MISSED   crates/rbitcoin-esplora/src/blindbit.rs:44:9: replace / with % in default_max_inflight in 4s build + 22s test
+MISSED   crates/rbitcoin-esplora/src/blindbit.rs:44:9: replace / with * in default_max_inflight in 3s build + 22s test
+MISSED   crates/rbitcoin-esplora/src/blindbit.rs:474:21: replace < with <= in block_sp_elements in 3s build + 22s test
+MISSED   crates/rbitcoin-esplora/src/handlers.rs:197:28: replace < with <= in block_status in 3s build + 22s test
+MISSED   crates/rbitcoin-esplora/src/handlers.rs:846:71: replace < with <= in block_template_sync in 3s build + 22s test
+MISSED   crates/rbitcoin-esplora/src/handlers.rs:859:36: replace == with != in block_template_sync in 3s build + 22s test
+MISSED   crates/rbitcoin-esplora/src/handlers.rs:2221:21: replace * with / in parse_maxfeerate_btc_kvb in 3s build + 22s test
+MISSED   crates/rbitcoin-esplora/src/server.rs:365:26: replace match guard asof.is_some() with false in stamp_chain_view_mw in 99s build + 22s test
+MISSED   crates/rbitcoin-esplora/src/server.rs:479:9: replace EsploraStop::load -> bool with false in 3s build + 22s test
+MISSED   crates/rbitcoin-esplora/src/tx_json.rs:551:31: replace == with != in tapscript_leaf in 101s build + 23s test
+MISSED   crates/rbitcoin-ibd/src/ibd/mod.rs:536:29: replace && with || in full_outbound_slots in 117s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/mod.rs:1176:68: replace && with || in ibd_cancellable in 5s build + 80s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:332:33: replace && with || in assign_work_ordered in 120s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:332:18: replace && with || in assign_work_ordered in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:332:48: replace > with >= in assign_work_ordered in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:335:24: replace += with *= in assign_work_ordered in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:960:39: replace || with && in first_pre_hole in 4s build + 80s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:366:16: delete ! in ConfirmFeed::install_unproven_bounds in 110s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:400:9: replace ConfirmFeed::unproven_lead_active -> bool with true in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:400:52: replace || with && in ConfirmFeed::unproven_lead_active in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:534:33: replace > with >= in ConfirmFeed::clear in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:540:19: replace > with == in ConfirmFeed::clear in 4s build + 80s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:847:54: replace && with || in rearm_script_reject in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:896:17: replace && with || in rearm_after_reject in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:896:8: delete ! in rearm_after_reject in 4s build + 80s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:896:26: replace == with != in rearm_after_reject in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:932:55: replace || with && in await_batches_below_reject in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:986:18: replace && with || in load_fail_rewind_wave in 4s build + 80s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3247:40: replace || with && in spawn_confirm_engine in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3464:46: replace > with == in offer_confirm_ready in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3464:46: replace > with >= in offer_confirm_ready in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3544:55: replace || with && in take_unproven_lead in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3544:41: replace != with == in take_unproven_lead in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3544:58: delete ! in take_unproven_lead in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:781:45: replace * with + in 112s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:834:42: replace * with + in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:930:36: replace * with + in contiguous_tip_holes in 4s build + 84s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:930:36: replace * with / in contiguous_tip_holes in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:999:35: replace && with || in pre_hole_should_extra_racer in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:1042:13: replace || with && in demote_zombie_pending_for_fetch in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:1092:24: replace == with != in peer_queue_len in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:1227:68: replace > with >= in tip_hole_owner_to_drop in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:1228:12: delete ! in tip_hole_owner_to_drop in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:1289:62: replace && with || in reask_aged_retired_owner in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:1327:23: replace == with != in pack_ewma_bps in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:1328:12: replace == with != in pack_ewma_bps in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:1383:68: replace && with || in steal_hung_densify in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:1525:25: replace || with && in cover_tip_holes in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:1603:20: replace == with != in cover_tip_holes in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/assign_plan.rs:39:30: replace / with % in compact_ordered in 2s build + 25s test
