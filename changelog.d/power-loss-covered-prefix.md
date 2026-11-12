@@ -5,7 +5,8 @@ Fixed
   to the last create those headers still name. A short `input.body` header
   cuts `input.loc` to the creates that header still names. The short-input
   probe runs only after that fit, and only when the next row is still inside
-  the fitted count. Open shrinks the tip to match,
+  the fitted count. A witness row past the body is not read; the input count
+  is the prefix that landed. Open shrinks the tip to match,
   then clears `header_txs` ranges past that prefix. A cut that drops
   creates syncs `(covered, old]` in `spend.recheck` before the Class A
   truncate. `old` is also the highest `header_txs` range end still past
@@ -30,7 +31,8 @@ Fixed
 - **The next block after a torn witness locator keeps its own witness.**
   Open appends an empty witness row for each create a short, non-zero
   locator did not name. A witness body that does not cover the last named
-  row is cut back to the last row it still covers before that fill. Open
+  row is cut back to the last row it still covers before that fill, including
+  when the locator count already matches the creates. Open
   refuses when the body covers no witness row. A locator already cut to zero stays empty, so the
   keep-window rewrite is not handed those rows. A 0-byte prune file with
   a positive locator is only that torn marker, so the following append

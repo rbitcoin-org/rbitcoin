@@ -826,10 +826,24 @@ pub fn create_prevout_on_inputs(stems: &ClassASkewStems<'_>, fk: Fk) -> Result<b
 
 /// A short `input` that already existed, whose next create is new-layout.
 ///
+/// The next create's witness row is named, and its first byte sits past the
+/// body open will read. A torn prune fit ignores that body, so the fitted
+/// count can still include the row.
+fn next_seqsigwit_row_past_body(stems: &ClassASkewStems<'_>, fk: Fk) -> Result<bool, StoreError> {
+    let Some(Some((off, len))) = stems.seqsigwit_loc.range_batch(&[fk])?.into_iter().next() else {
+        return Ok(false);
+    };
+    if len == 0 {
+        return Ok(false);
+    }
+    Ok(off.saturating_add(1) > stems.seqsigwit.body_logical_len())
+}
+
 /// `ceiling` is the count the body headers already cover. The probe reads
-/// the next seqsigwit row, so it does not run past that count. Legacy
-/// inline prevouts stay out of this floor so open can still backfill them.
-/// A fresh `Input::create` this open is not a power-loss tail.
+/// the next seqsigwit row, so it does not run past that count. A row past
+/// the witness body cannot rebuild the input, so the input count is the
+/// prefix. Legacy inline prevouts stay out of this floor so open can still
+/// backfill them. A fresh `Input::create` this open is not a power-loss tail.
 #[doc(hidden)]
 pub fn short_new_layout_input(
     stems: &ClassASkewStems<'_>,
@@ -844,6 +858,9 @@ pub fn short_new_layout_input(
         return Ok(None);
     }
     let next = Fk(n_in.saturating_add(1));
+    if next_seqsigwit_row_past_body(stems, next)? {
+        return Ok(Some(n_in));
+    }
     if create_prevout_on_inputs(stems, next)? {
         Ok(Some(n_in))
     } else {
@@ -1167,63 +1184,14 @@ fn coalesce_witness_gaps(spans: &mut Vec<(u64, u64)>) {
     *spans = merged;
 }
 
-/// A prune file left `seqsigwit.loc` behind the creates. Drop the body tail
-/// that locator does not name, then append one empty row per missing create
-/// so the next append's fk is the new create. A locator of 0 is the finished
-/// stem cut: those empty rows are not a witness, and the keep-window rewrite
-/// stops the cut from finishing. A locator ahead of the covered create count
-/// still names dropped creates, so it is cut back to that count. A body that
-/// does not cover the last named row is cut to the last row it does cover,
-/// then filled from there. No covered row refuses the open.
-fn align_short_witness_locator(
+/// Append one empty witness row per create in `(fill_from, through]`.
+fn fill_witness_gap(
     seqsigwit: &VarTable,
     loc: &crate::delta_loc::DeltaLoc,
-    named: u64,
+    fill_from: u64,
     through: u64,
     gap_dir: &Path,
 ) -> Result<bool, StoreError> {
-    if named > through {
-        cut_witness_body_to(seqsigwit, loc, through)?;
-        loc.truncate_to_count(through)?;
-    }
-    clamp_witness_gap_to_count(gap_dir, through)?;
-    if named >= through {
-        // The counter can already match while the file still holds a tail
-        // the covered prefix dropped. The next append would start past that
-        // tail, and the locator delta would keep naming the old row.
-        let end = witness_body_end(loc, through)?;
-        if seqsigwit.count() != through || seqsigwit.body_logical_len() != end {
-            cut_witness_body_to(seqsigwit, loc, through)?;
-        }
-        return Ok(false);
-    }
-    if named == 0 {
-        return Ok(false);
-    }
-    let (off, len) = loc
-        .range_batch(&[Fk(named)])?
-        .into_iter()
-        .next()
-        .flatten()
-        .ok_or(StoreError::Corrupt(
-            "invariant: seqsigwit.loc range for gap",
-        ))?;
-    let end = off.saturating_add(len);
-    let body_len = seqsigwit.body_logical_len();
-    let fill_from = if body_len < end {
-        let covered = witness_rows_body_covers(loc, named, body_len)?;
-        if covered == 0 {
-            return Err(StoreError::Corrupt(
-                "invariant: seqsigwit body covers no witness row",
-            ));
-        }
-        cut_witness_body_to(seqsigwit, loc, covered)?;
-        loc.truncate_to_count(covered)?;
-        covered
-    } else {
-        seqsigwit.truncate_body_to(named, end)?;
-        named
-    };
     let n = usize::try_from(through - fill_from)
         .map_err(|_| StoreError::Corrupt("invariant: seqsigwit gap"))?;
     let Some(prep) = seqsigwit.prepare_batch_encode(n, n.saturating_mul(8), |_i, _buf| {})? else {
@@ -1241,6 +1209,62 @@ fn align_short_witness_locator(
     let (_fks, durable) = publish_prepared_body(seqsigwit, prep, true)?;
     let _ = loc.commit_staged(staged, durable);
     Ok(loc.count() == through && seqsigwit.count() == through)
+}
+
+/// A prune file left `seqsigwit.loc` behind the creates. Drop the body tail
+/// that locator does not name, then append one empty row per missing create
+/// so the next append's fk is the new create. A locator of 0 is the finished
+/// stem cut: those empty rows are not a witness, and the keep-window rewrite
+/// stops the cut from finishing. A locator ahead of the covered create count
+/// still names dropped creates, so it is cut back to that count. A body that
+/// does not cover the last named row is cut to the last row it does cover,
+/// then filled from there, including when the locator count already matches
+/// the creates. No covered row refuses the open.
+fn align_short_witness_locator(
+    seqsigwit: &VarTable,
+    loc: &crate::delta_loc::DeltaLoc,
+    named: u64,
+    through: u64,
+    gap_dir: &Path,
+) -> Result<bool, StoreError> {
+    clamp_witness_gap_to_count(gap_dir, through)?;
+    if named == 0 || through == 0 {
+        if named > through {
+            cut_witness_body_to(seqsigwit, loc, through)?;
+            loc.truncate_to_count(through)?;
+        }
+        return Ok(false);
+    }
+    let claim = named.min(through);
+    let end = witness_body_end(loc, claim)?;
+    let body_len = seqsigwit.body_logical_len();
+    if body_len < end {
+        let covered = witness_rows_body_covers(loc, claim, body_len)?;
+        if covered == 0 {
+            return Err(StoreError::Corrupt(
+                "invariant: seqsigwit body covers no witness row",
+            ));
+        }
+        cut_witness_body_to(seqsigwit, loc, covered)?;
+        loc.truncate_to_count(covered)?;
+        return fill_witness_gap(seqsigwit, loc, covered, through, gap_dir);
+    }
+    if named > through {
+        cut_witness_body_to(seqsigwit, loc, through)?;
+        loc.truncate_to_count(through)?;
+        return Ok(false);
+    }
+    if named == through {
+        // The counter can already match while the file still holds a tail
+        // the covered prefix dropped. The next append would start past that
+        // tail, and the locator delta would keep naming the old row.
+        if seqsigwit.count() != through || body_len != end {
+            cut_witness_body_to(seqsigwit, loc, through)?;
+        }
+        return Ok(false);
+    }
+    seqsigwit.truncate_body_to(named, end)?;
+    fill_witness_gap(seqsigwit, loc, named, through, gap_dir)
 }
 
 #[doc(hidden)]

@@ -743,6 +743,106 @@ fn ovf_header_miss_does_not_seal_the_create() {
     assert!(t.get_meta_and_outputs(rbitcoin_primitives::Fk(2)).is_err());
 }
 
+/// The locator already names every create. The witness body only covers the
+/// first row. Open cuts to that row, fills the gap, and the next append
+/// does not fail the stem check.
+#[test]
+fn matched_locator_short_witness_body_fills_from_the_covered_row() {
+    let dir = super::tempfile_dir("matched-short-witness-body");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let seq_end = on_disk_hwm(&t.seqsigwit.body);
+    t.put_full_batch_indexed(&[one(2), one(3)], false).unwrap();
+    t.flush().unwrap();
+    set_disk_hwm(&t.seqsigwit.body, seq_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 3);
+    assert_eq!(t.seqsigwit_loc.count(), 3);
+    assert_eq!(t.seqsigwit.count(), 3);
+    assert!(!t.witness_row_is_gap(1));
+    assert!(t.witness_row_is_gap(2));
+    assert!(t.witness_row_is_gap(3));
+    t.put_full_batch_indexed(&[one(4)], false)
+        .expect("the next append must not fail the stem check");
+    assert_eq!(t.count(), 4);
+    assert_eq!(t.seqsigwit.count(), 4);
+}
+
+/// The locator names every create and the witness body covers none of them.
+/// Open refuses instead of filling from an empty stem.
+#[test]
+fn matched_locator_with_no_witness_row_refuses_open() {
+    let dir = super::tempfile_dir("matched-no-witness-row");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1), one(2), one(3)], false)
+        .unwrap();
+    t.flush().unwrap();
+    set_disk_hwm(&t.seqsigwit.body, FILE_HEADER_LEN as u64);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let msg = match TxTable::open_tiny(&dir) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("open kept a witness body that covers no row"),
+    };
+    assert!(
+        msg.contains("seqsigwit body covers no witness row"),
+        "{msg}"
+    );
+}
+
+/// Creates were cut to row 2, the locator still names row 3, and the body
+/// only covers row 1. Open keeps the txout prefix, cuts the witness to row
+/// 1, and fills the one missing row.
+#[test]
+fn short_body_behind_a_long_locator_fills_up_to_the_prefix() {
+    let dir = super::tempfile_dir("ahead-loc-short-body");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let seq_end = on_disk_hwm(&t.seqsigwit.body);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    let tx_end = on_disk_hwm(&t.body.body);
+    let sp_end = on_disk_hwm(&t.spent.body);
+    t.put_full_batch_indexed(&[one(3)], false).unwrap();
+    t.flush().unwrap();
+    set_disk_hwm(&t.seqsigwit.body, seq_end);
+    set_disk_hwm(&t.body.body, tx_end);
+    set_disk_hwm(&t.spent.body, sp_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 2);
+    assert_eq!(t.seqsigwit.count(), 2);
+    assert!(!t.witness_row_is_gap(1));
+    assert!(t.witness_row_is_gap(2));
+    t.put_full_batch_indexed(&[one(4)], false)
+        .expect("the next append must not fail the stem check");
+}
+
+/// A torn prune file ignores the short witness body in the fit. The short
+/// input probe must not read the next row past that body.
+#[test]
+fn torn_prune_short_input_does_not_read_past_the_witness_body() {
+    let dir = super::tempfile_dir("torn-short-input-body");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let seq_end = on_disk_hwm(&t.seqsigwit.body);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    set_disk_hwm(&t.input.loc, FILE_HEADER_LEN as u64 + 2);
+    set_disk_hwm(&t.seqsigwit.body, seq_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+
+    let t = TxTable::open_tiny(&dir).expect("open truncates instead of refusing");
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.input.count(), 1);
+    assert_eq!(outs(&t, 1)[0].script, vec![1]);
+}
+
 /// The torn marker kept the creates. The witness body only covers the first
 /// row the locator names. Open cuts the locator to that row, fills the gap,
 /// and the next append does not fail the stem check.
