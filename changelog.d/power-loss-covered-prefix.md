@@ -74,7 +74,8 @@ Fixed
   The packed head stays. A crash
   between those two writes still has the high watermark, so the next start
   tries again. The write-behind advance, the Class A tail backfill, and
-  the unsorted seal each record `scripthash.through` before the body sync.
+  the unsorted seal each record `scripthash.through` before a wave can
+  seal the ingest head, and again before the body sync.
   Open records `(covered, through]` in `scripthash.recheck` when
   that value is past the create count, including when `include_hwm` is not.
   That repair records the cut span before the watermark moves.

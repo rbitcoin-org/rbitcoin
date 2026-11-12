@@ -570,6 +570,9 @@ impl Query {
         let mut total = 0u64;
         loop {
             let last = self.store.txs.count();
+            // A wave can seal the ingest head before the flush below.
+            // Name this count first. A later equal note does not write.
+            rbitcoin_store::scripthash::note_sh_through(self.store.path(), last)?;
             self.sh_run.refresh_seal();
             let floor = durable_sh_inclusion_floor(
                 self.store.scripthash.include_hwm(),

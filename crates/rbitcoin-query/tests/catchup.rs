@@ -5,6 +5,7 @@ use rbitcoin_query::testutil::FixtureChain;
 use rbitcoin_query::Query;
 use rbitcoin_store::StoreError;
 use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, ScriptHashRecord, TxRecord};
+use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -1386,6 +1387,81 @@ fn backfill_includes_create_that_lands_after_count_sample() {
 
 fn extend_one_during_backfill(q: &Query) {
     extend_direct_chain(q, 1);
+}
+
+thread_local! {
+    static BACKFILL_THROUGH_AT_SAMPLE: Cell<u64> = const { Cell::new(u64::MAX) };
+}
+
+fn snap_through_at_sample(q: &Query) {
+    let through = rbitcoin_store::scripthash::load_sh_through(q.store.path());
+    BACKFILL_THROUGH_AT_SAMPLE.with(|c| c.set(through));
+}
+
+/// A wave can seal the ingest head before the flush. The through marker
+/// has to name that count before the first append, or a crash plus a cut
+/// leaves the synced fk out of `scripthash.recheck`.
+#[test]
+fn class_a_backfill_names_the_tail_before_the_append() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-backfill-before");
+    seed_direct_chain(&q, 3);
+    q.finalize_sh_runs().unwrap();
+    let _ = std::fs::remove_file(dir.join("scripthash.through"));
+    extend_direct_chain(&q, 1);
+    let count = q.store.txs.count();
+    assert!(q.store.scripthash.include_hwm() < count);
+    set_sh_backfill_after_sample_for_test(Some(snap_through_at_sample));
+    q.backfill_sh_creates_from_class_a().unwrap();
+    set_sh_backfill_after_sample_for_test(None);
+    let seen = BACKFILL_THROUGH_AT_SAMPLE.with(|c| c.get());
+    assert_eq!(
+        seen, count,
+        "the marker was still {seen} when the append began"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Write-behind can seal inside the append, then wait a second before
+/// `advance_sh_include_hwm`. The marker still has to be on disk.
+#[test]
+fn writebehind_names_the_tail_before_a_throttled_advance() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-wb-before");
+    seed_direct_chain(&q, 2);
+    q.enter_tip_index_mode();
+    let height = Height(1);
+    let header_fk = q.store.confirmed.get(height).unwrap().unwrap();
+    let tx_fks = q.store.header_txs.get_list(header_fk).unwrap().unwrap();
+    let mut records = Vec::new();
+    for fk in tx_fks {
+        q.collect_scripthash_creates(fk, &mut records, None)
+            .unwrap();
+    }
+    assert!(!records.is_empty());
+    q.sh.pending
+        .lock()
+        .unwrap()
+        .push_back(rbitcoin_query::connect::ShPendingJob {
+            height: Height(50),
+            header_fk: Fk::NULL,
+            records: Vec::new(),
+        });
+    let _ = std::fs::remove_file(dir.join("scripthash.through"));
+    let applied = q
+        .apply_sh_job_inner(&rbitcoin_query::connect::ShPendingJob {
+            height,
+            header_fk,
+            records,
+        })
+        .unwrap();
+    assert!(applied, "the job did not append");
+    let through = rbitcoin_store::scripthash::load_sh_through(q.store.path());
+    assert_eq!(through, q.store.txs.count());
+    assert_eq!(
+        q.store.scripthash.include_hwm(),
+        0,
+        "the throttled advance published the watermark"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Direct backfill syncs the new rows and then advances `include_hwm`.

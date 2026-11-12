@@ -536,6 +536,30 @@ impl Store {
         Self::open_layout(StoreLayout::tiny(path.into()))
     }
 
+    /// Record spans a covered-prefix cut must recheck, before readers load them.
+    ///
+    /// A header range can end past the stem the locator cut named. A
+    /// scripthash through-marker can name a create past `include_hwm`.
+    /// The watermark alone does not write a span, including a gap past a
+    /// million creates.
+    fn note_open_cut_spans(
+        path: &Path,
+        txs: &TxTable,
+        header_txs: &HeaderTxsTable,
+    ) -> Result<(), StoreError> {
+        if txs.count() != 0 || txs.bodies_allocated_past_header() {
+            if let Some(end) = Self::max_header_range_end_past(header_txs, txs.count())? {
+                crate::spend_recheck::note_spend_recheck(path, txs.count(), end)?;
+            }
+        }
+        let through = crate::scripthash::load_sh_through(path);
+        if through > txs.count() {
+            let end = through.max(crate::scripthash::load_include_hwm(path));
+            crate::scripthash::note_sh_recheck(path, txs.count(), end)?;
+        }
+        Ok(())
+    }
+
     pub fn open_layout(layout: StoreLayout) -> Result<Self, StoreError> {
         crate::file::ensure_nofile_budget();
         let path = layout.dir.clone();
@@ -568,22 +592,7 @@ impl Store {
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
         }
-        // The locator cut only names stems. A header range can still end
-        // past that count. Record it before this process loads the span
-        // and before those ranges are cleared.
-        if txs.count() != 0 || txs.bodies_allocated_past_header() {
-            if let Some(end) = Self::max_header_range_end_past(&header_txs, txs.count())? {
-                crate::spend_recheck::note_spend_recheck(&path, txs.count(), end)?;
-            }
-        }
-        // A flushed scripthash row can sit past `include_hwm`. The marker
-        // names that create. `include_hwm` alone stays the legacy seal and
-        // does not write a span, including a gap past a million creates.
-        let through = crate::scripthash::load_sh_through(&path);
-        if through > txs.count() {
-            let end = through.max(crate::scripthash::load_include_hwm(&path));
-            crate::scripthash::note_sh_recheck(&path, txs.count(), end)?;
-        }
+        Self::note_open_cut_spans(&path, &txs, &header_txs)?;
         let cold_path = layout.is_split().then_some(seqsigwit_dir);
         let spend_recheck = crate::spend_recheck::read_spend_recheck(&path)?;
         let store = Self {

@@ -1137,6 +1137,10 @@ impl Query {
             for r in sh_creates {
                 tip_sh_max_fk = tip_sh_max_fk.max(r.create_tx_fk.0);
             }
+            // The append can seal the ingest head before the advance
+            // below, including on the one-second wait. Name the live
+            // count first. The advance still notes again before its flush.
+            rbitcoin_store::scripthash::note_sh_through(self.store.path(), self.store.txs.count())?;
             let (n, timing) = self
                 .store
                 .scripthash
