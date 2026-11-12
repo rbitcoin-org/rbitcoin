@@ -4,7 +4,9 @@ use rbitcoin_query::sh_builder::{load_seal, store_seal};
 use rbitcoin_query::testutil::FixtureChain;
 use rbitcoin_query::Query;
 use rbitcoin_store::StoreError;
-use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, ScriptHashRecord, TxRecord};
+use rbitcoin_store::{
+    HeaderRecord, InputRecord, OutputRecord, ScriptHashRecord, StoreLayout, TxRecord,
+};
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
@@ -1390,6 +1392,260 @@ fn unsorted_done_above_the_count_does_not_publish_that_watermark() {
     assert!(
         spans.iter().any(|(lo, hi)| *lo == covered && *hi >= old),
         "the cut span was not on disk: {spans:?} old={old}"
+    );
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn script_on_shard(n_shards: usize, shard: usize, tag: u8) -> Vec<u8> {
+    for b in 0u16..=255 {
+        let script = vec![0x51, tag, b as u8];
+        let sh = rbitcoin_store::script_hash(&script);
+        if rbitcoin_store::scripthash_head::prefix_shard_of(&sh, n_shards) == shard {
+            return script;
+        }
+    }
+    panic!("no script lands on shard {shard}");
+}
+
+fn header_for_coinbase(
+    h: u32,
+    prev: Fk,
+    parent_hash: [u8; 32],
+    txid: &[u8; 32],
+) -> (HeaderRecord, rbitcoin_query::TxApply) {
+    let (mut header, mut ta) = coinbase_block(h, prev, Some(parent_hash));
+    ta.tx.txid = *txid;
+    header.merkle_root = rbitcoin_primitives::merkle_root_from_txids(&[*txid]);
+    header.hash = rbitcoin_store::block_header_hash(
+        header.version,
+        &parent_hash,
+        &header.merkle_root,
+        header.timestamp,
+        header.bits,
+        header.nonce,
+    );
+    (header, ta)
+}
+
+/// Height 0 stores `block_header_hash` and the coinbase merkle, so a later
+/// open keeps that block.
+fn seed_reopenable_chain(q: &Query, n: u32) {
+    q.enter_direct_index_mode().unwrap();
+    let mut prev = Fk::NULL;
+    let mut parent_hash = [0u8; 32];
+    for h in 0..n {
+        let mut txid = [0u8; 32];
+        txid[0..4].copy_from_slice(&h.to_le_bytes());
+        txid[31] = 0xcb;
+        let (header, ta) = header_for_coinbase(h, prev, parent_hash, &txid);
+        parent_hash = header.hash;
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    assert_eq!(q.tip_height(), Some(Height(n - 1)));
+    assert!(q.store.txs.count() >= u64::from(n));
+}
+
+fn connect_coinbase_paying(q: &Query, script: Vec<u8>) {
+    q.enter_direct_index_mode().unwrap();
+    let h = q
+        .tip_height()
+        .map(|tip| tip.0.saturating_add(1))
+        .unwrap_or(0);
+    let prev = if h == 0 {
+        Fk::NULL
+    } else {
+        q.store.confirmed.get(Height(h - 1)).unwrap().unwrap()
+    };
+    let parent_hash = if h == 0 {
+        [0u8; 32]
+    } else {
+        q.get_header(prev).unwrap().hash
+    };
+    let mut txid = [0u8; 32];
+    txid[0..4].copy_from_slice(&h.to_le_bytes());
+    txid[30] = h as u8;
+    txid[31] = 0xcb;
+    let (header, mut ta) = header_for_coinbase(h, prev, parent_hash, &txid);
+    ta.outputs = vec![OutputRecord::unspent(50_0000_0000, script)];
+    q.connect_block(Height(h), &header, &[ta]).unwrap();
+}
+
+fn cut_creates_to(q: &Query, keep: u64) {
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(keep, end).unwrap();
+    q.store.txs.create_loc.truncate_to_count(keep).unwrap();
+    assert_eq!(q.store.txs.count(), keep);
+}
+
+fn reopen_layout(dir: &std::path::Path, shards: usize) -> Query {
+    let layout = StoreLayout::tiny(dir).with_sh_shards(shards);
+    Query::open_or_create_layout(layout).unwrap()
+}
+
+/// Direct mode collects scripthash after IBD. A `DONE` last above the cut
+/// has to be recorded while the count is still short, or a chain that grows
+/// back to that last packs the pre-cut spills and skips the new creates.
+#[test]
+fn open_drops_done_above_the_cut_before_the_chain_grows() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-done-regrow");
+    seed_reopenable_chain(&q, 3);
+    let n_shards = q.store.scripthash.head_shard_count();
+    let udir = rbitcoin_store::unsorted_shard_dir(q.store.path());
+    rbitcoin_store::collect_unsorted_shard_files(&q.store, &udir, n_shards, 1, None).unwrap();
+    let old = rbitcoin_store::unsorted_done_last_fk(&udir, n_shards).unwrap();
+    cut_creates_to(&q, 1);
+    let path = dir.path().to_path_buf();
+    drop(q);
+    let q = reopen_layout(&path, n_shards);
+    let covered = q.store.txs.count();
+    assert!(covered < old, "reopen left count {covered}, DONE was {old}");
+    let through = rbitcoin_store::scripthash::load_sh_through(q.store.path());
+    assert!(
+        through >= old,
+        "open left through {through}, DONE last was {old}"
+    );
+    assert!(
+        !udir.join("DONE.keys").is_file(),
+        "DONE.keys still names the pre-cut scan"
+    );
+    assert!(
+        !udir.join("DONE.post").is_file(),
+        "DONE.post still names the pre-cut scan"
+    );
+    let fresh = vec![0x52, 1];
+    while q.store.txs.count() < old {
+        connect_coinbase_paying(&q, fresh.clone());
+    }
+    q.finalize_sh_runs().unwrap();
+    assert!(
+        !q.scripthash_history(&rbitcoin_store::script_hash(&fresh))
+            .unwrap()
+            .is_empty(),
+        "creates that replaced the cut were not indexed"
+    );
+    let stale = rbitcoin_store::script_hash(&[0x51, 1]);
+    assert!(
+        q.scripthash_history(&stale).unwrap().is_empty(),
+        "the pre-cut script is still history"
+    );
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Packing one shard, then cutting under `DONE`, must not replace that
+/// shard's extract. Finalize while the count is still short: that is the
+/// collect that walks every shard.
+#[test]
+fn packed_shard_keeps_its_extract_across_a_done_cut() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("q-sh-packed-cut").unwrap();
+    let layout = StoreLayout::tiny(dir.path()).with_sh_shards(2);
+    let q = Query::open_or_create_layout(layout).unwrap();
+    seed_reopenable_chain(&q, 3);
+    let n_shards = q.store.scripthash.head_shard_count();
+    assert_eq!(n_shards, 2);
+    let kept = rbitcoin_store::script_hash(&[0x51, 0]);
+    let shard = rbitcoin_store::scripthash_head::prefix_shard_of(&kept, n_shards);
+    let udir = rbitcoin_store::unsorted_shard_dir(q.store.path());
+    rbitcoin_store::collect_unsorted_shard_files(&q.store, &udir, n_shards, 1, None).unwrap();
+    let old = rbitcoin_store::unsorted_done_last_fk(&udir, n_shards).unwrap();
+    rbitcoin_store::scripthash_materialize::pack_one_extract_shard(
+        &q.store.scripthash,
+        &udir,
+        shard,
+    )
+    .unwrap();
+    let unsealed = q.store.scripthash.unsealed_main_shards();
+    assert!(
+        !unsealed.contains(&shard),
+        "packed shard {shard} is still unsealed: {unsealed:?}"
+    );
+    assert!(
+        unsealed.iter().any(|s| *s != shard),
+        "the other shard was packed too"
+    );
+    let base = rbitcoin_store::scripthash::sorted_main_shard_path(q.store.path(), shard, n_shards);
+    let mphf = rbitcoin_store::scripthash_mphf::mphf_path(&base);
+    let before = std::fs::read(&mphf).unwrap();
+    cut_creates_to(&q, 1);
+    assert!(old > q.store.txs.count());
+    q.finalize_sh_runs().unwrap();
+    let after = std::fs::read(&mphf).unwrap();
+    assert_eq!(before, after, "finalize replaced the packed shard extract");
+    assert!(
+        !q.scripthash_history(&kept).unwrap().is_empty(),
+        "the create that stayed on the packed shard disappeared"
+    );
+    assert_eq!(
+        q.store.scripthash.include_hwm(),
+        1,
+        "DONE last {old} was published as include_hwm"
+    );
+    let stale = rbitcoin_store::script_hash(&[0x51, 1]);
+    assert!(
+        q.scripthash_history(&stale).unwrap().is_empty(),
+        "the pre-cut script is still history"
+    );
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The chain can reach the old `DONE` last before the first finalize.
+/// The packed shard keeps its extract. The new creates on that shard
+/// arrive from the tail backfill, and the inclusion mark stays at the
+/// cut until that append finishes.
+#[test]
+fn open_regrowth_appends_onto_a_packed_shard() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("q-sh-packed-regrow").unwrap();
+    let layout = StoreLayout::tiny(dir.path()).with_sh_shards(2);
+    let q = Query::open_or_create_layout(layout).unwrap();
+    seed_reopenable_chain(&q, 3);
+    let n_shards = q.store.scripthash.head_shard_count();
+    let kept = rbitcoin_store::script_hash(&[0x51, 0]);
+    let shard = rbitcoin_store::scripthash_head::prefix_shard_of(&kept, n_shards);
+    let udir = rbitcoin_store::unsorted_shard_dir(q.store.path());
+    rbitcoin_store::collect_unsorted_shard_files(&q.store, &udir, n_shards, 1, None).unwrap();
+    let old = rbitcoin_store::unsorted_done_last_fk(&udir, n_shards).unwrap();
+    rbitcoin_store::scripthash_materialize::pack_one_extract_shard(
+        &q.store.scripthash,
+        &udir,
+        shard,
+    )
+    .unwrap();
+    let base = rbitcoin_store::scripthash::sorted_main_shard_path(q.store.path(), shard, n_shards);
+    let mphf = rbitcoin_store::scripthash_mphf::mphf_path(&base);
+    let before = std::fs::read(&mphf).unwrap();
+    cut_creates_to(&q, 1);
+    let path = dir.path().to_path_buf();
+    drop(q);
+    let q = reopen_layout(&path, n_shards);
+    let through = rbitcoin_store::scripthash::load_sh_through(q.store.path());
+    assert!(
+        through >= old,
+        "open left through {through}, DONE last was {old}"
+    );
+    assert!(!udir.join("DONE.keys").is_file(), "DONE.keys survived open");
+    let fresh = script_on_shard(n_shards, shard, 0x7a);
+    while q.store.txs.count() < old {
+        connect_coinbase_paying(&q, fresh.clone());
+    }
+    q.finalize_sh_runs().unwrap();
+    let after = std::fs::read(&mphf).unwrap();
+    assert_eq!(before, after, "finalize replaced the packed shard extract");
+    assert!(
+        !q.scripthash_history(&kept).unwrap().is_empty(),
+        "the create that stayed on the packed shard disappeared"
+    );
+    assert!(
+        !q.scripthash_history(&rbitcoin_store::script_hash(&fresh))
+            .unwrap()
+            .is_empty(),
+        "a new create on the packed shard was not indexed"
+    );
+    let stale = rbitcoin_store::script_hash(&[0x51, 1]);
+    assert!(
+        q.scripthash_history(&stale).unwrap().is_empty(),
+        "the pre-cut script is still history"
     );
     assert!(q.sh_is_tip_ready());
     let _ = std::fs::remove_dir_all(&dir);

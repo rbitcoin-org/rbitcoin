@@ -78,7 +78,10 @@ Fixed
   again before the body sync. The unsorted collect records that marker
   before the first shard pack. A `DONE` last above the create count collects
   the covered prefix again, leaves `include_hwm` at that count, and records
-  the dropped numbers in `scripthash.recheck`.
+  the dropped numbers in `scripthash.recheck`. Open records that span and
+  drops the `DONE` markers while the count is still the cut. A packed shard
+  keeps its extract. The inclusion watermark stays at the cut until the tail
+  backfill appends the new creates.
   Open records `(covered, through]` in `scripthash.recheck` when
   that value is past the create count, including when `include_hwm` is not.
   That repair records the cut span before the watermark moves.

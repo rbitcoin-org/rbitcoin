@@ -1197,7 +1197,16 @@ impl ScriptHashTable {
     }
 
     pub fn create_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
-        let n_shards = sh_main_shard_count(scale).max(1);
+        Self::create_with_n_shards(dir, sh_main_shard_count(scale), scale)
+    }
+
+    #[doc(hidden)]
+    pub fn create_with_n_shards(
+        dir: &std::path::Path,
+        n_shards: usize,
+        scale: HeadScale,
+    ) -> Result<Self, StoreError> {
+        let n_shards = n_shards.max(1);
         let body_dir = sh_body_path(dir);
         std::fs::create_dir_all(&body_dir).map_err(|e| StoreError::io(&body_dir, e))?;
         let mut bodies = Vec::with_capacity(n_shards);
@@ -1246,7 +1255,11 @@ impl ScriptHashTable {
     }
 
     pub fn open_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
-        let expected = sh_main_shard_count(scale);
+        let expected = if sh_body_path(dir).is_dir() {
+            sharded_body_n_shards(dir)?
+        } else {
+            sh_main_shard_count(scale)
+        };
         discard_incomplete_scripthash_head(dir, expected)?;
         discard_leftover_oa_overflow(dir)?;
         let layout = detect_sh_body_layout(dir)?;

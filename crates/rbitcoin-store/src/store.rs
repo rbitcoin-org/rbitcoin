@@ -39,6 +39,7 @@ pub struct StoreLayout {
     pub head_scale: HeadScale,
     pub tx_head_rebuild_seal_bits: Option<u32>,
     pub tx_head_rebuild_workers: Option<usize>,
+    sh_shards: usize,
 }
 
 impl StoreLayout {
@@ -49,6 +50,7 @@ impl StoreLayout {
             head_scale: HeadScale::Mainnet,
             tx_head_rebuild_seal_bits: None,
             tx_head_rebuild_workers: None,
+            sh_shards: HeadScale::Mainnet.sh_main_shards(),
         }
     }
 
@@ -59,7 +61,15 @@ impl StoreLayout {
             head_scale: HeadScale::Tiny,
             tx_head_rebuild_seal_bits: None,
             tx_head_rebuild_workers: None,
+            sh_shards: HeadScale::Tiny.sh_main_shards(),
         }
+    }
+
+    /// Scripthash shard count for tests. Production layouts keep the scale count.
+    #[doc(hidden)]
+    pub fn with_sh_shards(mut self, n: usize) -> Self {
+        self.sh_shards = n.max(1);
+        self
     }
 
     pub fn with_cold_dir(mut self, cold_dir: impl Into<PathBuf>) -> Self {
@@ -82,9 +92,9 @@ impl StoreLayout {
         crate::hashhead::initial_slots_for(self.head_scale)
     }
 
-    /// SH main shard count for this scale (1 Tiny, 64 Mainnet).
+    /// SH main shard count (1 Tiny, 64 Mainnet, or the test override).
     pub fn sh_shard_count(&self) -> usize {
-        self.head_scale.sh_main_shards()
+        self.sh_shards.max(1)
     }
 
     /// `tx.head` bits for this scale.
@@ -504,7 +514,11 @@ impl Store {
             headers: HeaderTable::create_with_scale(&path, layout.head_scale)?,
             txs,
             spenders: SpenderTable::create(&path)?,
-            scripthash: ScriptHashTable::create_with_scale(&path, layout.head_scale)?,
+            scripthash: ScriptHashTable::create_with_n_shards(
+                &path,
+                layout.sh_shard_count(),
+                layout.head_scale,
+            )?,
             confirmed: ConfirmedTable::create(&path)?,
             strong_tx: StrongTxTable::create(&path)?,
             header_txs: HeaderTxsTable::create(&path)?,
@@ -546,6 +560,7 @@ impl Store {
         path: &Path,
         txs: &TxTable,
         header_txs: &HeaderTxsTable,
+        sh_shards: usize,
     ) -> Result<(), StoreError> {
         if txs.count() != 0 || txs.bodies_allocated_past_header() {
             if let Some(end) = Self::max_header_range_end_past(header_txs, txs.count())? {
@@ -557,6 +572,11 @@ impl Store {
             let end = through.max(crate::scripthash::load_include_hwm(path));
             crate::scripthash::note_sh_recheck(path, txs.count(), end)?;
         }
+        crate::scripthash_materialize::record_unsorted_phase_above_count(
+            path,
+            sh_shards,
+            txs.count(),
+        )?;
         Ok(())
     }
 
@@ -592,7 +612,7 @@ impl Store {
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
         }
-        Self::note_open_cut_spans(&path, &txs, &header_txs)?;
+        Self::note_open_cut_spans(&path, &txs, &header_txs, scripthash.head_shard_count())?;
         let cold_path = layout.is_split().then_some(seqsigwit_dir);
         let spend_recheck = crate::spend_recheck::read_spend_recheck(&path)?;
         let store = Self {
