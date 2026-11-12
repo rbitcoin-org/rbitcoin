@@ -34,7 +34,8 @@ pub struct EventsQuery {
 }
 
 /// Parked polls. A parked poll holds a listener slot, so at most half the
-/// listener's in-flight limit may park.
+/// listener's in-flight limit (rounded down) may park. A one-slot listener
+/// parks none.
 #[doc(hidden)]
 pub struct EventPark {
     cap: usize,
@@ -57,7 +58,7 @@ impl EventPark {
     /// before the listener's timeout does.
     pub(crate) fn new(max_conn: usize, request_timeout: Duration) -> Arc<Self> {
         Arc::new(Self {
-            cap: (max_conn / 2).max(1),
+            cap: max_conn / 2,
             max_wait: EVENTS_MAX_WAIT.min(request_timeout / 2),
             parked: AtomicUsize::new(0),
             wake: Notify::new(),

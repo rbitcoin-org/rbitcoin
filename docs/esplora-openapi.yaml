@@ -805,7 +805,7 @@ paths:
           description: |
             No mempool on this node, or too many parked polls. The second
             carries `Retry-After: 1`. At most half the listener's in-flight
-            limit may be parked.
+            limit, rounded down, may be parked.
           headers:
             X-Powered-By: { $ref: "#/components/headers/PoweredBy" }
             Retry-After: { schema: { type: integer }, description: Seconds. Set when the parked-poll cap is full. }

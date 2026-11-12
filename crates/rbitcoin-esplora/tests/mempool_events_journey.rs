@@ -161,8 +161,8 @@ async fn mempool_events_follow_admits_and_replacements() {
     handle.shutdown().await;
 }
 
-/// Parked polls are capped at half the listener. Over the cap a poll is not
-/// parked. A poll that does not wait needs no parking slot.
+/// Parked polls are capped at half the listener, rounded down. Over the cap
+/// a poll is not parked. A poll that does not wait needs no parking slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mempool_events_park_cap_and_unix_listener() {
     let (dir, q) = temp_query("esplora-mempool-park");
@@ -204,6 +204,18 @@ async fn mempool_events_park_cap_and_unix_listener() {
     let (st, _) = http_get(bare.local_addr, "/mempool/events").await;
     assert_eq!(st, 503, "no mempool, no event log");
     bare.shutdown().await;
+
+    // A one-slot listener has no slot to spare, so no poll parks on it.
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.limits.max_connections = 1;
+    cfg.limits.idle_timeout = Duration::from_secs(2);
+    let one = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)))
+        .await
+        .expect("listen");
+    let (st, raw, body) = http_get_raw(one.local_addr, "/mempool/events?from=2&wait=20000").await;
+    assert_eq!(st, 503, "{body}");
+    assert_eq!(header_value(&raw, "retry-after").as_deref(), Some("1"));
+    one.shutdown().await;
 
     #[cfg(unix)]
     {

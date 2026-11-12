@@ -235,8 +235,8 @@ To join it to a snapshot with no gap:
 
 `wait` is capped at 25 s and at half the request timeout (the idle timeout
 above). The node keeps the newest 65,536 changes. A parked poll holds a
-listener slot; at most half of `--esplora-max-inflight` may park, and a poll
-over that is **503** with `Retry-After: 1`. Answers are capped at 5,000 events.
+listener slot; at most half of `--esplora-max-inflight` (rounded down) may
+park, and a poll over that is **503** with `Retry-After: 1`. Answers are capped at 5,000 events.
 **Package broadcast:** body is a JSON array of tx hex (max 25); uses the same libre-relay mempool policy as single `POST /tx`.
 
 ### mempool.space
