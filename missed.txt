@@ -1590,3 +1590,65 @@ MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:1383:68: replace && with || in st
 MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:1525:25: replace || with && in cover_tip_holes in 4s build + 78s test
 MISSED   crates/rbitcoin-ibd/src/ibd/assign.rs:1603:20: replace == with != in cover_tip_holes in 4s build + 78s test
 MISSED   crates/rbitcoin-ibd/src/ibd/assign_plan.rs:39:30: replace / with % in compact_ordered in 2s build + 25s test
+# 43177771634 2 7286c3662b40aff4e5e4c92e290eb1efde66712e
+MISSED   crates/rbitcoin-ibd/src/ibd/assign_plan.rs:119:31: replace < with <= in want_headers_beyond_soft_cap in 115s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/body.rs:137:9: replace BodyPresence::known_len -> usize with 1 in 111s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:96:9: replace LoadAheadState::publish_mem_stats with () in 119s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:411:39: replace < with <= in ConfirmFeed::held in 5s build + 80s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:475:9: replace ConfirmFeed::notify with () in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:609:13: replace || with && in ConfirmRejectClass::from_err_str in 4s build + 80s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:608:13: replace || with && in ConfirmRejectClass::from_err_str in 4s build + 80s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:631:13: replace || with && in ConfirmRejectClass::from_err_str in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:628:13: replace || with && in ConfirmRejectClass::from_err_str in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:666:39: replace match guard e.is_uring_session_fault() with false in ConfirmRejectClass::from_confirm in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:1074:5: replace take_lookup_wave_faults -> u64 with 0 in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:1074:5: replace take_lookup_wave_faults -> u64 with 1 in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:1146:5: replace clear_confirm_progress_clock with () in 4s build + 80s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:1198:58: replace > with >= in emit_confirm_reject in 5s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:1558:74: replace && with || in confirm_ready_count in 116s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:1558:41: replace && with || in confirm_ready_count in 4s build + 80s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:1558:30: replace >= with < in confirm_ready_count in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:1558:44: delete ! in confirm_ready_count in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:1677:9: replace ConfirmQueueDepths::load_depth -> usize with 0 in 4s build + 80s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:1677:9: replace ConfirmQueueDepths::load_depth -> usize with 1 in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:1951:8: delete ! in parent_check_wait_slice in 4s build + 78s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2094:58: replace != with == in drain_script_ok_write_queue in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2245:40: replace || with && in write_batch_is_stale_plan in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2342:38: replace || with && in spawn_confirm_engine in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2412:35: replace > with == in spawn_confirm_engine in 4s build + 79s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2417:48: replace > with == in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2417:48: replace > with < in spawn_confirm_engine in 2s build + 25s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2417:48: replace > with >= in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2440:47: replace || with && in spawn_confirm_engine in 2s build + 25s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2524:28: delete ! in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2531:28: delete ! in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2533:33: replace || with && in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2627:53: replace / with % in spawn_confirm_engine in 2s build + 25s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2627:53: replace / with * in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2628:46: replace / with % in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2628:46: replace / with * in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2642:42: replace || with && in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2642:34: replace > with == in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2642:34: replace > with < in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2642:34: replace > with >= in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2642:52: replace > with == in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2642:52: replace > with < in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2642:52: replace > with >= in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2650:40: replace && with || in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2655:41: replace || with && in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2712:38: replace || with && in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2738:40: replace || with && in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2830:40: replace || with && in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:2890:45: replace || with && in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3044:40: replace || with && in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3053:55: replace / with % in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3053:55: replace / with * in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3070:36: replace > with == in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3070:36: replace > with < in spawn_confirm_engine in 2s build + 25s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3070:36: replace > with >= in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3414:20: delete ! in spawn_confirm_engine in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3482:19: replace == with != in offer_confirm_ready in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3484:70: replace + with - in offer_confirm_ready in 2s build + 25s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3484:70: replace + with * in offer_confirm_ready in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3485:27: replace || with && in offer_confirm_ready in 2s build + 26s test
+MISSED   crates/rbitcoin-ibd/src/ibd/confirm/mod.rs:3485:22: replace <= with > in offer_confirm_ready in 2s build + 26s test
