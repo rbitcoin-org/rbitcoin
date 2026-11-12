@@ -1181,6 +1181,10 @@ impl Query {
         if want <= self.store.scripthash.include_hwm() {
             return Ok(());
         }
+        // Land the marker before the body sync. A crash in between still
+        // names these creates. The watermark stays behind until the flush
+        // returns, so recovery replays them instead of treating them as durable.
+        rbitcoin_store::scripthash::note_sh_through(self.store.path(), want)?;
         let t0 = std::time::Instant::now();
         self.store.scripthash.flush()?;
         let st = self.confirm_stats();

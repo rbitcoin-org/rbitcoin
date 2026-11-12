@@ -48,6 +48,12 @@ pub const INCLUDE_HWM_NAME: &str = "scripthash.include_hwm";
 /// Creates in `(covered, old_hwm]` may name a transaction the cut dropped.
 /// Windowed history checks those foreign keys against Class A.
 pub const SH_RECHECK_NAME: &str = "scripthash.recheck";
+/// Highest create fk whose posting bytes may already be on disk.
+///
+/// Written and synced before the body flush. `include_hwm` still moves only
+/// after that flush, so recovery keeps replaying the appends. `u64::MAX` is
+/// not a count.
+pub const SH_THROUGH_NAME: &str = "scripthash.through";
 
 /// Present while a framing fault still has to be rebuilt from Class A.
 pub const SH_REBUILD_NAME: &str = "scripthash.rebuild";
@@ -145,6 +151,50 @@ pub fn repair_heads_synced_for_test() -> u64 {
 #[cfg(debug_assertions)]
 fn note_repair_head_synced() {
     REPAIR_HEAD_SYNCS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Load the flushed-tail marker (`0` if missing, short, or `u64::MAX`).
+pub fn load_sh_through(store_dir: &Path) -> u64 {
+    let p = store_dir.join(SH_THROUGH_NAME);
+    let Ok(buf) = std::fs::read(&p) else {
+        return 0;
+    };
+    if buf.len() < 8 {
+        return 0;
+    }
+    let n = u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]));
+    if n == u64::MAX {
+        0
+    } else {
+        n
+    }
+}
+
+/// Remember a create whose posting bytes may have been synced.
+///
+/// Monotonic. A lower value, zero, and `u64::MAX` do not write. The ordinary
+/// append path passes `u64::MAX` and must not poison this file.
+pub fn note_sh_through(store_dir: &Path, max_create_fk: u64) -> Result<(), StoreError> {
+    if max_create_fk == 0 || max_create_fk == u64::MAX {
+        return Ok(());
+    }
+    if max_create_fk <= load_sh_through(store_dir) {
+        return Ok(());
+    }
+    crate::file::write_synced_tmp_rename(
+        &store_dir.join(SH_THROUGH_NAME),
+        &max_create_fk.to_le_bytes(),
+    )
+}
+
+/// Drop the flushed-tail marker. A full rebuild has no old posting to name.
+pub fn clear_sh_through(dir: &Path) -> Result<(), StoreError> {
+    let path = dir.join(SH_THROUGH_NAME);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StoreError::io(path, e)),
+    }
 }
 
 /// Load durable inclusion HWM (`0` if missing/corrupt).
@@ -1881,6 +1931,12 @@ impl ScriptHashTable {
 
         timing.body_ns = t_body.elapsed().as_nanos() as u64;
 
+        // The repaired bytes are synced next. Name the live count first so a
+        // crash during that sync still rechecks those rows. `u64::MAX` is the
+        // ordinary append and is not a create count.
+        if !retire.is_empty() && live_through != u64::MAX {
+            note_sh_through(self.store_dir(), live_through)?;
+        }
         self.sync_repaired_bodies(&retire)?;
         if !head_final.is_empty() {
             let t_head = std::time::Instant::now();

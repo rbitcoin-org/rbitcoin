@@ -572,6 +572,115 @@ fn txid_at(h: u32) -> [u8; 32] {
     txid
 }
 
+/// Rows flushed past `include_hwm` still have to be rechecked after a cut
+/// that leaves the watermark at or below the new create count.
+#[test]
+fn flushed_tail_above_the_watermark_is_rechecked_on_open() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-through");
+    q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    let count = q.store.txs.count();
+    assert!(count > 0);
+    assert!(q.store.scripthash.include_hwm() <= count);
+    let through = count.saturating_add(2);
+    std::fs::write(dir.join("scripthash.through"), through.to_le_bytes()).unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    let spans = rbitcoin_store::scripthash::sh_recheck_spans(q.store.path()).unwrap();
+    assert_eq!(
+        spans,
+        vec![(count, through)],
+        "a durable row above include_hwm was left out of the recheck span"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The flush marker lands before the body sync, so a crash in between still
+/// has the high create the watermark has not recorded.
+#[test]
+fn include_hwm_advance_records_the_flushed_tail_first() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-through-advance");
+    q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    let count = q.store.txs.count();
+    q.sh.applied_max_fk.store(count, Ordering::Release);
+    q.advance_sh_include_hwm().unwrap();
+    let bytes = std::fs::read(dir.join("scripthash.through")).expect("scripthash.through");
+    let through = u64::from_le_bytes(bytes.as_slice().try_into().unwrap());
+    assert_eq!(through, count);
+    assert_eq!(q.store.scripthash.include_hwm(), count);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The lost-tail span has to cover a flushed row past `include_hwm`.
+/// Stopping the span at the watermark leaves that row in history after reuse.
+#[test]
+fn lost_tail_recheck_reaches_the_flushed_mark() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-through-span");
+    q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    let hwm = q.store.scripthash.include_hwm();
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(1, end).unwrap();
+    q.store.txs.create_loc.truncate_to_count(1).unwrap();
+    assert!(hwm > 1, "hwm {hwm}");
+    let through = hwm.saturating_add(4);
+    std::fs::write(dir.join("scripthash.through"), through.to_le_bytes()).unwrap();
+    q.finalize_sh_runs().unwrap();
+    let spans = rbitcoin_store::scripthash::sh_recheck_spans(q.store.path()).unwrap();
+    assert_eq!(
+        spans,
+        vec![(1, through)],
+        "the recheck span stopped at include_hwm {hwm}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A repaired posting can be synced while `include_hwm` still names an older
+/// create. The marker is the live count, and an ordinary append does not
+/// write `u64::MAX`.
+#[test]
+fn repaired_body_records_the_live_count_not_the_sentinel() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-through-repair");
+    let sh = rbitcoin_store::script_hash(&[0x51, 0xee]);
+    q.store
+        .scripthash
+        .put_create_batch_append(&[
+            ScriptHashRecord::from_fk(sh, Fk(1)),
+            ScriptHashRecord::from_fk(sh, Fk(4)),
+            ScriptHashRecord::from_fk(sh, Fk(9)),
+        ])
+        .unwrap();
+    assert!(
+        !dir.join("scripthash.through").exists(),
+        "an ordinary append must not record u64::MAX"
+    );
+    q.store
+        .scripthash
+        .put_create_batch_append_through(&[ScriptHashRecord::from_fk(sh, Fk(2))], 5)
+        .unwrap();
+    let bytes = std::fs::read(dir.join("scripthash.through")).expect("scripthash.through");
+    let through = u64::from_le_bytes(bytes.as_slice().try_into().unwrap());
+    assert_eq!(through, 5);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A full rebuild wipes the head. A leftover flushed-tail mark would make
+/// the next open recheck creates the new head does not have.
+#[test]
+fn force_rebuild_clears_the_flushed_tail_mark() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-through-wipe");
+    std::fs::write(dir.join("scripthash.through"), 9u64.to_le_bytes()).unwrap();
+    q.sh_run.prepare_force_full_rebuild(&q.store).unwrap();
+    assert!(
+        !dir.join("scripthash.through").exists(),
+        "the rebuild left scripthash.through"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A cut create number that now pays a different script stays on the old
 /// row. Windowed history must not return it, and a newest page must not
 /// spend one of its slots on it.

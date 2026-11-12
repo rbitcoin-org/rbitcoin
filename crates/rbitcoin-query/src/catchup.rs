@@ -216,10 +216,14 @@ impl Query {
         }
         // The cut numbers stay on rows whose outputs were already gone.
         // History has to check those numbers after the chain reuses them.
-        // The file lands before the watermark moves, so a crash in between
-        // still retries this repair and still has the span.
-        if hwm > covered {
-            rbitcoin_store::scripthash::note_sh_recheck(self.store.path(), covered, hwm)?;
+        // A flush can have synced a row past `include_hwm`. The span has to
+        // reach that marker too. The file lands before the watermark moves,
+        // so a crash in between still retries this repair and still has the span.
+        let end = hwm.max(rbitcoin_store::scripthash::load_sh_through(
+            self.store.path(),
+        ));
+        if end > covered {
+            rbitcoin_store::scripthash::note_sh_recheck(self.store.path(), covered, end)?;
         }
         // Seal first. A crash before the watermark moves still has the high
         // mark, so the next start sees the lost tail and tries again. Deleting

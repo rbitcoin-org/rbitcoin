@@ -576,6 +576,14 @@ impl Store {
                 crate::spend_recheck::note_spend_recheck(&path, txs.count(), end)?;
             }
         }
+        // A flushed scripthash row can sit past `include_hwm`. The marker
+        // names that create. `include_hwm` alone stays the legacy seal and
+        // does not write a span, including a gap past a million creates.
+        let through = crate::scripthash::load_sh_through(&path);
+        if through > txs.count() {
+            let end = through.max(crate::scripthash::load_include_hwm(&path));
+            crate::scripthash::note_sh_recheck(&path, txs.count(), end)?;
+        }
         let cold_path = layout.is_split().then_some(seqsigwit_dir);
         let spend_recheck = crate::spend_recheck::read_spend_recheck(&path)?;
         let store = Self {
