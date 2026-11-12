@@ -16,8 +16,8 @@ use rbitcoin_mempool::{
     fee_at_target_sat_kvb, fine_candidate_rates, flow_for_depth, frontier_feerate_from_chunks,
     hold_defined_then_monotone, min_rate_for_capacity, percentile_sat, published_depth_rate,
     weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool, ChainPrevout, ChainTipCtx,
-    Chunk, Coin, FeeFlowMeter, PrepareOpts, SelectBudget, Selected, StockAbove, UtxoProvider,
-    BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
+    Chunk, Coin, FeeFlowMeter, PrepareOpts, RemovalReason, SelectBudget, Selected, StockAbove,
+    UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
@@ -2071,7 +2071,7 @@ impl MempoolHub {
                     n += 1;
                 }
             }
-            let _ = g.remove_live_txids(&present);
+            let _ = g.remove_live_txids(&present, RemovalReason::Expiry);
             for t in &present {
                 if !g.graph.contains(t) {
                     self.unindex_txid(t);
@@ -3364,7 +3364,7 @@ impl MempoolHub {
             let mut g = self.lock_write();
             let spent = g.graph.descendant_set(txid).is_some_and(|d| d.len() > 1);
             if !spent {
-                gone.extend(g.remove_txid_tree(txid));
+                gone.extend(g.remove_txid_tree(txid, RemovalReason::Rollback));
             }
         }
         self.unindex_evicted(&gone);
@@ -3491,7 +3491,7 @@ impl MempoolHub {
                 g.trust_kept.insert(*id);
             }
             for r in accepted.iter().rev() {
-                gone.extend(g.remove_txid_tree(&r.txid));
+                gone.extend(g.remove_txid_tree(&r.txid, RemovalReason::Rollback));
             }
         }
         self.unindex_evicted(&gone);
@@ -5228,7 +5228,7 @@ impl MempoolHub {
                     self.push_confirm_memory(rate);
                 }
             }
-            g.remove_live_txids(txids)?
+            g.remove_live_txids(txids, RemovalReason::Block)?
         };
         if removed > 0 {
             self.unindex_evicted(txids);
@@ -5302,7 +5302,8 @@ impl MempoolHub {
                 self.push_confirm_memory(rate);
             }
         }
-        g.remove_live_txids(txids).unwrap_or(0)
+        g.remove_live_txids(txids, RemovalReason::Block)
+            .unwrap_or(0)
     }
 
     /// Drop orphans the block spent, then the relay rows and fee deltas.
@@ -5717,7 +5718,7 @@ impl MempoolHub {
                 let mut g = self.lock_write();
                 for id in &to_drop {
                     if g.graph.contains(id) {
-                        gone.extend(g.remove_txid_tree(id));
+                        gone.extend(g.remove_txid_tree(id, RemovalReason::Reorg));
                     }
                 }
             }

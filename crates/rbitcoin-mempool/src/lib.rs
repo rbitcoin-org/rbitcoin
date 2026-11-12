@@ -52,6 +52,7 @@ pub mod fee_est;
 pub mod fee_flow;
 #[doc(hidden)]
 pub mod graph;
+mod journal;
 #[doc(hidden)]
 pub mod linearize;
 #[doc(hidden)]
@@ -82,6 +83,7 @@ pub use graph::{
     frontier_feerate_from_chunks, weight_above_from_chunks, Chunk, Cluster, MempoolGraphStats,
     SelectBudget, Selected, StockAbove, TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE,
 };
+pub use journal::{PoolChange, RemovalReason};
 pub use orphanage::{OrphanSnapshot, Orphanage};
 pub use packed::VinAux;
 pub use store::{Mempool, MempoolMeta};

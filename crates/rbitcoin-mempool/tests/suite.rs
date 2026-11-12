@@ -4,6 +4,7 @@ mod fee_analog;
 mod fee_est;
 mod fee_flow;
 mod graph;
+mod journal;
 mod orphanage;
 mod packed;
 mod store_tests;
