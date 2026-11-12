@@ -83,7 +83,12 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   the request timeout and the answer is then 408 (`admit_connection`,
   `TimeoutLayer`). A parked `/mempool/events` long-poll holds a slot; at most
   half the in-flight cap, rounded down, may park (503 `Retry-After: 1` past that), and a
-  park ends within 25 s and half the request timeout. Health, Esplora, Electrum, and inbound P2P leave a
+  park ends within 25 s and half the request timeout. The event ring is
+  readable by anyone who reaches the listener. It holds the txid, fee, sizes,
+  and accept time of the newest 65,536 mempool changes, including an admit
+  the node took back: a failed package, or a multi-transaction
+  `testmempoolaccept`, which admits its transactions and then removes them.
+  Health, Esplora, Electrum, and inbound P2P leave a
   descriptor reserve so the store and RPC can still open files. That reserve
   is Unix; Windows does not count descriptors and does not apply it. The numbers are
   [`docs/operator/interfaces.md`](docs/operator/interfaces.md). Esplora is

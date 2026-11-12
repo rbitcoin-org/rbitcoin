@@ -1314,8 +1314,10 @@ components:
           description: |
             `removed`: Core's removal reasons, plus `rollback` when a package,
             a one-parent-one-child pair, or a multi-transaction
-            `testmempoolaccept` takes back what it admitted. A descendant
-            removed with its parent carries the parent's reason.
+            `testmempoolaccept` takes back what it admitted, and for a
+            conflict taken out by a replacement that did not commit (an
+            `added` follows if it re-enters). A descendant removed with its
+            parent carries the parent's reason.
         by: { $ref: "#/components/schemas/Hash", description: "`replaced`: the txid that replaced it" }
     TestAcceptResult:
       type: object

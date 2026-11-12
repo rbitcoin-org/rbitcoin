@@ -7,7 +7,7 @@
 use bitcoin::Txid;
 
 /// Why a transaction left the pool. Core's `MemPoolRemovalReason` names,
-/// plus `rollback` for a staged admit this node took back.
+/// plus `rollback` for a staged change this node took back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemovalReason {
     /// Older than `-mempoolexpiry`.
@@ -23,7 +23,8 @@ pub enum RemovalReason {
     /// A conflicting admit (RBF) took its place.
     Replaced { by: Txid },
     /// A package, a 1p1c pair, or a `testmempoolaccept` dry run took back
-    /// what it had admitted.
+    /// what it had admitted, or a replacement that did not commit took this
+    /// conflict out. The conflict is added again if it can re-enter.
     Rollback,
 }
 

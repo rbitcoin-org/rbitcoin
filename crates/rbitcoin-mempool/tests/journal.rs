@@ -204,3 +204,24 @@ fn open_and_compact_journal_nothing() {
     assert_eq!(mp.live_count(), 2);
     assert!(journal(&mut mp).is_empty(), "a rebuild is not a change");
 }
+
+/// A replacement that does not commit was never in the pool. Its conflict
+/// leaves as a rollback, not as replaced by it, and the restore journals the
+/// add.
+#[test]
+fn failed_replacement_journals_a_rollback_then_the_restore() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(1);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let victim = spend(ops[0], 99_000);
+    let id = mp.accept_tx(&victim, &utxos, TIP_OK).expect("victim").txid;
+    let _ = journal(&mut mp);
+    let replacement = spend(ops[0], 90_000);
+    mp.store.fail_next_append = true;
+    assert!(mp.accept_tx(&replacement, &utxos, TIP_OK).is_err());
+    let got = journal(&mut mp);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!(got[0], removed(id, RemovalReason::Rollback));
+    assert!(matches!(got[1], PoolChange::Added { txid, .. } if txid == id));
+    assert!(mp.graph.contains(&id));
+}

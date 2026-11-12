@@ -1444,6 +1444,27 @@ impl ActiveMempool {
         prep: PreparedAdmit,
         trim: bool,
     ) -> Result<AcceptResult, AcceptError> {
+        let mark = self.journal.len();
+        let res = self.commit_staged(tx, prep, trim);
+        if res.is_err() {
+            // The replacer did not stay, so its conflicts did not leave for it.
+            for change in &mut self.journal[mark..] {
+                if let PoolChange::Removed { reason, .. } = change {
+                    if matches!(reason, RemovalReason::Replaced { .. }) {
+                        *reason = RemovalReason::Rollback;
+                    }
+                }
+            }
+        }
+        res
+    }
+
+    fn commit_staged(
+        &mut self,
+        tx: &Transaction,
+        prep: PreparedAdmit,
+        trim: bool,
+    ) -> Result<AcceptResult, AcceptError> {
         self.undone_replacements.clear();
         self.undone_accept_secs.clear();
         let (conflict_set, fee_sat, adj_weight) = self.plan_after_script(tx, &prep)?;
