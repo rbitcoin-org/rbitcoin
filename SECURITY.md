@@ -8,7 +8,7 @@ A consensus split on mainnet is vanishingly unlikely. The on-disk format
 and APIs can still change before **1.0** (a named refuse or wipe, not a
 silent wipe), and there is no long-term support window yet. **1.0** is
 where that window, further hardening, and signed release binaries are
-planned. **0.9.1** is this release. **`v0.9.x`** is the patch line.
+planned. **0.9.2** is this release. **`v0.9.x`** is the patch line.
 Occupied **0.6.x** stores refuse
 (wipe and sync again). Schema 24 and 25 open in place. A published 0.8
 directory is schema 26. This binary rewrites that `meta` to 27, and a 0.9.0
@@ -24,7 +24,7 @@ point a wallet at that node unless you accept that peer. The fault list is
 
 | Version | Support |
 |---------|---------|
-| **0.9.x** | Published line (0.9.1). No LTS. Report against the tag. |
+| **0.9.x** | Published line (0.9.2). No LTS. Report against the tag. |
 | **0.8.x** | Previous published line (0.8.0). Report against the tag. |
 | **0.7.x** | Previous published line (0.7.0). Report against the tag. |
 | **0.6.x** | Previous published line (0.6.0 / 0.6.1). Report against the tag. |

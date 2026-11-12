@@ -7,7 +7,7 @@ release binaries. Operators who want those can wait. This page is the
 runbook. Day-to-day flags stay in [`OPERATOR.md`](../../OPERATOR.md). The
 on-disk format stays in [`SCHEMA.md`](../../SCHEMA.md).
 
-This runbook matches **0.9.1**. The patch line is **`v0.9.x`**. The
+This runbook matches **0.9.2**. The patch line is **`v0.9.x`**. The
 container image and the Linux aarch64 binaries ship with this release
 ([`setup.md`](setup.md)).
 
