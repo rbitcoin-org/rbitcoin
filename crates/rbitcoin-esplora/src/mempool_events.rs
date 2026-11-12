@@ -77,7 +77,7 @@ impl EventPark {
 
     fn try_park(self: &Arc<Self>) -> Option<Parked> {
         self.parked
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n < self.cap).then_some(n + 1)
             })
             .ok()?;
