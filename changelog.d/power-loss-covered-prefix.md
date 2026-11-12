@@ -89,4 +89,7 @@ Fixed
   page read past that file's logical end schedules the same rebuild on either
   read backend. A history read of a stale slab does not. Repair of that mismatch
   still does. A
-  floor that already matches the count does not.
+  floor that already matches the count does not. An interrupted rebuild
+  leaves `scripthash.rebuild`. The next open keeps sealed shards instead of
+  wiping the head again. The first open that sees the fault still wipes once,
+  then writes the marker. An explicit force rebuild still wipes.

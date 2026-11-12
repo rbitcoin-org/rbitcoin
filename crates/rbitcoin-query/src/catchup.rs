@@ -354,8 +354,13 @@ impl Query {
             self.unlink_sh_tail(self.store.txs.count())?;
         }
         if rebuild && !self.sh_force_rebuild() {
+            // Wipe first, then mark. A crash during the wipe retries it.
+            // A crash after the mark keeps sealed shards on the next open.
+            // An explicit force rebuild still wipes, in the unsorted step.
+            if !rbitcoin_store::scripthash::sh_rebuild_marked(self.store.path()) {
+                self.sh_run.prepare_force_full_rebuild(&self.store)?;
+            }
             rbitcoin_store::scripthash::mark_sh_rebuild(self.store.path())?;
-            self.sh_run.prepare_force_full_rebuild(&self.store)?;
         }
         if let Some(done) = self.resume_sealed_writebehind_head(rebuild)? {
             return Ok(done);

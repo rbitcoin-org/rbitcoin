@@ -681,6 +681,30 @@ fn force_rebuild_clears_the_flushed_tail_mark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `scripthash.rebuild` is already on disk, so this open is a resume.
+/// Wiping the inclusion mark and the recheck span would throw away a head
+/// the last attempt had already sealed.
+#[test]
+fn interrupted_rebuild_keeps_the_inclusion_mark() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-rebuild-resume");
+    q.enter_direct_index_mode().unwrap();
+    rbitcoin_store::scripthash::mark_sh_rebuild(q.store.path()).unwrap();
+    rbitcoin_store::scripthash::store_include_hwm(q.store.path(), 5).unwrap();
+    let mut mark = [0u8; 16];
+    mark[..8].copy_from_slice(&1u64.to_le_bytes());
+    mark[8..].copy_from_slice(&4u64.to_le_bytes());
+    std::fs::write(q.store.path().join("scripthash.recheck"), mark).unwrap();
+    q.finalize_sh_runs().unwrap();
+    assert_eq!(
+        q.store.scripthash.include_hwm(),
+        5,
+        "the resume wiped the inclusion mark"
+    );
+    let got = std::fs::read(q.store.path().join("scripthash.recheck")).expect("scripthash.recheck");
+    assert_eq!(got, mark);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A cut create number that now pays a different script stays on the old
 /// row. Windowed history must not return it, and a newest page must not
 /// spend one of its slots on it.
