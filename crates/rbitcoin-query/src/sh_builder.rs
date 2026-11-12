@@ -211,6 +211,9 @@ impl ShRunBuilder {
             }
             Err(e) => return Err(e),
         };
+        if mat.max_fk > 0 {
+            rbitcoin_store::scripthash::note_sh_through(store.path(), mat.max_fk)?;
+        }
         store.scripthash.flush()?;
         self.discard_residual_runs();
         if mat.max_fk > 0 {

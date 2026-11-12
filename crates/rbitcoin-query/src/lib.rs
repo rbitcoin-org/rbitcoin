@@ -948,6 +948,10 @@ impl Query {
             let _ = q.ensure_height_by_hash_index(tip);
         }
         q.seed_published_tip()?;
+        // Write-behind starts before tip finalize. A watermark still above
+        // the covered count would skip those flushes, and recovery would
+        // treat the old floor as already covering the tip.
+        q.repair_lost_sh_tail(crate::catchup::FarSealCopy::NearbyOnly)?;
         q.recover_sh_writebehind()?;
         if let Some(t) = q
             .sp_tweaks

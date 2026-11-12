@@ -68,12 +68,14 @@ Fixed
   just above that count unlinks the tail when the outputs are still there.
   When those outputs are already gone, the seal falls first and the watermark
   file is replaced with the covered count. A missing include file copies
-  SEAL into that watermark before the check, so a seal within a million
-  creates of the stem unlinks on this open. A seal farther ahead stays.
+  a nearby SEAL into that watermark before the check, so a seal within a
+  million creates of the stem unlinks before write-behind recovery. A seal
+  farther ahead stays out of the inclusion file until tip finalize.
   The packed head stays. A crash
   between those two writes still has the high watermark, so the next start
-  tries again. A scripthash flush records `scripthash.through` before the
-  body sync. Open records `(covered, through]` in `scripthash.recheck` when
+  tries again. The write-behind advance, the Class A tail backfill, and
+  the unsorted seal each record `scripthash.through` before the body sync.
+  Open records `(covered, through]` in `scripthash.recheck` when
   that value is past the create count, including when `include_hwm` is not.
   That repair records the cut span before the watermark moves.
   A later cut that does not meet that span stays its own record. A full

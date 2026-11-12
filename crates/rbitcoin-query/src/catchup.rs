@@ -46,6 +46,16 @@ impl IndexMode {
     }
 }
 
+/// Whether a legacy SEAL that is not a nearby lost tail is copied into
+/// `include_hwm` before the lost-tail check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FarSealCopy {
+    /// Tip finalize. The far seal becomes the inclusion mark.
+    AtFinalize,
+    /// Process open, before write-behind recovery. A far seal stays in SEAL.
+    NearbyOnly,
+}
+
 impl Query {
     /// Current index / spentness mode ([`IndexMode`]).
     ///
@@ -344,15 +354,7 @@ impl Query {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<u64, QueryError> {
         self.discard_unproven_scripthash_head()?;
-        let rebuild = self.sh_force_rebuild()
-            || rbitcoin_store::scripthash::sh_rebuild_marked(self.store.path())
-            || self.store.scripthash.shard_offset_past_file()?;
-        self.copy_legacy_seal_before_lost_tail(rebuild)?;
-        if !rebuild
-            && Self::sh_lost_tail(self.store.scripthash.include_hwm(), self.store.txs.count())
-        {
-            self.unlink_sh_tail(self.store.txs.count())?;
-        }
+        let rebuild = self.repair_lost_sh_tail(FarSealCopy::AtFinalize)?;
         if rebuild && !self.sh_force_rebuild() {
             // A fault writes the marker before any wipe. Only the resume
             // byte, stored after this wipe, keeps sealed shards. A crash
@@ -370,6 +372,36 @@ impl Query {
         let n = self.finalize_sh_unsorted_cancellable(cancel)?;
         rbitcoin_store::scripthash::clear_sh_rebuild(self.store.path())?;
         Ok(n)
+    }
+
+    /// A covered-prefix cut can leave the inclusion mark above the stem.
+    /// Write-behind starts before tip finalize, so open repairs that tail
+    /// before recovery. Finalize runs the same repair: a crash between the
+    /// recheck span and the watermark file still retries.
+    ///
+    /// [`FarSealCopy::AtFinalize`] bootstraps a SEAL more than a million
+    /// creates ahead into `include_hwm`. Open uses
+    /// [`FarSealCopy::NearbyOnly`]. Copying that far seal first would make
+    /// catch-up appends skip their flush. A nearby seal is still copied,
+    /// then unlinked.
+    pub(super) fn repair_lost_sh_tail(&self, far_seal: FarSealCopy) -> Result<bool, QueryError> {
+        let rebuild = self.sh_force_rebuild()
+            || rbitcoin_store::scripthash::sh_rebuild_marked(self.store.path())
+            || self.store.scripthash.shard_offset_past_file()?;
+        if far_seal == FarSealCopy::NearbyOnly && self.store.scripthash.include_hwm() == 0 {
+            self.sh_run.refresh_seal();
+            let seal = self.sh_run.sealed_max_create_fk();
+            if !Self::sh_lost_tail(seal, self.store.txs.count()) {
+                return Ok(rebuild);
+            }
+        }
+        self.copy_legacy_seal_before_lost_tail(rebuild)?;
+        if !rebuild
+            && Self::sh_lost_tail(self.store.scripthash.include_hwm(), self.store.txs.count())
+        {
+            self.unlink_sh_tail(self.store.txs.count())?;
+        }
+        Ok(rebuild)
     }
 
     /// A legacy head keeps the floor in SEAL. Copy it before the
@@ -570,6 +602,10 @@ impl Query {
                     lo = hi.saturating_add(1);
                 }
             }
+            // Same order as the write-behind advance. The marker lands
+            // before the only sync Direct mode has. The watermark stays
+            // behind until that flush returns.
+            rbitcoin_store::scripthash::note_sh_through(self.store.path(), last)?;
             self.store.scripthash.flush()?;
             self.store.scripthash.note_include_hwm(last)?;
             self.sh_run.publish_seal_watermark(last)?;

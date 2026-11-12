@@ -970,6 +970,62 @@ fn lost_tail_lowers_the_seal_before_replacing_the_watermark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Write-behind starts before tip finalize. A lost tail still names the
+/// old count, so catch-up appends at or below that watermark skip their
+/// flush, and the next recovery treats them as already covered.
+#[test]
+fn open_lowers_a_lost_tail_before_writebehind_recovery() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-open-tail");
+    q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    let old = q.store.scripthash.include_hwm();
+    let end = q.store.txs.body.body_logical_len();
+    q.store.txs.body.truncate_body_to(1, end).unwrap();
+    q.store.txs.create_loc.truncate_to_count(1).unwrap();
+    assert!(old > 1);
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    let covered = q.store.txs.count();
+    assert!(covered < old, "reopen kept the pre-cut count {covered}");
+    assert_eq!(
+        q.store.scripthash.include_hwm(),
+        covered,
+        "recovery still sees the pre-cut watermark {old}"
+    );
+    assert!(q.sh_run.sealed_max_create_fk() <= covered);
+    let spans = rbitcoin_store::scripthash::sh_recheck_spans(q.store.path()).unwrap();
+    assert!(
+        spans.iter().any(|(lo, hi)| *lo == covered && *hi >= old),
+        "the cut span was not on disk before recovery: {spans:?} old={old}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A missing include file whose SEAL is more than a million creates ahead
+/// is the legacy watermark. Copying it into `include_hwm` at open would
+/// make catch-up appends skip their flush. Tip finalize still bootstraps it.
+#[test]
+fn open_leaves_a_far_seal_out_of_the_inclusion_mark() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-open-far-seal");
+    q.enter_direct_index_mode().unwrap();
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    let count = q.store.txs.count();
+    let far = count.saturating_add(1_000_001);
+    store_seal(&dir.join("scripthash.runs"), far).unwrap();
+    std::fs::remove_file(dir.join(rbitcoin_store::INCLUDE_HWM_NAME)).unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(
+        q.store.scripthash.include_hwm(),
+        0,
+        "open copied a far seal into the inclusion mark"
+    );
+    assert_eq!(q.sh_run.sealed_max_create_fk(), far);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn replace_include_hwm_overwrites_a_higher_mark() {
     let dir = std::env::temp_dir().join(format!("rbtc-hwm-replace-{}", std::process::id()));
@@ -1252,6 +1308,39 @@ fn backfill_includes_create_that_lands_after_count_sample() {
 
 fn extend_one_during_backfill(q: &Query) {
     extend_direct_chain(q, 1);
+}
+
+/// Direct backfill syncs the new rows and then advances `include_hwm`.
+/// The flushed-tail marker has to land first. A later cut otherwise
+/// stops the recheck span at the old watermark.
+#[test]
+fn class_a_backfill_records_the_flushed_tail_before_the_watermark() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-backfill-through");
+    seed_direct_chain(&q, 3);
+    q.finalize_sh_runs().unwrap();
+    let _ = std::fs::remove_file(dir.join("scripthash.through"));
+    extend_direct_chain(&q, 1);
+    let count = q.store.txs.count();
+    assert!(q.store.scripthash.include_hwm() < count);
+    q.backfill_sh_creates_from_class_a().unwrap();
+    let through = rbitcoin_store::scripthash::load_sh_through(q.store.path());
+    assert_eq!(through, count);
+    assert!(q.store.scripthash.include_hwm() >= count);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The unsorted seal flushes the new head before it publishes the
+/// watermark. That flush is the only sync while write-behind is off.
+#[test]
+fn unsorted_seal_records_the_flushed_tail_before_the_watermark() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-seal-through");
+    seed_direct_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    let count = q.store.txs.count();
+    let through = rbitcoin_store::scripthash::load_sh_through(q.store.path());
+    assert_eq!(through, count);
+    assert!(q.store.scripthash.include_hwm() >= count);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Two `put_create_batch_append` calls on one scripthash corrupt the chain
