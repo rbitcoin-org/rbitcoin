@@ -3569,7 +3569,7 @@ pub fn queue_due_tx_invs(
     }
     if n > 0 {
         // Only INV txs that existed when this INV was built.
-        // Never snap to current_relay_seq() — a later accept can race in
+        // Never snap to `next_relay_seq` — a later accept can race in
         // and make the new entry servable (mempool_reorg.py:122).
         session.note_tx_inv_seq(max_ann.max(session.last_inv_sequence()));
         session.set_inv_to_send(0);

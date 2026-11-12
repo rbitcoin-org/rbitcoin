@@ -17,6 +17,7 @@ use bitcoin::{
     Amount, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
 use rbitcoin_consensus::{grind_regtest_pow, ChainParams, ConsensusError, Milestone};
+use rbitcoin_net::mempool_events::RemovalReason;
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::accept_and_connect_block;
@@ -294,7 +295,10 @@ fn pin_restart_catchup_then_tip_purge(
         hub.set_relay_enabled(true);
         let mut strip = extra_ids;
         strip.push(child_id);
-        assert_eq!(hub.remove_for_block(&strip), strip.len());
+        assert_eq!(
+            hub.remove_for_block(&strip, RemovalReason::Block),
+            strip.len()
+        );
         hub.flush()
             .expect("restore singleton leftover for slots.tmp pin");
     }

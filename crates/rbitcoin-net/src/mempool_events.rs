@@ -9,7 +9,7 @@
 //! The ring mutex is a leaf. It is taken under the pool write lock and never
 //! held while taking the pool lock.
 
-use rbitcoin_mempool::PoolChange;
+pub use rbitcoin_mempool::{PoolChange, RemovalReason};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 

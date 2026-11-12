@@ -95,7 +95,7 @@ fn hub_removals_carry_their_reason() {
     let bump = spend(cbs[0], 50_000);
     hub.accept_tx(&first).expect("first");
     hub.accept_tx(&bump).expect("replacement");
-    hub.remove_for_block(&[bump.compute_txid()]);
+    hub.remove_for_block(&[bump.compute_txid()], RemovalReason::Block);
 
     let loser = spend(cbs[1], 1_000);
     hub.accept_tx(&loser).expect("loser");

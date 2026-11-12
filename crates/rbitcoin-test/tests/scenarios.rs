@@ -3094,7 +3094,13 @@ fn block_cache_and_mempool_hub_surface() {
     );
     hub.flush().unwrap();
     let _ = hub.compact();
-    assert_eq!(hub.remove_for_block(&[r.txid]), 1);
+    assert_eq!(
+        hub.remove_for_block(
+            &[r.txid],
+            rbitcoin_net::mempool_events::RemovalReason::Block
+        ),
+        1
+    );
     assert_eq!(hub.live_count(), 0);
     assert!(hub.reorg_reaccept(std::slice::from_ref(&spend)) >= 1);
     let _ = hub.accept_package(std::slice::from_ref(&spend));

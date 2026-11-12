@@ -4728,6 +4728,65 @@ fn testmempoolaccept_package_leaves_no_parent_behind() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `mempool_sequence` is the next pool event: it moves on every add and
+/// every removal, as in Core. The multi-tx `testmempoolaccept` dry run takes
+/// its members back as `rollback`, not as mined.
+#[test]
+fn getrawmempool_sequence_moves_on_every_add_and_removal() {
+    use bitcoin::consensus::encode::serialize;
+    use rbitcoin_net::mempool_events::{EventsFrom, PoolChange, RemovalReason};
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let mp = ctx.mempool.as_ref().unwrap();
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let listing =
+        |ctx: &RpcContext| dispatch(ctx, "getrawmempool", vec![json!(false), json!(true)]).unwrap();
+    assert_eq!(listing(&ctx)["mempool_sequence"], 1);
+    let (_, parent) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 1_000);
+    let child = op_true_spend(
+        parent.compute_txid(),
+        bitcoin::Sequence::MAX,
+        50_0000_0000 - 2_000,
+    );
+    let rows = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([hex(&parent), hex(&child)])],
+    )
+    .unwrap();
+    assert_eq!(rows[0]["allowed"], true, "{rows}");
+    assert_eq!(rows[1]["allowed"], true, "{rows}");
+    assert_eq!(
+        listing(&ctx)["mempool_sequence"],
+        5,
+        "two adds, two removals"
+    );
+    let EventsFrom::Events(dry) = mp.events().read(3, 10).from else {
+        panic!("events from 3");
+    };
+    assert!(
+        dry.iter().all(|e| matches!(
+            e.change,
+            PoolChange::Removed {
+                reason: RemovalReason::Rollback,
+                ..
+            }
+        )),
+        "{dry:?}"
+    );
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex(&parent))]).unwrap();
+    let after_add = listing(&ctx);
+    assert_eq!(
+        after_add["txids"],
+        json!([parent.compute_txid().to_string()])
+    );
+    assert_eq!(after_add["mempool_sequence"], 6);
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let after_block = listing(&ctx);
+    assert_eq!(after_block["txids"], json!([]));
+    assert_eq!(after_block["mempool_sequence"], 7);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Multi-tx `testmempoolaccept` admits each member and then removes it, so a
 /// TRUC sibling eviction there would lose the real child. Core allows no
 /// replacement in that call: the sibling is `TRUC-violation`.
