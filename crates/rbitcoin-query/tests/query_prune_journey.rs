@@ -714,6 +714,42 @@ fn cut_without_a_watermark_refuses_tweaks() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The tip keep file is gone and an older window file is still there.
+/// Open must refuse. Raising the watermark to the tip would delete that
+/// older file. An empty window still sets the prune height to the tip.
+#[test]
+fn missing_tip_keep_file_refuses_open() {
+    let (dir, q) = temp_query("prune-missing-tip");
+    let mut hashes = Vec::new();
+    let (prev, parent) = connect_checked(&q, 0, Fk::NULL, [0u8; 32]);
+    hashes.push(parent);
+    connect_range(&q, prev, Some(parent), 1, &[0x5c], &mut hashes);
+    q.set_prune_seqsigwit(true).unwrap();
+    assert_eq!(q.pruneheight(), None);
+    assert_eq!(q.store().txs.seqsigwit_loc.count(), 0);
+    let older = q.store().path().join("seqsigwit.window/0.bin");
+    let tip = q.store().path().join("seqsigwit.window/1.bin");
+    assert!(older.is_file());
+    assert!(tip.is_file());
+    q.store()
+        .sync_spend_durable(q.tip_height().unwrap().0)
+        .unwrap();
+    drop(q);
+    std::fs::remove_file(&tip).unwrap();
+    match Query::open_or_create_tiny(dir.path()) {
+        Ok(_) => panic!("open kept a datadir whose tip keep file is missing"),
+        Err(err) => assert!(
+            err.to_string().contains("seqsigwit window miss"),
+            "{err}"
+        ),
+    }
+    assert!(older.is_file(), "the older keep file was deleted");
+    std::fs::remove_file(&older).unwrap();
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(1)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn already_committed_batch(
     q: &Query,
     header_fk: Fk,

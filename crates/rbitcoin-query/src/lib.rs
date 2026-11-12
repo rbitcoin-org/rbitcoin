@@ -967,7 +967,8 @@ impl Query {
     /// leave a watermark the next block can connect under. A missing prefix
     /// of the keep window becomes that watermark. The tip file is not
     /// invented, and a file that is still on disk is not deleted to paper
-    /// over a hole at the tip. An empty window sets the watermark to the tip.
+    /// over a hole at the tip. A missing tip file with an older keep file
+    /// still on disk refuses open. An empty window sets the watermark to the tip.
     fn seal_finished_cut_pruneheight(&self) -> Result<(), QueryError> {
         if !self.prune_seqsigwit() || self.pruneheight().is_some() {
             return Ok(());
@@ -988,11 +989,13 @@ impl Query {
             h -= 1;
         }
         // `h` is missing. The tip file is the one case that must not raise
-        // the watermark over older files that are still on disk.
+        // the watermark over older files that are still on disk. The locator
+        // is already 0, so those files cannot be rewritten. Starting would
+        // fail every later seal with this same miss.
         if h == tip {
             for height in from..tip {
                 if self.seqsigwit_spill_file(height)?.is_file() {
-                    return Ok(());
+                    return Err(StoreError::Corrupt("seqsigwit window miss"));
                 }
             }
             return self.set_pruneheight(Some(Height(tip)));

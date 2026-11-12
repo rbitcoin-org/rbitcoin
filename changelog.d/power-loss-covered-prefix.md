@@ -42,7 +42,8 @@ Fixed
   the tip. A missing prefix of an otherwise present window sets the prune
   height to the last missing height, and the files still on disk stay.
   The next block's scriptSig is written to the keep window. A missing tip
-  file does not delete the older files. A 4-byte height is prune mode. A positive short locator on that
+  file does not delete the older files, and open refuses instead of starting
+  a node that cannot seal the next block. A 4-byte height is prune mode. A positive short locator on that
   height is the prefix that landed, so open drops the creates past it.
   Locator 0 is the finished cut and does not drop the chain. A stem cut in this process is that same finished cut: a body header that still names every create still seals the tip. The empty rows are still not a witness
   after a restart, and the tip stays. Deleting a gap span syncs the store
