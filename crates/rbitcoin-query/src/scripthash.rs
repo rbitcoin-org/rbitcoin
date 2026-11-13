@@ -656,20 +656,22 @@ impl Query {
         page: Option<&HistoryFilter>,
     ) -> Result<Vec<ShJoinedOut>, QueryError> {
         let paging = page.is_some_and(|f| f.limit.is_some());
-        let admit = if paging {
-            None
+        // The cap count and the strong list share one span walk. A second
+        // walk would read Class A again for every posting in the span.
+        let t_pages = std::time::Instant::now();
+        let (admit, mut fks) = if paging {
+            (None, self.strong_sh_creates(scripthash, view)?)
         } else {
-            Some(self.unpaged_join_admit(scripthash)?)
+            let (n, fks) = self.walk_sh_postings(scripthash, Some(view), true)?;
+            (Some(self.unpaged_join_admit(n)?), fks)
         };
+        let pages_us = t_pages.elapsed().as_micros();
         #[cfg(debug_assertions)]
         let _probe = admit.as_ref().map(|a| self.sh_join_probe.enter(a.heavy));
         // Release builds have no probe. Moving the guard into `_admit` keeps
         // it until this function returns. Debug drops `_probe` first.
         #[cfg(not(debug_assertions))]
         let _admit = admit;
-        let t_pages = std::time::Instant::now();
-        let mut fks = self.strong_sh_creates(scripthash, view)?;
-        let pages_us = t_pages.elapsed().as_micros();
         if let Some(to) = to_height {
             let heights = self.store.tx_height_get_batch(&fks)?;
             if heights.len() != fks.len() {
@@ -735,7 +737,7 @@ impl Query {
     /// only reads the store and never waits on a client, so a waiter (even
     /// one in the same connection's batch window) always gets it once that
     /// join returns, on success or error.
-    fn unpaged_join_admit(&self, scripthash: &[u8; 32]) -> Result<JoinAdmit<'_>, QueryError> {
+    fn unpaged_join_admit(&self, n: u32) -> Result<JoinAdmit<'_>, QueryError> {
         let light = JoinAdmit {
             heavy: false,
             _turn: None,
@@ -745,7 +747,6 @@ impl Query {
         if cap == 0 && heavy == 0 {
             return Ok(light);
         }
-        let n = self.scripthash_create_count(scripthash)?;
         if cap > 0 && n > cap {
             return Err(StoreError::ShCreatesCap { creates: n, cap });
         }
@@ -1284,30 +1285,76 @@ impl Query {
         scripthash: &[u8; 32],
         view: &ChainView,
     ) -> Result<Vec<Fk>, QueryError> {
-        let genesis = self.genesis_coinbase_fk()?;
+        Ok(self.walk_sh_postings(scripthash, Some(view), false)?.1)
+    }
+
+    /// Cap count and strong creates from one posting walk.
+    ///
+    /// A lost-tail span reads Class A per posting. The unpaged join asks for
+    /// both results, so that read runs once. With no span the count stays
+    /// the packed counter.
+    fn walk_sh_postings(
+        &self,
+        scripthash: &[u8; 32],
+        view: Option<&ChainView>,
+        want_count: bool,
+    ) -> Result<(u32, Vec<Fk>), QueryError> {
         let suspect = rbitcoin_store::scripthash::sh_recheck_spans(self.store.path())?;
-        let mut fks = Vec::new();
+        let pending = self.pending_sh_create_fks(scripthash);
+        let mut count = 0u32;
+        if want_count && suspect.is_empty() {
+            count = self
+                .store
+                .scripthash
+                .create_count(scripthash)?
+                .saturating_add(pending.len() as u32);
+        }
+        if view.is_none() && suspect.is_empty() {
+            return Ok((count, Vec::new()));
+        }
+        let genesis = if view.is_some() {
+            self.genesis_coinbase_fk()?
+        } else {
+            None
+        };
+        let mut strong = Vec::new();
         for fk in self.store.scripthash.create_fks(scripthash)? {
-            if Some(fk) == genesis || !self.confirmed_strong_in(fk, view)? {
+            let cut = if suspect.is_empty() {
+                false
+            } else {
+                self.reused_cut_fk(scripthash, fk, &suspect)?
+            };
+            if want_count && !suspect.is_empty() && !cut {
+                count = count.saturating_add(1);
+            }
+            let Some(view) = view else {
+                continue;
+            };
+            if Some(fk) == genesis || cut || !self.confirmed_strong_in(fk, view)? {
                 continue;
             }
-            if self.reused_cut_fk(scripthash, fk, &suspect)? {
-                continue;
-            }
-            fks.push(fk);
+            strong.push(fk);
         }
-        for fk in self.pending_sh_create_fks(scripthash) {
-            if Some(fk) == genesis || !self.confirmed_strong_in(fk, view)? {
+        for fk in pending {
+            let cut = if suspect.is_empty() {
+                false
+            } else {
+                self.reused_cut_fk(scripthash, fk, &suspect)?
+            };
+            if want_count && !suspect.is_empty() && !cut {
+                count = count.saturating_add(1);
+            }
+            let Some(view) = view else {
+                continue;
+            };
+            if Some(fk) == genesis || cut || !self.confirmed_strong_in(fk, view)? {
                 continue;
             }
-            if self.reused_cut_fk(scripthash, fk, &suspect)? {
-                continue;
-            }
-            if let Err(at) = fks.binary_search_by_key(&fk.0, |f| f.0) {
-                fks.insert(at, fk);
+            if let Err(at) = strong.binary_search_by_key(&fk.0, |f| f.0) {
+                strong.insert(at, fk);
             }
         }
-        Ok(fks)
+        Ok((count, strong))
     }
 
     /// A create number inside a lost-tail span whose current transaction
@@ -1325,6 +1372,9 @@ impl Query {
         {
             return Ok(false);
         }
+        #[cfg(debug_assertions)]
+        self.sh_recheck_class_a_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.tx_output_run_class_a(fk) {
             Ok(outs) => Ok(!outs.iter().any(|o| script_hash(&o.script) == *scripthash)),
             Err(StoreError::NotFound) => Ok(true),
@@ -2265,30 +2315,21 @@ impl Query {
         self.listunspent_from_joined(&slot_arc.joined)
     }
 
+    /// Class A reads made by a lost-tail span check since this query opened.
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn sh_recheck_class_a_read_count(&self) -> u64 {
+        self.sh_recheck_class_a_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Durable SH create count plus pending write-behind for this key.
     ///
     /// A lost-tail span walks the rows and skips a create that no longer
     /// pays this script. Pending and durable copies of one fk both count.
     /// With no span this stays the packed counter.
     pub fn scripthash_create_count(&self, scripthash: &[u8; 32]) -> Result<u32, QueryError> {
-        let suspect = rbitcoin_store::scripthash::sh_recheck_spans(self.store.path())?;
-        let pending = self.pending_sh_create_fks(scripthash);
-        if suspect.is_empty() {
-            let durable = self.store.scripthash.create_count(scripthash)?;
-            return Ok(durable.saturating_add(pending.len() as u32));
-        }
-        let mut n = 0u32;
-        for fk in self.store.scripthash.create_fks(scripthash)? {
-            if !self.reused_cut_fk(scripthash, fk, &suspect)? {
-                n = n.saturating_add(1);
-            }
-        }
-        for fk in pending {
-            if !self.reused_cut_fk(scripthash, fk, &suspect)? {
-                n = n.saturating_add(1);
-            }
-        }
-        Ok(n)
+        Ok(self.walk_sh_postings(scripthash, None, true)?.0)
     }
 
     /// Confirmed chain_stats for Esplora address/scripthash routes.

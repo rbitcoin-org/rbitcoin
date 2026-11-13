@@ -520,6 +520,9 @@ pub struct Query {
     /// Unpaged SH join overlap by kind. Tests only.
     #[cfg(debug_assertions)]
     pub sh_join_probe: crate::scripthash::ShJoinProbe,
+    /// Class A reads inside a lost-tail span check. Tests only.
+    #[cfg(debug_assertions)]
+    pub sh_recheck_class_a_reads: AtomicU64,
     /// Packed `tx.body` bytes read by [`Self::load_thin_tweaks`].
     pub thin_tweak_body_bytes: AtomicU64,
     /// Max fk `head_insert_many` has published (0 = never). Load polls this
@@ -914,6 +917,8 @@ impl Query {
             heavy_sh_join: Mutex::new(()),
             #[cfg(debug_assertions)]
             sh_join_probe: crate::scripthash::ShJoinProbe::default(),
+            #[cfg(debug_assertions)]
+            sh_recheck_class_a_reads: AtomicU64::new(0),
             thin_tweak_body_bytes: AtomicU64::new(0),
             head_drain_fk: AtomicU64::new(head_drained),
             disconnect_height: AtomicU32::new(0),

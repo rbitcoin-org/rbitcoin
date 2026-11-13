@@ -1335,6 +1335,30 @@ fn reused_cut_fk_stays_out_of_touch_and_create_count() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An unpaged join counts creates, then builds the strong list. With a
+/// span on disk both steps read Class A. The covered pay is still one read.
+#[cfg(debug_assertions)]
+#[test]
+fn unpaged_join_reads_a_cut_posting_once() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-cut-once");
+    q.enter_direct_index_mode().unwrap();
+    let script = [0x51u8, 0xab];
+    connect_spk(&q, 0, Fk::NULL, None, &script);
+    q.finalize_sh_runs().unwrap();
+    let sh = rbitcoin_store::script_hash(&script);
+    let fks = q.store.scripthash.create_fks(&sh).unwrap();
+    assert_eq!(fks.len(), 1, "the pay was not indexed");
+    let mut mark = [0u8; 16];
+    mark[8..].copy_from_slice(&fks[0].0.to_le_bytes());
+    std::fs::write(q.store.path().join("scripthash.recheck"), mark).unwrap();
+    let before = q.sh_recheck_class_a_read_count();
+    let rows = q.scripthash_history(&sh).unwrap();
+    assert_eq!(rows.len(), 1, "the covered pay was dropped");
+    let reads = q.sh_recheck_class_a_read_count() - before;
+    assert_eq!(reads, 1, "the join read the cut posting {reads} times");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A second lost-tail span is its own record. History still drops a reused
 /// create that sits only in that later span.
 #[test]
