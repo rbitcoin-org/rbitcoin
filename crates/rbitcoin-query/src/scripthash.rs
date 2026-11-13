@@ -1319,42 +1319,71 @@ impl Query {
         };
         let mut strong = Vec::new();
         for fk in self.store.scripthash.create_fks(scripthash)? {
-            let cut = if suspect.is_empty() {
-                false
-            } else {
-                self.reused_cut_fk(scripthash, fk, &suspect)?
-            };
-            if want_count && !suspect.is_empty() && !cut {
-                count = count.saturating_add(1);
-            }
-            let Some(view) = view else {
-                continue;
-            };
-            if Some(fk) == genesis || cut || !self.confirmed_strong_in(fk, view)? {
-                continue;
-            }
-            strong.push(fk);
+            self.note_sh_posting(
+                scripthash,
+                fk,
+                view,
+                want_count,
+                &suspect,
+                genesis,
+                false,
+                &mut count,
+                &mut strong,
+            )?;
         }
         for fk in pending {
-            let cut = if suspect.is_empty() {
-                false
-            } else {
-                self.reused_cut_fk(scripthash, fk, &suspect)?
-            };
-            if want_count && !suspect.is_empty() && !cut {
-                count = count.saturating_add(1);
-            }
-            let Some(view) = view else {
-                continue;
-            };
-            if Some(fk) == genesis || cut || !self.confirmed_strong_in(fk, view)? {
-                continue;
-            }
+            self.note_sh_posting(
+                scripthash,
+                fk,
+                view,
+                want_count,
+                &suspect,
+                genesis,
+                true,
+                &mut count,
+                &mut strong,
+            )?;
+        }
+        Ok((count, strong))
+    }
+
+    /// One posting in [`Self::walk_sh_postings`].
+    ///
+    /// `sorted_insert` is the pending list: a copy of a durable fk stays once.
+    fn note_sh_posting(
+        &self,
+        scripthash: &[u8; 32],
+        fk: Fk,
+        view: Option<&ChainView>,
+        want_count: bool,
+        suspect: &[(u64, u64)],
+        genesis: Option<Fk>,
+        sorted_insert: bool,
+        count: &mut u32,
+        strong: &mut Vec<Fk>,
+    ) -> Result<(), QueryError> {
+        let cut = if suspect.is_empty() {
+            false
+        } else {
+            self.reused_cut_fk(scripthash, fk, suspect)?
+        };
+        if want_count && !suspect.is_empty() && !cut {
+            *count = count.saturating_add(1);
+        }
+        let Some(view) = view else {
+            return Ok(());
+        };
+        if Some(fk) == genesis || cut || !self.confirmed_strong_in(fk, view)? {
+            return Ok(());
+        }
+        if sorted_insert {
             if let Err(at) = strong.binary_search_by_key(&fk.0, |f| f.0) {
                 strong.insert(at, fk);
             }
+        } else {
+            strong.push(fk);
         }
-        Ok((count, strong))
+        Ok(())
     }
 
     /// A create number inside a lost-tail span whose current transaction
