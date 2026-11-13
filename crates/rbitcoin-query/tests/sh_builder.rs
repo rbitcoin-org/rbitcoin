@@ -34,6 +34,12 @@ fn force_rebuild_resets_seal_and_clears_runs() {
     assert!(store.scripthash.head_is_empty());
     assert_eq!(store.scripthash.entry_count(), 0);
     assert_eq!(store.scripthash.include_hwm(), 0);
+    let marker = std::fs::read(dir.join("scripthash.rebuild")).unwrap_or_default();
+    assert_eq!(
+        marker, b"1",
+        "the wipe byte has to be durable before pack marks are dropped"
+    );
+    assert!(!rbitcoin_store::scripthash::sh_rebuild_resume(&dir));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

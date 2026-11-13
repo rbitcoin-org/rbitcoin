@@ -401,6 +401,12 @@ fn plan_collect(
     if action != UnsortedCollectAction::Skip {
         return action;
     }
+    // The body reset can stick while the old map and an equal `DONE` stay.
+    // Skip would mark that map packed over no rows. Pass-1 sets `live_count`,
+    // so a real extract is not this case.
+    if class_a_last > 0 && table.entry_count() == 0 {
+        return UnsortedCollectAction::Full;
+    }
     let n = table.head_shard_count().max(1);
     let missing = table
         .unsealed_main_shards()
@@ -450,6 +456,7 @@ pub(crate) fn record_unsorted_phase_above_count(
 #[cfg(debug_assertions)]
 thread_local! {
     static BEFORE_UNSORTED_PACK: std::cell::Cell<Option<fn(u64)>> = const { std::cell::Cell::new(None) };
+    static BEFORE_KEYS_MERGE: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(debug_assertions)]
@@ -466,6 +473,21 @@ fn fire_before_unsorted_pack(store_dir: &Path) {
 #[doc(hidden)]
 pub fn set_before_unsorted_pack_for_test(hook: Option<fn(u64)>) {
     BEFORE_UNSORTED_PACK.with(|c| c.set(hook));
+}
+
+#[cfg(debug_assertions)]
+fn fire_before_keys_merge(dir: &Path) {
+    let Some(hook) = BEFORE_KEYS_MERGE.with(|c| c.take()) else {
+        return;
+    };
+    hook(dir);
+}
+
+/// One-shot hook after key spills are written and before merge unlinks them.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_before_keys_merge_for_test(hook: Option<fn(&Path)>) {
+    BEFORE_KEYS_MERGE.with(|c| c.set(hook));
 }
 
 #[doc(hidden)]
@@ -1396,6 +1418,8 @@ pub fn collect_keys_from_txs(
     let last_status = Mutex::new(t0);
     let spans = worker_fk_spans(first, last, workers);
     let live = rbitcoin_log::progress::begin("scripthash keys collect", span_fks);
+    // A packed shard already has its map. Spills for it are unlinked at merge.
+    let unsealed: HashSet<usize> = table.unsealed_main_shards().into_iter().collect();
     std::thread::scope(|scope| {
         let n_workers = spans.len().max(1);
         rbitcoin_log::info!(
@@ -1411,6 +1435,7 @@ pub fn collect_keys_from_txs(
             let live = &live;
             let err = &err;
             let last_status = &last_status;
+            let unsealed = &unsealed;
             scope.spawn(move || {
                 let mut locals: Vec<Key16PackMap> =
                     (0..n_shards).map(|_| Key16PackMap::default()).collect();
@@ -1429,7 +1454,9 @@ pub fn collect_keys_from_txs(
                     let r = txs.for_each_script_hashes_in_fk_span(lo, hi, |fk, sh| {
                         let si = prefix_shard_of(&sh, n_shards);
                         tally.recs = tally.recs.saturating_add(1);
-                        insert_key_pack(&mut locals[si], head_key_from_full(&sh), fk);
+                        if unsealed.contains(&si) {
+                            insert_key_pack(&mut locals[si], head_key_from_full(&sh), fk);
+                        }
                         Ok(())
                     });
                     flush_collect_tally(&mut tally, recs, None, None);
@@ -1480,6 +1507,8 @@ pub fn collect_keys_from_txs(
         return Err(e);
     }
     drop(live);
+    #[cfg(debug_assertions)]
+    fire_before_keys_merge(dir);
     let merge_workers = workers.max(1).min(n_shards.max(1));
     fs::create_dir_all(dir.join(MULTI_SUBDIR)).map_err(|e| StoreError::io(dir, e))?;
     let live_merge = rbitcoin_log::progress::begin("scripthash keys merge", n_shards as u64);
@@ -1488,7 +1517,6 @@ pub fn collect_keys_from_txs(
     );
     let t_merge = Instant::now();
     let per_shard: Vec<AtomicU64> = (0..n_shards).map(|_| AtomicU64::new(0)).collect();
-    let unsealed: HashSet<usize> = table.unsealed_main_shards().into_iter().collect();
     if merge_workers <= 1 {
         for (si, slot) in per_shard.iter().enumerate() {
             check_cancel(cancel, "scripthash keys merge")?;
@@ -1856,6 +1884,8 @@ pub fn collect_posts_from_txs(
     let last_status = Mutex::new(t0);
     let spans = worker_fk_spans(first, last, workers);
     let live = rbitcoin_log::progress::begin("scripthash postings collect", span_fks);
+    // Pack walks unsealed shards only. Post spills for a packed shard are discarded.
+    let unsealed: HashSet<usize> = table.unsealed_main_shards().into_iter().collect();
     std::thread::scope(|scope| {
         let n_workers = spans.len().max(1);
         rbitcoin_log::info!(
@@ -1874,6 +1904,7 @@ pub fn collect_posts_from_txs(
             let per = &per;
             let err = &err;
             let last_status = &last_status;
+            let unsealed = &unsealed;
             scope.spawn(move || {
                 let mut locals: Vec<PostPackMap> =
                     (0..n_shards).map(|_| PostPackMap::default()).collect();
@@ -1892,6 +1923,9 @@ pub fn collect_posts_from_txs(
                     let r = txs.for_each_script_hashes_in_fk_span(lo, hi, |fk, sh| {
                         tally.recs = tally.recs.saturating_add(1);
                         let si = prefix_shard_of(&sh, n_shards);
+                        if !unsealed.contains(&si) {
+                            return Ok(());
+                        }
                         let Some(fuse) = fuses[si].as_ref() else {
                             return Ok(());
                         };

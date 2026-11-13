@@ -309,26 +309,50 @@ impl Query {
     /// from 0 cannot fill a hole under a later append, and on a long chain it
     /// is the slow path. A SEAL still names the prefix when the mark file is
     /// missing. `--sh-index` off leaves the files in place.
+    ///
+    /// Resume byte `2` keeps that head, including when the include mark and
+    /// SEAL were not published yet. A wipe byte finishes the wipe even when
+    /// a later open restored the pack marks and the inclusion watermark.
+    /// The resume byte then replaces it, so the packs written next stay.
     pub fn discard_unproven_scripthash_head(&self) -> Result<(), QueryError> {
-        if !self.sh_index_enabled() || !self.store.scripthash.has_durable_index() {
+        if !self.sh_index_enabled() {
             return Ok(());
         }
-        if self.store.txs.count() == 0 {
+        let path = self.store.path();
+        // Checked before the floor. A resume head can be pack-complete with
+        // both marks still missing, and prepare would turn byte `2` into a wipe.
+        if rbitcoin_store::scripthash::sh_rebuild_resume(path) {
             return Ok(());
         }
-        self.sh_run.refresh_seal();
-        let floor = crate::sh_builder::durable_sh_inclusion_floor(
-            self.store.scripthash.include_hwm(),
-            self.sh_run.sealed_max_create_fk(),
-        );
-        if floor > 0 {
-            return Ok(());
+        let wipe_requested = rbitcoin_store::scripthash::sh_rebuild_marked(path);
+        if !wipe_requested {
+            if !self.store.scripthash.has_durable_index() {
+                return Ok(());
+            }
+            if self.store.txs.count() == 0 {
+                return Ok(());
+            }
+            self.sh_run.refresh_seal();
+            let floor = crate::sh_builder::durable_sh_inclusion_floor(
+                self.store.scripthash.include_hwm(),
+                self.sh_run.sealed_max_create_fk(),
+            );
+            if floor > 0 {
+                return Ok(());
+            }
+            rbitcoin_log::warn!(
+                "scripthash head has no include mark and no SEAL; deleting it so \
+                 tip entry can materialize from Class A"
+            );
+        } else {
+            rbitcoin_log::warn!(
+                "scripthash wipe is unfinished; deleting the head so tip entry \
+                 can materialize from Class A"
+            );
         }
-        rbitcoin_log::warn!(
-            "scripthash head has no include mark and no SEAL; deleting it so \
-             tip entry can materialize from Class A"
-        );
         self.sh_run.prepare_force_full_rebuild(&self.store)?;
+        // Byte `1` would make the following finalize wipe the shards it packs.
+        rbitcoin_store::scripthash::mark_sh_rebuild_resume(path)?;
         self.set_sh_indexed_through_height(None);
         self.sh.applied_max_fk.store(0, Ordering::Release);
         self.sh.pending.lock().unwrap().clear();

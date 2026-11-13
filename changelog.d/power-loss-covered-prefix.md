@@ -85,10 +85,14 @@ Fixed
   is removed, so the next open does not mark that map packed or publish its
   create count. Dropping the markers syncs that directory, and removing the
   directory syncs the store directory. A `DONE` last that still equals the
-  create count is collected again when an unsealed shard has no map. A fault
-  rebuild, and a pack-complete head with no include mark and no SEAL, remove
-  that directory and those unpacked maps after the pack marks are gone, so
-  the old map is not published onto the wiped body. The inclusion watermark stays at the cut until the tail
+  create count is collected again when an unsealed shard has no map, and
+  again when the body has no rows. A fault rebuild writes the wipe byte
+  before it drops pack marks. A pack-complete head with no include mark,
+  no SEAL, and no resume mark does the same, then removes that directory
+  and those unpacked maps, so the old map is not published onto the wiped
+  body. A crash during that wipe retries even when the next open restored
+  the pack marks and the inclusion watermark. A resume mark keeps that
+  pack-complete head, and the tail backfill publishes the watermark. The inclusion watermark stays at the cut until the tail
   backfill appends the new creates.
   Open records `(covered, through]` in `scripthash.recheck` when
   that value is past the create count, including when `include_hwm` is not.
@@ -109,7 +113,8 @@ Fixed
   floor that already matches the count does not. A fault writes
   `scripthash.rebuild` as a wipe request. That open wipes once, then
   rewrites the file as a resume mark. The next open keeps sealed shards
-  while the resume mark is still there. A nearby lost tail still comes
+  while the resume mark is still there, including a pack-complete head
+  whose include mark and SEAL were not published yet. A nearby lost tail still comes
   down under that mark, so the high watermark does not stick and the
   next finalize can clear the mark. A fault mark, including one
   written again during the rebuild, wipes once more. An explicit force

@@ -898,6 +898,126 @@ fn unproven_head_with_done_at_the_count_keeps_both_pays() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Resume byte `2` is written before `include_hwm` and SEAL. A crash in
+/// that window leaves a pack-complete head with floor 0. Deleting it
+/// throws away shards the resume mark was supposed to keep.
+#[test]
+fn resume_keeps_a_pack_complete_head_with_no_inclusion_mark() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-resume-floor0");
+    let (sh, before) = index_two_pays(&q);
+    let n_shards = q.store.scripthash.head_shard_count();
+    let path = dir.path().to_path_buf();
+    let base = rbitcoin_store::scripthash::sorted_main_shard_path(&path, 0, n_shards);
+    let mphf = rbitcoin_store::scripthash_mphf::mphf_path(&base);
+    let mphf_before = std::fs::read(&mphf).unwrap();
+    std::fs::remove_file(dir.join(rbitcoin_store::INCLUDE_HWM_NAME)).unwrap();
+    std::fs::remove_file(q.sh_run.runs_dir.join("SEAL")).unwrap();
+    rbitcoin_store::scripthash::mark_sh_rebuild_resume(&path).unwrap();
+    drop(q);
+    let q = reopen_layout(&path, n_shards);
+    assert_eq!(q.store.scripthash.include_hwm(), 0);
+    assert_eq!(q.sh_run.sealed_max_create_fk(), 0);
+    assert!(q.store.scripthash.has_durable_index());
+    let mut mark = [0u8; 16];
+    mark[..8].copy_from_slice(&1u64.to_le_bytes());
+    mark[8..].copy_from_slice(&4u64.to_le_bytes());
+    std::fs::write(q.store.path().join("scripthash.recheck"), mark).unwrap();
+    q.finalize_sh_runs()
+        .expect("a resume head must not fail the create gap");
+    let got = std::fs::read(q.store.path().join("scripthash.recheck")).unwrap_or_default();
+    assert_eq!(got, mark, "the resume wiped the sealed head");
+    assert_eq!(
+        std::fs::read(&mphf).unwrap_or_default(),
+        mphf_before,
+        "the resume replaced the packed extract"
+    );
+    assert_eq!(history_txids(&q, &sh), before);
+    assert!(
+        q.store.scripthash.include_hwm() > 0,
+        "the tail backfill did not publish the inclusion mark"
+    );
+    assert!(
+        !rbitcoin_store::scripthash::sh_rebuild_marked(q.store.path()),
+        "a finished finalize left the resume mark"
+    );
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A wipe request can sit next to a restored pack mark and inclusion
+/// watermark. Leaving that head lets startup serve it. The wipe has to
+/// finish, and the resume byte has to replace the wipe byte so the next
+/// finalize does not delete the shards it is about to pack.
+#[test]
+fn wipe_marker_deletes_a_head_that_still_has_an_inclusion_mark() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-wipe-with-hwm");
+    let (sh, before) = index_two_pays(&q);
+    rbitcoin_store::scripthash::mark_sh_rebuild(q.store.path()).unwrap();
+    let mut mark = [0u8; 16];
+    mark[..8].copy_from_slice(&1u64.to_le_bytes());
+    mark[8..].copy_from_slice(&4u64.to_le_bytes());
+    std::fs::write(q.store.path().join("scripthash.recheck"), mark).unwrap();
+    assert!(q.store.scripthash.include_hwm() > 0);
+    assert!(q.store.scripthash.has_durable_index());
+    q.discard_unproven_scripthash_head().unwrap();
+    assert_eq!(
+        q.store.scripthash.entry_count(),
+        0,
+        "the wipe marker left the head"
+    );
+    assert!(
+        !q.store.scripthash.has_durable_index(),
+        "the wipe marker left the pack marks"
+    );
+    assert!(
+        !q.store.path().join("scripthash.recheck").exists(),
+        "the wipe marker left the recheck span"
+    );
+    assert!(
+        rbitcoin_store::scripthash::sh_rebuild_resume(q.store.path()),
+        "a finished wipe left the wipe byte, so the next finalize deletes the new packs"
+    );
+    q.finalize_sh_runs().unwrap();
+    assert_eq!(history_txids(&q, &sh), before);
+    assert!(
+        !rbitcoin_store::scripthash::sh_rebuild_marked(q.store.path()),
+        "a finished finalize left the rebuild mark"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The body reset can stick while the map and `DONE` stay, and no wipe
+/// byte was written. Skip then marks that map packed over the empty body.
+#[test]
+fn empty_body_with_done_at_the_count_keeps_both_pays() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-empty-body-done");
+    let (sh, before) = index_two_pays(&q);
+    let count = q.store.txs.count();
+    let n_shards = q.store.scripthash.head_shard_count();
+    let path = dir.path().to_path_buf();
+    plant_done_at(&q, count, 0);
+    q.store
+        .scripthash
+        .reinit_empty_for_cold_materialize()
+        .unwrap();
+    q.store.scripthash.flush().unwrap();
+    std::fs::remove_file(dir.join(rbitcoin_store::INCLUDE_HWM_NAME)).unwrap();
+    std::fs::remove_file(q.sh_run.runs_dir.join("SEAL")).unwrap();
+    assert!(!rbitcoin_store::scripthash::sh_rebuild_marked(&path));
+    drop(q);
+    let q = reopen_layout(&path, n_shards);
+    assert_eq!(q.store.scripthash.entry_count(), 0);
+    assert!(!q.store.scripthash.has_durable_index());
+    q.finalize_sh_runs()
+        .expect("an empty body must be collected again");
+    assert_eq!(
+        history_txids(&q, &sh),
+        before,
+        "DONE at the count published the leftover map onto the empty body"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `DONE` names the live count and the unsealed shard has no map. Skip
 /// would pack that shard empty, so the create is missing from history.
 #[test]
@@ -1727,6 +1847,86 @@ fn packed_shard_keeps_its_extract_across_a_done_cut() {
         "the pre-cut script is still history"
     );
     assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A packed shard already has its map. Key and post spills for that shard
+/// are deleted after the scan, and they grow with the rest of the chain.
+#[test]
+fn collect_does_not_spill_a_packed_shard() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("q-sh-sealed-spill").unwrap();
+    let layout = StoreLayout::tiny(dir.path()).with_sh_shards(2);
+    let q = Query::open_or_create_layout(layout).unwrap();
+    let n_shards = 2;
+    let packed_script = script_on_shard(n_shards, 0, 0x41);
+    let open_script = script_on_shard(n_shards, 1, 0x42);
+    connect_coinbase_paying(&q, packed_script.clone());
+    connect_coinbase_paying(&q, packed_script);
+    connect_coinbase_paying(&q, open_script.clone());
+    connect_coinbase_paying(&q, open_script);
+    let udir = rbitcoin_store::unsorted_shard_dir(q.store.path());
+    rbitcoin_store::collect_unsorted_shard_files(&q.store, &udir, n_shards, 1, None).unwrap();
+    rbitcoin_store::scripthash_materialize::pack_one_extract_shard(&q.store.scripthash, &udir, 0)
+        .unwrap();
+    let unsealed = q.store.scripthash.unsealed_main_shards();
+    assert!(
+        !unsealed.contains(&0),
+        "shard 0 is still unsealed: {unsealed:?}"
+    );
+    assert!(
+        unsealed.contains(&1),
+        "shard 1 was packed too: {unsealed:?}"
+    );
+    let _ = std::fs::remove_dir_all(udir.join("keys"));
+    let _ = std::fs::remove_dir_all(udir.join("post"));
+    let last = q.store.txs.count();
+    thread_local! {
+        static KEY_SPILL: Cell<(bool, bool)> = const { Cell::new((false, false)) };
+    }
+    fn snap_key_spills(dir: &std::path::Path) {
+        KEY_SPILL.with(|c| {
+            c.set((
+                rbitcoin_store::scripthash_materialize::unsorted_keys_path(dir, 0).exists(),
+                rbitcoin_store::scripthash_materialize::unsorted_keys_path(dir, 1).exists(),
+            ));
+        });
+    }
+    rbitcoin_store::scripthash_materialize::set_before_keys_merge_for_test(Some(snap_key_spills));
+    rbitcoin_store::scripthash_materialize::collect_keys_from_txs(
+        &q.store.txs,
+        &q.store.scripthash,
+        &udir,
+        1,
+        last,
+        1,
+        None,
+    )
+    .unwrap();
+    let (sealed_keys, open_keys) = KEY_SPILL.with(|c| c.get());
+    assert!(!sealed_keys, "the packed shard got key spills");
+    assert!(open_keys, "the unsealed shard collected no keys");
+    rbitcoin_store::scripthash_materialize::collect_posts_from_txs(
+        &q.store.txs,
+        &q.store.scripthash,
+        &udir,
+        1,
+        last,
+        1,
+        None,
+    )
+    .unwrap();
+    let sealed_posts = rbitcoin_store::scripthash_materialize::unsorted_post_path(&udir, 0);
+    let open_posts = rbitcoin_store::scripthash_materialize::unsorted_post_path(&udir, 1);
+    assert!(
+        !sealed_posts.exists(),
+        "the packed shard got post spills at {}",
+        sealed_posts.display()
+    );
+    assert!(
+        open_posts.exists(),
+        "the unsealed shard collected no posts at {}",
+        open_posts.display()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

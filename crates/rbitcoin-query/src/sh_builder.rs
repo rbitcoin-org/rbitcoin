@@ -135,11 +135,15 @@ impl ShRunBuilder {
     /// Wipe SH runs/SEAL/cold progress/include_hwm and empty durable SH tables.
     ///
     /// Used by [`crate::Query::set_sh_force_rebuild`] so tip collects **all** Class A.
-    /// Pack marks are cleared before the unsorted directory. That order is
-    /// what lets the map removal see an unpacked shard. A `DONE` last that
-    /// still names the create count would otherwise publish the old map.
+    /// The wipe byte is synced before any pack mark is dropped. A crash in
+    /// that gap retries, even if the next open restores the marks and the
+    /// inclusion watermark. Pack marks are cleared before the unsorted
+    /// directory. That order is what lets the map removal see an unpacked
+    /// shard. A `DONE` last that still names the create count would otherwise
+    /// publish the old map. Resume byte `2` must not call this.
     pub fn prepare_force_full_rebuild(&self, store: &Store) -> Result<(), StoreError> {
         info!("node: scripthash FORCE_REBUILD — clearing runs/SEAL/progress/HWM and reinit head");
+        rbitcoin_store::scripthash::mark_sh_rebuild(store.path())?;
         self.wipe_catalog_and_seal()?;
         Self::clear_cold_progress_and_hwm(store);
         store.scripthash.reinit_empty_for_cold_materialize()?;
