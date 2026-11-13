@@ -812,6 +812,146 @@ fn resume_marker_unlinks_a_nearby_seal_when_the_include_file_is_missing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn history_txids(q: &Query, sh: &[u8; 32]) -> Vec<[u8; 32]> {
+    q.scripthash_history(sh)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.txid)
+        .collect()
+}
+
+fn plant_done_at(q: &Query, last: u64, word: u64) {
+    let n = q.store.scripthash.head_shard_count();
+    let udir = rbitcoin_store::unsorted_shard_dir(q.store.path());
+    std::fs::create_dir_all(&udir).unwrap();
+    let counts = vec![word; n];
+    rbitcoin_store::scripthash_materialize::write_phase_done(
+        &udir,
+        rbitcoin_store::scripthash_materialize::KEYS_DONE_NAME,
+        rbitcoin_store::scripthash_materialize::KEYS_DONE_MAGIC,
+        last,
+        &counts,
+    )
+    .unwrap();
+    rbitcoin_store::scripthash_materialize::write_phase_done(
+        &udir,
+        rbitcoin_store::scripthash_materialize::POST_DONE_NAME,
+        rbitcoin_store::scripthash_materialize::POST_DONE_MAGIC,
+        last,
+        &counts,
+    )
+    .unwrap();
+}
+
+fn index_two_pays(q: &Query) -> ([u8; 32], Vec<[u8; 32]>) {
+    let script = vec![0x51, 0xee, 0x11];
+    connect_coinbase_paying(q, script.clone());
+    connect_coinbase_paying(q, script.clone());
+    q.finalize_sh_runs().unwrap();
+    let sh = rbitcoin_store::script_hash(&script);
+    let txids = history_txids(q, &sh);
+    assert_eq!(txids.len(), 2, "the double pay was not indexed");
+    (sh, txids)
+}
+
+/// A fault marker wipes the body, then `DONE` still names the create count.
+/// Skip would mark the old map packed. A script paid twice still points
+/// into the body that wipe cut back.
+#[test]
+fn fault_rebuild_with_done_at_the_count_keeps_both_pays() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-rebuild-done");
+    let (sh, before) = index_two_pays(&q);
+    plant_done_at(&q, q.store.txs.count(), 0);
+    rbitcoin_store::scripthash::mark_sh_rebuild(q.store.path()).unwrap();
+    q.finalize_sh_runs().unwrap();
+    assert_eq!(
+        history_txids(&q, &sh),
+        before,
+        "the rebuild republished the wiped body"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pack-complete head with no include mark and no SEAL takes the same
+/// wipe. `DONE` at the create count must not put the old map back.
+#[test]
+fn unproven_head_with_done_at_the_count_keeps_both_pays() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-unproven-done");
+    let (sh, before) = index_two_pays(&q);
+    let count = q.store.txs.count();
+    let n_shards = q.store.scripthash.head_shard_count();
+    let path = dir.path().to_path_buf();
+    plant_done_at(&q, count, 0);
+    std::fs::remove_file(dir.join(rbitcoin_store::INCLUDE_HWM_NAME)).unwrap();
+    std::fs::remove_file(q.sh_run.runs_dir.join("SEAL")).unwrap();
+    drop(q);
+    let q = reopen_layout(&path, n_shards);
+    assert_eq!(q.store.scripthash.include_hwm(), 0);
+    assert_eq!(q.sh_run.sealed_max_create_fk(), 0);
+    assert!(q.store.scripthash.has_durable_index());
+    q.finalize_sh_runs().unwrap();
+    assert_eq!(
+        history_txids(&q, &sh),
+        before,
+        "the unproven wipe republished the wiped body"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `DONE` names the live count and the unsealed shard has no map. Skip
+/// would pack that shard empty, so the create is missing from history.
+#[test]
+fn done_at_the_count_without_a_map_indexes_the_pay() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-done-no-map");
+    let script = vec![0x51, 0xee, 0x22];
+    connect_coinbase_paying(&q, script.clone());
+    let sh = rbitcoin_store::script_hash(&script);
+    let n = q.store.scripthash.head_shard_count();
+    plant_done_at(&q, q.store.txs.count(), 7);
+    let base = rbitcoin_store::scripthash::sorted_main_shard_path(q.store.path(), 0, n);
+    assert!(
+        !rbitcoin_store::scripthash_mphf::MphfHead::exists(&base),
+        "the fixture already had a map"
+    );
+    q.finalize_sh_runs().unwrap();
+    assert_eq!(
+        q.scripthash_history(&sh).unwrap().len(),
+        1,
+        "DONE at the count packed an empty shard"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Dropping a `DONE` last above the count has to sync that directory.
+/// A crash can otherwise restore the marker after the map removal stuck.
+#[test]
+fn open_syncs_the_unsorted_dir_when_done_is_above_the_count() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-done-fsync");
+    seed_reopenable_chain(&q, 2);
+    let n_shards = q.store.scripthash.head_shard_count();
+    let udir = rbitcoin_store::unsorted_shard_dir(q.store.path());
+    rbitcoin_store::collect_unsorted_shard_files(&q.store, &udir, n_shards, 1, None).unwrap();
+    let old = rbitcoin_store::unsorted_done_last_fk(&udir, n_shards).unwrap();
+    cut_creates_to(&q, 1);
+    assert!(old > q.store.txs.count());
+    let path = dir.path().to_path_buf();
+    drop(q);
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let q = reopen_layout(&path, n_shards);
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(
+        !udir.join("DONE.keys").is_file(),
+        "DONE.keys survived the cut open"
+    );
+    assert!(
+        synced.iter().any(|p| p == &udir),
+        "open dropped DONE without syncing {}: {synced:?}",
+        udir.display()
+    );
+    drop(q);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A cut create number that now pays a different script stays on the old
 /// row. Windowed history must not return it, and a newest page must not
 /// spend one of its slots on it.

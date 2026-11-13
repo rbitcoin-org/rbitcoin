@@ -83,7 +83,12 @@ Fixed
   keeps its extract. A first-pass map on a shard that is not packed is
   removed before those markers go, and again before the unsorted directory
   is removed, so the next open does not mark that map packed or publish its
-  create count. The inclusion watermark stays at the cut until the tail
+  create count. Dropping the markers syncs that directory, and removing the
+  directory syncs the store directory. A `DONE` last that still equals the
+  create count is collected again when an unsealed shard has no map. A fault
+  rebuild, and a pack-complete head with no include mark and no SEAL, remove
+  that directory and those unpacked maps after the pack marks are gone, so
+  the old map is not published onto the wiped body. The inclusion watermark stays at the cut until the tail
   backfill appends the new creates.
   Open records `(covered, through]` in `scripthash.recheck` when
   that value is past the create count, including when `include_hwm` is not.

@@ -135,6 +135,9 @@ impl ShRunBuilder {
     /// Wipe SH runs/SEAL/cold progress/include_hwm and empty durable SH tables.
     ///
     /// Used by [`crate::Query::set_sh_force_rebuild`] so tip collects **all** Class A.
+    /// Pack marks are cleared before the unsorted directory. That order is
+    /// what lets the map removal see an unpacked shard. A `DONE` last that
+    /// still names the create count would otherwise publish the old map.
     pub fn prepare_force_full_rebuild(&self, store: &Store) -> Result<(), StoreError> {
         info!("node: scripthash FORCE_REBUILD — clearing runs/SEAL/progress/HWM and reinit head");
         self.wipe_catalog_and_seal()?;
@@ -142,6 +145,9 @@ impl ShRunBuilder {
         store.scripthash.reinit_empty_for_cold_materialize()?;
         rbitcoin_store::scripthash::clear_sh_recheck(store.path())?;
         rbitcoin_store::scripthash::clear_sh_through(store.path())?;
+        rbitcoin_store::clear_unsorted_shard_dir(&rbitcoin_store::unsorted_shard_dir(
+            store.path(),
+        ))?;
         Ok(())
     }
 

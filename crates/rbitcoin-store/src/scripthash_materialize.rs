@@ -226,10 +226,19 @@ pub fn clear_unsorted_shard_dir(dir: &Path) -> Result<(), StoreError> {
         crate::scripthash::unlink_unpacked_shard_maps(store)?;
     }
     match fs::remove_dir_all(dir) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(StoreError::io(dir, e)),
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(StoreError::io(dir, e)),
     }
+    // Map removal syncs the head directory. This directory's removal is a
+    // dirent in the store directory. A crash before that sync can restore
+    // `DONE` after the maps are gone, and the next collect then skips.
+    if let Some(store) = dir.parent() {
+        if !store.as_os_str().is_empty() {
+            crate::file::fsync_parent_dir(store).map_err(|e| StoreError::io(store, e))?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -372,7 +381,36 @@ fn drop_phase_markers(dir: &Path) -> Result<(), StoreError> {
             Err(e) => return Err(StoreError::io(&path, e)),
         }
     }
+    // The map removal already synced the head directory. These unlinks live
+    // here. A crash before this sync can restore `DONE` once the chain has
+    // grown back to that last, and collect then skips a shard with no map.
+    crate::file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
     Ok(())
+}
+
+/// Equal `DONE` is a finished pass only when every unsealed shard still has
+/// its map. A missing map packs empty, or fails when a post spill opens it.
+fn plan_collect(
+    table: &ScriptHashTable,
+    done_last: Option<u64>,
+    class_a_last: u64,
+    any_sealed_shards: bool,
+    keys_present: bool,
+) -> UnsortedCollectAction {
+    let action = plan_unsorted_collect(done_last, class_a_last, any_sealed_shards, keys_present);
+    if action != UnsortedCollectAction::Skip {
+        return action;
+    }
+    let n = table.head_shard_count().max(1);
+    let missing = table
+        .unsealed_main_shards()
+        .into_iter()
+        .any(|si| !MphfHead::exists(&sorted_main_shard_path(table.store_dir(), si, n)));
+    if missing {
+        UnsortedCollectAction::Full
+    } else {
+        action
+    }
 }
 
 /// A phase marker above the live count names creates this open already
@@ -1572,7 +1610,8 @@ pub fn collect_unsorted_covering_txs(
     }
     let done = read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards);
     let keys_present = any_unsorted_keys(dir, n_shards);
-    let action = plan_unsorted_collect(
+    let action = plan_collect(
+        table,
         done.as_ref().map(|d| d.last_fk),
         last,
         any_sealed_shards,
@@ -1938,7 +1977,8 @@ pub fn collect_posts_covering(
     let n_shards = table.head_shard_count().max(1);
     let last = txs.count();
     let done = read_phase_done(dir, POST_DONE_NAME, POST_DONE_MAGIC, n_shards);
-    let action = plan_unsorted_collect(
+    let action = plan_collect(
+        table,
         done.as_ref().map(|d| d.last_fk),
         last,
         any_sealed_shards,
