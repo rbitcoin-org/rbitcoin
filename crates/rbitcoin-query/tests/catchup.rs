@@ -1335,6 +1335,69 @@ fn reused_cut_fk_stays_out_of_touch_and_create_count() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// No recheck span and a count above `--max-sh-creates` refuses from the
+/// packed counter. The strong list is not built.
+#[cfg(debug_assertions)]
+#[test]
+fn unpaged_join_over_cap_skips_the_strong_list() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-cap-skip");
+    q.enter_direct_index_mode().unwrap();
+    let script = [0x51u8, 0xab];
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    for h in 0..2u32 {
+        let fk = connect_spk(&q, h, prev, parent, &script);
+        parent = Some(q.get_header(fk).unwrap().hash);
+        prev = fk;
+    }
+    q.finalize_sh_runs().unwrap();
+    let sh = rbitcoin_store::script_hash(&script);
+    q.set_max_sh_creates(1);
+    let before = q.sh_posting_note_count();
+    let err = q.scripthash_history(&sh).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "scripthash join exceeds --max-sh-creates (2 creates, cap 1)"
+    );
+    let notes = q.sh_posting_note_count() - before;
+    assert_eq!(notes, 0, "the over-cap join visited {notes} postings");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A span can cut the walked count down to the cap while the packed counter
+/// stays above it. The join walks, then admits.
+#[cfg(debug_assertions)]
+#[test]
+fn unpaged_join_walks_a_span_before_the_cap() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-cap-span");
+    q.enter_direct_index_mode().unwrap();
+    let script = [0x51u8, 0xab];
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    for h in 0..2u32 {
+        let fk = connect_spk(&q, h, prev, parent, &script);
+        parent = Some(q.get_header(fk).unwrap().hash);
+        prev = fk;
+    }
+    q.finalize_sh_runs().unwrap();
+    let sh = rbitcoin_store::script_hash(&script);
+    q.store
+        .scripthash
+        .put_create_batch_append(&[ScriptHashRecord::from_fk(sh, Fk(99))])
+        .unwrap();
+    let mut mark = [0u8; 16];
+    mark[8..].copy_from_slice(&99u64.to_le_bytes());
+    std::fs::write(q.store.path().join("scripthash.recheck"), mark).unwrap();
+    let packed = q.store.scripthash.create_count(&sh).unwrap();
+    assert!(packed > 2, "packed count {packed} is not over the cap");
+    q.set_max_sh_creates(2);
+    let before = q.sh_posting_note_count();
+    let rows = q.scripthash_history(&sh).unwrap();
+    assert_eq!(rows.len(), 2, "the cut posting was kept");
+    assert!(q.sh_posting_note_count() > before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An unpaged join counts creates, then builds the strong list. With a
 /// span on disk both steps read Class A. The covered pay is still one read.
 #[cfg(debug_assertions)]

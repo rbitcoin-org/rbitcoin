@@ -509,7 +509,9 @@ pub struct Query {
     /// 0 = unlimited. Electrum + Esplora SH joins refuse above this create count.
     pub max_sh_creates: AtomicU32,
     /// 0 = off. An unpaged SH join above this create count holds
-    /// [`Self::heavy_sh_join`] for its whole walk.
+    /// [`Self::heavy_sh_join`] for the strong list when the count is already
+    /// known, and for the expand either way. A recheck span is counted
+    /// before that lock.
     pub heavy_sh_creates: AtomicU32,
     /// Shared API store-read slots. Tests leave this at `tokio::sync::Semaphore::MAX_PERMITS`.
     /// The node replaces it once at listen from `--store-read-budget`.
@@ -523,6 +525,9 @@ pub struct Query {
     /// Class A reads inside a lost-tail span check. Tests only.
     #[cfg(debug_assertions)]
     pub sh_recheck_class_a_reads: AtomicU64,
+    /// Postings visited by a scripthash walk. Tests only.
+    #[cfg(debug_assertions)]
+    pub sh_posting_notes: AtomicU64,
     /// Packed `tx.body` bytes read by [`Self::load_thin_tweaks`].
     pub thin_tweak_body_bytes: AtomicU64,
     /// Max fk `head_insert_many` has published (0 = never). Load polls this
@@ -919,6 +924,8 @@ impl Query {
             sh_join_probe: crate::scripthash::ShJoinProbe::default(),
             #[cfg(debug_assertions)]
             sh_recheck_class_a_reads: AtomicU64::new(0),
+            #[cfg(debug_assertions)]
+            sh_posting_notes: AtomicU64::new(0),
             thin_tweak_body_bytes: AtomicU64::new(0),
             head_drain_fk: AtomicU64::new(head_drained),
             disconnect_height: AtomicU32::new(0),

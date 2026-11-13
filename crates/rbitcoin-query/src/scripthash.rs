@@ -667,14 +667,15 @@ impl Query {
         page: Option<&HistoryFilter>,
     ) -> Result<Vec<ShJoinedOut>, QueryError> {
         let paging = page.is_some_and(|f| f.limit.is_some());
-        // The cap count and the strong list share one span walk. A second
-        // walk would read Class A again for every posting in the span.
+        // A span walk counts and lists together, so Class A runs once.
+        // With no span the packed count admits first. Over the cap that
+        // returns before the strong list, and a heavy join holds the lock
+        // for that list.
         let t_pages = std::time::Instant::now();
         let (admit, mut fks) = if paging {
             (None, self.strong_sh_creates(scripthash, view)?)
         } else {
-            let (n, fks) = self.walk_sh_postings(scripthash, Some(view), true)?;
-            (Some(self.unpaged_join_admit(n)?), fks)
+            self.unpaged_join_postings(scripthash, view)?
         };
         let pages_us = t_pages.elapsed().as_micros();
         #[cfg(debug_assertions)]
@@ -740,6 +741,24 @@ impl Query {
         // Debug drops `_probe` before `admit`. Releasing the heavy lock first
         // lets the next heavy join enter the probe while this one is still counted.
         Ok(out)
+    }
+
+    /// Packed count, then the strong list. A recheck span uses one walk for
+    /// both, and that walk runs before the cap.
+    fn unpaged_join_postings<'a>(
+        &'a self,
+        scripthash: &[u8; 32],
+        view: &ChainView,
+    ) -> Result<(Option<JoinAdmit<'a>>, Vec<Fk>), QueryError> {
+        let spans = rbitcoin_store::scripthash::sh_recheck_spans(self.store.path())?;
+        if spans.is_empty() {
+            let n = self.scripthash_create_count(scripthash)?;
+            let admit = self.unpaged_join_admit(n)?;
+            let fks = self.strong_sh_creates(scripthash, view)?;
+            return Ok((Some(admit), fks));
+        }
+        let (n, fks) = self.walk_sh_postings(scripthash, Some(view), true)?;
+        Ok((Some(self.unpaged_join_admit(n)?), fks))
     }
 
     /// Refuse an unpaged join above `--max-sh-creates`, then hand back the
@@ -1358,6 +1377,9 @@ impl Query {
         fk: Fk,
         sorted_insert: bool,
     ) -> Result<(), QueryError> {
+        #[cfg(debug_assertions)]
+        self.sh_posting_notes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cut = if note.suspect.is_empty() {
             false
         } else {
@@ -2345,6 +2367,14 @@ impl Query {
     #[cfg(debug_assertions)]
     pub fn sh_recheck_class_a_read_count(&self) -> u64 {
         self.sh_recheck_class_a_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Postings a scripthash walk has visited since this query opened.
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn sh_posting_note_count(&self) -> u64 {
+        self.sh_posting_notes
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
