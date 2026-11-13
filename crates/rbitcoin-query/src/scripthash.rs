@@ -467,6 +467,17 @@ impl std::fmt::Display for ShJoinNeed {
     }
 }
 
+/// Mutable state for one scripthash posting walk.
+struct ShPostingNote<'a> {
+    scripthash: &'a [u8; 32],
+    view: Option<&'a ChainView>,
+    want_count: bool,
+    suspect: &'a [(u64, u64)],
+    genesis: Option<Fk>,
+    count: &'a mut u32,
+    strong: &'a mut Vec<Fk>,
+}
+
 impl Query {
     /// Expand confirmed-strong create fks in one idx→body wave (`load_creates_once`).
     #[doc(hidden)]
@@ -1318,31 +1329,22 @@ impl Query {
             None
         };
         let mut strong = Vec::new();
-        for fk in self.store.scripthash.create_fks(scripthash)? {
-            self.note_sh_posting(
+        {
+            let mut note = ShPostingNote {
                 scripthash,
-                fk,
                 view,
                 want_count,
-                &suspect,
+                suspect: &suspect,
                 genesis,
-                false,
-                &mut count,
-                &mut strong,
-            )?;
-        }
-        for fk in pending {
-            self.note_sh_posting(
-                scripthash,
-                fk,
-                view,
-                want_count,
-                &suspect,
-                genesis,
-                true,
-                &mut count,
-                &mut strong,
-            )?;
+                count: &mut count,
+                strong: &mut strong,
+            };
+            for fk in self.store.scripthash.create_fks(scripthash)? {
+                self.note_sh_posting(&mut note, fk, false)?;
+            }
+            for fk in pending {
+                self.note_sh_posting(&mut note, fk, true)?;
+            }
         }
         Ok((count, strong))
     }
@@ -1352,36 +1354,30 @@ impl Query {
     /// `sorted_insert` is the pending list: a copy of a durable fk stays once.
     fn note_sh_posting(
         &self,
-        scripthash: &[u8; 32],
+        note: &mut ShPostingNote<'_>,
         fk: Fk,
-        view: Option<&ChainView>,
-        want_count: bool,
-        suspect: &[(u64, u64)],
-        genesis: Option<Fk>,
         sorted_insert: bool,
-        count: &mut u32,
-        strong: &mut Vec<Fk>,
     ) -> Result<(), QueryError> {
-        let cut = if suspect.is_empty() {
+        let cut = if note.suspect.is_empty() {
             false
         } else {
-            self.reused_cut_fk(scripthash, fk, suspect)?
+            self.reused_cut_fk(note.scripthash, fk, note.suspect)?
         };
-        if want_count && !suspect.is_empty() && !cut {
-            *count = count.saturating_add(1);
+        if note.want_count && !note.suspect.is_empty() && !cut {
+            *note.count = note.count.saturating_add(1);
         }
-        let Some(view) = view else {
+        let Some(view) = note.view else {
             return Ok(());
         };
-        if Some(fk) == genesis || cut || !self.confirmed_strong_in(fk, view)? {
+        if Some(fk) == note.genesis || cut || !self.confirmed_strong_in(fk, view)? {
             return Ok(());
         }
         if sorted_insert {
-            if let Err(at) = strong.binary_search_by_key(&fk.0, |f| f.0) {
-                strong.insert(at, fk);
+            if let Err(at) = note.strong.binary_search_by_key(&fk.0, |f| f.0) {
+                note.strong.insert(at, fk);
             }
         } else {
-            strong.push(fk);
+            note.strong.push(fk);
         }
         Ok(())
     }
