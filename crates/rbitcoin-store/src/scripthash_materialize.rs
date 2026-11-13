@@ -221,8 +221,15 @@ pub fn unsorted_pack_workers() -> usize {
     sh_extract_workers()
 }
 
-pub fn clear_unsorted_shard_dir(dir: &Path) {
-    let _ = fs::remove_dir_all(dir);
+pub fn clear_unsorted_shard_dir(dir: &Path) -> Result<(), StoreError> {
+    if let Some(store) = dir.parent() {
+        crate::scripthash::unlink_unpacked_shard_maps(store)?;
+    }
+    match fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StoreError::io(dir, e)),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +403,9 @@ pub(crate) fn record_unsorted_phase_above_count(
         return Ok(());
     };
     note_phase_above_count(store_dir, covered, old)?;
+    // The pass-1 map must be gone before the markers are. A crash after
+    // this open, once keys/ and post/ are gone, would otherwise mark it packed.
+    crate::scripthash::unlink_unpacked_shard_maps(store_dir)?;
     drop_phase_markers(&dir)
 }
 
@@ -1558,7 +1568,7 @@ pub fn collect_unsorted_covering_txs(
     if leftover_legacy_unsorted(dir)
         && read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards).is_none()
     {
-        clear_unsorted_shard_dir(dir);
+        clear_unsorted_shard_dir(dir)?;
     }
     let done = read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards);
     let keys_present = any_unsorted_keys(dir, n_shards);
@@ -1579,7 +1589,7 @@ pub fn collect_unsorted_covering_txs(
             })
         }
         UnsortedCollectAction::Full => {
-            clear_unsorted_shard_dir(dir);
+            clear_unsorted_shard_dir(dir)?;
             collect_keys_from_txs(txs, table, dir, 1, last, workers, cancel)
         }
         UnsortedCollectAction::Append { first, last } => {
@@ -2275,7 +2285,7 @@ pub fn materialize_sh_unsorted_from_class_a(
 
     let unsealed = table.unsealed_main_shards();
     if unsealed.is_empty() && (!table.head_is_empty() || table.entry_count() > 0) {
-        clear_unsorted_shard_dir(&dir);
+        clear_unsorted_shard_dir(&dir)?;
         ColdProgress::clear(store.path());
         return Ok(ShShardMaterialize {
             creates: table.entry_count(),
@@ -2323,7 +2333,7 @@ pub fn materialize_sh_unsorted_from_class_a(
     // cut so the tail backfill appends the creates that arrived after it.
     mat.max_fk = capped_publish_fk(store.path(), any_sealed, mat.max_fk)?;
     if table.unsealed_main_shards().is_empty() {
-        clear_unsorted_shard_dir(&dir);
+        clear_unsorted_shard_dir(&dir)?;
         ColdProgress::clear(store.path());
     }
     Ok(mat)

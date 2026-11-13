@@ -1590,6 +1590,98 @@ fn packed_shard_keeps_its_extract_across_a_done_cut() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Keys collect, pass-1 maps on both shards, and a pack mark on shard 0.
+/// `DONE` still names the scanned count. The other shard has no pack mark.
+fn pass1_with_one_pack_mark(label: &str) -> (rbitcoin_store::testutil::TempDir, u64) {
+    let dir = rbitcoin_store::testutil::TempDir::labeled(label).unwrap();
+    let layout = StoreLayout::tiny(dir.path()).with_sh_shards(2);
+    let q = Query::open_or_create_layout(layout).unwrap();
+    seed_reopenable_chain(&q, 3);
+    let n_shards = q.store.scripthash.head_shard_count();
+    assert_eq!(n_shards, 2);
+    let udir = rbitcoin_store::unsorted_shard_dir(q.store.path());
+    rbitcoin_store::collect_unsorted_shard_files(&q.store, &udir, n_shards, 1, None).unwrap();
+    let old = rbitcoin_store::unsorted_done_last_fk(&udir, n_shards).unwrap();
+    rbitcoin_store::scripthash_materialize::seal_mphf_from_keys(
+        &q.store.scripthash,
+        &udir,
+        n_shards,
+        None,
+    )
+    .unwrap();
+    let packed = rbitcoin_store::scripthash::sorted_main_shard_path(q.store.path(), 0, n_shards);
+    rbitcoin_store::scripthash::write_shard_pack_mark(&packed).unwrap();
+    let pass1 = rbitcoin_store::scripthash::sorted_main_shard_path(q.store.path(), 1, n_shards);
+    assert!(
+        rbitcoin_store::scripthash_mphf::MphfHead::exists(&pass1),
+        "pass-1 map was not sealed"
+    );
+    assert!(
+        !rbitcoin_store::scripthash::shard_pack_mark_path(&pass1).is_file(),
+        "the pass-1 shard was already packed"
+    );
+    drop(q);
+    (dir, old)
+}
+
+fn assert_pass1_shard_stays_unpacked(dir: &std::path::Path) {
+    let q = reopen_layout(dir, 2);
+    let pass1 = rbitcoin_store::scripthash::sorted_main_shard_path(q.store.path(), 1, 2);
+    assert!(
+        !rbitcoin_store::scripthash::shard_pack_mark_path(&pass1).is_file(),
+        "open wrote a pack mark on the pass-1 shard"
+    );
+    assert_eq!(
+        q.store.scripthash.include_hwm(),
+        0,
+        "open published the pass-1 create count"
+    );
+    assert!(
+        !q.store.scripthash.has_durable_index(),
+        "the pass-1 head was treated as finished"
+    );
+    let packed = rbitcoin_store::scripthash::sorted_main_shard_path(q.store.path(), 0, 2);
+    assert!(
+        rbitcoin_store::scripthash::shard_pack_mark_path(&packed).is_file(),
+        "the packed shard lost its mark"
+    );
+}
+
+/// Open drops `DONE` while a pass-1 map is still on disk. Once the key and
+/// post directories are gone too, the next open must not pack that map.
+#[test]
+fn reopen_after_done_drop_does_not_pack_a_pass1_shard() {
+    let (dir, old) = pass1_with_one_pack_mark("q-sh-pass1-done-drop");
+    let layout = StoreLayout::tiny(dir.path()).with_sh_shards(2);
+    let q = Query::open_or_create_layout(layout).unwrap();
+    cut_creates_to(&q, 1);
+    assert!(old > q.store.txs.count());
+    let path = dir.path().to_path_buf();
+    drop(q);
+    let q = reopen_layout(&path, 2);
+    let udir = rbitcoin_store::unsorted_shard_dir(&path);
+    assert!(
+        !udir.join("DONE.keys").is_file(),
+        "DONE.keys survived the cut open"
+    );
+    drop(q);
+    let _ = std::fs::remove_dir_all(udir.join("keys"));
+    let _ = std::fs::remove_dir_all(udir.join("post"));
+    assert_pass1_shard_stays_unpacked(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A full collect deletes the unsorted directory before the new keys exist.
+/// A crash in that gap must not pack the pass-1 shard on the next open.
+#[test]
+fn clear_unsorted_does_not_pack_a_pass1_shard() {
+    let (dir, _old) = pass1_with_one_pack_mark("q-sh-pass1-clear");
+    let path = dir.path().to_path_buf();
+    rbitcoin_store::clear_unsorted_shard_dir(&rbitcoin_store::unsorted_shard_dir(&path)).unwrap();
+    assert_pass1_shard_stays_unpacked(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The chain can reach the old `DONE` last before the first finalize.
 /// The packed shard keeps its extract. The new creates on that shard
 /// arrive from the tail backfill, and the inclusion mark stays at the

@@ -80,7 +80,10 @@ Fixed
   the covered prefix again, leaves `include_hwm` at that count, and records
   the dropped numbers in `scripthash.recheck`. Open records that span and
   drops the `DONE` markers while the count is still the cut. A packed shard
-  keeps its extract. The inclusion watermark stays at the cut until the tail
+  keeps its extract. A first-pass map on a shard that is not packed is
+  removed before those markers go, and again before the unsorted directory
+  is removed, so the next open does not mark that map packed or publish its
+  create count. The inclusion watermark stays at the cut until the tail
   backfill appends the new creates.
   Open records `(covered, through]` in `scripthash.recheck` when
   that value is past the create count, including when `include_hwm` is not.

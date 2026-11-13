@@ -176,7 +176,7 @@ impl ShRunBuilder {
             self.discard_residual_runs();
             rbitcoin_store::clear_unsorted_shard_dir(&rbitcoin_store::unsorted_shard_dir(
                 store.path(),
-            ));
+            ))?;
             return Ok(0);
         }
 

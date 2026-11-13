@@ -15,7 +15,7 @@ use crate::scripthash_layout::{
     SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_INLINE_CAP, SH_MAX_CLASS,
     SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS,
 };
-use crate::scripthash_mphf::{mix_key16, MphfHead};
+use crate::scripthash_mphf::{mix_key16, mphf_path, val_path, MphfHead};
 use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
 use crate::scripthash_pages::{
     sh_page_as_array, sh_page_chunk_ranges, sh_page_decode_slice_into, sh_page_extent,
@@ -741,6 +741,55 @@ pub fn migrate_legacy_pack_marks(
     }
     if wrote && load_include_hwm(dir) == 0 && create_count > 0 {
         store_include_hwm(dir, create_count)?;
+    }
+    Ok(())
+}
+
+/// Remove pass-1 `.mphf` and `.val` from shards that have no pack mark.
+///
+/// The next open marks every shard that still has a map once the unsorted
+/// directory no longer shows an extract. A pass-1 word of 0 reads as an
+/// empty script. A packed shard keeps its files. The head directory is
+/// synced before this returns so the removal survives a crash.
+pub fn unlink_unpacked_shard_maps(store_dir: &Path) -> Result<(), StoreError> {
+    let head = store_dir.join("scripthash.head");
+    let (bases, sync_dir) = if head.is_file() {
+        (vec![head], store_dir.to_path_buf())
+    } else if head.is_dir() {
+        let mut names = std::collections::BTreeSet::new();
+        for ent in std::fs::read_dir(&head).map_err(|e| StoreError::io(&head, e))? {
+            let ent = ent.map_err(|e| StoreError::io(&head, e))?;
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            let stem = name
+                .strip_suffix(".mphf")
+                .or_else(|| name.strip_suffix(".val"))
+                .or_else(|| name.strip_suffix(".packed"))
+                .unwrap_or(name.as_ref());
+            if stem.len() == 2 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
+                names.insert(stem.to_string());
+            }
+        }
+        let bases = names.into_iter().map(|stem| head.join(stem)).collect();
+        (bases, head)
+    } else {
+        return Ok(());
+    };
+    let mut removed = false;
+    for base in bases {
+        if shard_pack_mark_path(&base).is_file() {
+            continue;
+        }
+        for path in [mphf_path(&base), val_path(&base)] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StoreError::io(&path, e)),
+            }
+        }
+    }
+    if removed {
+        crate::file::fsync_parent_dir(&sync_dir).map_err(|e| StoreError::io(&sync_dir, e))?;
     }
     Ok(())
 }

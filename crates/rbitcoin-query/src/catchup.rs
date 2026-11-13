@@ -493,7 +493,7 @@ impl Query {
             self.sh_run.prepare_force_full_rebuild(&self.store)?;
             rbitcoin_store::clear_unsorted_shard_dir(&rbitcoin_store::unsorted_shard_dir(
                 self.store.path(),
-            ));
+            ))?;
         }
         let tip_max = self.store.txs.count();
         let n = self
