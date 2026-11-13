@@ -13,8 +13,8 @@ fn tmp_path() -> std::path::PathBuf {
 /// shortened table, not a mix and not a panic.
 #[test]
 fn get_racing_truncate_does_not_panic() {
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = Arc::new(ArrayTable::create(&path, TableKind::Confirmed).unwrap());
@@ -137,8 +137,8 @@ fn fd_only_truncate_then_get_is_absent() {
 /// value or the new one for that index.
 #[test]
 fn get_during_set_many_is_old_or_new() {
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = Arc::new(ArrayTable::create(&path, TableKind::Confirmed).unwrap());
@@ -705,7 +705,6 @@ fn sparse_set_after_truncate_is_corrupt() {
 }
 
 /// Open copies each flushed 8-byte slot into the in-RAM image.
-/// A body that is not a multiple of 8 stays corrupt.
 #[test]
 fn array_open_reads_flushed_slots() {
     let path = tmp_path();
@@ -726,16 +725,35 @@ fn array_open_reads_flushed_slots() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A body that ends mid-record opens at the last whole row.
 #[test]
-fn array_open_rejects_a_ragged_body() {
+fn array_open_floors_a_ragged_body() {
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let f = rbitcoin_store::file::TableFile::create(&path, TableKind::Confirmed).unwrap();
     f.set_logical_len(FILE_HEADER_LEN as u64 + 1).unwrap();
     drop(f);
-    assert!(matches!(
-        ArrayTable::open(&path, TableKind::Confirmed),
-        Err(StoreError::Corrupt("array table size"))
-    ));
+    let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
+    assert_eq!(t.len(), 0);
+    drop(t);
+    let f = rbitcoin_store::file::TableFile::open(&path, TableKind::Confirmed).unwrap();
+    assert_eq!(f.logical_len(), FILE_HEADER_LEN as u64);
+    drop(f);
+
+    let _ = std::fs::remove_file(&path);
+    let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 0, 0x1111)
+        .unwrap();
+    t.flush().unwrap();
+    drop(t);
+    let f = rbitcoin_store::file::TableFile::open(&path, TableKind::Confirmed).unwrap();
+    f.set_logical_len(FILE_HEADER_LEN as u64 + ELEM + 1)
+        .unwrap();
+    drop(f);
+    let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
+    assert_eq!((t.len(), t.get(0).unwrap()), (1, 0x1111));
+    drop(t);
+    let f = rbitcoin_store::file::TableFile::open(&path, TableKind::Confirmed).unwrap();
+    assert_eq!(f.logical_len(), FILE_HEADER_LEN as u64 + ELEM);
     let _ = std::fs::remove_file(&path);
 }
