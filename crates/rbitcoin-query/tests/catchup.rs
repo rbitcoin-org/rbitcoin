@@ -944,6 +944,72 @@ fn resume_keeps_a_pack_complete_head_with_no_inclusion_mark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A resume head is pack-complete and has no inclusion mark yet. Startup
+/// must not enter Tip. The next block would publish the watermark over
+/// creates the pack never scanned. Finalize backfills first.
+#[test]
+fn resume_head_stays_direct_until_the_tail_is_backfilled() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-resume-direct");
+    let script = vec![0x51, 0xee, 0x11];
+    let (sh, before) = index_two_pays(&q);
+    std::fs::remove_file(dir.join(rbitcoin_store::INCLUDE_HWM_NAME)).unwrap();
+    std::fs::remove_file(q.sh_run.runs_dir.join("SEAL")).unwrap();
+    rbitcoin_store::scripthash::mark_sh_rebuild_resume(q.store.path()).unwrap();
+    assert!(
+        !q.sh_use_writebehind(),
+        "a resume head started write-behind before the tail backfill"
+    );
+    connect_coinbase_paying(&q, script);
+    q.finalize_sh_runs().unwrap();
+    let txids = history_txids(&q, &sh);
+    assert_eq!(
+        txids.len(),
+        before.len() + 1,
+        "the tail pay was not indexed"
+    );
+    assert!(txids.starts_with(&before));
+    assert!(
+        !rbitcoin_store::scripthash::sh_rebuild_marked(q.store.path()),
+        "a finished finalize left the resume mark"
+    );
+    assert!(q.sh_use_writebehind());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Open sees a shard bump past the file. The wipe byte has to be on disk
+/// before startup can enter Tip, or the appender dies on the torn body
+/// and the next start does the same.
+#[test]
+fn shard_bump_writes_the_wipe_byte_before_tip() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-bump-mark");
+    q.enter_direct_index_mode().unwrap();
+    seed_reopenable_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    assert!(q.store.scripthash.include_hwm() > 0);
+    {
+        let body = &q.store.scripthash.bodies[0];
+        let mut state = q.store.scripthash.allocs[0].lock().unwrap();
+        state.bump = body.logical_len() + 64;
+        rbitcoin_store::scripthash::write_alloc_header(body, &state).unwrap();
+    }
+    let n_shards = q.store.scripthash.head_shard_count();
+    let path = dir.path().to_path_buf();
+    drop(q);
+    let q = reopen_layout(&path, n_shards);
+    let marker = std::fs::read(path.join("scripthash.rebuild")).unwrap_or_default();
+    assert_eq!(
+        marker, b"1",
+        "a shard bump past the file did not write the wipe byte"
+    );
+    assert!(q.store.scripthash.has_durable_index());
+    q.discard_unproven_scripthash_head().unwrap();
+    assert!(
+        !q.store.scripthash.has_durable_index(),
+        "startup left the torn head in place"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A wipe request can sit next to a restored pack mark and inclusion
 /// watermark. Leaving that head lets startup serve it. The wipe has to
 /// finish, and the resume byte has to replace the wipe byte so the next

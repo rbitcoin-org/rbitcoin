@@ -92,7 +92,9 @@ Fixed
   and those unpacked maps, so the old map is not published onto the wiped
   body. A crash during that wipe retries even when the next open restored
   the pack marks and the inclusion watermark. A resume mark keeps that
-  pack-complete head, and the tail backfill publishes the watermark. The inclusion watermark stays at the cut until the tail
+  pack-complete head, and startup stays Direct until the tail backfill
+  publishes the watermark, so the next block does not publish it over
+  creates the pack never scanned. The inclusion watermark stays at the cut until the tail
   backfill appends the new creates.
   Open records `(covered, through]` in `scripthash.recheck` when
   that value is past the create count, including when `include_hwm` is not.
@@ -106,9 +108,12 @@ Fixed
   no longer pays the script stays out of windowed history and does not
   shorten an Esplora page. That number also stays out of a height touch,
   a subscription status, and the join create count. With no recheck span,
-  that count stays the packed counter. A shard offset past its file rebuilds once. A
-  page read past that file's logical end schedules the same rebuild on either
-  read backend. A history read of a stale slab does not. Repair of that mismatch
+  that count stays the packed counter. A shard offset past its file rebuilds once.
+  Open writes the wipe byte when that bump is past the file, before startup
+  discard. A page, slab, or extent read past the logical end writes the same
+  byte on either read backend. A cold rebuild drops sealed overflow heads,
+  including L0 and L1, and starts ingest empty. Several keys repaired in one
+  batch flush each body and each home once. A history read of a stale slab does not. Repair of that mismatch
   still does. A
   floor that already matches the count does not. A fault writes
   `scripthash.rebuild` as a wipe request. That open wipes once, then

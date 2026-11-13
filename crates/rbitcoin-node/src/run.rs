@@ -2416,6 +2416,7 @@ pub fn apply_startup_index_mode(
     }
     // Before write-behind starts. An unproven head must not catch up by
     // appending from height 0; delete it and stay Direct until materialize.
+    // A resume head stays Direct too: its pack may not cover Class A yet.
     query
         .discard_unproven_scripthash_head()
         .map_err(|e| NodeError::Config(format!("scripthash index: {e}")))?;

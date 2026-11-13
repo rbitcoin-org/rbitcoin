@@ -748,6 +748,74 @@ fn stale_slab_read_does_not_mark_rebuild() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Two keys repaired in one batch share a body and a home. Each row must
+/// not flush that home again.
+#[test]
+fn two_repairs_sync_the_home_once() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let a = script_hash(&[0x31]);
+    let b = script_hash(&[0x32]);
+    let rows: Vec<_> = [a, b]
+        .into_iter()
+        .flat_map(|sh| (1..=4u32).map(move |v| rec(sh, u64::from(v), v)))
+        .collect();
+    t.put_create_batch_append(&rows).unwrap();
+    let before = repair_heads_synced_for_test();
+    let again = vec![rec(a, 2, 2), rec(b, 2, 2)];
+    t.put_create_batch_append_through(&again, 2).unwrap();
+    let synced = repair_heads_synced_for_test().saturating_sub(before);
+    assert_eq!(synced, 1, "each repaired row flushed the same home");
+    assert_eq!(t.entries(&a).unwrap().len(), 2);
+    assert_eq!(t.entries(&b).unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cold rebuild resets the overflow body. Sealed overflow heads must
+/// not keep slab words that point into that reset body.
+#[test]
+fn rebuild_drops_sealed_overflow_heads() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0x41]);
+    t.put_create_batch_append(&[rec(sh, 1, 1)]).unwrap();
+    t.seal_ingest().unwrap();
+    assert!(t.head_value(&sh).unwrap().is_some());
+    assert!(sealed_ovf_path(&dir, 0).is_file());
+    t.reinit_empty_for_cold_materialize().unwrap();
+    assert!(
+        t.sealed_ovf.lock().unwrap().is_empty(),
+        "the rebuild left a sealed overflow head loaded"
+    );
+    assert!(
+        !sealed_ovf_path(&dir, 0).exists(),
+        "the rebuild left the sealed overflow file"
+    );
+    assert!(
+        t.head_value(&sh).unwrap().is_none(),
+        "the rebuild still serves the overflow key"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A slab read past the file is the same framing fault as a page read.
+#[test]
+fn slab_read_past_logical_end_marks_rebuild() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let body = t.ovf_file();
+    let err = t.read_slab(body, 0, body.logical_len()).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt("pread past logical end")),
+        "{err}"
+    );
+    assert!(
+        sh_rebuild_marked(&dir),
+        "a past-end slab read must schedule scripthash.rebuild"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A page read past the logical end is a framing fault on either backend.
 #[test]
 fn page_read_past_logical_end_marks_rebuild() {

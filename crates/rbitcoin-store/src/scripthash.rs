@@ -1582,8 +1582,10 @@ impl ScriptHashTable {
     ///
     /// Used when runs/`*.run.mat` still hold the complete create set after a
     /// partial/crashed bulk load. Resets body alloc in place and unlinks
-    /// `.packed` so the emptied head is not pack-complete. MPHF files stay
-    /// until the next seal overwrites them. Exclusive: no concurrent SH readers/writers.
+    /// `.packed` so the emptied head is not pack-complete. Main MPHF files
+    /// stay until the next seal overwrites them. Sealed overflow heads are
+    /// dropped: their words point into the overflow body this reset truncates.
+    /// Exclusive: no concurrent SH readers/writers.
     ///
     /// Must run whenever claims are about to cold-load, not only when
     /// `entry_count > 0`: crash mid-finish can leave head shards occupied while
@@ -1602,6 +1604,51 @@ impl ScriptHashTable {
         for i in 0..n {
             unlink_shard_pack_mark(&sorted_main_shard_path(&self.store_dir, i, n));
         }
+        self.drop_overflow_heads()?;
+        Ok(())
+    }
+
+    /// Drop sealed overflow heads and start ingest empty.
+    ///
+    /// The overflow body was just truncated. Leaving L0 or L1 loaded keeps
+    /// slab and extent words that `locate_head` serves before main. The next
+    /// append then fails in `read_slab`, and a later ingest slab at the same
+    /// offset returns another key's creates.
+    fn drop_overflow_heads(&self) -> Result<(), StoreError> {
+        drop(std::mem::take(&mut *self.sealed_ovf.lock().unwrap()));
+        *self.ovf_l1.lock().unwrap() = None;
+        let ovf = self.store_dir.join("scripthash.ovf");
+        match std::fs::read_dir(&ovf) {
+            Ok(rd) => {
+                for ent in rd {
+                    let ent = ent.map_err(|e| StoreError::io(&ovf, e))?;
+                    let name = ent.file_name();
+                    let name = name.to_string_lossy();
+                    let stem = name.split('.').next().unwrap_or("");
+                    if six_digit_name(stem).is_none() {
+                        continue;
+                    }
+                    let path = ent.path();
+                    if path.is_file() {
+                        std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StoreError::io(&ovf, e)),
+        }
+        let ingest = ingest_path(&self.store_dir);
+        if ingest.is_file() {
+            std::fs::remove_file(&ingest).map_err(|e| StoreError::io(&ingest, e))?;
+        }
+        let mut occ = ingest.as_os_str().to_os_string();
+        occ.push(".occ");
+        let occ = PathBuf::from(occ);
+        if occ.is_file() {
+            std::fs::remove_file(&occ).map_err(|e| StoreError::io(&occ, e))?;
+        }
+        *self.ingest.lock().unwrap() =
+            ScriptHashHead::create_with_slots(ingest, ingest_oa_slots(self.scale))?;
         Ok(())
     }
 
@@ -1938,7 +1985,8 @@ impl ScriptHashTable {
             }
             ShHeadValue::Extent { last_page } => {
                 let mut page = [0u8; SH_PAGE_SIZE];
-                body.read_at(*last_page, &mut page)?;
+                body.read_at(*last_page, &mut page)
+                    .map_err(|e| self.note_framing_fault(e))?;
                 if sh_page_extent(&page)?.is_none() {
                     return Err(StoreError::Corrupt("scripthash extent last page not ver=2"));
                 }
@@ -2160,18 +2208,67 @@ impl ScriptHashTable {
     }
 
     fn sync_repaired_bodies(&self, retire: &[RetiredPosting]) -> Result<(), StoreError> {
+        let mut seen: Vec<std::path::PathBuf> = Vec::new();
         for row in retire {
+            let path = self.body_for(&row.key, row.home).path().to_path_buf();
+            if seen.iter().any(|got| got == &path) {
+                continue;
+            }
             self.body_for(&row.key, row.home).sync_data_only()?;
+            seen.push(path);
+        }
+        Ok(())
+    }
+
+    /// One flush per home. A sealed overflow home rewrites every L0 file and
+    /// L1, so a row-by-row sync flushes those files once per key.
+    fn sync_repaired_homes(&self, retire: &[RetiredPosting]) -> Result<(), StoreError> {
+        let mut mains: Vec<usize> = Vec::new();
+        let mut ingest = false;
+        let mut ovf = false;
+        for row in retire {
+            match row.home {
+                KeyHome::Main => {
+                    let si = self.shard_index(&row.key);
+                    if !mains.contains(&si) {
+                        mains.push(si);
+                    }
+                    ingest = true;
+                }
+                KeyHome::Ingest => ingest = true,
+                KeyHome::SealedOvf => ovf = true,
+                KeyHome::Absent => {}
+            }
+        }
+        for si in mains {
+            if let Some(slot) = self.sorted_main.get(si) {
+                if let Some(h) = slot.read().unwrap().as_ref() {
+                    h.flush()?;
+                }
+            }
+            #[cfg(debug_assertions)]
+            note_repair_head_synced();
+        }
+        if ingest {
+            self.ingest.lock().unwrap().flush()?;
+            #[cfg(debug_assertions)]
+            note_repair_head_synced();
+        }
+        if ovf {
+            for h in self.sealed_ovf.lock().unwrap().iter() {
+                h.flush()?;
+            }
+            if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+                l1.head.flush()?;
+            }
+            #[cfg(debug_assertions)]
+            note_repair_head_synced();
         }
         Ok(())
     }
 
     fn free_repaired_rows(&self, retire: Vec<RetiredPosting>) -> Result<(), StoreError> {
-        for row in &retire {
-            self.sync_repair_home(&row.key, row.home)?;
-            #[cfg(debug_assertions)]
-            note_repair_head_synced();
-        }
+        self.sync_repaired_homes(&retire)?;
         #[cfg(debug_assertions)]
         if !retire.is_empty() {
             if let Some(hook) = take_repair_retire_hook() {
@@ -2187,18 +2284,6 @@ impl ScriptHashTable {
             write_alloc_header(body, &alloc)?;
         }
         Ok(())
-    }
-
-    /// Sync the home that holds the repaired value. A main update that missed
-    /// copied the value onto ingest, so that home syncs both.
-    fn sync_repair_home(&self, key: &[u8; 32], kh: KeyHome) -> Result<(), StoreError> {
-        let home = match kh {
-            KeyHome::Main => LocatedHome::Main,
-            KeyHome::SealedOvf => LocatedHome::SealedOvf,
-            KeyHome::Ingest => LocatedHome::Ingest,
-            KeyHome::Absent => return Ok(()),
-        };
-        self.sync_home(home, key)
     }
 
     /// Keep creates at or below `live_through`, merge `fk_vals` in that same
@@ -2759,10 +2844,21 @@ impl ScriptHashTable {
             return Err(StoreError::Corrupt("scripthash slab class overflow"));
         }
         let buf = &mut stack[..need];
-        body.read_at(off, buf)?;
+        body.read_at(off, buf)
+            .map_err(|e| self.note_framing_fault(e))?;
         let mut out = Vec::new();
         decode_slab_payload_into(buf, &mut out)?;
         Ok(out)
+    }
+
+    /// A read past the published end is the same framing fault as a torn
+    /// page. The wipe byte makes the next open rebuild instead of dying on
+    /// the same offset. A resume byte is overwritten: this read is a new fault.
+    fn note_framing_fault(&self, err: StoreError) -> StoreError {
+        if matches!(err, StoreError::Corrupt("pread past logical end")) {
+            let _ = mark_sh_rebuild(&self.store_dir);
+        }
+        err
     }
 
     #[doc(hidden)]

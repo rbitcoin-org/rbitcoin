@@ -154,8 +154,14 @@ impl Query {
     ///
     /// Residual `scripthash.runs` next to a live head are leftover (cancelled
     /// WarmOnly / crash); they are discarded, not merged.
+    ///
+    /// A resume mark means the pack may not cover Class A yet. Stay Direct
+    /// until finalize backfills. The next block would otherwise publish the
+    /// watermark over creates the pack never scanned.
     pub fn sh_use_writebehind(&self) -> bool {
-        self.sh_index_enabled() && self.store.scripthash.has_durable_index()
+        self.sh_index_enabled()
+            && self.store.scripthash.has_durable_index()
+            && !rbitcoin_store::scripthash::sh_rebuild_resume(self.store.path())
     }
 
     /// True when durable SH already covers Class A through tip (safe to stay in
@@ -416,9 +422,15 @@ impl Query {
     pub(super) fn repair_lost_sh_tail(&self, far_seal: FarSealCopy) -> Result<bool, QueryError> {
         let path = self.store.path();
         let force = self.sh_force_rebuild();
-        let marked = rbitcoin_store::scripthash::sh_rebuild_marked(path);
         let resume = rbitcoin_store::scripthash::sh_rebuild_resume(path);
+        let mut marked = rbitcoin_store::scripthash::sh_rebuild_marked(path);
         let shard_past = self.store.scripthash.shard_offset_past_file()?;
+        // Startup discard runs after this and only looks at the marker.
+        // A torn bump with no byte would enter Tip and die on the next read.
+        if shard_past && !resume && !marked {
+            rbitcoin_store::scripthash::mark_sh_rebuild(path)?;
+            marked = true;
+        }
         let will_wipe = force || ((marked || shard_past) && !resume);
         let rebuild = force || marked || shard_past;
         if far_seal == FarSealCopy::NearbyOnly && self.store.scripthash.include_hwm() == 0 {

@@ -113,9 +113,11 @@ fn mark(scratch: &StructuralScratch, create: Fk) -> Result<(), rbitcoin_query::C
     structural_mark_pending(&spends, &mut pending, &run, &scratch.durable_spent)
 }
 
-/// The store says the parent is unspent. Validation and the spend join
-/// must agree, including when the stored spender's height is below the
-/// create. A later input that still names the parent is spent.
+/// Open drops a spender the cut removed, so the parent is unspent. A later
+/// slot that names the fk a new coinbase reused is still not a confirmed
+/// spend of the parent. Validation and the spend join must agree, including
+/// when that spender's height is below the create. A later input that still
+/// names the parent is spent.
 #[test]
 fn reused_spender_does_not_reject_the_parent() {
     let dir = tmp();
@@ -177,6 +179,9 @@ fn reused_spender_does_not_reject_the_parent() {
     assert_eq!(s.txs.count(), 1);
     assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
     assert_eq!(s.unspent_create_vouts(parent, &[0], None).unwrap(), vec![0]);
+    let (multi, field, _) = s.txs.get_output_spender_meta(parent, 0).unwrap();
+    assert!(!multi);
+    assert!(field.is_null(), "open kept a spender the cut removed");
     let other = s.put_tx_full_batch_indexed(&[coinbase(9)], false).unwrap()[0];
     assert_eq!(other, Fk(2));
     let other_rec = hdr(genesis, hash0, 9, [9u8; 32]);
@@ -188,6 +193,7 @@ fn reused_spender_does_not_reject_the_parent() {
     s.strong_tx.set_strong(&write, other, other_header).unwrap();
     s.confirmed.set(&write, Height(1), other_header).unwrap();
     s.rebuild_height_fence().unwrap();
+    s.put_spend_create(parent, 0, other, 0).unwrap();
     let (multi, field, vin) = s.txs.get_output_spender_meta(parent, 0).unwrap();
     assert!(!multi);
     assert_eq!(field, Fk(2));
