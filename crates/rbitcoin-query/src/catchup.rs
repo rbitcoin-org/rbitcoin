@@ -389,7 +389,7 @@ impl Query {
             // A fault writes the marker before any wipe. Only the resume
             // byte, stored after this wipe, keeps sealed shards. A crash
             // before that byte retries the wipe. An explicit force rebuild
-            // still wipes, in the unsorted step.
+            // still wipes, then stores the resume byte before the collect.
             if !rbitcoin_store::scripthash::sh_rebuild_resume(self.store.path()) {
                 self.sh_run.prepare_force_full_rebuild(&self.store)?;
                 rbitcoin_store::scripthash::mark_sh_rebuild_resume(self.store.path())?;
@@ -527,6 +527,9 @@ impl Query {
                 "node: scripthash FORCE_REBUILD + unsorted-shards — wipe head then Class A collect"
             );
             self.sh_run.prepare_force_full_rebuild(&self.store)?;
+            // Byte `1` would make the next start delete shards and `DONE`
+            // this collect already wrote.
+            rbitcoin_store::scripthash::mark_sh_rebuild_resume(self.store.path())?;
         }
         let tip_max = self.store.txs.count();
         let n = self

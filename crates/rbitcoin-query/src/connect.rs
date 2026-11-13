@@ -1233,7 +1233,9 @@ impl Query {
     pub fn recover_sh_writebehind(&self) -> Result<(), QueryError> {
         let recovered = self.recover_sh_indexed_through()?;
         self.set_sh_indexed_through_height(recovered);
-        if !self.store.scripthash.has_durable_index() {
+        // A resume head stays Direct. Queuing here copies creates the tail
+        // backfill also packs, and write-behind never removes those copies.
+        if !self.sh_use_writebehind() {
             return Ok(());
         }
         let Some(tip) = self.tip_height() else {

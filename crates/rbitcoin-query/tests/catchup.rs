@@ -9,7 +9,7 @@ use rbitcoin_store::{
 };
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -973,6 +973,40 @@ fn resume_head_stays_direct_until_the_tail_is_backfilled() {
         "a finished finalize left the resume mark"
     );
     assert!(q.sh_use_writebehind());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Open still runs in Tip. A resume head must not copy the covered tail
+/// into `ram_head`. The tail backfill packs those creates, write-behind
+/// then sees them as already indexed, and the RAM copies stay for the
+/// life of the process. The create count is the packed rows plus those copies.
+#[test]
+fn resume_open_does_not_queue_the_covered_tail() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-resume-ram");
+    seed_reopenable_chain(&q, 3);
+    q.finalize_sh_runs().unwrap();
+    let n_shards = q.store.scripthash.head_shard_count();
+    let path = dir.path().to_path_buf();
+    let sh = rbitcoin_store::script_hash(&[0x51, 2]);
+    let packed = q.store.scripthash.create_count(&sh).unwrap();
+    assert!(packed >= 1, "the last coinbase was not indexed");
+    drop(q);
+    std::fs::write(
+        path.join(rbitcoin_store::INCLUDE_HWM_NAME),
+        1u64.to_le_bytes(),
+    )
+    .unwrap();
+    rbitcoin_store::scripthash::mark_sh_rebuild_resume(&path).unwrap();
+    let q = reopen_layout(&path, n_shards);
+    assert!(
+        q.pending_sh_create_fks(&sh).is_empty(),
+        "open queued covered creates into ram_head"
+    );
+    assert_eq!(
+        q.scripthash_create_count(&sh).unwrap(),
+        q.store.scripthash.create_count(&sh).unwrap(),
+        "open counted the packed create again from ram_head"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2252,6 +2286,54 @@ thread_local! {
 
 fn snap_through_before_unsorted_pack(through: u64) {
     THROUGH_BEFORE_PACK.with(|c| c.set(through));
+}
+
+static CANCEL_FORCE_BEFORE_PACK: AtomicBool = AtomicBool::new(false);
+
+fn cancel_force_before_pack(_: u64) {
+    CANCEL_FORCE_BEFORE_PACK.store(true, Ordering::Relaxed);
+}
+
+/// A forced rebuild writes the wipe byte, then the collect packs. A cancel
+/// after `DONE.keys` is on disk has to leave the resume byte. The next start
+/// without the force flag otherwise deletes that progress and cannot resume.
+#[test]
+fn cancelled_force_rebuild_keeps_done_for_the_next_start() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-force-cancel");
+    seed_reopenable_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    assert!(q.store.scripthash.has_durable_index());
+    let n_shards = q.store.scripthash.head_shard_count();
+    let path = dir.path().to_path_buf();
+    q.set_sh_force_rebuild(true);
+    CANCEL_FORCE_BEFORE_PACK.store(false, Ordering::Relaxed);
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_pack_for_test(Some(
+        cancel_force_before_pack,
+    ));
+    let err = q
+        .finalize_sh_runs_cancellable(Some(&CANCEL_FORCE_BEFORE_PACK))
+        .expect_err("the force collect was not cancelled");
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_pack_for_test(None);
+    assert!(
+        matches!(err, StoreError::Cancelled(_)),
+        "cancel returned {err:?}"
+    );
+    let marker = std::fs::read(path.join("scripthash.rebuild")).unwrap_or_default();
+    assert_eq!(marker, b"2", "a cancelled force rebuild left the wipe byte");
+    let done = rbitcoin_store::unsorted_shard_dir(&path)
+        .join(rbitcoin_store::scripthash_materialize::KEYS_DONE_NAME);
+    assert!(
+        done.is_file(),
+        "the cancelled collect did not leave DONE.keys"
+    );
+    drop(q);
+    let q = reopen_layout(&path, n_shards);
+    q.discard_unproven_scripthash_head().unwrap();
+    assert!(
+        done.is_file(),
+        "the next start deleted DONE.keys and cannot resume the forced collect"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A wave can seal the ingest head before the flush. The through marker

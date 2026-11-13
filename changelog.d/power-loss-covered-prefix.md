@@ -124,4 +124,7 @@ Fixed
   down under that mark, so the high watermark does not stick and the
   next finalize can clear the mark. A fault mark, including one
   written again during the rebuild, wipes once more. An explicit force
-  rebuild still wipes.
+  rebuild still wipes, then stores the resume byte before the collect.
+  A cancel keeps `DONE` and any shard already packed. The next start
+  without the force flag resumes from that progress. A resume head does
+  not queue write-behind copies of creates the tail backfill also packs.
