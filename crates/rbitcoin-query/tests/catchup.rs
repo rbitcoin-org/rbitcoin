@@ -1010,6 +1010,44 @@ fn shard_bump_writes_the_wipe_byte_before_tip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A torn overflow body is the same bump as a torn main shard. Open has
+/// to write the wipe byte before startup can enter Tip.
+#[test]
+fn overflow_bump_writes_the_wipe_byte_before_tip() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-ovf-bump");
+    q.enter_direct_index_mode().unwrap();
+    seed_reopenable_chain(&q, 2);
+    q.finalize_sh_runs().unwrap();
+    assert!(q.store.scripthash.include_hwm() > 0);
+    {
+        let body = q.store.scripthash.ovf_file();
+        assert_eq!(
+            body.path().file_name().and_then(|n| n.to_str()),
+            Some("body"),
+            "the overflow bump was planted on a main shard"
+        );
+        let mut state = q.store.scripthash.ovf_alloc_mutex().lock().unwrap();
+        state.bump = body.logical_len() + 64;
+        rbitcoin_store::scripthash::write_alloc_header(body, &state).unwrap();
+    }
+    let n_shards = q.store.scripthash.head_shard_count();
+    let path = dir.path().to_path_buf();
+    drop(q);
+    let q = reopen_layout(&path, n_shards);
+    let marker = std::fs::read(path.join("scripthash.rebuild")).unwrap_or_default();
+    assert_eq!(
+        marker, b"1",
+        "a torn overflow bump did not write the wipe byte"
+    );
+    assert!(q.store.scripthash.has_durable_index());
+    q.discard_unproven_scripthash_head().unwrap();
+    assert!(
+        !q.store.scripthash.has_durable_index(),
+        "startup left the torn overflow head in place"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A wipe request can sit next to a restored pack mark and inclusion
 /// watermark. Leaving that head lets startup serve it. The wipe has to
 /// finish, and the resume byte has to replace the wipe byte so the next

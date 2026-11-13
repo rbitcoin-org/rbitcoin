@@ -1649,6 +1649,9 @@ impl ScriptHashTable {
         }
         *self.ingest.lock().unwrap() =
             ScriptHashHead::create_with_slots(ingest, ingest_oa_slots(self.scale))?;
+        // The resume byte syncs `store/`, not this directory. Without this
+        // sync a crash can restore the old heads into the reset body.
+        crate::file::fsync_parent_dir(&ovf).map_err(|e| StoreError::io(&ovf, e))?;
         Ok(())
     }
 
@@ -3200,22 +3203,34 @@ impl ScriptHashTable {
         self.n_shards
     }
 
-    /// One alloc-header bump compared with that shard file's length.
+    /// One alloc-header bump compared with that body file's length.
     ///
     /// A bump past the file is a torn body. This does not read slab records.
+    /// The overflow body has its own header. A torn bump there is the same
+    /// fault as a torn main shard.
     pub fn shard_offset_past_file(&self) -> Result<bool, StoreError> {
         for body in &self.bodies {
-            if body.logical_len() < FILE_HEADER_LEN as u64 + 24 {
-                continue;
+            if Self::alloc_bump_past_file(body)? {
+                return Ok(true);
             }
-            match read_alloc_header(body) {
-                Ok((state, _)) if state.bump > body.logical_len() => return Ok(true),
-                Ok(_) => {}
-                Err(StoreError::Corrupt(_)) => {}
-                Err(e) => return Err(e),
+        }
+        if let Some(ovf) = &self.ovf_body {
+            if Self::alloc_bump_past_file(ovf)? {
+                return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    fn alloc_bump_past_file(body: &TableFile) -> Result<bool, StoreError> {
+        if body.logical_len() < FILE_HEADER_LEN as u64 + 24 {
+            return Ok(false);
+        }
+        match read_alloc_header(body) {
+            Ok((state, _)) => Ok(state.bump > body.logical_len()),
+            Err(StoreError::Corrupt(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Current body bump (complete-shard HWM). Shared file: the one bump.

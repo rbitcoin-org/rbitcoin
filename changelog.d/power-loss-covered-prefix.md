@@ -110,9 +110,10 @@ Fixed
   a subscription status, and the join create count. With no recheck span,
   that count stays the packed counter. A shard offset past its file rebuilds once.
   Open writes the wipe byte when that bump is past the file, before startup
-  discard. A page, slab, or extent read past the logical end writes the same
+  discard. The overflow body is checked the same way. A page, slab, or extent read past the logical end writes the same
   byte on either read backend. A cold rebuild drops sealed overflow heads,
-  including L0 and L1, and starts ingest empty. Several keys repaired in one
+  including L0 and L1, starts ingest empty, and syncs `scripthash.ovf/` so
+  those files cannot come back after the resume byte. Several keys repaired in one
   batch flush each body and each home once. A history read of a stale slab does not. Repair of that mismatch
   still does. A
   floor that already matches the count does not. A fault writes

@@ -782,7 +782,14 @@ fn rebuild_drops_sealed_overflow_heads() {
     t.seal_ingest().unwrap();
     assert!(t.head_value(&sh).unwrap().is_some());
     assert!(sealed_ovf_path(&dir, 0).is_file());
+    rbitcoin_store::file::arm_fsync_dir_trace();
     t.reinit_empty_for_cold_materialize().unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    let ovf = dir.join("scripthash.ovf");
+    assert!(
+        synced.iter().any(|p| p == &ovf),
+        "the rebuild left the overflow directory unsynced: {synced:?}"
+    );
     assert!(
         t.sealed_ovf.lock().unwrap().is_empty(),
         "the rebuild left a sealed overflow head loaded"
