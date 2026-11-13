@@ -454,12 +454,12 @@ impl Query {
     /// this open. A seal farther ahead is not that tail.
     ///
     /// `will_wipe` skips the copy. The head is about to be replaced, and
-    /// a resume mark is not that wipe.
+    /// a resume mark is not that wipe. A resume head stays out of
+    /// write-behind, and this copy still runs. The seal is the only floor,
+    /// and leaving it above the stem sticks the next finalize.
     fn copy_legacy_seal_before_lost_tail(&self, will_wipe: bool) -> Result<(), QueryError> {
-        if will_wipe
-            || !self.sh_use_writebehind()
-            || !self.store.scripthash.unsealed_main_shards().is_empty()
-        {
+        let durable = self.sh_index_enabled() && self.store.scripthash.has_durable_index();
+        if will_wipe || !durable || !self.store.scripthash.unsealed_main_shards().is_empty() {
             return Ok(());
         }
         self.sh_run.refresh_seal();
