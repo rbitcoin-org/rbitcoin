@@ -21,6 +21,7 @@ use rbitcoin_mempool::{
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
+use rbitcoin_store::durability::Durable as _;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
@@ -6532,7 +6533,7 @@ impl MempoolHub {
         let tmp = path.with_file_name("mempool.dat.new");
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&bytes)?;
-        f.sync_all()?;
+        f.durable_sync_all()?;
         drop(f);
         std::fs::rename(&tmp, &path)?;
         rbitcoin_log::info!(

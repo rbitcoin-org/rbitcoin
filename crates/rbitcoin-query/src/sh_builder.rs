@@ -7,6 +7,7 @@
 
 use super::run_builder_core::{clear_runs_dir, on_disk_run_count, runs_dir_io, RunControl};
 use rbitcoin_log::info;
+use rbitcoin_store::durability::Durable as _;
 use rbitcoin_store::{materialize_sh_unsorted_from_class_a, ColdProgress, Store, StoreError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -54,7 +55,7 @@ pub fn store_seal(runs_dir: &Path, max_fk: u64) -> Result<(), StoreError> {
             .write(true)
             .open(&tmp)
             .map_err(|e| StoreError::io(&tmp, e))?;
-        f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+        f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
     }
     std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))?;
     Ok(())

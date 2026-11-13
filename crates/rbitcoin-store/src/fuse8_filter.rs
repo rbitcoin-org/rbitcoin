@@ -17,6 +17,7 @@
 //! `read_from`, fingerprints are a read-only file map (`fuse8=` heap 0).
 
 use crate::binary_fuse8::{BinaryFuse8, Fingerprints};
+use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::readonly_map::ReadonlyMap;
 use std::fs::File;
@@ -81,7 +82,7 @@ impl SealedFuse8 {
         f.write_all(&(body.len() as u64).to_le_bytes())
             .map_err(|e| StoreError::io(path, e))?;
         f.write_all(&body).map_err(|e| StoreError::io(path, e))?;
-        f.sync_all().map_err(|e| StoreError::io(path, e))?;
+        f.durable_sync_all().map_err(|e| StoreError::io(path, e))?;
         Ok(())
     }
 

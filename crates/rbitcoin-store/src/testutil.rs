@@ -40,6 +40,67 @@ fn unique_path(label: &str, tick: u128) -> PathBuf {
     std::env::temp_dir().join(format!("rbitcoin-{safe}-{}-{tick}-{n}", std::process::id(),))
 }
 
+/// Skip every file flush in this process from now on
+/// ([`crate::durability`]). Only [`crate::skip_flushes_before_main!`] calls it.
+#[cfg(debug_assertions)]
+pub fn skip_flushes_in_this_process() {
+    crate::durability::skip_in_this_process();
+}
+
+/// Turn file flushes off for this test binary before any test runs, under
+/// the calling crate's `skip-flushes` feature ([`crate::durability`]). Call it
+/// once, at the top of a `tests/suite.rs`, in a crate that declares that
+/// feature. It also adds a test that the switch matches the feature and that
+/// a flush through [`crate::durability::Durable`] obeys it. A test
+/// that checks a flush belongs in a suite that does not call it.
+#[macro_export]
+macro_rules! skip_flushes_before_main {
+    () => {
+        #[cfg(all(feature = "skip-flushes", not(debug_assertions)))]
+        compile_error!("skip-flushes needs a debug build");
+
+        // Before `main`, so before any test thread (the net suite's lane gate
+        // uses the same sections).
+        #[cfg(all(feature = "skip-flushes", debug_assertions))]
+        #[used]
+        #[cfg_attr(
+            any(target_os = "linux", target_os = "android", target_os = "freebsd"),
+            link_section = ".init_array"
+        )]
+        #[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
+        #[cfg_attr(target_os = "windows", link_section = ".CRT$XCU")]
+        static SKIP_FLUSHES_BEFORE_MAIN: extern "C" fn() = {
+            extern "C" fn skip() {
+                $crate::testutil::skip_flushes_in_this_process();
+            }
+            skip
+        };
+
+        #[cfg(debug_assertions)]
+        #[test]
+        fn flushes_skipped_matches_the_skip_flushes_feature() -> ::std::io::Result<()> {
+            use $crate::durability::Durable as _;
+
+            let skip = cfg!(feature = "skip-flushes");
+            assert_eq!($crate::durability::flushes_skipped(), skip);
+
+            let dir = $crate::testutil::TempDir::labeled("skip-flushes")?;
+            let file = ::std::fs::File::create(dir.path().join("f"))?;
+            let before = $crate::durability::flushes_issued();
+            file.durable_sync_all()?;
+            file.durable_sync_data()?;
+            let issued = $crate::durability::flushes_issued() - before;
+            // Other tests run beside this one, so an unskipped count is a floor.
+            if skip {
+                assert_eq!(issued, 0);
+            } else {
+                assert!(issued >= 2, "issued {issued}");
+            }
+            Ok(())
+        }
+    };
+}
+
 /// Unique path. The file or directory is not created.
 pub fn fresh_path(label: &str) -> PathBuf {
     unique_path(label, clock_tick())

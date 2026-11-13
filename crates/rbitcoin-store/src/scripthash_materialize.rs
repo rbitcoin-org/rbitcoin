@@ -14,6 +14,7 @@
 //! `post/NN/`. Pack folds those spills, then `slot_for_key16` + 2+ bodies;
 //! 1-fk after fold is `fp_singles`. A `post/NN` file refuses.
 
+use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::fuse8_filter::SealedFuse8;
 use crate::scripthash::{sorted_main_shard_path, ColdProgress, ScriptHashTable, ShShardPack};
@@ -297,7 +298,7 @@ pub fn write_phase_done(
             .write(true)
             .open(&tmp)
             .map_err(|e| StoreError::io(&tmp, e))?;
-        f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+        f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
     }
     fs::rename(&tmp, &dst).map_err(|e| StoreError::io(&dst, e))?;
     Ok(())

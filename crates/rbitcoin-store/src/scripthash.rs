@@ -4,6 +4,7 @@
 //! paged / extent). Body slabs pack ULEB128 fk deltas; vouts expanded from
 //! Class A at query.
 
+use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
 use crate::fuse8_filter::SealedFuse8;
@@ -81,7 +82,7 @@ impl ColdProgress {
                 .write(true)
                 .open(&tmp)
                 .map_err(|e| StoreError::io(&tmp, e))?;
-            f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+            f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
         }
         std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
         Ok(())
@@ -121,7 +122,7 @@ pub fn store_include_hwm(store_dir: &Path, max_create_fk: u64) -> Result<(), Sto
             .write(true)
             .open(&tmp)
             .map_err(|e| StoreError::io(&tmp, e))?;
-        f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+        f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
     }
     std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
     Ok(())
@@ -430,7 +431,7 @@ pub fn write_shard_pack_mark(base: &Path) -> Result<(), StoreError> {
             .write(true)
             .open(&tmp)
             .map_err(|e| StoreError::io(&tmp, e))?;
-        f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+        f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
     }
     std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
     Ok(())

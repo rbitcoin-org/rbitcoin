@@ -247,8 +247,12 @@ engineering.
     files are `#[cfg(debug_assertions)]`, and every debug node runs that
     code, so a hook is either a bounded counter (`Cell` / atomic increment)
     or **opt-in**: off until the test arms it on its thread. Nothing
-    accumulates unarmed (`spindle_mark` is the pattern). A
-    `cfg(debug_assertions)` gate never covers an import or re-export that
+    accumulates unarmed (`spindle_mark` is the pattern). The one
+    process-wide hook is `rbitcoin_store::durability`'s flush switch:
+    flushes run on threads a test never arms, so a suite's
+    `skip_flushes_before_main!` turns it on for the whole binary under
+    `--features skip-flushes` ([`TESTING.md`](TESTING.md)).
+    A `cfg(debug_assertions)` gate never covers an import or re-export that
     production code uses, and it never changes a production constant or
     code path. The node redials, retries SAM, and defers an SV2 budget on
     one interval each; a test that waits on that sleep passes the short

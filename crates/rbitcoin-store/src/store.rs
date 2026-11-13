@@ -1,4 +1,5 @@
 use crate::chain::{ConfirmedTable, HeaderTxsTable, StrongTxTable};
+use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::hashhead::{HeadOpenOpts, HeadScale};
 use crate::header_table::{HeaderRecord, HeaderTable};
@@ -2361,7 +2362,7 @@ pub fn rewrite_meta_current(dir: &Path) -> Result<(), StoreError> {
             .map_err(|e| StoreError::io(&tmp, e))?;
         f.write_all(&SCHEMA_VERSION.to_le_bytes())
             .map_err(|e| StoreError::io(&tmp, e))?;
-        f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+        f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
     }
     std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))?;
     // The rename has to survive a crash before a witness cut. A 26 `meta`

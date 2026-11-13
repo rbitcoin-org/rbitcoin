@@ -18,6 +18,7 @@
 
 use crate::fee_history::HistoricalFeeBlock;
 use bitcoin::hashes::{sha256d, Hash};
+use rbitcoin_store::durability::Durable as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
@@ -122,7 +123,7 @@ pub fn write_snapshot(
     let tmp = dir.join(format!("{SNAPSHOT_FILE}.tmp"));
     let mut f = File::create(&tmp)?;
     f.write_all(&out)?;
-    f.sync_all()?;
+    f.durable_sync_all()?;
     std::fs::rename(&tmp, dir.join(SNAPSHOT_FILE))?;
     Ok(generation)
 }

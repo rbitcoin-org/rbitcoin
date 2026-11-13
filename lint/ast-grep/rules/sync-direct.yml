@@ -1,0 +1,31 @@
+id: sync-direct
+language: rust
+severity: error
+message: Flush files with rbitcoin_store::durability::Durable, not sync_all / sync_data.
+note: Every file flush goes through one helper (crates/rbitcoin-store/src/durability.rs). An async file flushes through it after into_std().
+rule:
+  all:
+    - any:
+        - pattern: $F.sync_all()
+        - pattern: $F.sync_data()
+        # Path form, such as std::fs::File::sync_all(&f).
+        - kind: call_expression
+          has:
+            field: function
+            kind: scoped_identifier
+            has:
+              field: name
+              regex: "^sync_(all|data)$"
+    - not:
+        inside:
+          stopBy: end
+          kind: mod_item
+          has:
+            field: name
+            regex: "tests$"
+ignores:
+  - "crates/rbitcoin-store/src/durability.rs"
+  - "**/*tests*.rs"
+  - "**/tests/**"
+  - "**/benches/**"
+  - "crates/rbitcoin-bench/**"

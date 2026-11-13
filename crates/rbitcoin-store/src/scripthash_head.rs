@@ -11,6 +11,7 @@
 //! reinit, cold install, and inserts). Large shards without a sidecar skip
 //! the scan and mark occupancy **unknown** (never treated as empty, never bulk-fill).
 
+use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::open_address::{self, MAX_LOAD_DEN, MAX_LOAD_NUM};
@@ -111,7 +112,7 @@ pub fn store_occ_sidecar(head_path: &Path, occupied: u64) -> Result<(), StoreErr
             .write(true)
             .open(&tmp)
             .map_err(|e| StoreError::io(&tmp, e))?;
-        f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+        f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
     }
     std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
     Ok(())

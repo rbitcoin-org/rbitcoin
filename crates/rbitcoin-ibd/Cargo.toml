@@ -14,6 +14,9 @@ doctest = false
 
 [features]
 mutants = []
+# Skip file flushes in `suite` (`cargo test --workspace --features
+# skip-flushes`, TESTING.md).
+skip-flushes = []
 
 [dependencies]
 rbitcoin-primitives = { workspace = true }

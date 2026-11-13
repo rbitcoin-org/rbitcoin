@@ -1,3 +1,5 @@
+rbitcoin_store::skip_flushes_before_main!();
+
 mod archive;
 mod batch_parents;
 mod bip68_store_tests;

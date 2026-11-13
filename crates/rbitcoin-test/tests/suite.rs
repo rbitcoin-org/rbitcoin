@@ -1,3 +1,5 @@
+rbitcoin_store::skip_flushes_before_main!();
+
 mod asmap_journey;
 mod consensus_rules;
 mod core_analogs;

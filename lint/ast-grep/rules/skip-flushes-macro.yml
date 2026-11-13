@@ -1,0 +1,12 @@
+id: skip-flushes-macro
+language: rust
+severity: error
+message: Call skip_flushes_before_main! only at the top of a crate's tests/suite.rs.
+note: It turns flushes off for the whole test binary under that crate's skip-flushes feature (TESTING.md).
+rule:
+  kind: macro_invocation
+  has:
+    field: macro
+    regex: "(^|::)skip_flushes_before_main$"
+ignores:
+  - "crates/*/tests/suite.rs"

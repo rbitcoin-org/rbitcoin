@@ -12,3 +12,11 @@ fn copy_store_tree_copies_nested_files() {
     let got = std::fs::read(dst.join("nested/page")).unwrap();
     assert_eq!(got, b"store-bytes");
 }
+
+/// Nothing in this binary opts in, so a test store still flushes.
+#[cfg(debug_assertions)]
+#[test]
+fn tiny_store_leaves_flushes_on() {
+    let (_dir, _store) = tiny_store();
+    assert!(!rbitcoin_store::durability::flushes_skipped());
+}
