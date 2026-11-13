@@ -13,8 +13,8 @@ fn tmp_path() -> std::path::PathBuf {
 /// shortened table, not a mix and not a panic.
 #[test]
 fn get_racing_truncate_does_not_panic() {
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = Arc::new(ArrayTable::create(&path, TableKind::Confirmed).unwrap());
@@ -137,8 +137,8 @@ fn fd_only_truncate_then_get_is_absent() {
 /// value or the new one for that index.
 #[test]
 fn get_during_set_many_is_old_or_new() {
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = Arc::new(ArrayTable::create(&path, TableKind::Confirmed).unwrap());
