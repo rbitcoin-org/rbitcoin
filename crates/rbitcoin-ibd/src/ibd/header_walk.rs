@@ -108,6 +108,9 @@ pub struct Challenger {
     pub fork_height: u32,
     pub tip: WalkTip,
     pub checkpoints: Vec<Checkpoint>,
+    /// Its first headers past the fork point, up to
+    /// [`super::fork_proof::MAX_BLOCKS`], for the proof that peers serve it.
+    pub prefix: Vec<Header>,
 }
 
 #[derive(Debug, Default)]
@@ -739,23 +742,26 @@ const PROBE_AHEAD: u32 = 4_096;
 /// Ask one block peer for headers, so block getdata follows what it holds:
 /// one that has not announced a chain (Core starts header sync with each
 /// peer), or one whose record no longer decides the next blocks. One probe
-/// at a time, never the reserved header peer, and not a peer with a walk ask
-/// open.
+/// at a time, and not a peer with a walk ask open. The reserved header peer,
+/// or a lone peer, is probed only when a rewind left its record stale or no
+/// live peer has shown the next block: its record then says whether that
+/// block is withheld. Its walk replies keep the record fresh otherwise.
 pub fn probe_unprobed_peer(st: &mut IbdWorkState, hub: &ChainHub) {
     use super::peer_io::PeerSlot;
     let walk = &st.header_walk;
-    // A record only chooses among peers. With one live peer it would only
-    // take the header lane, and its reply would not reach the walk.
-    if walk.probe.is_some()
-        || walk.probe_open.is_some()
-        || st.slots.iter().filter(|s| s.alive).count() < 2
-    {
+    if walk.probe.is_some() || walk.probe_open.is_some() {
         return;
     }
     let tip = hub.tip_height().unwrap_or(0);
     let ahead = tip.saturating_add(PROBE_AHEAD).min(st.max_ordered_height);
     let now = Instant::now();
+    let several = st.slots.iter().filter(|s| s.alive).count() >= 2;
+    let unshown = next_unshown(st, hub);
     let due = |s: &PeerSlot| {
+        let header_peer = !several || walk.reserved == Some(s.id);
+        if header_peer {
+            return !s.chain.probed() && (s.chain.stale() || unshown);
+        }
         !s.chain.probed() || (ahead > tip && s.chain.needs_refresh(&st.height_to_hash, ahead, now))
     };
     let Some(slot) = st
@@ -768,16 +774,10 @@ pub fn probe_unprobed_peer(st: &mut IbdWorkState, hub: &ChainHub) {
     st.header_walk.probe = Some(slot.id);
 }
 
-/// The header peer, or a peer with a walk ask open or expired and not yet
-/// answered, whose late reply could be read as a probe's.
+/// A peer with a walk ask open or expired and not yet answered, whose late
+/// reply could be read as a probe's.
 fn walk_busy(walk: &HeaderWalk, peer: usize) -> bool {
-    [
-        walk.reserved,
-        walk.challenge_open,
-        walk.walk.peer,
-        walk.walk.prev_peer,
-    ]
-    .contains(&Some(peer))
+    [walk.challenge_open, walk.walk.peer, walk.walk.prev_peer].contains(&Some(peer))
         || walk.header_misses.contains_key(&peer)
 }
 
@@ -865,7 +865,8 @@ pub fn note_reservation(
 /// Whether block `hash` may be asked of `peer`. As in Core, a peer is asked
 /// only for a block its chain showed (`PeerChain::shows`), and not for one it
 /// answered `notfound`. The reserved header peer is asked only when no other
-/// peer shows the block. A single peer still does both.
+/// peer shows the block. A single peer still does both. A peer whose record
+/// shows another chain at or below the block is never asked for it.
 pub fn may_serve(st: &IbdWorkState, peer: usize, hash: &BlockHash) -> bool {
     use super::peer_io::PeerSlot;
     let height = st.hash_height.get(hash).copied();
@@ -878,16 +879,19 @@ pub fn may_serve(st: &IbdWorkState, peer: usize, hash: &BlockHash) -> bool {
     let Some(slot) = st.slots.iter().find(|s| s.id == peer) else {
         return false;
     };
-    // With no peer that shows the block, a record can be stale: a peer whose
-    // chain has not left the path is asked, else any peer that did not answer
-    // `notfound`, the header peer too. Otherwise the header peer stays on
-    // headers while another peer can fetch the block.
+    // With no peer that shows the block, a record can be stale or short: a
+    // peer whose chain has not left the path is asked, else any peer that
+    // did not answer `notfound` and has not shown another chain there, the
+    // header peer too. Otherwise the header peer stays on headers while
+    // another peer can fetch the block.
+    let behind =
+        |s: &PeerSlot| askable(s) && !height.is_some_and(|ht| s.chain.on_other_chain(path, ht));
     let tier: &dyn Fn(&PeerSlot) -> bool = if st.slots.iter().any(&shows) {
         &shows
     } else if st.slots.iter().any(&open) {
         &open
     } else {
-        return askable(slot);
+        &behind
     };
     tier(slot)
         && (st.header_walk.reserved != Some(peer)
@@ -1130,17 +1134,386 @@ pub fn refuse_invalid_linked(
 /// the path above its parent is dropped and every peer may be asked for
 /// headers again. A candidate built on it falls back to that parent.
 pub fn retire_invalid(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u32) {
-    let report_epoch = hub.ibd_header_epoch();
-    if !st.is_on_path(&hash, height) {
+    retire_candidate(st, hub, hash, height, "failed");
+}
+
+/// How long the confirmed tip's next block may have no peer to serve it
+/// before the chain is retired: one stall window, the floor
+/// `disconnect_stalled_block_peers` waits on a silent peer. A peer that has
+/// the header and not the body yet has that long to get it.
+pub const WITHHELD_WINDOW_SECS: u64 = 30;
+
+/// No live peer has been able to serve the next path block for
+/// [`WITHHELD_WINDOW_SECS`], nothing holds its body, and a live peer's chain
+/// is another chain at that height. As in Core, a header chain whose bodies
+/// no peer serves does not hold the tip below one whose bodies are served:
+/// the candidate is retired at that block like a failed one, but the block
+/// is not marked invalid. That chain is not seeded, rewound onto, or taken
+/// from headers until peers serve its first blocks
+/// ([`super::fork_proof`]), and the path is seeded again from the store
+/// without it. This is for a candidate the walk took without a fork offer
+/// (the first header peer's chain); a fork offer is proved before it is
+/// taken. True when the candidate was retired.
+pub fn retire_withheld(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
+    let now = hub.clock.now_secs();
+    let next = hub
+        .tip_height()
+        .and_then(|tip| st.height_to_hash.get(&tip.saturating_add(1)).copied());
+    let unserved = next_unserved(st, hub);
+    let Some(since) = st
+        .reorg
+        .withheld
+        .unserved_since(next, unserved.is_some(), now)
+    else {
+        return false;
+    };
+    let Some((hash, height)) = unserved else {
+        return false;
+    };
+    if now.saturating_sub(since) < WITHHELD_WINDOW_SECS {
+        return false;
+    }
+    let path = &st.height_to_hash;
+    if !st
+        .slots
+        .iter()
+        .any(|s| s.alive && s.chain.on_other_chain(path, height))
+    {
+        return false;
+    }
+    if !retire_candidate(st, hub, hash, height, "withheld") {
+        return false;
+    }
+    st.reorg.withheld.retire(hash);
+    st.reorg.clear_explore();
+    super::path::seed_work_path_from_store(st, hub);
+    true
+}
+
+/// The path block after the confirmed tip, when nothing holds its body and
+/// no live peer may serve it. A request to a peer that may not serve it does
+/// not count. A `--connect` peer paused for stalling still counts while it
+/// shows the block: it is asked again when the pause ends.
+fn next_unserved(st: &IbdWorkState, hub: &ChainHub) -> Option<(BlockHash, u32)> {
+    let height = hub.tip_height()?.saturating_add(1);
+    let hash = *st.height_to_hash.get(&height)?;
+    let path = &st.height_to_hash;
+    let paused_shows = |s: &super::peer_io::PeerSlot| {
+        s.block_download_paused_until.is_some() && s.chain.shows(path, height)
+    };
+    if st
+        .slots
+        .iter()
+        .any(|s| s.alive && (may_serve(st, s.id, &hash) || paused_shows(s)))
+    {
+        return None;
+    }
+    (!body_held(st, hub, &hash)).then_some((hash, height))
+}
+
+/// The path block after the confirmed tip is needed and no live peer has
+/// shown it.
+fn next_unshown(st: &IbdWorkState, hub: &ChainHub) -> bool {
+    let Some(height) = hub.tip_height().map(|h| h.saturating_add(1)) else {
+        return false;
+    };
+    let Some(hash) = st.height_to_hash.get(&height) else {
+        return false;
+    };
+    let path = &st.height_to_hash;
+    !st.slots
+        .iter()
+        .any(|s| s.alive && s.chain.shows(path, height))
+        && !body_held(st, hub, hash)
+}
+
+fn body_held(st: &IbdWorkState, hub: &ChainHub, hash: &BlockHash) -> bool {
+    st.body.is_rejected(hash)
+        || st.body.is_pending(hash)
+        || hub.query.block_queue_has_hash(&hash.to_byte_array())
+}
+
+pub fn refuse_withheld_batch(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    peer: usize,
+    headers: &[Header],
+) -> bool {
+    let linked = !headers.is_empty() && pow_linked(headers);
+    refuse_withheld_linked(st, hub, peer, headers, linked)
+}
+
+/// Refuse a linked batch that holds or builds on a retired chain, and
+/// retire `peer` from the walk, unless peers have served that chain's first
+/// blocks since. A batch that starts at the retired block goes through the
+/// same proof as any fork; a later batch of that chain is remembered so the
+/// next one is refused too.
+pub fn refuse_withheld_linked(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    peer: usize,
+    headers: &[Header],
+    linked: bool,
+) -> bool {
+    let (Some(first), Some(last), true) = (headers.first(), headers.last(), linked) else {
+        return false;
+    };
+    let hashes =
+        std::iter::once(first.prev_blockhash).chain(headers.iter().map(|h| h.block_hash()));
+    let Some(root) = st.reorg.withheld.root_of(hashes) else {
+        return false;
+    };
+    if first.block_hash() == root {
+        let prev = first.prev_blockhash;
+        let served = height_of(st, hub, prev)
+            .zip(work_at(st, hub, prev))
+            .is_some_and(|(height, parent)| {
+                fork_served(st, hub, prev, height, parent, headers, Some(peer), 1)
+            });
+        if served {
+            st.reorg.withheld.release(&root);
+            return false;
+        }
+    }
+    st.reorg.withheld.note_tip(last.block_hash(), root);
+    st.header_walk.walk_quiet.insert(peer);
+    if st.header_walk.reserved == Some(peer) {
+        st.header_walk.reserved = None;
+    }
+    true
+}
+
+/// Whether peers have served enough of `headers`, which fork at `prev`
+/// (`fork_height`, chain work `parent`), for the walk to take them. That is
+/// the shortest prefix whose work beats this node's chain with data above
+/// the fork point ([`data_work_above`]): taking a fork then never leaves the
+/// node with less work it can connect than before. Until then the fork is
+/// held for proof ([`super::fork_proof`]), its blocks are asked of the peers
+/// that announced it, and the walk, the download path and the confirmed tip
+/// stay where they are.
+/// `at_least` blocks must be served even when that prefix is shorter: a
+/// chain once retired as withheld proves its first block.
+#[allow(clippy::too_many_arguments)] // one fork's identity, kept flat
+pub fn fork_served(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    prev: BlockHash,
+    fork_height: u32,
+    parent: Work,
+    headers: &[Header],
+    peer: Option<usize>,
+    at_least: usize,
+) -> bool {
+    // Headers this node already holds on its chain are not the fork.
+    let skip = headers
+        .iter()
+        .enumerate()
+        .take_while(|(i, h)| {
+            let ht = fork_height.saturating_add(1).saturating_add(*i as u32);
+            let hash = h.block_hash();
+            st.is_on_path(&hash, ht) || hub.is_connected(&hash)
+        })
+        .count();
+    let (prev, fork_height, parent) = match skip.checked_sub(1) {
+        Some(last) => (
+            headers[last].block_hash(),
+            fork_height.saturating_add(skip as u32),
+            chain_work_after(parent, &headers[..skip]),
+        ),
+        None => (prev, fork_height, parent),
+    };
+    let headers = &headers[skip..];
+    if headers.is_empty() {
+        return true;
+    }
+    let Some(need) = proof_need(st, hub, fork_height, parent, headers) else {
+        return false;
+    };
+    let need = need.max(at_least).min(headers.len());
+    if need == 0 {
+        return true;
+    }
+    if st.reorg.proofs.is_proven(prev, headers, need) {
+        st.reorg.proofs.note_taken(prev, headers);
+        return true;
+    }
+    let work = chain_work_after(parent, headers);
+    st.reorg
+        .proofs
+        .offer(prev, fork_height, headers, need, work, peer);
+    false
+}
+
+/// How many of `headers` must be served: the shortest prefix whose work
+/// beats [`data_work_above`] the fork point, or none when this node has no
+/// block it could connect there: taking the fork then disconnects nothing
+/// and drops no body. Past
+/// [`super::fork_proof::MAX_BLOCKS`] a fork is not provable, except while the
+/// confirmed chain is still under the work floor, where the first
+/// `MAX_BLOCKS` are enough: that chain is not yet worth keeping.
+#[doc(hidden)]
+pub fn proof_need(
+    st: &IbdWorkState,
+    hub: &ChainHub,
+    fork_height: u32,
+    parent: Work,
+    headers: &[Header],
+) -> Option<usize> {
+    use super::fork_proof::MAX_BLOCKS;
+    let ours = data_work_above(st, hub, fork_height, parent);
+    if ours == Work::from_be_bytes([0; 32]) {
+        return Some(0);
+    }
+    let need = super::fork_proof::prefix_beating(headers, ours)?;
+    if need <= MAX_BLOCKS {
+        return Some(need);
+    }
+    let tip_work = hub.chain_work().ok()?;
+    below_floor(hub, &tip_work.to_be_bytes()).then_some(MAX_BLOCKS)
+}
+
+/// Work this node can connect above the fork point at `fork_height` (chain
+/// work `parent`): its confirmed blocks there, then the download path's
+/// bodies already in the body queue, in order from the tip.
+#[doc(hidden)]
+pub fn data_work_above(st: &IbdWorkState, hub: &ChainHub, fork_height: u32, parent: Work) -> Work {
+    let zero = Work::from_be_bytes([0; 32]);
+    let tip_h = hub.tip_height().unwrap_or(0);
+    let mut ours = if tip_h > fork_height {
+        hub.chain_work()
+            .ok()
+            .filter(|w| *w > parent)
+            .map_or(zero, |w| w - parent)
+    } else {
+        zero
+    };
+    let mut h = tip_h.max(fork_height).saturating_add(1);
+    while let Some(hash) = st.height_to_hash.get(&h) {
+        if !hub.query.block_queue_has_hash(&hash.to_byte_array()) {
+            break;
+        }
+        let Some(header) = hub.header_of(hash) else {
+            break;
+        };
+        ours = ours + header.work();
+        h = h.saturating_add(1);
+    }
+    ours
+}
+
+/// One turn of fork proofs: drop forks the confirmed chain out-worked, or
+/// whose served bodies the path took; send a fork whose prefix was served
+/// back through the walk, which now takes it; hand served bodies the path
+/// holds above the tip to the body queue; ask for the blocks still wanted;
+/// and tell the peer readers which blocks they may pass on unrequested.
+pub fn advance_fork_proofs(st: &mut IbdWorkState, hub: &ChainHub) {
+    if st.reorg.proofs.is_empty() {
+        publish_proof_wanted(st);
         return;
     }
-    let Some(parent) = hub.header_of(&hash).map(|h| h.prev_blockhash) else {
+    let tip_work = hub.chain_work().ok();
+    let invalid = &st.reorg.invalid;
+    st.reorg.proofs.retain(|f| {
+        !super::fork_proof::ForkProofs::spent(f)
+            && tip_work.is_none_or(|w| f.work > w)
+            && !f
+                .headers
+                .iter()
+                .any(|h| invalid.contains(h.block_hash().to_byte_array()))
+    });
+    if let Some((peer, _fork, headers)) = st.reorg.proofs.take_ready() {
+        rbitcoin_log::info!(
+            "ibd: fork served, taking {} header(s) from {}",
+            headers.len(),
+            headers[0].prev_blockhash
+        );
+        match peer {
+            Some(peer) => super::events::apply_headers_event(st, hub, peer, headers),
+            // A stored fork from the resume seed: seed again, now served.
+            None => super::path::seed_work_path_from_store(st, hub),
+        }
+    }
+    feed_proof_bodies(st, hub);
+    super::assign::assign_fork_proofs(st);
+    publish_proof_wanted(st);
+}
+
+/// Served fork bodies the download path now holds above the confirmed tip
+/// go to the body queue at their height, replacing a body for a block the
+/// path no longer holds there.
+fn feed_proof_bodies(st: &mut IbdWorkState, hub: &ChainHub) {
+    let Some(tip_h) = hub.tip_height() else {
         return;
+    };
+    let taken = hub.query.lookup_taken_hi().unwrap_or(0);
+    for hash in st.reorg.proofs.held() {
+        let Some(&h) = st.hash_height.get(&hash) else {
+            continue;
+        };
+        if h <= tip_h || h <= taken || !st.is_on_path(&hash, h) {
+            continue;
+        }
+        let raw = hash.to_byte_array();
+        if hub.query.block_queue_has_hash(&raw) {
+            let _ = st.reorg.proofs.take_body(&hash);
+            continue;
+        }
+        let fk = st.header_fks.get(&hash).copied().or_else(|| {
+            hub.query
+                .get_header_by_hash(&raw)
+                .ok()
+                .flatten()
+                .map(|(fk, _)| fk)
+        });
+        let Some(fk) = fk else {
+            continue;
+        };
+        if hub.query.block_queue_has_height(h) {
+            let _ = hub.query.block_queue_dequeue_height(h);
+        }
+        let Some(body) = st.reorg.proofs.take_body(&hash) else {
+            continue;
+        };
+        if hub
+            .query
+            .block_queue_offer_vec(h, raw, fk.0, body, None)
+            .is_ok()
+        {
+            st.body.mark_pending(hash);
+        }
+    }
+}
+
+fn publish_proof_wanted(st: &IbdWorkState) {
+    let wanted = st.reorg.proofs.wanted();
+    let mut set = st
+        .proof_wanted
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    set.clear();
+    set.extend(wanted.into_iter().map(|w| w.hash));
+}
+
+/// Drop the path above the parent of `hash` and walk the candidate back to
+/// that parent. False when the path does not hold `hash` at `height`.
+fn retire_candidate(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    hash: BlockHash,
+    height: u32,
+    why: &str,
+) -> bool {
+    let report_epoch = hub.ibd_header_epoch();
+    if !st.is_on_path(&hash, height) {
+        return false;
+    }
+    let Some(parent) = hub.header_of(&hash).map(|h| h.prev_blockhash) else {
+        return false;
     };
     let parent_h = height.saturating_sub(1);
     drop_dead_path(st, Some(hub.query.as_ref()), parent_h);
     if !st.header_walk.origin || st.header_walk.tip_height() < height {
-        return;
+        return true;
     }
     let tip = cut_back_to(st, hub, parent, parent_h);
     if st.header_walk.base_height > parent_h {
@@ -1168,10 +1541,11 @@ pub fn retire_invalid(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, he
     // chain comes back as headers that are stored and can be rewound onto.
     st.header_walk.challenger = None;
     rbitcoin_log::warn!(
-        "ibd: header candidate retired at {hash} height={height}; walk back to {parent} height={parent_h}"
+        "ibd: header candidate retired ({why}) at {hash} height={height}; walk back to {parent} height={parent_h}"
     );
     publish_work(st, hub);
     save_adopt(st, hub);
+    true
 }
 
 /// Forget the download path above `keep`: queued hashes, bodies waiting in
@@ -1353,7 +1727,9 @@ pub fn offer_alternate(
         return Some(true);
     }
     let work = chain_work_after(parent, headers);
-    if work > Work::from_be_bytes(st.header_walk.tip_work()) {
+    if work > Work::from_be_bytes(st.header_walk.tip_work())
+        && fork_served(st, hub, prev, fork_height, parent, headers, peer, 0)
+    {
         adopt_heavier(st, hub, prev, headers, work, peer);
         return Some(st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP);
     }
@@ -1591,6 +1967,11 @@ pub fn note_challenger(
         fork_height,
         checkpoints,
         tip,
+        prefix: headers
+            .iter()
+            .take(super::fork_proof::MAX_BLOCKS)
+            .copied()
+            .collect(),
     });
 }
 
@@ -1634,8 +2015,16 @@ pub fn extend_challenger(
         stamp_supplier(&mut ch.checkpoints, supplier);
     }
     ch.tip = tip;
+    let room = super::fork_proof::MAX_BLOCKS.saturating_sub(ch.prefix.len());
+    ch.prefix.extend(headers.iter().take(room).copied());
     if beat {
-        promote_challenger(st, hub);
+        let (fork_hash, fork_height, prefix) = (ch.fork_hash, ch.fork_height, ch.prefix.clone());
+        let served = work_at(st, hub, fork_hash).is_some_and(|parent| {
+            fork_served(st, hub, fork_hash, fork_height, parent, &prefix, peer, 0)
+        });
+        if served {
+            promote_challenger(st, hub);
+        }
     }
     true
 }

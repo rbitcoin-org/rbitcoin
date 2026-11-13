@@ -330,6 +330,8 @@ fn test_ctx(
             ctrl: ctrl_tx,
 
             header_fks: empty_header_fk_bus(),
+
+            proof_wanted: Default::default(),
         },
         requested: Arc::new(Mutex::new(HashSet::new())),
         solicited_bytes: Arc::new(AtomicU64::new(0)),
@@ -721,6 +723,8 @@ fn sinks() -> (
             ctrl: ctrl_tx,
 
             header_fks: empty_header_fk_bus(),
+
+            proof_wanted: Default::default(),
         },
         body_rx,
         ctrl_rx,
@@ -832,6 +836,8 @@ fn event_sinks_send_body_and_ctrl() {
         ctrl: ctrl_tx,
 
         header_fks: empty_header_fk_bus(),
+
+        proof_wanted: Default::default(),
     };
     sinks.send_body(PeerEvent::Dead {
         peer: 1,

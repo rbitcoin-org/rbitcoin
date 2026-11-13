@@ -1985,7 +1985,23 @@ fn ibd_bad_prev_fork() {
     let w1 = w[0].block_hash();
     let mut st = IbdWorkState::new(vec![dummy_slot(0)], hub.tip_hash(), hub.tip_height());
     seed_work_path_from_store(&mut st, &hub);
-    assert_eq!(hub.tip_hash(), Some(tip), "resume seed rewinds the loser");
+    assert_eq!(
+        hub.tip_hash(),
+        Some(l2.block_hash()),
+        "stored headers alone do not rewind"
+    );
+    for b in &w {
+        let _ = st
+            .reorg
+            .proofs
+            .accept(b.block_hash(), bitcoin::consensus::encode::serialize(b));
+    }
+    seed_work_path_from_store(&mut st, &hub);
+    assert_eq!(
+        hub.tip_hash(),
+        Some(tip),
+        "resume seed rewinds the loser once W is served"
+    );
     for (i, b) in w.iter().enumerate() {
         assert_eq!(
             st.height_to_hash.get(&(t + 1 + i as u32)),

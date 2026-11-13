@@ -9,7 +9,7 @@ use rbitcoin_net::chain::ChainHub;
 use rbitcoin_net::error::NetError;
 use rbitcoin_net::most_work::{sum_work, work_better, InvalidHashSet};
 use rbitcoin_primitives::{Fk, Height};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::thread::ThreadId;
 
@@ -34,6 +34,109 @@ pub struct IbdReorgState {
     pub explore_need: Vec<BlockHash>,
     /// Candidate tips on an exploration path (for proactive most-work apply).
     pub explore_tips: Vec<BlockHash>,
+    /// Chains retired because no peer served their next block.
+    pub withheld: Withheld,
+    /// Heavier forks waiting for peers to serve their first blocks.
+    pub proofs: super::fork_proof::ForkProofs,
+}
+
+/// Chains whose next block no live peer could serve for a stall window,
+/// keyed by that block. A retired chain is not seeded or rewound onto, and a
+/// header batch on it is not taken, until peers serve its first blocks
+/// ([`super::fork_proof`]). No timer brings it back.
+#[derive(Debug, Default)]
+pub struct Withheld {
+    roots: HashSet<BlockHash>,
+    /// Roots, oldest first. Past the cap the oldest gives way.
+    order: VecDeque<BlockHash>,
+    /// The last header of a refused batch, to its root, so the next batch
+    /// of that chain is recognized too.
+    tips: HashMap<BlockHash, BlockHash>,
+    tip_order: VecDeque<BlockHash>,
+    /// The block the confirmed tip needs next, and since when no live peer
+    /// could serve it.
+    needed: Option<(BlockHash, Option<u64>)>,
+}
+
+impl Withheld {
+    /// Roots, and refused-batch tips, kept.
+    pub const CAP: usize = 1024;
+
+    /// Retire the chain from `root`.
+    pub fn retire(&mut self, root: BlockHash) {
+        if self.roots.insert(root) {
+            if self.order.len() >= Self::CAP {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.release(&oldest);
+                    self.roots.insert(root);
+                }
+            }
+            self.order.push_back(root);
+        }
+    }
+
+    /// The retired root a batch with these hashes holds or builds on.
+    pub fn root_of(&self, hashes: impl IntoIterator<Item = BlockHash>) -> Option<BlockHash> {
+        hashes.into_iter().find_map(|h| {
+            if self.roots.contains(&h) {
+                Some(h)
+            } else {
+                self.tips.get(&h).copied()
+            }
+        })
+    }
+
+    /// Remember `last`, the end of a refused batch on `root`.
+    pub fn note_tip(&mut self, last: BlockHash, root: BlockHash) {
+        if !self.tips.contains_key(&last) {
+            if self.tip_order.len() >= Self::CAP {
+                if let Some(oldest) = self.tip_order.pop_front() {
+                    self.tips.remove(&oldest);
+                }
+            }
+            self.tip_order.push_back(last);
+        }
+        self.tips.insert(last, root);
+    }
+
+    /// Peers served the chain from `root`: it is no longer retired.
+    pub fn release(&mut self, root: &BlockHash) {
+        if self.roots.remove(root) {
+            self.order.retain(|r| r != root);
+            self.tips.retain(|_, r| r != root);
+            self.tip_order.retain(|t| self.tips.contains_key(t));
+        }
+    }
+
+    pub fn excluded(&self) -> impl Iterator<Item = BlockHash> + '_ {
+        self.roots.iter().copied()
+    }
+
+    /// The confirmed tip needs `next`, and `unserved` says no live peer may
+    /// serve it. Returns since when it has been unserved: the clock starts
+    /// when nobody can serve it and stops when someone can.
+    pub fn unserved_since(
+        &mut self,
+        next: Option<BlockHash>,
+        unserved: bool,
+        now: u64,
+    ) -> Option<u64> {
+        let Some(hash) = next else {
+            self.needed = None;
+            return None;
+        };
+        let since = match self.needed {
+            Some((was, since)) if was == hash => since,
+            _ => None,
+        };
+        let since = if unserved {
+            Some(since.unwrap_or(now))
+        } else {
+            None
+        };
+        self.needed = Some((hash, since));
+        since
+    }
 }
 
 impl IbdReorgState {
@@ -370,7 +473,7 @@ pub fn heavier_fork_candidates(
     if cands.is_empty() {
         cands.extend(unplanted_walk_tip(st, hub));
     }
-    let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
+    let invalid: HashSet<[u8; 32]> = st.excluded().into_iter().collect();
     Ok((cands, invalid))
 }
 
@@ -509,7 +612,7 @@ pub fn maybe_rewind_to_best_work(
     hub: &ChainHub,
 ) -> Result<bool, NetError> {
     let cands = rewind_candidate_hashes(st, hub)?;
-    let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
+    let invalid: HashSet<[u8; 32]> = st.excluded().into_iter().collect();
     let Some(path) = select_heavier_path(hub, &cands, &invalid)? else {
         return Ok(false);
     };
@@ -823,7 +926,7 @@ pub fn rewind_off_coord_lock(
     let (cands, invalid) = {
         let st = shared.lock().unwrap_or_else(|err| err.into_inner());
         let cands = rewind_candidate_hashes(&st, hub)?;
-        let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
+        let invalid: HashSet<[u8; 32]> = st.excluded().into_iter().collect();
         (cands, invalid)
     };
     let Some(pairs) = apply_off_lock_rewind(shared, hub, &cands, &invalid)? else {

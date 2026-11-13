@@ -319,9 +319,12 @@ pub fn on_headers_batch(
     fks: &[rbitcoin_primitives::Fk],
     work: Option<bitcoin::Work>,
 ) -> usize {
-    // A block in this batch can fail while its headers are written outside
-    // the lock. The retire already dropped that path.
-    if super::header_walk::refuse_invalid_batch(st, peer, &headers) {
+    // A block in this batch can fail, or its chain be retired as withheld,
+    // while its headers are written outside the lock. The retire already
+    // dropped that path.
+    if super::header_walk::refuse_invalid_batch(st, peer, &headers)
+        || super::header_walk::refuse_withheld_batch(st, hub, peer, &headers)
+    {
         return 0;
     }
     let accepted = accepted_headers(&headers, fks);
@@ -562,19 +565,7 @@ pub fn run_header_batch(
     match plan {
         HeaderPlan::Done => {}
         HeaderPlan::Resume => {
-            let exclude: Vec<[u8; 32]> = {
-                let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-                st.reorg.invalid.iter().collect()
-            };
-            let path = super::path::load_resume_entries(hub, &exclude);
-            let pairs: Vec<(BlockHash, rbitcoin_primitives::Fk)> = path
-                .iter()
-                .map(|e| (BlockHash::from_byte_array(e.hash), e.header_fk))
-                .collect();
-            {
-                let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
-                super::path::stage_resumed_path(&mut st, hub, &path);
-            }
+            let pairs = super::path::stage_from_store(shared, hub);
             super::peer_io::publish_header_fks(bus, &pairs);
             let rewound = match super::reorg::rewind_off_coord_lock(shared, hub, Some(bus)) {
                 Ok(rewound) => rewound,
@@ -738,7 +729,9 @@ pub fn plan_header_reply(
     }
     let linked = super::header_walk::pow_linked(&headers);
     super::header_walk::note_header_witness(st, hub, peer, ask, &headers, linked);
-    if super::header_walk::refuse_invalid_linked(st, peer, &headers, linked) {
+    if super::header_walk::refuse_invalid_linked(st, peer, &headers, linked)
+        || super::header_walk::refuse_withheld_linked(st, hub, peer, &headers, linked)
+    {
         return HeaderPlan::Done;
     }
     let class = super::header_walk::classify_linked(st, hub, ask, &headers, linked);
@@ -851,6 +844,20 @@ pub fn apply_block_framed(
         header_fk,
     } = body;
     let wire_bytes = payload.len();
+    // A fork block a proof wants, asked for or passed on unrequested by the
+    // reader: kept by the proof when it is that block, never queued here.
+    if st.reorg.proofs.wants(&hash) {
+        let _ = st
+            .slots
+            .iter_mut()
+            .find(|s| s.id == peer)
+            .map(|s| s.note_answer(&hash));
+        clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+        if st.reorg.proofs.accept(hash, payload) {
+            note_block_rx(&mut st.slots, peer, wire_bytes);
+        }
+        return;
+    }
     // Unsolicited wire is not a body we asked for. Drop it before any copy
     // and before it can move this peer's progress clock. An answer to a
     // getdata that was withdrawn from this peer is a body, as in Core.
@@ -1082,23 +1089,42 @@ fn note_announcement(st: &mut IbdWorkState, peer: usize) {
 
 pub fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
     note_block_progress(&mut st.slots, peer);
-    let mut freed = Vec::new();
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
+        let now = super::peer_io::ibd_mono_ms();
         for h in &hashes {
-            s.note_answer(h);
-            s.chain.note_notfound(*h, super::peer_io::ibd_mono_ms());
-            let empty = st
-                .inflight
-                .get_mut(h)
-                .map(|e| e.remove_peer(peer))
-                .unwrap_or(false);
-            if empty {
-                st.inflight.remove(h);
-                if st.body.is_pending(h) {
-                    st.body.mark_missing(*h);
-                }
-                freed.push(*h);
+            if s.in_flight.contains(h) {
+                s.chain.note_refusal(*h, now);
+            } else {
+                s.chain.note_notfound(*h, now);
             }
+        }
+    }
+    release_requests(
+        st,
+        &hashes.into_iter().map(|h| (peer, h)).collect::<Vec<_>>(),
+    );
+}
+
+/// Each `(peer, hash)` will not be answered with a block: drop it from that
+/// peer's requests, and reopen a hash that no other peer was asked for.
+pub fn release_requests(st: &mut IbdWorkState, released: &[(usize, BlockHash)]) {
+    let mut freed = Vec::new();
+    for &(peer, h) in released {
+        let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) else {
+            continue;
+        };
+        s.note_answer(&h);
+        let empty = st
+            .inflight
+            .get_mut(&h)
+            .map(|e| e.remove_peer(peer))
+            .unwrap_or(false);
+        if empty {
+            st.inflight.remove(&h);
+            if st.body.is_pending(&h) {
+                st.body.mark_missing(h);
+            }
+            freed.push(h);
         }
     }
     st.reopen_for_densify(&freed);

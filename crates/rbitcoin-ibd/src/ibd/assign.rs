@@ -203,7 +203,7 @@ pub fn prune_off_path_inflight(st: &mut IbdWorkState) {
         .keys()
         .copied()
         .filter(|h| {
-            if st.ordered_set.contains(h) {
+            if st.ordered_set.contains(h) || st.reorg.proofs.wants(h) {
                 return false;
             }
             if let Some(&ht) = st.hash_height.get(h) {
@@ -216,6 +216,87 @@ pub fn prune_off_path_inflight(st: &mut IbdWorkState) {
         .collect();
     for h in drop {
         clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
+    }
+}
+
+/// A peer whose record shows another chain at a requested path block will
+/// not send it: release that request as if it had answered `notfound`, so
+/// the stall check does not drop the peer for a block it never had.
+pub fn release_off_chain_requests(st: &mut IbdWorkState) {
+    let path = &st.height_to_hash;
+    let released: Vec<(usize, BlockHash)> = st
+        .slots
+        .iter()
+        .flat_map(|s| {
+            s.in_flight
+                .iter()
+                .filter(|h| {
+                    st.hash_height
+                        .get(*h)
+                        .is_some_and(|&ht| s.chain.on_other_chain(path, ht))
+                })
+                .map(move |h| (s.id, *h))
+        })
+        .collect();
+    if !released.is_empty() {
+        super::events::release_requests(st, &released);
+    }
+}
+
+/// Ask for the fork blocks a proof still wants ([`super::fork_proof`]): from
+/// the peer that sent the fork, else from a peer whose chain record
+/// announced that block or the fork's last header. Never from a peer that
+/// did not announce the fork. At most
+/// [`super::fork_proof::MAX_ASKS_PER_FORK`] asks per fork are in flight, so
+/// a fork nobody serves does not hold the asks of one that is served.
+pub fn assign_fork_proofs(st: &mut IbdWorkState) {
+    use super::fork_proof::MAX_ASKS_PER_FORK;
+    let wanted = st.reorg.proofs.wanted();
+    if wanted.is_empty() {
+        return;
+    }
+    let now = ibd_mono_ms();
+    let mut asked: HashMap<BlockHash, usize> = HashMap::new();
+    for w in &wanted {
+        if st.inflight.contains_key(&w.hash) {
+            *asked.entry(w.fork).or_default() += 1;
+        }
+    }
+    for w in wanted {
+        if st.inflight.contains_key(&w.hash) {
+            continue;
+        }
+        let in_flight = asked.entry(w.fork).or_default();
+        if *in_flight >= MAX_ASKS_PER_FORK {
+            continue;
+        }
+        let announced = |s: &PeerSlot| {
+            s.chain.announced_hash(&w.hash) || w.top.is_some_and(|t| s.chain.announced_hash(&t))
+        };
+        let pick = st
+            .slots
+            .iter()
+            .filter(|s| s.may_take_block(&w.hash, now))
+            .find(|s| Some(s.id) == w.peer)
+            .or_else(|| {
+                st.slots
+                    .iter()
+                    .find(|s| s.may_take_block(&w.hash, now) && announced(s))
+            })
+            .map(|s| s.id);
+        let Some(pid) = pick else {
+            continue;
+        };
+        let Some(idx) = st.slots.iter().position(|s| s.id == pid) else {
+            continue;
+        };
+        st.slots[idx].track_insert(w.hash);
+        st.slots[idx].getdata_wire.queue(1);
+        let _ = st.slots[idx].cmd_tx.send(PeerCmd::GetData {
+            hashes: vec![w.hash],
+        });
+        inflight_add_peer(&mut st.inflight, w.hash, pid);
+        *in_flight += 1;
     }
 }
 
@@ -301,6 +382,7 @@ pub fn assign_work_ordered(
 
     prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
     prune_off_path_inflight(st);
+    release_off_chain_requests(st);
 
     let tip = hub.tip_height().unwrap_or(0);
     let path_lo = if hub.tip_height().is_none() {

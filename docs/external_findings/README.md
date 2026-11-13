@@ -118,6 +118,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [112](./112-stall-solicited-bytes.md) | medium | Stall counted unsolicited socket bytes as block progress | fixed | `disconnect_stalled_drops_a_peer_sending_only_unsolicited_bytes`, `disconnect_stalled_keeps_a_peer_still_sending_a_block`, `relative_slow_zero_throughput_uses_solicited_bytes`, `open_block_bytes_count_a_frame_past_a_headers_message`, `block_progress_stamp_records_solicited_bytes` |
 | [113](./113-proved-header-adopt.md) | medium | A proved header walk rewrote `header.adopt` on every short batch | fixed | `proved_short_batches_do_not_rewrite_header_adopt`, `promoting_a_challenger_persists_that_chains_tip` |
 | [114](./114-respend-after-rejected-write.md) | critical | Re-spend of a same-block spend connects after a merged IBD write rejects | fixed | `respend_of_a_same_block_spend_rejects_on_single_block_retry`, `merged_respend_of_a_same_block_spend_is_rejected_alone` |
+| [115](./115-withheld-heavier-fork.md) | high | IBD stayed below a heavier fork whose bodies were never served | fixed | `withheld_fork_*`, `unrequested_fork_blocks_prove_the_fork`, `served_fork_is_taken_after_its_peer_leaves`, `heavier_fork_served_after_one_notfound_is_adopted`, `a_withheld_chain_is_retired_after_one_window`, `ibd::fork_proof::*` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
 `8f3990f`). Report-local 001–010 are **renumbered** here. Identity/BIP30

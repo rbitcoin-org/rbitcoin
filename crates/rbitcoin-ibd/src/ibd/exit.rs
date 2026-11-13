@@ -72,11 +72,22 @@ pub fn on_path_inflight(st: &IbdWorkState) -> bool {
 }
 
 /// Work still owed to the confirmed best chain (not explore/orphan getdata).
+/// A heavier fork whose blocks are being fetched for its proof counts, and
+/// one served and handed back to the walk: a peer that serves them moves the
+/// tip. One that withholds holds this for at most one stall window, and a
+/// `notfound` leaves nothing in flight.
 pub fn best_chain_remainder(st: &IbdWorkState, tip_h: u32) -> bool {
     !st.ordered.is_empty()
         || st.height_to_hash.any_above(tip_h)
         || st.max_ready_height > tip_h
         || on_path_inflight(st)
+        || st.reorg.proofs.handing_off()
+        || st
+            .reorg
+            .proofs
+            .wanted()
+            .iter()
+            .any(|w| st.inflight.contains_key(&w.hash))
 }
 
 /// WARN cadence for empty `headers` while still lagging peer horizon.

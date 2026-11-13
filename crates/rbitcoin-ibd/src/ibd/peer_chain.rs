@@ -4,11 +4,12 @@
 //! (`pindexBestKnownBlock`). A peer whose announced headers leave the
 //! download path is not asked for blocks above that point, and a peer that
 //! answered `notfound` for a block is not asked for it again for a while.
+//! A second refusal of a requested block holds across announcements.
 
 use super::state::HeightOccupants;
 use bitcoin::block::Header;
 use bitcoin::BlockHash;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// `notfound` hashes kept per peer. Past the cap a peer may be asked again.
@@ -28,6 +29,16 @@ const PROBE_REFRESH: Duration = Duration::from_secs(10);
 pub struct PeerChain {
     /// `notfound` hashes, with the mono ms they were answered.
     lacks: HashMap<BlockHash, u64>,
+    /// Requested hashes answered `notfound` at least once, kept across
+    /// announcements, newest last. A second refusal moves the hash to
+    /// `refused`. Past the cap the oldest gives way.
+    answered_notfound: HashSet<BlockHash>,
+    answered_order: VecDeque<BlockHash>,
+    /// Requested hashes refused twice, with the mono ms of the second
+    /// refusal. They hold for one stall window across announcements:
+    /// re-announcing a chain the peer already showed does not reopen a block
+    /// it keeps refusing.
+    refused: HashMap<BlockHash, u64>,
     /// This peer's announced chain above the confirmed tip, oldest first.
     announced: VecDeque<BlockHash>,
     /// Height of `announced[0]`.
@@ -60,6 +71,31 @@ pub struct PeerChain {
 }
 
 impl PeerChain {
+    /// A `notfound` for a block this peer was asked for. Also a
+    /// [`Self::note_notfound`]. Only asked-for hashes enter the history, and
+    /// a peer has few requests at a time, so it cannot push out a refusal
+    /// between two asks for the same block.
+    pub fn note_refusal(&mut self, hash: BlockHash, now_ms: u64) {
+        if self.answered_notfound.contains(&hash) {
+            if self.refused.len() >= LACKS_CAP {
+                self.refused
+                    .retain(|_, at| now_ms.saturating_sub(*at) < LACKS_TTL_MS);
+            }
+            if self.refused.len() < LACKS_CAP || self.refused.contains_key(&hash) {
+                self.refused.insert(hash, now_ms);
+            }
+        } else {
+            if self.answered_order.len() >= LACKS_CAP {
+                if let Some(oldest) = self.answered_order.pop_front() {
+                    self.answered_notfound.remove(&oldest);
+                }
+            }
+            self.answered_notfound.insert(hash);
+            self.answered_order.push_back(hash);
+        }
+        self.note_notfound(hash, now_ms);
+    }
+
     pub fn note_notfound(&mut self, hash: BlockHash, now_ms: u64) {
         if self.lacks.len() >= LACKS_CAP {
             self.lacks
@@ -71,9 +107,8 @@ impl PeerChain {
     }
 
     pub fn lacks(&self, hash: &BlockHash, now_ms: u64) -> bool {
-        self.lacks
-            .get(hash)
-            .is_some_and(|at| now_ms.saturating_sub(*at) < LACKS_TTL_MS)
+        let fresh = |at: &u64| now_ms.saturating_sub(*at) < LACKS_TTL_MS;
+        self.refused.get(hash).is_some_and(fresh) || self.lacks.get(hash).is_some_and(fresh)
     }
 
     /// A headers message or a block inv: the peer may have those blocks now.
@@ -83,6 +118,17 @@ impl PeerChain {
 
     pub fn probed(&self) -> bool {
         self.probed
+    }
+
+    /// The peer announced `hash`: it is in the kept run, or it is where
+    /// the peer's chain left this node's.
+    pub fn announced_hash(&self, hash: &BlockHash) -> bool {
+        self.announced.contains(hash) || self.split.is_some_and(|(_, h)| h == *hash)
+    }
+
+    /// A rewind left this record stale until the peer answers again.
+    pub fn stale(&self) -> bool {
+        self.stale_from.is_some()
     }
 
     /// Whether the next probe asks from the confirmed tip.
@@ -317,9 +363,15 @@ impl PeerChain {
     /// whole chain ends below it, or a rewind left its record stale there. Two
     /// chains that differ at one height differ above it.
     pub fn left_path_by(&self, path: &impl HeightOccupants, height: u32) -> bool {
-        if self.stale_from.is_some_and(|from| height >= from) {
-            return true;
-        }
+        self.stale_from.is_some_and(|from| height >= from)
+            || self.ends.is_some_and(|top| height > top)
+            || self.on_other_chain(path, height)
+    }
+
+    /// The peer showed a block other than this node's at or below `height`:
+    /// its chain is another chain there. A record that only ends below
+    /// `height`, or that a rewind left stale, is not.
+    pub fn on_other_chain(&self, path: &impl HeightOccupants, height: u32) -> bool {
         if let Some((at, hash)) = self.split {
             let differs = match path.occupant(at) {
                 Some(p) => p != hash,
@@ -328,9 +380,6 @@ impl PeerChain {
             if at <= height && differs {
                 return true;
             }
-        }
-        if self.ends.is_some_and(|top| height > top) {
-            return true;
         }
         let Some(len) = (self.announced.len() as u32).checked_sub(1) else {
             return false;

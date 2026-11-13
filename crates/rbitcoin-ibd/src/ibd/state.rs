@@ -14,6 +14,7 @@
 use super::assign_plan::compact_ordered;
 use super::body::{BodyPresence, BodyPresenceSizes};
 use super::reorg::IbdReorgState;
+use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use rbitcoin_net::NetAddr;
 use rbitcoin_primitives::Fk;
@@ -206,6 +207,9 @@ pub struct IbdWorkState {
     /// Mono ms of last relative-slow disconnect (`0` = never).
     pub relative_slow_last_kick_ms: u64,
     /// Process-local invalid apply marks for most-work reorg (IBD run only).
+    /// Fork blocks a proof still wants. Peer readers pass these on even
+    /// when they were not asked for ([`super::fork_proof`]).
+    pub proof_wanted: super::peer_io::ProofWanted,
     pub reorg: IbdReorgState,
     /// First height ≥ path_lo densify should walk (filled prefix skip).
     pub densify_scan_lo: u32,
@@ -330,6 +334,7 @@ impl IbdWorkState {
             relative_slow_suspect: None,
             relative_slow_last_kick_ms: 0,
             reorg: IbdReorgState::new(),
+            proof_wanted: Default::default(),
             densify_scan_lo: 0,
             assign_path_lo: 0,
             engine_fault_seen: HashSet::new(),
@@ -412,6 +417,16 @@ impl IbdWorkState {
         }
         self.height_to_hash.insert(ht, hash);
         true
+    }
+
+    /// Hashes no seeded path or rewind may run through: blocks that failed,
+    /// and the first blocks of withheld chains no peer has served since.
+    pub fn excluded(&self) -> Vec<[u8; 32]> {
+        self.reorg
+            .invalid
+            .iter()
+            .chain(self.reorg.withheld.excluded().map(|h| h.to_byte_array()))
+            .collect()
     }
 
     pub fn is_on_path(&self, hash: &BlockHash, ht: u32) -> bool {

@@ -1876,15 +1876,20 @@ fn a_confirmed_tip_on_another_branch_keeps_the_candidate_anchor() {
         .collect();
     let tip = *confirmed.last().unwrap();
     let fork_at = 20usize;
-    let branch = headers_on(confirmed[fork_at], 21..=34);
+    let branch_blocks = blocks_on(confirmed[fork_at], 21..=34);
+    let branch: Vec<Header> = branch_blocks.iter().map(|b| b.header).collect();
     let branch_tip = branch.last().unwrap().block_hash();
     let (s0, mut rx) = slot(0);
     let mut st = IbdWorkState::new(vec![s0], Some(tip.block_hash()), Some(LOCATOR_FIXTURE_TIP));
     ensure_origin(&mut st, &hub);
     assert!(send_getheaders(&mut st, &hub).unwrap());
     let _ = rx.try_recv();
-    // A heavier branch below the confirmed tip becomes the candidate. The
-    // walk had recorded the batch that ended at the fork as a checkpoint.
+    // A heavier branch below the confirmed tip becomes the candidate once
+    // its blocks are served. The walk had recorded the batch that ended at
+    // the fork as a checkpoint.
+    apply(&mut st, &hub, 0, branch.clone());
+    assert_ne!(st.header_walk.tip_hash(), Some(branch_tip), "headers alone");
+    serve(&mut st, &branch_blocks);
     apply(&mut st, &hub, 0, branch.clone());
     assert_eq!(st.header_walk.tip_hash(), Some(branch_tip));
     let at_fork = checkpoint_at(&WalkTip {
@@ -2455,8 +2460,9 @@ fn two_peers_reserve_the_header_walk() {
         "the header peer, or a peer with no record, takes what no other peer holds"
     );
 
-    // With no peer that holds the block by what it announced, a peer that
-    // did not answer `notfound` is still asked.
+    // With no peer that holds the block by what it announced, a peer whose
+    // chain left the path below it is still not asked: it would not answer,
+    // and a stall would disconnect it for a block it never had.
     st.slots[0].chain.note_notfound(
         path[1].block_hash(),
         rbitcoin_ibd::ibd::peer_io::ibd_mono_ms(),
@@ -2469,7 +2475,7 @@ fn two_peers_reserve_the_header_walk() {
         path[1].block_hash(),
         rbitcoin_ibd::ibd::peer_io::ibd_mono_ms(),
     );
-    assert!(may_serve(&st, 6, &path[1].block_hash()));
+    assert!(!may_serve(&st, 6, &path[1].block_hash()));
 
     // A batch stored after one of its blocks failed is not planted, and does
     // not grow the candidate again.
@@ -2532,7 +2538,8 @@ fn two_peers_reserve_the_header_walk() {
         "a peer that left where this node confirmed a different block has still left"
     );
     // With no peer that holds a block by what it announced, the header peer
-    // is asked too.
+    // is still not asked: its chain left where this node confirmed a
+    // different block.
     st.slots[1].chain.note_notfound(
         taken2.block_hash(),
         rbitcoin_ibd::ibd::peer_io::ibd_mono_ms(),
@@ -2541,7 +2548,7 @@ fn two_peers_reserve_the_header_walk() {
         taken2.block_hash(),
         rbitcoin_ibd::ibd::peer_io::ibd_mono_ms(),
     );
-    assert!(may_serve(&st, 8, &taken2.block_hash()));
+    assert!(!may_serve(&st, 8, &taken2.block_hash()));
 
     // A sixth, on its own hub, because a probe must say what a peer has. It
     // asks after the path top alone, and a reply on that top shows the whole
@@ -2863,6 +2870,154 @@ fn two_peers_reserve_the_header_walk() {
         Some(24),
         "the next is the peer with no record"
     );
+
+    // A record that only ends below a block is not another chain: with no
+    // peer that shows or may hold it, that peer is still asked, as it may
+    // have caught up.
+    st.slots[1].chain.note_ends_at(1_000);
+    assert!(st.slots[1].chain.left_path_by(&st.height_to_hash, 2_004));
+    assert!(!st.slots[1].chain.on_other_chain(&st.height_to_hash, 2_004));
+    st.slots[0].alive = false;
+    st.slots[2].alive = false;
+    assert!(
+        may_serve(&st, 23, &at(2_004)),
+        "a peer whose record ends below a block is asked when nobody else may hold it"
+    );
+    assert!(!may_serve(&st, 25, &at(2_004)));
+}
+
+/// The planted chain's next block has no peer to serve it while another
+/// peer is on a different chain: it is retired one stall window on the node
+/// clock after nobody could serve it, not while a paused `--connect` peer
+/// still shows it, and then its first block is kept out of seeding and
+/// rewinds.
+#[test]
+fn a_withheld_chain_is_retired_after_one_window() {
+    use rbitcoin_ibd::ibd::header_walk::{retire_withheld, WITHHELD_WINDOW_SECS};
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-retire-withheld");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let (fork_peer, _rx0) = slot(0);
+    let (other_peer, _rx1) = slot(1);
+    let mut st = IbdWorkState::new(vec![fork_peer, other_peer], Some(gen), Some(0));
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let f1_block = mine_block(gen, 1);
+    let f1 = f1_block.header;
+    let f2 = mine(f1.block_hash(), 2);
+    apply(&mut st, &hub, 0, vec![f1, f2]);
+    assert_eq!(st.height_to_hash.get(&1), Some(&f1.block_hash()));
+    apply(&mut st, &hub, 1, vec![mine(gen, 3)]);
+    assert!(st.slots[1].chain.on_other_chain(&st.height_to_hash, 1));
+    let t0 = 2_000_000u64;
+    let at = |secs: u64| hub.clock.set_mock((t0 + secs) as i64);
+    at(0);
+    // The fork peer is paused, not gone: it is asked again after the pause.
+    st.slots[0].block_download_paused_until = Some(u64::MAX);
+    assert!(!retire_withheld(&mut st, &hub));
+    at(10 * WITHHELD_WINDOW_SECS);
+    assert!(
+        !retire_withheld(&mut st, &hub),
+        "a paused peer that shows it still serves it"
+    );
+    // Dropped for withholding: the stall kick leaves the slot dead. The
+    // window starts now, not when the block was first needed.
+    st.slots[0].block_download_paused_until = None;
+    st.slots[0].alive = false;
+    assert!(
+        !retire_withheld(&mut st, &hub),
+        "the window starts when nobody can serve it"
+    );
+    at(11 * WITHHELD_WINDOW_SECS - 1);
+    assert!(!retire_withheld(&mut st, &hub), "not before one window");
+    at(11 * WITHHELD_WINDOW_SECS);
+    assert!(retire_withheld(&mut st, &hub));
+    assert_ne!(st.height_to_hash.get(&1), Some(&f1.block_hash()));
+    let excluded: Vec<[u8; 32]> = st.excluded();
+    assert!(excluded.contains(&f1.block_hash().to_byte_array()));
+    assert!(
+        refuse_withheld_batch(&mut st, &hub, 1, &[f1, f2]),
+        "no address brings it back before its first block is served"
+    );
+    hub.clock.set_mock((t0 + 100_000) as i64);
+    assert!(
+        refuse_withheld_batch(&mut st, &hub, 1, &[f1, f2]),
+        "no timer brings it back either"
+    );
+    // An answer that is not that block does not serve it. The block itself
+    // does, also unrequested.
+    let deliver = |st: &mut IbdWorkState, payload: Vec<u8>| {
+        rbitcoin_ibd::ibd::events::apply_block_framed(
+            st,
+            &hub,
+            &AtomicU32::new(0),
+            None,
+            rbitcoin_ibd::ibd::events::FramedBody {
+                peer: 1,
+                hash: f1.block_hash(),
+                payload,
+                header_fk: None,
+            },
+        );
+    };
+    deliver(&mut st, Vec::new());
+    let mut wrong = f1_block.clone();
+    wrong.txdata[0].lock_time = bitcoin::absolute::LockTime::from_consensus(1);
+    deliver(&mut st, bitcoin::consensus::encode::serialize(&wrong));
+    assert!(
+        refuse_withheld_batch(&mut st, &hub, 1, &[f1, f2]),
+        "not that block"
+    );
+    deliver(&mut st, bitcoin::consensus::encode::serialize(&f1_block));
+    assert!(
+        !refuse_withheld_batch(&mut st, &hub, 1, &[f1, f2]),
+        "served"
+    );
+    assert!(st.excluded().is_empty());
+}
+
+/// A retired chain is refused from every address, also as it grows, and no
+/// time brings it back: only its first block being served does.
+#[test]
+fn a_retired_chain_is_refused_until_peers_serve_it() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-withheld");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let (s0, _rx0) = slot(0);
+    let (s1, _rx1) = slot(1);
+    let mut st = IbdWorkState::new(vec![s0, s1], Some(gen), Some(0));
+    let now = 1_000_000;
+    hub.clock.set_mock(now as i64);
+    let first_block = mine_block(gen, 1);
+    let first = first_block.header;
+    let second = mine(first.block_hash(), 2);
+    let third = mine(second.block_hash(), 3);
+    assert!(
+        !refuse_withheld_batch(&mut st, &hub, 0, &[first, second]),
+        "nothing is retired yet"
+    );
+    st.reorg.withheld.retire(first.block_hash());
+    assert!(st.excluded().contains(&first.block_hash().to_byte_array()));
+    assert!(refuse_withheld_batch(&mut st, &hub, 0, &[first, second]));
+    assert!(st.header_walk.walk_quiet.contains(&0));
+    assert!(
+        refuse_withheld_batch(&mut st, &hub, 1, &[third]),
+        "another address, on the next batch of that chain"
+    );
+    hub.clock.set_mock((now + 3_600) as i64);
+    assert!(
+        refuse_withheld_batch(&mut st, &hub, 1, &[first]),
+        "an hour later"
+    );
+    assert!(
+        st.reorg.proofs.wants(&first.block_hash()),
+        "its first block is asked for"
+    );
+    assert!(st.reorg.proofs.accept(
+        first.block_hash(),
+        bitcoin::consensus::encode::serialize(&first_block)
+    ));
+    assert!(!refuse_withheld_batch(&mut st, &hub, 0, &[first, second]));
+    assert!(st.excluded().is_empty(), "served, it is a candidate again");
 }
 
 /// A long chain on an invalid block stays refused past the cap on
@@ -3200,13 +3355,16 @@ fn a_heavier_header_chain_keeps_its_context() {
             );
 
             let mut prev = gen;
-            let mut honest = Vec::new();
+            let mut honest_blocks = Vec::new();
             for n in 10..16 {
-                let hdr = mine(prev, n);
-                prev = hdr.block_hash();
-                honest.push(hdr);
+                let block = body_at(prev, n, 1_600_000_000 + n);
+                prev = block.block_hash();
+                honest_blocks.push(block);
             }
+            let honest: Vec<Header> = honest_blocks.iter().map(|b| b.header).collect();
             let heavy = prev;
+            apply(&mut st, &hub, 0, honest.clone());
+            serve(&mut st, &honest_blocks);
             apply(&mut st, &hub, 0, honest);
             assert!(
                 st.slots[0].alive,
@@ -5455,6 +5613,7 @@ fn plant_challenger(st: &mut IbdWorkState, fork: BlockHash) {
         fork_height: 1,
         tip: WalkTip::default(),
         checkpoints: Vec::new(),
+        prefix: Vec::new(),
     });
 }
 
@@ -5977,14 +6136,62 @@ impl WithheldCandidate {
 }
 
 fn headers_on(parent: Header, salts: std::ops::RangeInclusive<u32>) -> Vec<Header> {
+    blocks_on(parent, salts)
+        .into_iter()
+        .map(|b| b.header)
+        .collect()
+}
+
+/// Blocks whose headers are what [`mine_at`] would give, with a body whose
+/// merkle root the header commits to.
+fn blocks_on(parent: Header, salts: std::ops::RangeInclusive<u32>) -> Vec<bitcoin::Block> {
     let mut prev = parent.block_hash();
     let mut out = Vec::new();
     for n in salts {
-        let hdr = mine_at(prev, n, parent.time + n);
-        prev = hdr.block_hash();
-        out.push(hdr);
+        let block = body_at(prev, n, parent.time + n);
+        prev = block.block_hash();
+        out.push(block);
     }
     out
+}
+
+/// A block on `prev`: one coinbase that names `n`, and its header at `time`.
+fn body_at(prev: BlockHash, n: u32, time: u32) -> bitcoin::Block {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let coinbase = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(n.to_le_bytes().to_vec()),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new(),
+        }],
+    };
+    let mut block = bitcoin::Block {
+        header: mine_at(prev, n, time),
+        txdata: vec![coinbase],
+    };
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
+    block
+}
+
+/// Serve `blocks` to the fork proofs the walk opened for them.
+fn serve(st: &mut IbdWorkState, blocks: &[bitcoin::Block]) {
+    for b in blocks {
+        let _ = st
+            .reorg
+            .proofs
+            .accept(b.block_hash(), bitcoin::consensus::encode::serialize(b));
+    }
 }
 
 /// What Bitcoin Core sends: the headers after the first locator hash on its
@@ -6213,6 +6420,7 @@ fn a_full_queue_merges_a_lighter_fork_by_height() {
             ..WalkTip::default()
         },
         checkpoints: Vec::new(),
+        prefix: Vec::new(),
     });
     while f.st.ordered.len() < ORDERED_HEADERS_SOFT_CAP {
         let mut b = [0x77; 32];
