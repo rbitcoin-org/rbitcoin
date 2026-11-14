@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Version-file gate. Exit 0 when Cargo.toml, nix/rbitcoin.nix, and CHANGELOG
 # agree for the current workspace version. --kind prints ship|dev.
-# --ci-extra enforces core-functional, overlay-functional, and warnet on ship
-# PRs (DETECT_SHIP / CF_RESULT / OF_RESULT / WN_RESULT).
+# --ci-extra enforces core-functional, overlay-functional, warnet, and
+# consensus-spec on ship PRs (DETECT_SHIP / CF_RESULT / OF_RESULT / WN_RESULT /
+# CS_RESULT).
 set -euo pipefail
 
 ROOT=""
@@ -40,7 +41,7 @@ source "$HERE/release-lib.sh"
 if [[ "$CI_EXTRA" -eq 1 ]]; then
   ship="${DETECT_SHIP:-}"
   if [[ "$ship" == "true" ]]; then
-    for gate in core-functional:CF_RESULT overlay-functional:OF_RESULT warnet:WN_RESULT; do
+    for gate in core-functional:CF_RESULT overlay-functional:OF_RESULT warnet:WN_RESULT consensus-spec:CS_RESULT; do
       name="${gate%%:*}"
       var="${gate#*:}"
       result="${!var:-}"
@@ -48,7 +49,7 @@ if [[ "$CI_EXTRA" -eq 1 ]]; then
         release_die "ship version PR requires $name success (got $var=${result:-empty})"
     done
   fi
-  echo "release-gate: ci-extra ok (DETECT_SHIP=${ship:-} CF_RESULT=${CF_RESULT:-} OF_RESULT=${OF_RESULT:-} WN_RESULT=${WN_RESULT:-})"
+  echo "release-gate: ci-extra ok (DETECT_SHIP=${ship:-} CF_RESULT=${CF_RESULT:-} OF_RESULT=${OF_RESULT:-} WN_RESULT=${WN_RESULT:-} CS_RESULT=${CS_RESULT:-})"
   exit 0
 fi
 

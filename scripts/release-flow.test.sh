@@ -500,7 +500,7 @@ assert_fail_msg "gate fails ship version without changelog heading" \
   bash "$GATE" --root "$NOCL"
 
 # --- gate --ci-extra ---
-ALL_OK=(CF_RESULT=success OF_RESULT=success WN_RESULT=success)
+ALL_OK=(CF_RESULT=success OF_RESULT=success WN_RESULT=success CS_RESULT=success)
 assert_ok "ci-extra passes ship when all functional gates succeeded" \
   env DETECT_SHIP=true "${ALL_OK[@]}" bash "$GATE" --root "$MINOR" --ci-extra
 assert_fail_msg "ci-extra fails ship when core-functional skipped" \
@@ -512,8 +512,11 @@ assert_fail_msg "ci-extra fails ship when overlay-functional failed" \
 assert_fail_msg "ci-extra fails ship when warnet skipped" \
   "warnet" \
   env DETECT_SHIP=true "${ALL_OK[@]}" WN_RESULT=skipped bash "$GATE" --root "$MINOR" --ci-extra
+assert_fail_msg "ci-extra fails ship when consensus-spec skipped" \
+  "consensus-spec" \
+  env DETECT_SHIP=true "${ALL_OK[@]}" CS_RESULT=skipped bash "$GATE" --root "$MINOR" --ci-extra
 assert_ok "ci-extra passes dev when functional gates skipped" \
-  env DETECT_SHIP=false CF_RESULT=skipped OF_RESULT=skipped WN_RESULT=skipped \
+  env DETECT_SHIP=false CF_RESULT=skipped OF_RESULT=skipped WN_RESULT=skipped CS_RESULT=skipped \
   bash "$GATE" --root "$DEVNEXT" --ci-extra
 
 # --- latest maint branch ---

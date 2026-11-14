@@ -87,6 +87,53 @@ Selector: `./scripts/test-hornet-rules.sh` (runs `structure_rule_tests`,
 header version/time, `finality_tests`, `sigop_cost_tests`,
 `consensus_rules`).
 
+## bitcoin-consensus-spec
+
+[bitcoin-consensus-spec](https://github.com/coreyphillips/bitcoin-consensus-spec)
+is an executable specification pinned to Bitcoin Core v32.1, with a
+conformance runner. The revision we run is `scripts/consensus-spec/pin.env`.
+`release-gate.yml` runs it on a ship PR, where `release-extra` needs it, and
+`release.yml` runs it again on the tag before `publish`
+([`releases.md`](./releases.md)). It runs weekly on `master`, so a red
+run names at most a week of commits. Label **`consensus-spec`** runs it on any PR.
+
+| Suite | Driver | Gate |
+|-------|--------|------|
+| vectors | `bcs-harness` (`rbitcoin-test`), in process: `ScriptCheckJob` and `script::verify_input`, the `CheckTransaction` pieces, the legacy and taproot sighash, the control-block commitment, BIP340 | Core's script, tx and sighash vectors, the BIP341 and BIP340 vectors, and qa-assets `script_assets_test.json`: every script query under all 64 consensus flag sets, against Core's verdict |
+| corpus | `chain_harness.py`: a fresh `rbitcoin-node --network regtest` per scenario, blocks through `submitblock` | Tip and height at every normative check of Core's recorded block scenarios. The harness applies Core's P2P delivery rules, so our P2P code is not under test here |
+| interop | `interop_node.py`: `rbitcoin-node --connect` to bitcoind v32.1, BIP324 v2 | Tip and height after syncing each scenario's chain, with no `Misbehaving` line in bitcoind's log |
+| peer-sync | `sync_node.py`: `rbitcoin-node --connect` to the runner, BIP324 v2. bitcoind v32.1 only tells which corpus blocks Core rejects | The runner is our only peer and serves each scenario's chain with every recorded block Core rejects on it, through our own sync. After each one the tip must still be its parent: one node takes them all in chain order, then reaches the final tip (follow), and a fresh node meets each at the end of its initial block download (ibd, 32 per scenario), the shape of #1537 |
+
+Level 2 is reported, not gated: our script error tokens are not Core's
+names, and we keep no UTXO set to hash.
+
+`scripts/consensus-spec/known-failures.txt` names each check we are known
+to fail, with the reason. A failure it does not name fails the run. So does
+an entry that no longer fails: delete its line in the change that fixes it.
+
+```bash
+export BCS_SPEC=/path/to/bitcoin-consensus-spec   # at pin.env's BCS_COMMIT
+./scripts/consensus-spec/run.sh build
+./scripts/consensus-spec/run.sh vectors           # about a minute
+./scripts/consensus-spec/run.sh corpus            # about 20 minutes
+# Linux; elsewhere pass a bitcoind v32.1.
+BITCOIND="$(FETCH_BITCOIND_INVENTORY=scripts/consensus-spec/bitcoind.toml ./scripts/core-functional/fetch-bitcoind.sh)"
+./scripts/consensus-spec/run.sh interop "$BITCOIND"
+./scripts/consensus-spec/run.sh peer-sync "$BITCOIND"   # about an hour
+```
+
+peer-sync needs no harness of ours: `sync_node.py` answers the runner's tip
+requests on standard input over RPC. It catches #1537 often, not always:
+the merged write that bug needed happens only when the confirm engine is
+still busy when the rejected block arrives.
+
+To move the pin, set `BCS_COMMIT`, run all four, and update
+`known-failures.txt` from the `FAIL` and `STALE` lines. When the spec moves
+to another Core release, also set `BCS_CORE_VERSION` and point
+`scripts/consensus-spec/bitcoind.toml` at that release's tarballs and
+SHA256s (`pin.test.sh` checks they agree). Interop's bitcoind is its own
+pin, so core-functional's `[release]` can move without it.
+
 ## A. Block structure — `validate_block_structure_hashed`
 
 | ID | Rule | Error signal | Test |

@@ -16,7 +16,7 @@ it into this skill.
 Ship commands (worktree, HTTPS push, poll) are
 [`ship-pr`](../ship-pr/SKILL.md). A ship PR also needs the `release`
 label and a green `release-extra` check (core, overlay, and Warnet
-functional all green).
+functional and consensus-spec all green).
 See the CI gates section of `docs/releases.md`.
 
 ## Scripts

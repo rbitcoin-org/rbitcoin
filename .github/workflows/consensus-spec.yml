@@ -1,0 +1,113 @@
+# bitcoin-consensus-spec conformance (scripts/consensus-spec/run.sh): the
+# vector suites, the block corpus, interop against bitcoind, and peer-sync
+# (the runner as our only peer, serving the blocks Core rejects through our
+# own sync), at the spec revision scripts/consensus-spec/pin.env pins.
+# release-gate.yml calls it with `gate: true` on a ship PR, and
+# `release-extra` fails that PR unless it passes. release.yml calls it again
+# on the tag and `publish` needs it, so a tag that diverges from the spec's
+# Bitcoin Core does not become a GitHub Release. Weekly on the default branch
+# too, so a regression, or a known-failures.txt line that no longer fails,
+# shows up within a week of its commit rather than at the next ship PR. Also
+# workflow_dispatch and label `consensus-spec`. Not a required check on other
+# PRs.
+#
+# No build cache: this gates a publish, and a cold build fits the timeout.
+name: consensus-spec
+
+on:
+  schedule:
+    # Mondays, off the hour, clear of the nightlies and zizmor.
+    - cron: "53 7 * * 1"
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref or SHA to test (empty = the caller's)
+        type: string
+        default: ""
+      gate:
+        type: boolean
+        default: false
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+concurrency:
+  # The weekly run has its own group, so a dispatch on the default branch
+  # does not cancel it.
+  group: consensus-spec-${{ github.event_name == 'schedule' && 'schedule-' || '' }}${{ inputs.gate && 'gate-' || '' }}${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  suite:
+    name: consensus-spec-${{ matrix.suite }}
+    if: >-
+      inputs.gate ||
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'consensus-spec')
+    runs-on: ubuntu-latest
+    # peer-sync starts about 230 nodes and takes about an hour.
+    timeout-minutes: ${{ matrix.suite == 'peer-sync' && 180 || 120 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [vectors, corpus, interop, peer-sync]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Read the spec pin
+        id: pin
+        run: |
+          set -euo pipefail
+          source scripts/consensus-spec/pin.env
+          echo "repo=$BCS_REPO" >> "$GITHUB_OUTPUT"
+          echo "commit=$BCS_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.pin.outputs.repo }}
+          ref: ${{ steps.pin.outputs.commit }}
+          path: .bcs
+          persist-credentials: false
+
+      - name: Build bcs-conformance, rbitcoin-node, bcs-harness
+        env:
+          BCS_SPEC: .bcs
+        run: ./scripts/consensus-spec/run.sh build
+
+      # Its own pin, scripts/consensus-spec/bitcoind.toml. run.sh refuses a
+      # version the spec is not pinned to. peer-sync uses it to tell the
+      # blocks Core rejects.
+      - name: Fetch bitcoind
+        if: matrix.suite == 'interop' || matrix.suite == 'peer-sync'
+        id: bitcoind
+        run: |
+          set -euo pipefail
+          # Assigned first: a failed substitution inside echo's argument
+          # would not stop the step.
+          path="$(FETCH_BITCOIND_INVENTORY=scripts/consensus-spec/bitcoind.toml ./scripts/core-functional/fetch-bitcoind.sh)"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Run ${{ matrix.suite }}
+        env:
+          BCS_SPEC: .bcs
+          SUITE: ${{ matrix.suite }}
+          BITCOIND: ${{ steps.bitcoind.outputs.path }}
+        run: ./scripts/consensus-spec/run.sh "$SUITE" ${BITCOIND:+"$BITCOIND"}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: consensus-spec-${{ matrix.suite }}
+          path: target/consensus-spec/
+          if-no-files-found: ignore
+          retention-days: 30

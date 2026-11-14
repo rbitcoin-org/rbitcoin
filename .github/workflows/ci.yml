@@ -99,6 +99,8 @@ jobs:
         run: ./scripts/core-functional/release_pin.test.sh
       - name: fetch-bitcoind self-test
         run: ./scripts/core-functional/fetch-bitcoind.test.sh
+      - name: consensus-spec bitcoind pin self-test
+        run: ./scripts/consensus-spec/pin.test.sh
       - name: init-submodule self-test
         run: ./scripts/core-functional/init-submodule.test.sh
       - name: miri-run self-test

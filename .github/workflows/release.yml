@@ -11,6 +11,9 @@
 # pushes the multi-arch manifest to GHCR, and to Docker Hub when the repo
 # variable DOCKERHUB_REPOSITORY is set, after the Release exists.
 #
+# `publish` also needs `consensus-spec` (consensus-spec.yml): the tag's SHA
+# against bitcoin-consensus-spec's suites, at scripts/consensus-spec/pin.env.
+#
 # Nightly builds master's musl binaries, smokes the image per arch, and
 # pushes it as `nightly` and `nightly-YYYYMMDD` to the same registries. It
 # skips Windows, Darwin, the NixOS VM test, and the GitHub Release.
@@ -287,6 +290,17 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  # bitcoin-consensus-spec conformance at this SHA. A tag that fails it does
+  # not publish. Not on a nightly: consensus-spec.yml runs weekly on master
+  # itself, and peer-sync takes about an hour.
+  consensus-spec:
+    name: consensus-spec
+    if: github.event_name != 'schedule' && !inputs.nightly
+    uses: $/.github/workflows/consensus-spec.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+      gate: true
+
   nixos-module-runtime:
     name: nixos-module-runtime
     if: github.event_name != 'schedule' && !inputs.nightly
@@ -318,7 +332,7 @@ jobs:
 
   publish:
     name: github-release
-    needs: [musl, docker, windows, macos, nixos-module-runtime]
+    needs: [musl, docker, windows, macos, nixos-module-runtime, consensus-spec]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 15

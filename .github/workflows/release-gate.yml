@@ -1,7 +1,7 @@
 # Ship-PR gate. `release-extra` always reports on pull_request. It fails
 # when the tree is a ship version (patch != 99) and any of core-functional,
-# overlay-functional, or warnet-example was not success. Ship PRs and
-# label `release` call all three suites here (workflow_call); `needs:`
+# overlay-functional, warnet-example, or consensus-spec was not success.
+# Ship PRs and label `release` call all four here (workflow_call); `needs:`
 # cannot cross workflows. Ask the operator to make `release-extra` a
 # required check on master / v*.*.x. See docs/releases.md.
 name: release-gate
@@ -68,9 +68,19 @@ jobs:
     with:
       gate: true
 
+  # release.yml runs it again on the tag, and publish needs it there. Here a
+  # failure stops the merge, before the version is spent.
+  consensus-spec:
+    name: consensus-spec
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    uses: $/.github/workflows/consensus-spec.yml
+    with:
+      gate: true
+
   release-extra:
     name: release-extra
-    needs: [detect, core-functional, overlay-functional, warnet-example]
+    needs: [detect, core-functional, overlay-functional, warnet-example, consensus-spec]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -81,10 +91,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: ship PRs require core, overlay, and warnet functional
+      - name: ship PRs require core, overlay, warnet, and consensus-spec
         env:
           DETECT_SHIP: ${{ needs.detect.outputs.ship }}
           CF_RESULT: ${{ needs.core-functional.result }}
           OF_RESULT: ${{ needs.overlay-functional.result }}
           WN_RESULT: ${{ needs.warnet-example.result }}
+          CS_RESULT: ${{ needs.consensus-spec.result }}
         run: ./scripts/release-gate.sh --ci-extra
