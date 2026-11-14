@@ -101,6 +101,7 @@ fn rpc_regtest_from_genesis() {
     chain_ops_refusals_at_genesis(&ctx, &hub);
     chain_ops_first_block_to_an_address(&ctx, &hub, &addr, &p2wpkh);
     chain_ops_first_block_info(&ctx, &hub, &store, &p2wpkh, size_at_genesis);
+    chain_ops_core_verbosity(&ctx);
     chain_ops_mocktime(&ctx, &hub, &p2wpkh);
     chain_ops_coinbase_only_blocks(&ctx);
     chain_ops_empty_template_and_proposals(&ctx);
@@ -1621,6 +1622,72 @@ fn chain_ops_first_block_info(
         "{tips}"
     );
     chain_ops_getblockstats_errors(ctx, &child);
+}
+
+fn chain_ops_core_verbosity(ctx: &RpcContext) {
+    let hash = best_hash(ctx);
+    let block = dispatch(ctx, "getblock", vec![hash.clone()]).unwrap();
+    let txid = block["tx"][0].clone();
+    for method in ["getblock", "getrawtransaction"] {
+        for text in [
+            "null",
+            "false",
+            "true",
+            "-2147483648",
+            "-1",
+            "-0",
+            "0",
+            "1",
+            "2",
+            "3",
+            "2147483647",
+            "2147483648",
+            "4294967296",
+            "4294967297",
+            "-2147483649",
+            "1.5",
+            "1e0",
+            "\"1\"",
+            "[]",
+            "{}",
+        ] {
+            let value: Value = serde_json::from_str(text).unwrap();
+            let mut params = vec![
+                if method == "getblock" {
+                    hash.clone()
+                } else {
+                    txid.clone()
+                },
+                value,
+            ];
+            if method == "getrawtransaction" {
+                params.push(hash.clone());
+            }
+            let got = dispatch(ctx, method, params).map(|value| match value {
+                Value::String(_) => "hex",
+                Value::Object(_) => "object",
+                _ => "unexpected result type",
+            });
+            let expected = match text {
+                "2147483648" | "4294967296" | "4294967297" | "-2147483649" | "1.5" | "1e0" => {
+                    Err(json!({"code": -1, "message": "JSON integer out of range"}))
+                }
+                "\"1\"" => Err(
+                    json!({"code": -3, "message": "JSON value of type string is not of expected type number"}),
+                ),
+                "[]" => Err(
+                    json!({"code": -3, "message": "JSON value of type array is not of expected type number"}),
+                ),
+                "{}" => Err(
+                    json!({"code": -3, "message": "JSON value of type object is not of expected type number"}),
+                ),
+                "false" | "-2147483648" | "-1" | "-0" | "0" => Ok("hex"),
+                "null" if method == "getrawtransaction" => Ok("hex"),
+                _ => Ok("object"),
+            };
+            assert_eq!(got, expected, "{method}({text})");
+        }
+    }
 }
 
 fn chain_ops_mocktime(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wpkh: &ScriptBuf) {

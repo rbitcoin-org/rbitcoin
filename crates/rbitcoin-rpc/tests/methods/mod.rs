@@ -7018,7 +7018,7 @@ fn rpc_params_type_coercion_and_unknown_named() {
             ["message"]
             .as_str()
             .unwrap()
-            .contains("must be an integer")
+            .contains("not of expected type number")
     );
 }
 

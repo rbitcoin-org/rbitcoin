@@ -701,9 +701,7 @@ pub fn opt_verbosity(params: &RpcParams, index: usize, name: &str) -> Result<u32
         None | Some(Value::Null) => Ok(1),
         Some(Value::Bool(false)) => Ok(0),
         Some(Value::Bool(true)) => Ok(1),
-        Some(v) => json_u64(v)
-            .map(|n| n as u32)
-            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, format!("{name} must be an integer"))),
+        Some(v) => core_json_int::<i32>(v).map(|n| n.max(0) as u32),
     }
 }
 

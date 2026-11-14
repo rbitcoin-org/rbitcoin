@@ -290,9 +290,7 @@ fn raw_tx_verbosity(params: &RpcParams) -> Result<u32, Value> {
     {
         None | Some(Value::Null) => Ok(0),
         Some(Value::Bool(b)) => Ok(u32::from(*b)),
-        Some(v) => json_u64(v)
-            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
-            .ok_or_else(|| rpc_error(ERR_TYPE_ERROR, "not of expected type number")),
+        Some(v) => core_json_int::<i32>(v).map(|n| n.max(0) as u32),
     }
 }
 

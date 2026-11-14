@@ -1,0 +1,1 @@
+RPC `getblock` and `getrawtransaction` read verbosity as Core's signed 32-bit integer. Negative values return hex; out-of-range values, fractions, and exponents return `-1`, and invalid types return Core's `-3` error. Boolean and null defaults are unchanged.
