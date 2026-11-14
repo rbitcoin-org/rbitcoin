@@ -3049,35 +3049,6 @@ fn parent_req_stops_at_per_peer_cap() {
 }
 
 #[test]
-fn parent_req_stops_at_global_cap() {
-    let dir = tmp();
-    let store_dir = tmp();
-    let q = Query::open_or_create_tiny(&store_dir).unwrap();
-    let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
-    let per_peer = parent_req::MAX_PARENT_ANN_PER_PEER as u32;
-    let global = parent_req::MAX_PARENT_ANN_GLOBAL as u32;
-    let mut n = 0u32;
-    let mut peer = 1u64;
-    while n < global {
-        assert_eq!(
-            hub.note_inv_tx_requested(peer, parent_hash(n), false, 1_000, false),
-            ParentNote::RequestNow
-        );
-        n += 1;
-        if n.is_multiple_of(per_peer) {
-            peer += 1;
-        }
-    }
-    assert_eq!(
-        hub.note_inv_tx_requested(peer, parent_hash(n), false, 1_000, false),
-        ParentNote::GlobalFull,
-        "a peer under its own cap is not misbehavior when the table is full"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&store_dir);
-}
-
-#[test]
 fn second_peer_take_due_does_not_drop_other_peers_keys() {
     let dir = tmp();
     let store_dir = tmp();

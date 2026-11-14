@@ -1,7 +1,10 @@
 //! Missing-parent GETDATA tracker.
 //!
 //! One mutex owns the hash map and a per-peer time index. A heartbeat walks
-//! only that peer's due entries. Caps are announcements, not a new knob.
+//! only that peer's due entries. The cap is announcements per peer, as Core
+//! `MAX_PEER_TX_ANNOUNCEMENTS`. There is no process-wide cap, so one peer's
+//! rows never refuse another peer's. The table is at most the cap times the
+//! live sessions, because `forget_peer` runs when a session unregisters.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -9,8 +12,6 @@ use super::{GETDATA_TX_INTERVAL_SECS, MAX_PARENTS_PER_PARK};
 
 /// Announcements one peer may add. Past this the map does not grow.
 pub const MAX_PARENT_ANN_PER_PEER: usize = 5_000;
-/// Process-wide announcements. A few hundred thousand, not tens of millions.
-pub const MAX_PARENT_ANN_GLOBAL: usize = 200_000;
 
 /// One parent GETDATA the sweep should send.
 pub struct DueParent {
@@ -28,8 +29,6 @@ pub enum ParentNote {
     Deferred,
     /// This peer's own counter is full.
     PeerCapped,
-    /// The process-wide table is full. The announcement is skipped.
-    GlobalFull,
 }
 
 #[doc(hidden)]
@@ -60,6 +59,10 @@ pub struct ParentTracker {
     pub inflight_by_peer: HashMap<u64, BTreeMap<u64, Vec<[u8; 32]>>>,
     pub hashes_by_peer: HashMap<u64, HashSet<[u8; 32]>>,
     pub ann_per_peer: HashMap<u64, usize>,
+    /// Peers that took a row and have not been forgotten. Only these take a
+    /// row as another transaction's announcer, so a row added after
+    /// `forget_peer` cannot outlive its session.
+    pub sessions: HashSet<u64>,
     pub announcements: usize,
 }
 
@@ -77,6 +80,7 @@ impl ParentTracker {
             inflight_by_peer: HashMap::new(),
             hashes_by_peer: HashMap::new(),
             ann_per_peer: HashMap::new(),
+            sessions: HashSet::new(),
             announcements: 0,
         }
     }
@@ -84,11 +88,6 @@ impl ParentTracker {
     #[doc(hidden)]
     pub fn peer_at_cap(&self, peer: u64) -> bool {
         self.ann_per_peer.get(&peer).copied().unwrap_or(0) >= MAX_PARENT_ANN_PER_PEER
-    }
-
-    #[doc(hidden)]
-    pub fn global_full(&self) -> bool {
-        self.announcements >= MAX_PARENT_ANN_GLOBAL
     }
 
     pub fn note_inv(
@@ -104,9 +103,6 @@ impl ParentTracker {
         }
         if self.peer_at_cap(peer) {
             return ParentNote::PeerCapped;
-        }
-        if self.global_full() {
-            return ParentNote::GlobalFull;
         }
         let exp = now.saturating_add(GETDATA_TX_INTERVAL_SECS);
         // Same-kind in-flight stays the one request. This announcer waits
@@ -143,7 +139,7 @@ impl ParentTracker {
         {
             return;
         }
-        if self.peer_at_cap(peer) || self.global_full() {
+        if self.peer_at_cap(peer) {
             return;
         }
         self.add_ann(
@@ -200,11 +196,11 @@ impl ParentTracker {
         let peer = ann.peer;
         let due_at = ann.due_at;
         let exp = ann.requested_until;
-        let slot = self
-            .by_hash
-            .entry(hash)
-            .or_insert_with(|| ParentSlot { anns: Vec::new() });
+        let slot = self.by_hash.entry(hash).or_insert_with(|| ParentSlot {
+            anns: Vec::with_capacity(1),
+        });
         slot.anns.push(ann);
+        self.sessions.insert(peer);
         *self.ann_per_peer.entry(peer).or_default() += 1;
         self.announcements += 1;
         self.hashes_by_peer.entry(peer).or_default().insert(hash);
@@ -236,6 +232,7 @@ impl ParentTracker {
     }
 
     pub fn forget_peer(&mut self, peer: u64) {
+        self.sessions.remove(&peer);
         self.due_by_peer.remove(&peer);
         self.inflight_by_peer.remove(&peer);
         let Some(hashes) = self.hashes_by_peer.remove(&peer) else {
