@@ -483,6 +483,27 @@ fn fire_before_keys_merge(dir: &Path) {
     hook(dir);
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static BEFORE_UNSORTED_CLEAR: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+fn fire_before_unsorted_clear(store_dir: &Path) {
+    let Some(hook) = BEFORE_UNSORTED_CLEAR.with(|c| c.take()) else {
+        return;
+    };
+    hook(store_dir);
+}
+
+/// One-shot hook immediately before a pack-complete head drops `DONE`.
+/// Tests check that `include_hwm` is already durable.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_before_unsorted_clear_for_test(hook: Option<fn(&Path)>) {
+    BEFORE_UNSORTED_CLEAR.with(|c| c.set(hook));
+}
+
 /// One-shot hook after key spills are written and before merge unlinks them.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
@@ -2337,6 +2358,44 @@ fn capped_publish_fk(
         .unwrap_or(publishing))
 }
 
+/// Sync the sealed bodies, then store `publish` as `include_hwm`.
+///
+/// `0` does not move a watermark that is already set. The directory clear
+/// has to follow this, or a crash drops `DONE` and the next finalize scans
+/// from create 1.
+#[doc(hidden)]
+pub fn sync_sealed_inclusion_floor(store: &Store, publish: u64) -> Result<(), StoreError> {
+    store.scripthash.flush()?;
+    if publish > 0 {
+        store.scripthash.note_include_hwm(publish)?;
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn clear_unsorted_after_inclusion_floor(store: &Store) -> Result<(), StoreError> {
+    #[cfg(debug_assertions)]
+    fire_before_unsorted_clear(store.path());
+    let dir = unsorted_shard_dir(store.path());
+    clear_unsorted_shard_dir(&dir)?;
+    ColdProgress::clear(store.path());
+    Ok(())
+}
+
+/// Floor for a pack-complete head whose `include_hwm` is still missing.
+///
+/// `0` leaves a watermark that is already set, and leaves a head whose
+/// `scripthash.through` is still 0. A later through is not a floor: a
+/// backfill can name the new tip before those rows exist.
+#[doc(hidden)]
+pub fn sealed_resume_publish_fk(store_dir: &Path) -> Result<u64, StoreError> {
+    if crate::scripthash::load_include_hwm(store_dir) > 0 {
+        return Ok(0);
+    }
+    let through = crate::scripthash::load_sh_through(store_dir);
+    capped_publish_fk(store_dir, true, through)
+}
+
 pub fn materialize_sh_unsorted_from_class_a(
     store: &Store,
     collect_workers: usize,
@@ -2359,8 +2418,9 @@ pub fn materialize_sh_unsorted_from_class_a(
 
     let unsealed = table.unsealed_main_shards();
     if unsealed.is_empty() && (!table.head_is_empty() || table.entry_count() > 0) {
-        clear_unsorted_shard_dir(&dir)?;
-        ColdProgress::clear(store.path());
+        let publish = sealed_resume_publish_fk(store.path())?;
+        sync_sealed_inclusion_floor(store, publish)?;
+        clear_unsorted_after_inclusion_floor(store)?;
         return Ok(ShShardMaterialize {
             creates: table.entry_count(),
             keys: 0,
@@ -2407,8 +2467,10 @@ pub fn materialize_sh_unsorted_from_class_a(
     // cut so the tail backfill appends the creates that arrived after it.
     mat.max_fk = capped_publish_fk(store.path(), any_sealed, mat.max_fk)?;
     if table.unsealed_main_shards().is_empty() {
-        clear_unsorted_shard_dir(&dir)?;
-        ColdProgress::clear(store.path());
+        // The capped create, not the raw `DONE` last. Partial packs leave
+        // both the watermark and the directory alone.
+        sync_sealed_inclusion_floor(store, mat.max_fk)?;
+        clear_unsorted_after_inclusion_floor(store)?;
     }
     Ok(mat)
 }

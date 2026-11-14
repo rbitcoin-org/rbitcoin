@@ -9,6 +9,7 @@ use rbitcoin_store::{
 };
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -973,6 +974,102 @@ fn resume_head_stays_direct_until_the_tail_is_backfilled() {
         "a finished finalize left the resume mark"
     );
     assert!(q.sh_use_writebehind());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The last shard pack has to store `include_hwm` before it deletes
+/// `DONE`. Until then a crash leaves a sealed head with no floor.
+#[test]
+fn inclusion_floor_lands_before_done_is_dropped() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-floor-before-done");
+    seed_direct_chain(&q, 3);
+    FLOOR_BEFORE_CLEAR.with(|c| c.set((0, false)));
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_clear_for_test(Some(
+        snap_floor_before_unsorted_clear,
+    ));
+    let result = q.finalize_sh_runs();
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_clear_for_test(None);
+    result.unwrap();
+    let (hwm, done) = FLOOR_BEFORE_CLEAR.with(|c| c.get());
+    assert!(
+        done,
+        "DONE.keys was already gone when the inclusion floor was checked"
+    );
+    assert!(
+        hwm > 0,
+        "include_hwm was still 0 while DONE.keys was the only progress mark"
+    );
+    assert!(q.store.scripthash.include_hwm() > 0);
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Resume byte `2` keeps a pack-complete head whose watermark was never
+/// published. The tail scan has to start at that packed floor. Create 1
+/// is already in its row.
+#[test]
+fn packed_floor_lands_before_the_tail_scan() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-resume-packed-floor");
+    let script = vec![0x51, 0xee, 0x11];
+    let (sh, before) = index_two_pays(&q);
+    let packed = q.store.scripthash.include_hwm();
+    assert!(packed > 0, "the first pack did not publish a floor");
+    assert_eq!(packed, q.store.txs.count());
+    std::fs::remove_file(dir.join(rbitcoin_store::INCLUDE_HWM_NAME)).unwrap();
+    std::fs::remove_file(q.sh_run.runs_dir.join("SEAL")).unwrap();
+    rbitcoin_store::scripthash::mark_sh_rebuild_resume(q.store.path()).unwrap();
+    connect_coinbase_paying(&q, script);
+    FLOOR_AT_BACKFILL.with(|c| c.set(u64::MAX));
+    set_sh_backfill_after_sample_for_test(Some(snap_floor_at_backfill));
+    let result = q.finalize_sh_runs();
+    set_sh_backfill_after_sample_for_test(None);
+    result.unwrap();
+    let seen = FLOOR_AT_BACKFILL.with(|c| c.get());
+    assert_eq!(
+        seen, packed,
+        "the tail scan started without the packed inclusion floor"
+    );
+    let txids = history_txids(&q, &sh);
+    assert_eq!(
+        txids.len(),
+        before.len() + 1,
+        "the tail pay was not indexed"
+    );
+    assert!(txids.starts_with(&before));
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A crashed backfill can name the new tip in `scripthash.through` before
+/// those rows exist. A resume that already has a floor must not publish
+/// that later through.
+#[test]
+fn resume_keeps_a_saved_floor_under_a_later_through() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-resume-no-raise");
+    let script = vec![0x51, 0xee, 0x11];
+    let (sh, before) = index_two_pays(&q);
+    let packed = q.store.scripthash.include_hwm();
+    assert!(packed > 0);
+    rbitcoin_store::scripthash::mark_sh_rebuild_resume(q.store.path()).unwrap();
+    connect_coinbase_paying(&q, script);
+    rbitcoin_store::scripthash::note_sh_through(q.store.path(), q.store.txs.count()).unwrap();
+    FLOOR_AT_BACKFILL.with(|c| c.set(u64::MAX));
+    set_sh_backfill_after_sample_for_test(Some(snap_floor_at_backfill));
+    let result = q.finalize_sh_runs();
+    set_sh_backfill_after_sample_for_test(None);
+    result.unwrap();
+    let seen = FLOOR_AT_BACKFILL.with(|c| c.get());
+    assert_eq!(
+        seen, packed,
+        "the resume published scripthash.through over the packed floor"
+    );
+    let txids = history_txids(&q, &sh);
+    assert_eq!(
+        txids.len(),
+        before.len() + 1,
+        "the tail pay was not indexed"
+    );
+    assert!(q.sh_is_tip_ready());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2411,6 +2508,26 @@ thread_local! {
 
 fn snap_through_before_unsorted_pack(through: u64) {
     THROUGH_BEFORE_PACK.with(|c| c.set(through));
+}
+
+thread_local! {
+    static FLOOR_BEFORE_CLEAR: Cell<(u64, bool)> = const { Cell::new((0, false)) };
+}
+
+fn snap_floor_before_unsorted_clear(dir: &Path) {
+    let hwm = rbitcoin_store::scripthash::load_include_hwm(dir);
+    let done = rbitcoin_store::unsorted_shard_dir(dir)
+        .join(rbitcoin_store::scripthash_materialize::KEYS_DONE_NAME)
+        .is_file();
+    FLOOR_BEFORE_CLEAR.with(|c| c.set((hwm, done)));
+}
+
+thread_local! {
+    static FLOOR_AT_BACKFILL: Cell<u64> = const { Cell::new(u64::MAX) };
+}
+
+fn snap_floor_at_backfill(q: &Query) {
+    FLOOR_AT_BACKFILL.with(|c| c.set(q.store.scripthash.include_hwm()));
 }
 
 static CANCEL_FORCE_BEFORE_PACK: AtomicBool = AtomicBool::new(false);

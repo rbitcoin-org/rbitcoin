@@ -98,7 +98,12 @@ Fixed
   the pack marks and the inclusion watermark. A resume mark keeps that
   pack-complete head, and startup stays Direct until the tail backfill
   publishes the watermark, so the next block does not publish it over
-  creates the pack never scanned. The inclusion watermark stays at the cut until the tail
+  creates the pack never scanned. The pack syncs the shard bodies and
+  stores `include_hwm` at the capped create before it removes the unsorted
+  directory. A later finalize of that head, when the watermark is still
+  missing, stores the capped `scripthash.through` and SEAL before that
+  removal and does not raise a watermark that is already set. The tail
+  backfill then starts after that floor. The inclusion watermark stays at the cut until the tail
   backfill appends the new creates.
   Open records `(covered, through]` in `scripthash.recheck` when
   that value is past the create count, including when `include_hwm` is not.
