@@ -255,6 +255,74 @@ impl SegmentedTxHead {
         }
     }
 
+    /// Shorten the head to creates `1..=n`.
+    ///
+    /// `meta` is a synced rename. Body headers are not, so a covered-prefix
+    /// cut leaves this head naming creates the body dropped. A segment that
+    /// starts past `n` leaves the list. Its maps are closed, then the
+    /// open-address file and sealed packs are unlinked. A shortened segment
+    /// that stays keeps its slot bytes and sealed packs. Probes ignore a
+    /// relative fk above the shortened count. The next roll in this process
+    /// reuses the lowest dropped file id.
+    pub fn clamp_to_create_count(&self, n: u64) -> Result<(), StoreError> {
+        let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let segs = self.segments_snapshot();
+        let mut list = Vec::with_capacity(segs.len());
+        let mut dropped = Vec::new();
+        let mut changed = false;
+        for s in segs.iter() {
+            if n == 0 || s.first_fk > n {
+                changed = true;
+                dropped.push(s.file_id);
+                continue;
+            }
+            let c = s.count.load(Ordering::Relaxed);
+            let keep = n - s.first_fk + 1;
+            if c > keep {
+                s.count.store(keep, Ordering::Relaxed);
+                changed = true;
+            }
+            list.push(Arc::clone(s));
+        }
+        if list.len() != segs.len() {
+            changed = true;
+            let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
+            *guard = Arc::new(list);
+        }
+        if changed {
+            self.persist_meta_locked()?;
+        }
+        // Last owner of a dropped segment. Close the maps before unlink.
+        drop(segs);
+        let Some(&min_id) = dropped.iter().min() else {
+            return Ok(());
+        };
+        for file_id in &dropped {
+            self.unlink_segment_files(*file_id)?;
+        }
+        self.next_file_id.fetch_min(min_id, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Drop one segment's open-address file and sealed packs. A missing file
+    /// is the seal path, which already unlinked the open-address table.
+    fn unlink_segment_files(&self, file_id: u32) -> Result<(), StoreError> {
+        let base = segment_head_path(&self.dir, file_id);
+        for path in [
+            base.clone(),
+            crate::tx_head_mphf::mphf_path(&base),
+            segment_fuse_path(&self.dir, file_id),
+        ] {
+            refuse_mapped_unlink(&path)?;
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StoreError::io(path, e)),
+            }
+        }
+        Ok(())
+    }
+
     /// Highest create_fk present in any segment (0 if empty).
     pub fn last_inserted_fk(&self) -> u64 {
         let segs = self.segments_snapshot();
@@ -589,7 +657,7 @@ impl SegmentedTxHead {
             let rel_lists = head.probe_fks_batch(&pass_keys);
             for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                 for r in rels.into_iter().rev() {
-                    if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {
+                    if let Some(fk) = abs_in_segment(seg, r.0) {
                         out[orig_i].push(fk);
                     }
                 }
@@ -657,7 +725,7 @@ impl SegmentedTxHead {
             let rel_lists = pack.read_rels_batch(&slots, ctx)?;
             for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                 for r in rels {
-                    if let Some(fk) = rel_to_abs(seg.first_fk, u64::from(r)) {
+                    if let Some(fk) = abs_in_segment(seg, u64::from(r)) {
                         out[orig_i].push(fk);
                     }
                 }
@@ -670,7 +738,7 @@ impl SegmentedTxHead {
                 .probe_fks_batch(&pass_keys);
             for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                 for r in rels.into_iter().rev() {
-                    if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {
+                    if let Some(fk) = abs_in_segment(seg, r.0) {
                         out[orig_i].push(fk);
                     }
                 }
@@ -1086,6 +1154,18 @@ pub fn rel_to_abs(first_fk: u64, rel: u64) -> Option<Fk> {
     Some(Fk(first_fk + rel - 1))
 }
 
+/// Absolute fk for a slot that is still inside the segment count.
+///
+/// A covered-prefix cut lowers `count` and leaves the old slot bytes. A
+/// relative fk above that count is a create the body no longer has.
+#[inline]
+fn abs_in_segment(seg: &Segment, rel: u64) -> Option<Fk> {
+    if rel == 0 || rel > seg.count.load(Ordering::Relaxed) {
+        return None;
+    }
+    rel_to_abs(seg.first_fk, rel)
+}
+
 #[doc(hidden)]
 pub fn max_keys_for_layout(layout: HeadLayout) -> u64 {
     let slots = layout.slots();
@@ -1167,6 +1247,36 @@ pub fn ensure_head_layout(dir: &Path) -> Result<(), StoreError> {
         return Ok(());
     }
     std::fs::create_dir_all(&root).map_err(|e| StoreError::io(&root, e))?;
+    Ok(())
+}
+
+/// Windows will not delete a file that still has a mapped view. Debug Linux
+/// builds refuse the same case so a clamp that still holds the segment fails
+/// here instead of only on Windows.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn refuse_mapped_unlink(path: &Path) -> Result<(), StoreError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let Ok(want) = path.canonicalize() else {
+        return Ok(());
+    };
+    let Ok(dir) = std::fs::read_dir("/proc/self/fd") else {
+        return Ok(());
+    };
+    for ent in dir.flatten() {
+        let Ok(target) = std::fs::read_link(ent.path()) else {
+            continue;
+        };
+        if target == want {
+            return Err(StoreError::Corrupt("tx.head unlink while mapped"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(all(debug_assertions, target_os = "linux")))]
+fn refuse_mapped_unlink(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 

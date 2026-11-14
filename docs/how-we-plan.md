@@ -362,7 +362,10 @@ Test moves ([`TESTING.md`](../TESTING.md) owns the budget):
   refactor and delete the test that only painted it.
   [`TESTING.md`](../TESTING.md) owns that fold and the coverage floor.
 - A CRAP failure on a function this step made more branched is a simplify,
-  not a new test and not a new allowlist row.
+  not a new test and not a new allowlist row. Split it in the change that
+  added the branch, at a stage the caller already had. A cut's two writes
+  and every reader of the dropped id are that same change
+  ([`CONTRIBUTING.md`](../CONTRIBUTING.md#a-repair-and-the-next-review)).
 - Delete tests that pin implementation shape rather than behavior.
 - Dropping the twin after the journey hits the path, and dropping the test
   that only painted a deleted branch, are the duplicate and empty pins the

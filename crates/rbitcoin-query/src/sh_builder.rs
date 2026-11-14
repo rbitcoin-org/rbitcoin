@@ -135,11 +135,23 @@ impl ShRunBuilder {
     /// Wipe SH runs/SEAL/cold progress/include_hwm and empty durable SH tables.
     ///
     /// Used by [`crate::Query::set_sh_force_rebuild`] so tip collects **all** Class A.
+    /// The wipe byte is synced before any pack mark is dropped. A crash in
+    /// that gap retries, even if the next open restores the marks and the
+    /// inclusion watermark. Pack marks are cleared before the unsorted
+    /// directory. That order is what lets the map removal see an unpacked
+    /// shard. A `DONE` last that still names the create count would otherwise
+    /// publish the old map. Resume byte `2` must not call this.
     pub fn prepare_force_full_rebuild(&self, store: &Store) -> Result<(), StoreError> {
         info!("node: scripthash FORCE_REBUILD — clearing runs/SEAL/progress/HWM and reinit head");
+        rbitcoin_store::scripthash::mark_sh_rebuild(store.path())?;
         self.wipe_catalog_and_seal()?;
         Self::clear_cold_progress_and_hwm(store);
         store.scripthash.reinit_empty_for_cold_materialize()?;
+        rbitcoin_store::scripthash::clear_sh_recheck(store.path())?;
+        rbitcoin_store::scripthash::clear_sh_through(store.path())?;
+        rbitcoin_store::clear_unsorted_shard_dir(&rbitcoin_store::unsorted_shard_dir(
+            store.path(),
+        ))?;
         Ok(())
     }
 
@@ -172,9 +184,15 @@ impl ShRunBuilder {
                 "node: scripthash unsorted-shards skip (all {n_shards} shards sealed, entry_count={n_existing})"
             );
             self.discard_residual_runs();
-            rbitcoin_store::clear_unsorted_shard_dir(&rbitcoin_store::unsorted_shard_dir(
-                store.path(),
-            ));
+            // A missing watermark is the capped through. One already set stays.
+            // SEAL follows that value, and both precede the directory drop.
+            let publish =
+                rbitcoin_store::scripthash_materialize::sealed_resume_publish_fk(store.path())?;
+            rbitcoin_store::scripthash_materialize::sync_sealed_inclusion_floor(store, publish)?;
+            if publish > 0 {
+                self.publish_seal_watermark(publish)?;
+            }
+            rbitcoin_store::scripthash_materialize::clear_unsorted_after_inclusion_floor(store)?;
             return Ok(0);
         }
 
@@ -209,11 +227,14 @@ impl ShRunBuilder {
             }
             Err(e) => return Err(e),
         };
+        if mat.max_fk > 0 {
+            rbitcoin_store::scripthash::note_sh_through(store.path(), mat.max_fk)?;
+        }
         store.scripthash.flush()?;
         self.discard_residual_runs();
         if mat.max_fk > 0 {
             self.publish_seal_watermark(mat.max_fk)?;
-            let _ = store.scripthash.note_include_hwm(mat.max_fk);
+            store.scripthash.note_include_hwm(mat.max_fk)?;
         }
         info!(
             "node: scripthash unsorted-shards done creates≈{} keys≈{} shards={n_shards} \

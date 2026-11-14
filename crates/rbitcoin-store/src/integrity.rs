@@ -547,15 +547,27 @@ impl Store {
             return Err(TipFault::Bad("input edges short"));
         }
         let prune = self.txs.prune_seqsigwit_mode();
+        // A prune file means this stem may already lag the creates. A
+        // create it does not name has no scriptSig count to match.
+        // Without that file, a missing locator is a bad record.
+        let lag = self.txs.witness_stem_may_lag();
         let mut parents: Vec<(Fk, u32)> = Vec::new();
         for (i, slot) in spans.iter().enumerate() {
             let Some(edges) = slot else {
                 return Err(TipFault::Bad("input unstamped"));
             };
             if !prune {
-                let n = self.seqsigwit_input_count(Fk(first + i as u64))?;
-                if n != edges.len() {
-                    return Err(TipFault::Bad("input edge count"));
+                let fk = Fk(first + i as u64);
+                match self.txs.seqsigwit_range(fk) {
+                    Err(StoreError::NotFound) if lag => {}
+                    Err(e) => return Err(TipFault::read("seqsigwit range")(e)),
+                    Ok(_) if self.txs.witness_row_is_gap(fk.0) => {}
+                    Ok(_) => {
+                        let n = self.seqsigwit_input_count(fk)?;
+                        if n != edges.len() {
+                            return Err(TipFault::Bad("input edge count"));
+                        }
+                    }
                 }
             }
             if i == 0 {
@@ -679,48 +691,128 @@ impl Store {
         Ok(self.class_a_confirmed_cut(covered)?.is_none())
     }
 
-    /// After open truncates Class A, drop confirmed heights whose tx range
-    /// ends past that count. The header clear is flushed before the tip
-    /// shrink. A crash after that clear still shrinks: the strong bit past
-    /// the count is set and the range is already gone. Trailing nulls, a
-    /// header-only tip, and a Class C fixture are not this drop.
+    /// After open truncates Class A, shrink confirmed heights that no longer
+    /// fit, then clear every `header_txs` range that ends past that count.
+    ///
+    /// The tip flush lands before those ranges are cleared. A crash that
+    /// already cleared the tail still shrinks, including when the next
+    /// create is an unstrong orphan. Trailing nulls, a header-only tip, and
+    /// a Class C fixture are not this drop.
     pub(crate) fn drop_confirmed_past_creates(&self) -> Result<(), StoreError> {
         let covered = self.txs.count();
         let Some(tip) = self.confirmed.tip_height() else {
+            self.clear_header_ranges_past_covered(covered)?;
+            return Ok(());
+        };
+        let kept = self.covered_tip_shrink(covered, tip.0)?;
+        let Some(kept) = kept else {
+            self.clear_header_ranges_past_covered(covered)?;
             return Ok(());
         };
         let write = crate::array_table::ClassCWrite::new();
         let mut report = TipRevalidateReport::default();
+        self.shrink_tip_to(&write, kept, &mut report)?;
+        self.clear_header_ranges_past_covered(covered)
+    }
+
+    /// `None` keeps the tip. `Some` is the last height that still fits, or
+    /// empty when none do.
+    fn covered_tip_shrink(
+        &self,
+        covered: u64,
+        tip: u32,
+    ) -> Result<Option<Option<u32>>, StoreError> {
         if let Some(bad) = self.class_a_confirmed_cut(covered)? {
-            let kept = bad.checked_sub(1);
-            match self.header_tx_end(Height(bad))? {
-                Some(end) if end > covered => {
-                    if covered == 0 && !self.txs.bodies_allocated_past_header() {
-                        return Ok(());
-                    }
-                    let mut fks = Vec::new();
-                    for h in bad..=tip.0 {
-                        if let Some(fk) = self.confirmed.get(Height(h))? {
-                            fks.push(fk);
-                        }
-                    }
-                    self.clear_header_fks(&write, &fks)?;
-                    self.shrink_tip_to(&write, kept, &mut report)?;
-                }
-                None if self.strong_past_covered(covered)? => {
-                    self.shrink_tip_to(&write, kept, &mut report)?;
-                }
-                _ => {}
+            return self.shrink_at_cut(covered, bad);
+        }
+        self.shrink_without_cut(covered, tip)
+    }
+
+    fn shrink_at_cut(&self, covered: u64, bad: u32) -> Result<Option<Option<u32>>, StoreError> {
+        let past = self
+            .header_tx_end(Height(bad))?
+            .is_some_and(|end| end > covered);
+        if past && covered == 0 && !self.txs.bodies_allocated_past_header() {
+            return Ok(None);
+        }
+        // A missing range means the tip sits above the last range that still
+        // fits. That height is not sealed. The strong bit of the next create
+        // is not required: an unstrong orphan lives there after the tail was
+        // already cleared.
+        Ok(Some(bad.checked_sub(1)))
+    }
+
+    fn shrink_without_cut(
+        &self,
+        covered: u64,
+        tip: u32,
+    ) -> Result<Option<Option<u32>>, StoreError> {
+        if self.header_tx_end(Height(tip))?.is_some() || !self.strong_past_covered(covered)? {
+            return Ok(None);
+        }
+        if self.highest_height_with_tx_range(tip)?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(None))
+    }
+
+    /// In-RAM `header_txs` only. A clean chain walks slots that are already
+    /// resident. A header-only store and a Class C fixture name no archive.
+    fn clear_header_ranges_past_covered(&self, covered: u64) -> Result<(), StoreError> {
+        if covered == 0 && !self.txs.bodies_allocated_past_header() {
+            return Ok(());
+        }
+        let write = crate::array_table::ClassCWrite::new();
+        let n = self.header_txs.first.len().min(self.header_txs.count.len());
+        let mut cleared = false;
+        for i in 0..n {
+            let count = self.header_txs.count.get(i)?;
+            if count == 0 {
+                continue;
             }
-            return Ok(());
+            let first = self.header_txs.first.get(i)?;
+            if first == 0 {
+                continue;
+            }
+            let end = first.saturating_add(count).saturating_sub(1);
+            if end <= covered {
+                continue;
+            }
+            let Some(fk) = Fk::new(i.saturating_add(1)) else {
+                continue;
+            };
+            cleared |= self.header_txs.clear_body(&write, fk)?;
         }
-        if self.header_tx_end(tip)?.is_some() || !self.strong_past_covered(covered)? {
-            return Ok(());
+        if cleared {
+            self.header_txs.flush()?;
         }
-        if self.highest_height_with_tx_range(tip.0)?.is_some() {
-            return Ok(());
+        Ok(())
+    }
+
+    /// Highest `header_txs` range end past `covered`. Every range is scanned:
+    /// the clear that follows drops each of them, not only the confirmed chain.
+    pub(crate) fn max_header_range_end_past(
+        header_txs: &crate::chain::HeaderTxsTable,
+        covered: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        let n = header_txs.first.len().min(header_txs.count.len());
+        let mut max_end = None;
+        for i in 0..n {
+            let count = header_txs.count.get(i)?;
+            if count == 0 {
+                continue;
+            }
+            let first = header_txs.first.get(i)?;
+            if first == 0 {
+                continue;
+            }
+            let end = first.saturating_add(count).saturating_sub(1);
+            if end <= covered {
+                continue;
+            }
+            max_end = Some(max_end.map_or(end, |cur: u64| cur.max(end)));
         }
-        self.shrink_tip_to(&write, None, &mut report)
+        Ok(max_end)
     }
 
     fn strong_past_covered(&self, covered: u64) -> Result<bool, StoreError> {
@@ -728,17 +820,6 @@ impl Store {
             return Ok(false);
         };
         self.strong_tx.is_strong(fk)
-    }
-
-    fn clear_header_fks(
-        &self,
-        write: &crate::array_table::ClassCWrite,
-        fks: &[Fk],
-    ) -> Result<(), StoreError> {
-        for fk in fks {
-            let _ = self.header_txs.clear_body(write, *fk)?;
-        }
-        self.header_txs.flush()
     }
 
     /// Height a spend checkpoint may call durable, or `None` when no create is.

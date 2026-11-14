@@ -578,3 +578,45 @@ fn roll_does_not_join_seal_open_probes_sealing_oa() {
         .any(|f| f.0 == 1));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A segment that starts past the covered count leaves the list and the disk.
+/// The segment that stays keeps its pack. The next roll reuses the dropped id.
+#[test]
+fn clamp_unlinks_a_segment_past_the_covered_count() {
+    let dir = tmp();
+    let layout = HeadLayout::new(8).unwrap();
+    let h = SegmentedTxHead::create(&dir, layout).unwrap();
+    let mut fill: Vec<_> = (0..254u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+    h.insert_many(&mut fill).unwrap();
+    h.flush().unwrap();
+    assert!(h.segment_count() >= 2, "segs={}", h.segment_count());
+    let firsts = h.first_fks_snapshot();
+    let keep = firsts[1] - 1;
+    let unsealed = h.unsealed_ranges();
+    assert_eq!(unsealed.len(), 1, "tail stays open, unsealed={unsealed:?}");
+    let dropped = unsealed[0].0;
+    assert!(unsealed[0].1 > keep, "tail starts past the cut");
+    let oa = segment_head_path(&dir, dropped);
+    let mphf = rbitcoin_store::tx_head_mphf::mphf_path(&oa);
+    let fuse = segment_fuse_path(&dir, dropped);
+    std::fs::write(&mphf, b"mphf").unwrap();
+    std::fs::write(&fuse, b"fuse").unwrap();
+    assert!(oa.is_file(), "open tail {}", oa.display());
+    let kept = dir.join("tx.head").join("000000.mphf");
+    assert!(kept.is_file(), "sealed segment stays packed");
+    h.clamp_to_create_count(keep).unwrap();
+    assert!(!oa.exists(), "dropped OA {}", oa.display());
+    assert!(!mphf.exists(), "dropped mphf {}", mphf.display());
+    assert!(!fuse.exists(), "dropped fuse {}", fuse.display());
+    assert!(kept.is_file(), "a segment inside the cut keeps its pack");
+    assert_eq!(
+        h.next_file_id.load(std::sync::atomic::Ordering::Relaxed),
+        dropped
+    );
+    assert!(h
+        .probe_candidates(&mixed(1))
+        .unwrap()
+        .iter()
+        .any(|f| f.0 == 1));
+    let _ = std::fs::remove_dir_all(&dir);
+}

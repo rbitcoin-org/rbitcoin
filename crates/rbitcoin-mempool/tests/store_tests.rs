@@ -221,6 +221,22 @@ fn tmp_dir() -> rbitcoin_store::testutil::TempDir {
     rbitcoin_store::testutil::TempDir::labeled("mempool").unwrap()
 }
 
+/// A 0-byte `meta` is a torn sidecar. Open quarantines it and starts empty.
+#[test]
+fn short_meta_opens_an_empty_pool() {
+    let dir = tmp_dir();
+    fs::write(dir.join("meta"), []).unwrap();
+    let mp =
+        rbitcoin_mempool::ActiveMempool::open_with_limit_persist(&dir, 50_000_000, true).unwrap();
+    let torn = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().starts_with("torn-"));
+    assert!(torn, "short meta must be quarantined");
+    assert!(dir.join("meta").metadata().unwrap().len() >= META_LEN as u64);
+    let _ = mp;
+}
+
 fn tiny_tx() -> bitcoin::Transaction {
     bitcoin::Transaction {
         version: bitcoin::transaction::Version::TWO,
@@ -1107,7 +1123,7 @@ fn open_or_init_meta_reads_written_fields_and_rejects_bad_files() {
     }
     fs::write(&path, b"rBMP").unwrap();
     match open_or_init_meta(&path) {
-        Err(MempoolError::Io { .. }) => {}
+        Err(MempoolError::Corrupt(m)) => assert!(m.contains("mempool meta short"), "{m}"),
         Err(err) => panic!("{err}"),
         Ok(_) => panic!("short meta opened"),
     }

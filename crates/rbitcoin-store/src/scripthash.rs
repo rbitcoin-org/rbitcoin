@@ -15,7 +15,7 @@ use crate::scripthash_layout::{
     SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_INLINE_CAP, SH_MAX_CLASS,
     SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS,
 };
-use crate::scripthash_mphf::{mix_key16, MphfHead};
+use crate::scripthash_mphf::{mix_key16, mphf_path, val_path, MphfHead};
 use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
 use crate::scripthash_pages::{
     sh_page_as_array, sh_page_chunk_ranges, sh_page_decode_slice_into, sh_page_extent,
@@ -45,6 +45,55 @@ pub const COLD_PROGRESS_NAME: &str = "scripthash.cold_progress";
 pub const COLD_PROGRESS_MAGIC: &[u8; 8] = b"SHCOLDP1";
 /// Max create_fk fully present in durable SH (inclusion HWM; crash catch-up).
 pub const INCLUDE_HWM_NAME: &str = "scripthash.include_hwm";
+/// Creates in `(covered, old_hwm]` may name a transaction the cut dropped.
+/// Windowed history checks those foreign keys against Class A.
+pub const SH_RECHECK_NAME: &str = "scripthash.recheck";
+/// Highest create fk whose posting bytes may already be on disk.
+///
+/// Written and synced before the body flush. `include_hwm` still moves only
+/// after that flush, so recovery keeps replaying the appends. `u64::MAX` is
+/// not a count.
+pub const SH_THROUGH_NAME: &str = "scripthash.through";
+
+/// Present while a framing fault still has to be rebuilt from Class A.
+///
+/// `1` asks the next finalize to wipe. A past-end page read and a slab-used
+/// repair write that before any wipe. `2` means this finalize already wiped,
+/// so a crash during the rebuild keeps sealed shards.
+pub const SH_REBUILD_NAME: &str = "scripthash.rebuild";
+
+const SH_REBUILD_WIPE: &[u8] = b"1";
+const SH_REBUILD_RESUME: &[u8] = b"2";
+
+pub fn sh_rebuild_marked(store_dir: &Path) -> bool {
+    store_dir.join(SH_REBUILD_NAME).is_file()
+}
+
+/// The wipe for this marker already finished. Any other contents still wipe.
+pub fn sh_rebuild_resume(store_dir: &Path) -> bool {
+    std::fs::read(store_dir.join(SH_REBUILD_NAME))
+        .ok()
+        .as_deref()
+        == Some(SH_REBUILD_RESUME)
+}
+
+pub fn mark_sh_rebuild(store_dir: &Path) -> Result<(), StoreError> {
+    crate::file::write_synced_tmp_rename(&store_dir.join(SH_REBUILD_NAME), SH_REBUILD_WIPE)
+}
+
+/// Record that the wipe finished. A later fault overwrites this with `1`.
+pub fn mark_sh_rebuild_resume(store_dir: &Path) -> Result<(), StoreError> {
+    crate::file::write_synced_tmp_rename(&store_dir.join(SH_REBUILD_NAME), SH_REBUILD_RESUME)
+}
+
+pub fn clear_sh_rebuild(store_dir: &Path) -> Result<(), StoreError> {
+    let path = store_dir.join(SH_REBUILD_NAME);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StoreError::io(path, e)),
+    }
+}
 
 /// Progress after each fully installed prefix shard (SIGINT resume).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +141,116 @@ impl ColdProgress {
     }
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static REPAIR_RETIRE_HOOK: std::cell::Cell<Option<fn(&ScriptHashTable)>> =
+        const { std::cell::Cell::new(None) };
+    static REPAIR_HEAD_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+fn take_repair_retire_hook() -> Option<fn(&ScriptHashTable)> {
+    REPAIR_RETIRE_HOOK.with(|c| c.take())
+}
+
+/// One-shot hook after a repaired scripthash head is synced and before the
+/// old slab is freed.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_repair_retire_hook_for_test(hook: Option<fn(&ScriptHashTable)>) {
+    REPAIR_RETIRE_HOOK.with(|c| c.set(hook));
+}
+
+/// How many repaired heads this thread has synced before freeing the old slab.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn repair_heads_synced_for_test() -> u64 {
+    REPAIR_HEAD_SYNCS.with(|c| c.get())
+}
+
+#[cfg(debug_assertions)]
+fn note_repair_head_synced() {
+    REPAIR_HEAD_SYNCS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Load the flushed-tail marker (`0` if missing, short, or `u64::MAX`).
+pub fn load_sh_through(store_dir: &Path) -> u64 {
+    let p = store_dir.join(SH_THROUGH_NAME);
+    let Ok(buf) = std::fs::read(&p) else {
+        return 0;
+    };
+    if buf.len() < 8 {
+        return 0;
+    }
+    let n = u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]));
+    if n == u64::MAX {
+        0
+    } else {
+        n
+    }
+}
+
+fn sh_through_lock() -> &'static Mutex<()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    &LOCK
+}
+
+/// Remember a create whose posting bytes may have been synced.
+///
+/// Monotonic. A lower value, zero, and `u64::MAX` do not write. The ordinary
+/// append path passes `u64::MAX` and must not poison this file. The lock
+/// covers the load and the rename: the tail backfill and write-behind share
+/// `scripthash.through.tmp`.
+pub fn note_sh_through(store_dir: &Path, max_create_fk: u64) -> Result<(), StoreError> {
+    if max_create_fk == 0 || max_create_fk == u64::MAX {
+        return Ok(());
+    }
+    let _guard = sh_through_lock().lock().unwrap();
+    if max_create_fk <= load_sh_through(store_dir) {
+        return Ok(());
+    }
+    #[cfg(debug_assertions)]
+    fire_before_through_rename();
+    crate::file::write_synced_tmp_rename(
+        &store_dir.join(SH_THROUGH_NAME),
+        &max_create_fk.to_le_bytes(),
+    )
+}
+
+#[cfg(debug_assertions)]
+fn before_through_rename() -> &'static Mutex<Option<fn()>> {
+    static HOOK: Mutex<Option<fn()>> = Mutex::new(None);
+    &HOOK
+}
+
+#[cfg(debug_assertions)]
+fn fire_before_through_rename() {
+    let hook = before_through_rename().lock().unwrap().take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// One-shot hook after the monotonic check and before the rename.
+///
+/// Process-wide: the two notes under test run on different threads.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_before_through_rename_for_test(hook: Option<fn()>) {
+    *before_through_rename().lock().unwrap() = hook;
+}
+
+/// Drop the flushed-tail marker. A full rebuild has no old posting to name.
+pub fn clear_sh_through(dir: &Path) -> Result<(), StoreError> {
+    let _guard = sh_through_lock().lock().unwrap();
+    let path = dir.join(SH_THROUGH_NAME);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StoreError::io(path, e)),
+    }
+}
+
 /// Load durable inclusion HWM (`0` if missing/corrupt).
 pub fn load_include_hwm(store_dir: &Path) -> u64 {
     let p = store_dir.join(INCLUDE_HWM_NAME);
@@ -104,6 +263,135 @@ pub fn load_include_hwm(store_dir: &Path) -> u64 {
     let mut word = [0u8; 8];
     word.copy_from_slice(&buf[..8]);
     u64::from_le_bytes(word)
+}
+
+/// Replace the inclusion HWM, including with a lower value.
+///
+/// The hot path stays [`store_include_hwm`], which never decreases. Recovery
+/// uses this when the covered prefix is shorter than the mark already on disk.
+pub fn replace_include_hwm(store_dir: &Path, max_create_fk: u64) -> Result<(), StoreError> {
+    if max_create_fk == 0 {
+        return Ok(());
+    }
+    let p = store_dir.join(INCLUDE_HWM_NAME);
+    crate::file::write_synced_tmp_rename(&p, &max_create_fk.to_le_bytes())
+}
+
+type ShRecheckMap = HashMap<PathBuf, Vec<(u64, u64)>>;
+
+fn recheck_cache() -> &'static Mutex<ShRecheckMap> {
+    static CACHE: std::sync::OnceLock<Mutex<ShRecheckMap>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn read_sh_recheck(dir: &Path) -> Result<Vec<(u64, u64)>, StoreError> {
+    let path = dir.join(SH_RECHECK_NAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(StoreError::io(&path, e)),
+    };
+    if bytes.is_empty() || bytes.len() % 16 != 0 {
+        return Err(StoreError::Corrupt("scripthash.recheck"));
+    }
+    let mut spans = Vec::with_capacity(bytes.len() / 16);
+    let mut prev_end = 0u64;
+    for chunk in bytes.chunks_exact(16) {
+        let covered = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let old_hwm = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+        if covered >= old_hwm || covered < prev_end {
+            return Err(StoreError::Corrupt("scripthash.recheck"));
+        }
+        prev_end = old_hwm;
+        spans.push((covered, old_hwm));
+    }
+    Ok(spans)
+}
+
+fn write_sh_recheck(dir: &Path, spans: &[(u64, u64)]) -> Result<(), StoreError> {
+    let mut bytes = Vec::with_capacity(spans.len() * 16);
+    for &(covered, old_hwm) in spans {
+        bytes.extend_from_slice(&covered.to_le_bytes());
+        bytes.extend_from_slice(&old_hwm.to_le_bytes());
+    }
+    crate::file::write_synced_tmp_rename(&dir.join(SH_RECHECK_NAME), &bytes)?;
+    recheck_cache()
+        .lock()
+        .unwrap()
+        .insert(dir.to_path_buf(), spans.to_vec());
+    Ok(())
+}
+
+/// Overlap and a shared endpoint become one span. A gap stays two spans.
+fn merge_sh_recheck(spans: &mut Vec<(u64, u64)>, covered: u64, old_hwm: u64) {
+    spans.push((covered, old_hwm));
+    spans.sort_by_key(|span| (span.0, span.1));
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+    for (covered, old_hwm) in spans.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            if covered <= last.1 {
+                last.1 = last.1.max(old_hwm);
+                continue;
+            }
+        }
+        merged.push((covered, old_hwm));
+    }
+    *spans = merged;
+}
+
+/// Spans of create numbers a lost tail may have left on a scripthash row.
+///
+/// Missing file means there is nothing to recheck. The result is cached for
+/// this process so a history lookup does not stat the file every time.
+pub fn sh_recheck_spans(dir: &Path) -> Result<Vec<(u64, u64)>, StoreError> {
+    {
+        let cache = recheck_cache().lock().unwrap();
+        if let Some(hit) = cache.get(dir) {
+            return Ok(hit.clone());
+        }
+    }
+    let spans = read_sh_recheck(dir)?;
+    recheck_cache()
+        .lock()
+        .unwrap()
+        .insert(dir.to_path_buf(), spans.clone());
+    Ok(spans)
+}
+
+/// Remember that creates in `(covered, old_hwm]` were indexed and then cut.
+///
+/// A later call merges only when the new span overlaps or touches an older
+/// one. A gap stays its own span. The hot path does not write this file.
+pub fn note_sh_recheck(dir: &Path, covered: u64, old_hwm: u64) -> Result<(), StoreError> {
+    if old_hwm <= covered {
+        return Ok(());
+    }
+    let mut spans = read_sh_recheck(dir)?;
+    merge_sh_recheck(&mut spans, covered, old_hwm);
+    write_sh_recheck(dir, &spans)
+}
+
+/// Drop the recheck file. A full rebuild has no stale rows left to check.
+pub fn clear_sh_recheck(dir: &Path) -> Result<(), StoreError> {
+    let path = dir.join(SH_RECHECK_NAME);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(StoreError::io(&path, e)),
+    }
+    recheck_cache()
+        .lock()
+        .unwrap()
+        .insert(dir.to_path_buf(), Vec::new());
+    Ok(())
+}
+
+fn apply_live_delta(alloc: &mut AllocState, delta: i64) {
+    if delta >= 0 {
+        alloc.live_count = alloc.live_count.saturating_add(delta as u64);
+    } else {
+        alloc.live_count = alloc.live_count.saturating_sub(delta.unsigned_abs());
+    }
 }
 
 /// Store durable inclusion HWM (monotonic: never decreases).
@@ -491,6 +779,55 @@ pub fn migrate_legacy_pack_marks(
     Ok(())
 }
 
+/// Remove pass-1 `.mphf` and `.val` from shards that have no pack mark.
+///
+/// The next open marks every shard that still has a map once the unsorted
+/// directory no longer shows an extract. A pass-1 word of 0 reads as an
+/// empty script. A packed shard keeps its files. The head directory is
+/// synced before this returns so the removal survives a crash.
+pub fn unlink_unpacked_shard_maps(store_dir: &Path) -> Result<(), StoreError> {
+    let head = store_dir.join("scripthash.head");
+    let (bases, sync_dir) = if head.is_file() {
+        (vec![head], store_dir.to_path_buf())
+    } else if head.is_dir() {
+        let mut names = std::collections::BTreeSet::new();
+        for ent in std::fs::read_dir(&head).map_err(|e| StoreError::io(&head, e))? {
+            let ent = ent.map_err(|e| StoreError::io(&head, e))?;
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            let stem = name
+                .strip_suffix(".mphf")
+                .or_else(|| name.strip_suffix(".val"))
+                .or_else(|| name.strip_suffix(".packed"))
+                .unwrap_or(name.as_ref());
+            if stem.len() == 2 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
+                names.insert(stem.to_string());
+            }
+        }
+        let bases = names.into_iter().map(|stem| head.join(stem)).collect();
+        (bases, head)
+    } else {
+        return Ok(());
+    };
+    let mut removed = false;
+    for base in bases {
+        if shard_pack_mark_path(&base).is_file() {
+            continue;
+        }
+        for path in [mphf_path(&base), val_path(&base)] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StoreError::io(&path, e)),
+            }
+        }
+    }
+    if removed {
+        crate::file::fsync_parent_dir(&sync_dir).map_err(|e| StoreError::io(&sync_dir, e))?;
+    }
+    Ok(())
+}
+
 #[doc(hidden)]
 pub fn open_sorted_main_shards(
     dir: &Path,
@@ -681,6 +1018,20 @@ pub fn paged_first_from_last(body: &TableFile, last_page: u64) -> Result<u64, St
     sh_page_first_off(page)
 }
 
+fn note_sh_framing_near(body: &TableFile) {
+    let path = body.path();
+    let store = if path.file_name().and_then(|s| s.to_str()) == Some("scripthash.body") {
+        path.parent().map(|p| p.to_path_buf())
+    } else {
+        path.parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+    };
+    if let Some(store) = store {
+        let _ = mark_sh_rebuild(&store);
+    }
+}
+
 /// Cap on a contiguous megakey span pread (64 MiB ≈ 16k pages).
 #[doc(hidden)]
 pub const SH_PAGE_SPAN_MAX: u64 = 64 * 1024 * 1024;
@@ -690,13 +1041,14 @@ pub fn read_sh_page_bytes(body: &TableFile, off: u64, buf: &mut [u8]) -> Result<
     if buf.is_empty() {
         return Ok(());
     }
+    let end = off.saturating_add(buf.len() as u64);
+    if end > body.logical_len() {
+        note_sh_framing_near(body);
+        return Err(StoreError::Corrupt("pread past logical end"));
+    }
     match crate::io_backend::read_io_backend() {
         ReadIoBackend::Pread => body.pread_at(off, buf),
         ReadIoBackend::Uring => {
-            let end = off.saturating_add(buf.len() as u64);
-            if end > body.logical_len() {
-                return Err(StoreError::Corrupt("pread past logical end"));
-            }
             use crate::bulk_io::{self, ReadOp};
             let fd = body.read_fd();
             let mut ops = [ReadOp {
@@ -928,7 +1280,16 @@ impl ScriptHashTable {
     }
 
     pub fn create_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
-        let n_shards = sh_main_shard_count(scale).max(1);
+        Self::create_with_n_shards(dir, sh_main_shard_count(scale), scale)
+    }
+
+    #[doc(hidden)]
+    pub fn create_with_n_shards(
+        dir: &std::path::Path,
+        n_shards: usize,
+        scale: HeadScale,
+    ) -> Result<Self, StoreError> {
+        let n_shards = n_shards.max(1);
         let body_dir = sh_body_path(dir);
         std::fs::create_dir_all(&body_dir).map_err(|e| StoreError::io(&body_dir, e))?;
         let mut bodies = Vec::with_capacity(n_shards);
@@ -977,7 +1338,11 @@ impl ScriptHashTable {
     }
 
     pub fn open_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
-        let expected = sh_main_shard_count(scale);
+        let expected = if sh_body_path(dir).is_dir() {
+            sharded_body_n_shards(dir)?
+        } else {
+            sh_main_shard_count(scale)
+        };
         discard_incomplete_scripthash_head(dir, expected)?;
         discard_leftover_oa_overflow(dir)?;
         let layout = detect_sh_body_layout(dir)?;
@@ -1192,6 +1557,25 @@ pub fn unlink_scripthash_run_leftovers(store_dir: &Path) -> Result<(), StoreErro
     Ok(())
 }
 
+struct PostedKey {
+    value: ShHeadValue,
+    home: KeyHome,
+    written: usize,
+    repaired: Option<(ShHeadValue, i64)>,
+}
+
+struct SeededHeads {
+    values: HashMap<[u8; 32], ShHeadValue>,
+    home: HashMap<[u8; 32], KeyHome>,
+}
+
+struct RetiredPosting {
+    key: [u8; 32],
+    home: KeyHome,
+    previous: ShHeadValue,
+    live_delta: i64,
+}
+
 impl ScriptHashTable {
     pub fn entry_count(&self) -> u64 {
         let mut n = 0u64;
@@ -1232,8 +1616,10 @@ impl ScriptHashTable {
     ///
     /// Used when runs/`*.run.mat` still hold the complete create set after a
     /// partial/crashed bulk load. Resets body alloc in place and unlinks
-    /// `.packed` so the emptied head is not pack-complete. MPHF files stay
-    /// until the next seal overwrites them. Exclusive: no concurrent SH readers/writers.
+    /// `.packed` so the emptied head is not pack-complete. Main MPHF files
+    /// stay until the next seal overwrites them. Sealed overflow heads are
+    /// dropped: their words point into the overflow body this reset truncates.
+    /// Exclusive: no concurrent SH readers/writers.
     ///
     /// Must run whenever claims are about to cold-load, not only when
     /// `entry_count > 0`: crash mid-finish can leave head shards occupied while
@@ -1252,6 +1638,54 @@ impl ScriptHashTable {
         for i in 0..n {
             unlink_shard_pack_mark(&sorted_main_shard_path(&self.store_dir, i, n));
         }
+        self.drop_overflow_heads()?;
+        Ok(())
+    }
+
+    /// Drop sealed overflow heads and start ingest empty.
+    ///
+    /// The overflow body was just truncated. Leaving L0 or L1 loaded keeps
+    /// slab and extent words that `locate_head` serves before main. The next
+    /// append then fails in `read_slab`, and a later ingest slab at the same
+    /// offset returns another key's creates.
+    fn drop_overflow_heads(&self) -> Result<(), StoreError> {
+        drop(std::mem::take(&mut *self.sealed_ovf.lock().unwrap()));
+        *self.ovf_l1.lock().unwrap() = None;
+        let ovf = self.store_dir.join("scripthash.ovf");
+        match std::fs::read_dir(&ovf) {
+            Ok(rd) => {
+                for ent in rd {
+                    let ent = ent.map_err(|e| StoreError::io(&ovf, e))?;
+                    let name = ent.file_name();
+                    let name = name.to_string_lossy();
+                    let stem = name.split('.').next().unwrap_or("");
+                    if six_digit_name(stem).is_none() {
+                        continue;
+                    }
+                    let path = ent.path();
+                    if path.is_file() {
+                        std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StoreError::io(&ovf, e)),
+        }
+        let ingest = ingest_path(&self.store_dir);
+        if ingest.is_file() {
+            std::fs::remove_file(&ingest).map_err(|e| StoreError::io(&ingest, e))?;
+        }
+        let mut occ = ingest.as_os_str().to_os_string();
+        occ.push(".occ");
+        let occ = PathBuf::from(occ);
+        if occ.is_file() {
+            std::fs::remove_file(&occ).map_err(|e| StoreError::io(&occ, e))?;
+        }
+        *self.ingest.lock().unwrap() =
+            ScriptHashHead::create_with_slots(ingest, ingest_oa_slots(self.scale))?;
+        // The resume byte syncs `store/`, not this directory. Without this
+        // sync a crash can restore the old heads into the reset body.
+        crate::file::fsync_parent_dir(&ovf).map_err(|e| StoreError::io(&ovf, e))?;
         Ok(())
     }
 
@@ -1297,6 +1731,11 @@ impl ScriptHashTable {
     /// Advance inclusion HWM after successful cold/warm materialize.
     pub fn note_include_hwm(&self, max_create_fk: u64) -> Result<(), StoreError> {
         store_include_hwm(self.store_dir(), max_create_fk)
+    }
+
+    /// Write the inclusion HWM even when `max_create_fk` is below the file.
+    pub fn replace_include_hwm(&self, max_create_fk: u64) -> Result<(), StoreError> {
+        replace_include_hwm(self.store_dir(), max_create_fk)
     }
 
     /// True when every main shard's pack mark is durable.
@@ -1583,7 +2022,8 @@ impl ScriptHashTable {
             }
             ShHeadValue::Extent { last_page } => {
                 let mut page = [0u8; SH_PAGE_SIZE];
-                body.read_at(*last_page, &mut page)?;
+                body.read_at(*last_page, &mut page)
+                    .map_err(|e| self.note_framing_fault(e))?;
                 if sh_page_extent(&page)?.is_none() {
                     return Err(StoreError::Corrupt("scripthash extent last page not ver=2"));
                 }
@@ -1605,6 +2045,18 @@ impl ScriptHashTable {
         &self,
         recs: &[ScriptHashRecord],
     ) -> Result<(usize, AppendTiming), StoreError> {
+        self.put_create_batch_append_through(recs, u64::MAX)
+    }
+
+    /// Like [`Self::put_create_batch_append`]. `live_through` is the create
+    /// count already in Class A. A row whose last fk sits past that count is
+    /// repaired against it. `u64::MAX` leaves every row on the append path.
+    #[doc(hidden)]
+    pub fn put_create_batch_append_through(
+        &self,
+        recs: &[ScriptHashRecord],
+        live_through: u64,
+    ) -> Result<(usize, AppendTiming), StoreError> {
         let mut timing = AppendTiming::default();
         if recs.is_empty() {
             return Ok((0, timing));
@@ -1615,96 +2067,323 @@ impl ScriptHashTable {
         order.sort_by(|&a, &b| recs[a].scripthash.cmp(&recs[b].scripthash));
         timing.sort_ns = t_sort.elapsed().as_nanos() as u64;
 
-        let mut heads: HashMap<[u8; 32], ShHeadValue> = HashMap::new();
-        let mut home: HashMap<[u8; 32], KeyHome> = HashMap::new();
-
         let t_seed = std::time::Instant::now();
-        // Cold body (no prior creates): skip N head gets — empty table probes.
-        if self.entry_count() > 0 || !self.head_is_empty() {
-            let mut keys: Vec<[u8; 32]> = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for &i in &order {
-                let rec = &recs[i];
-                if rec.create_tx_fk.is_null() {
-                    continue;
-                }
-                if seen.insert(rec.scripthash) {
-                    keys.push(rec.scripthash);
-                }
-            }
-            keys.sort_unstable();
-            for key in keys {
-                if let Some((v, kh)) = self.locate_head(&key)? {
-                    heads.insert(key, v);
-                    home.insert(key, KeyHome::from(kh));
-                } else {
-                    home.insert(key, KeyHome::Absent);
-                }
-            }
-        }
+        let seeded = self.seed_batch_heads(recs, &order)?;
         timing.seed_ns = t_seed.elapsed().as_nanos() as u64;
 
         let t_body = std::time::Instant::now();
         let mut head_final: Vec<([u8; 32], ShHeadValue, KeyHome)> = Vec::new();
+        let mut retire: Vec<RetiredPosting> = Vec::new();
         let mut written = 0usize;
 
         let mut i = 0usize;
         while i < order.len() {
-            let rec0 = &recs[order[i]];
-            if rec0.create_tx_fk.is_null() {
-                i += 1;
+            let Some((key, fk_vals)) = Self::take_key_fks(recs, &order, &mut i) else {
                 continue;
-            }
-            let key = rec0.scripthash;
-            let mut fk_vals: Vec<u64> = Vec::new();
-            while i < order.len() {
-                let rec = &recs[order[i]];
-                if rec.scripthash != key {
-                    break;
-                }
-                if !rec.create_tx_fk.is_null() {
-                    fk_vals.push(rec.create_tx_fk.0);
-                }
-                i += 1;
-            }
-            if fk_vals.is_empty() {
+            };
+            let Some(posted) = self.post_sorted_key(key, fk_vals, &seeded, live_through)? else {
                 continue;
+            };
+            written += posted.written;
+            head_final.push((key, posted.value, posted.home));
+            if let Some((previous, live_delta)) = posted.repaired {
+                retire.push(RetiredPosting {
+                    key,
+                    home: posted.home,
+                    previous,
+                    live_delta,
+                });
             }
-            fk_vals.sort_unstable();
-            fk_vals.dedup();
-
-            let cur = heads.get(&key).cloned().unwrap_or(ShHeadValue::Empty);
-            let kh_early = home.get(&key).copied().unwrap_or(KeyHome::Absent);
-            let max = self.last_create_fk_on(self.body_for(&key, kh_early), &cur)?;
-            let max_u = max.map(|f| f.0).unwrap_or(0);
-            let add: Vec<Fk> = fk_vals
-                .into_iter()
-                .filter(|&fk| max.is_none() || fk > max_u)
-                .map(Fk)
-                .collect();
-            if add.is_empty() {
-                continue;
-            }
-            written += add.len();
-            let kh = home.get(&key).copied().unwrap_or(KeyHome::Absent);
-            let body = self.body_for(&key, kh);
-            let alloc_mu = self.alloc_for(&key, kh);
-            let mut alloc = alloc_mu.lock().unwrap();
-            let new_val = self.append_sorted_creates(body, &mut alloc, &cur, &add)?;
-            write_alloc_header(body, &alloc)?;
-            drop(alloc);
-            head_final.push((key, new_val, kh));
         }
 
         timing.body_ns = t_body.elapsed().as_nanos() as u64;
 
+        // The repaired bytes are synced next. Name the live count first so a
+        // crash during that sync still rechecks those rows. `u64::MAX` is the
+        // ordinary append and is not a create count.
+        if !retire.is_empty() && live_through != u64::MAX {
+            note_sh_through(self.store_dir(), live_through)?;
+        }
+        self.sync_repaired_bodies(&retire)?;
         if !head_final.is_empty() {
             let t_head = std::time::Instant::now();
             let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
             self.apply_head_upserts(&head_final, flush_each)?;
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }
+        self.free_repaired_rows(retire)?;
         Ok((written, timing))
+    }
+
+    fn take_key_fks(
+        recs: &[ScriptHashRecord],
+        order: &[usize],
+        i: &mut usize,
+    ) -> Option<([u8; 32], Vec<u64>)> {
+        let rec0 = &recs[order[*i]];
+        if rec0.create_tx_fk.is_null() {
+            *i += 1;
+            return None;
+        }
+        let key = rec0.scripthash;
+        let mut fk_vals = Vec::new();
+        while *i < order.len() {
+            let rec = &recs[order[*i]];
+            if rec.scripthash != key {
+                break;
+            }
+            if !rec.create_tx_fk.is_null() {
+                fk_vals.push(rec.create_tx_fk.0);
+            }
+            *i += 1;
+        }
+        if fk_vals.is_empty() {
+            None
+        } else {
+            Some((key, fk_vals))
+        }
+    }
+
+    /// Cold body (no prior creates): skip N head gets — empty table probes.
+    fn seed_batch_heads(
+        &self,
+        recs: &[ScriptHashRecord],
+        order: &[usize],
+    ) -> Result<SeededHeads, StoreError> {
+        let mut values = HashMap::new();
+        let mut home = HashMap::new();
+        if self.entry_count() == 0 && self.head_is_empty() {
+            return Ok(SeededHeads { values, home });
+        }
+        let mut keys: Vec<[u8; 32]> = Vec::new();
+        let mut seen = HashSet::new();
+        for &i in order {
+            let rec = &recs[i];
+            if rec.create_tx_fk.is_null() {
+                continue;
+            }
+            if seen.insert(rec.scripthash) {
+                keys.push(rec.scripthash);
+            }
+        }
+        keys.sort_unstable();
+        for key in keys {
+            if let Some((v, kh)) = self.locate_head(&key)? {
+                values.insert(key, v);
+                home.insert(key, KeyHome::from(kh));
+            } else {
+                home.insert(key, KeyHome::Absent);
+            }
+        }
+        Ok(SeededHeads { values, home })
+    }
+
+    /// A stored end past `live_through` would skip every later fk at or below
+    /// that end. Once the live count has passed the end, a create at or below
+    /// it is skipped the same way. Both cases rebuild the row.
+    fn batch_meets_stale_end(max: Option<Fk>, fk_vals: &[u64], live_through: u64) -> bool {
+        let Some(max) = max else {
+            return false;
+        };
+        if max.0 > live_through {
+            return true;
+        }
+        fk_vals
+            .iter()
+            .any(|&fk| fk > 0 && fk <= max.0 && fk <= live_through)
+    }
+
+    fn post_sorted_key(
+        &self,
+        key: [u8; 32],
+        mut fk_vals: Vec<u64>,
+        seeded: &SeededHeads,
+        live_through: u64,
+    ) -> Result<Option<PostedKey>, StoreError> {
+        fk_vals.sort_unstable();
+        fk_vals.dedup();
+        let cur = seeded
+            .values
+            .get(&key)
+            .cloned()
+            .unwrap_or(ShHeadValue::Empty);
+        let kh = seeded.home.get(&key).copied().unwrap_or(KeyHome::Absent);
+        let body = self.body_for(&key, kh);
+        let max = self.last_create_fk_on(body, &cur)?;
+        let max_u = max.map(|f| f.0).unwrap_or(0);
+        if Self::batch_meets_stale_end(max, &fk_vals, live_through) {
+            let Some((new_val, n_new, live_delta)) =
+                self.repair_posting_through(&key, kh, &cur, &fk_vals, live_through)?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(PostedKey {
+                value: new_val,
+                home: kh,
+                written: n_new,
+                repaired: Some((cur, live_delta)),
+            }));
+        }
+        let add: Vec<Fk> = fk_vals
+            .into_iter()
+            .filter(|&fk| fk <= live_through && (max.is_none() || fk > max_u))
+            .map(Fk)
+            .collect();
+        if add.is_empty() {
+            return Ok(None);
+        }
+        let alloc_mu = self.alloc_for(&key, kh);
+        let mut alloc = alloc_mu.lock().unwrap();
+        let new_val = self.append_sorted_creates(body, &mut alloc, &cur, &add)?;
+        write_alloc_header(body, &alloc)?;
+        Ok(Some(PostedKey {
+            value: new_val,
+            home: kh,
+            written: add.len(),
+            repaired: None,
+        }))
+    }
+
+    fn sync_repaired_bodies(&self, retire: &[RetiredPosting]) -> Result<(), StoreError> {
+        let mut seen: Vec<std::path::PathBuf> = Vec::new();
+        for row in retire {
+            let path = self.body_for(&row.key, row.home).path().to_path_buf();
+            if seen.iter().any(|got| got == &path) {
+                continue;
+            }
+            self.body_for(&row.key, row.home).sync_data_only()?;
+            seen.push(path);
+        }
+        Ok(())
+    }
+
+    /// One flush per home. A sealed overflow home rewrites every L0 file and
+    /// L1, so a row-by-row sync flushes those files once per key.
+    fn sync_repaired_homes(&self, retire: &[RetiredPosting]) -> Result<(), StoreError> {
+        let mut mains: Vec<usize> = Vec::new();
+        let mut ingest = false;
+        let mut ovf = false;
+        for row in retire {
+            match row.home {
+                KeyHome::Main => {
+                    let si = self.shard_index(&row.key);
+                    if !mains.contains(&si) {
+                        mains.push(si);
+                    }
+                    ingest = true;
+                }
+                KeyHome::Ingest => ingest = true,
+                KeyHome::SealedOvf => ovf = true,
+                KeyHome::Absent => {}
+            }
+        }
+        for si in mains {
+            if let Some(slot) = self.sorted_main.get(si) {
+                if let Some(h) = slot.read().unwrap().as_ref() {
+                    h.flush()?;
+                }
+            }
+            #[cfg(debug_assertions)]
+            note_repair_head_synced();
+        }
+        if ingest {
+            self.ingest.lock().unwrap().flush()?;
+            #[cfg(debug_assertions)]
+            note_repair_head_synced();
+        }
+        if ovf {
+            for h in self.sealed_ovf.lock().unwrap().iter() {
+                h.flush()?;
+            }
+            if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+                l1.head.flush()?;
+            }
+            #[cfg(debug_assertions)]
+            note_repair_head_synced();
+        }
+        Ok(())
+    }
+
+    fn free_repaired_rows(&self, retire: Vec<RetiredPosting>) -> Result<(), StoreError> {
+        self.sync_repaired_homes(&retire)?;
+        #[cfg(debug_assertions)]
+        if !retire.is_empty() {
+            if let Some(hook) = take_repair_retire_hook() {
+                hook(self);
+            }
+        }
+        for row in retire {
+            let body = self.body_for(&row.key, row.home);
+            let alloc_mu = self.alloc_for(&row.key, row.home);
+            let mut alloc = alloc_mu.lock().unwrap();
+            apply_live_delta(&mut alloc, row.live_delta);
+            self.free_if_paged(body, &mut alloc, &row.previous)?;
+            write_alloc_header(body, &alloc)?;
+        }
+        Ok(())
+    }
+
+    /// Keep creates at or below `live_through`, merge `fk_vals` in that same
+    /// range, and pack the list again. A new fk can sit below one we kept,
+    /// so this is not an append. `live_count` stays unchanged until the caller
+    /// has synced the new head: subtracting first makes the next repair
+    /// subtract the same tail again.
+    fn repair_posting_through(
+        &self,
+        key: &[u8; 32],
+        kh: KeyHome,
+        cur: &ShHeadValue,
+        fk_vals: &[u64],
+        live_through: u64,
+    ) -> Result<Option<(ShHeadValue, usize, i64)>, StoreError> {
+        let body = self.body_for(key, kh);
+        let old = match self.collect_entries_from(body, cur) {
+            Ok(old) => old,
+            Err(StoreError::Corrupt(Self::SLAB_USED_MISMATCH)) => {
+                let _ = mark_sh_rebuild(&self.store_dir);
+                return Err(StoreError::Corrupt(Self::SLAB_USED_MISMATCH));
+            }
+            Err(e) => return Err(e),
+        };
+        let old_len = old.len();
+        let mut live = Vec::with_capacity(old_len.saturating_add(fk_vals.len()));
+        for fk in &old {
+            if fk.0 <= live_through {
+                live.push(*fk);
+            }
+        }
+        for &fk in fk_vals {
+            if fk > 0 && fk <= live_through {
+                live.push(Fk(fk));
+            }
+        }
+        live.sort_unstable_by_key(|f| f.0);
+        live.dedup();
+        if live.len() == old_len && live.iter().eq(old.iter()) {
+            return Ok(None);
+        }
+        let mut already = HashSet::with_capacity(old_len);
+        for fk in &old {
+            already.insert(fk.0);
+        }
+        let n_new = live.iter().filter(|fk| !already.contains(&fk.0)).count();
+        let alloc_mu = self.alloc_for(key, kh);
+        let mut alloc = alloc_mu.lock().unwrap();
+        let saved = *alloc;
+        let new_val = match self.rewrite_entries_for_key(body, &mut alloc, &live) {
+            Ok(v) => v,
+            Err(e) => {
+                *alloc = saved;
+                return Err(e);
+            }
+        };
+        if let Err(e) = write_alloc_header(body, &alloc) {
+            *alloc = saved;
+            let _ = write_alloc_header(body, &alloc);
+            return Err(e);
+        }
+        let live_delta = (live.len() as i64).saturating_sub(old_len as i64);
+        Ok(Some((new_val, n_new, live_delta)))
     }
 
     /// Route head upserts without get-then-insert:
@@ -2007,6 +2686,8 @@ impl ScriptHashTable {
     /// ≈1M create rows: materialize flushes each head shard after its bucket.
     pub const LARGE_BATCH_ROWS: u64 = 1_000_000;
 
+    const SLAB_USED_MISMATCH: &str = "invariant: scripthash slab used != decoded fk count";
+
     #[doc(hidden)]
     pub fn collect_entries_from(
         &self,
@@ -2019,9 +2700,11 @@ impl ScriptHashTable {
             ShHeadValue::Slab { class, off, used } => {
                 let got = self.read_slab(body, *class, *off)?;
                 if got.len() != *used as usize {
-                    return Err(StoreError::Corrupt(
-                        "invariant: scripthash slab used != decoded fk count",
-                    ));
+                    // A history read can hold the head from before an in-place
+                    // append. That mismatch is transient. Scheduling a rebuild
+                    // here would rescan Class A on the next start. Repair marks
+                    // the file when it sees this error.
+                    return Err(StoreError::Corrupt(Self::SLAB_USED_MISMATCH));
                 }
                 Ok(got)
             }
@@ -2198,10 +2881,21 @@ impl ScriptHashTable {
             return Err(StoreError::Corrupt("scripthash slab class overflow"));
         }
         let buf = &mut stack[..need];
-        body.read_at(off, buf)?;
+        body.read_at(off, buf)
+            .map_err(|e| self.note_framing_fault(e))?;
         let mut out = Vec::new();
         decode_slab_payload_into(buf, &mut out)?;
         Ok(out)
+    }
+
+    /// A read past the published end is the same framing fault as a torn
+    /// page. The wipe byte makes the next open rebuild instead of dying on
+    /// the same offset. A resume byte is overwritten: this read is a new fault.
+    fn note_framing_fault(&self, err: StoreError) -> StoreError {
+        if matches!(err, StoreError::Corrupt("pread past logical end")) {
+            let _ = mark_sh_rebuild(&self.store_dir);
+        }
+        err
     }
 
     #[doc(hidden)]
@@ -2541,6 +3235,36 @@ impl ScriptHashTable {
     /// Number of SH head shards (1 on Tiny, 64 on mainnet).
     pub fn head_shard_count(&self) -> usize {
         self.n_shards
+    }
+
+    /// One alloc-header bump compared with that body file's length.
+    ///
+    /// A bump past the file is a torn body. This does not read slab records.
+    /// The overflow body has its own header. A torn bump there is the same
+    /// fault as a torn main shard.
+    pub fn shard_offset_past_file(&self) -> Result<bool, StoreError> {
+        for body in &self.bodies {
+            if Self::alloc_bump_past_file(body)? {
+                return Ok(true);
+            }
+        }
+        if let Some(ovf) = &self.ovf_body {
+            if Self::alloc_bump_past_file(ovf)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn alloc_bump_past_file(body: &TableFile) -> Result<bool, StoreError> {
+        if body.logical_len() < FILE_HEADER_LEN as u64 + 24 {
+            return Ok(false);
+        }
+        match read_alloc_header(body) {
+            Ok((state, _)) => Ok(state.bump > body.logical_len()),
+            Err(StoreError::Corrupt(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Current body bump (complete-shard HWM). Shared file: the one bump.

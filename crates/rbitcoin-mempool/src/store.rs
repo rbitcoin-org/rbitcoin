@@ -939,14 +939,16 @@ impl Mempool {
         let meta_path = self.dir.join("meta");
         let mut meta = [0u8; META_LEN];
         write_meta_bytes(&mut meta, self.generation, self.slot_cap, self.live_count);
-        self.meta_file
-            .seek(SeekFrom::Start(0))
-            .map_err(|e| MempoolError::io(&meta_path, e))?;
-        self.meta_file
-            .write_all(&meta)
-            .map_err(|e| MempoolError::io(&meta_path, e))?;
-        self.meta_file
-            .sync_data()
+        rbitcoin_store::file::write_synced_tmp_rename(&meta_path, &meta).map_err(|e| match e {
+            rbitcoin_store::error::StoreError::Io { path, source } => {
+                MempoolError::io(path, source)
+            }
+            other => MempoolError::io(&meta_path, std::io::Error::other(other.to_string())),
+        })?;
+        self.meta_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&meta_path)
             .map_err(|e| MempoolError::io(&meta_path, e))?;
         #[cfg(debug_assertions)]
         {
@@ -1120,6 +1122,12 @@ pub fn accepted_schema(schema: u16) -> Result<u16, MempoolError> {
 #[doc(hidden)]
 pub fn open_or_init_meta(path: &Path) -> Result<(File, u64, u32, u32, u16), MempoolError> {
     if path.exists() {
+        let meta_len = std::fs::metadata(path)
+            .map_err(|e| MempoolError::io(path, e))?
+            .len();
+        if meta_len < META_LEN as u64 {
+            return Err(MempoolError::Corrupt("mempool meta short"));
+        }
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1140,17 +1148,19 @@ pub fn open_or_init_meta(path: &Path) -> Result<(File, u64, u32, u32, u16), Memp
         }
         Ok((file, generation, slot_cap, live_count, schema))
     } else {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|e| MempoolError::io(path, e))?;
         let mut buf = [0u8; META_LEN];
         write_meta_bytes(&mut buf, 0, DEFAULT_SLOT_CAP, 0);
-        file.write_all(&buf)
+        rbitcoin_store::file::write_synced_tmp_rename(path, &buf).map_err(|e| match e {
+            rbitcoin_store::error::StoreError::Io { path, source } => {
+                MempoolError::io(path, source)
+            }
+            other => MempoolError::io(path, std::io::Error::other(other.to_string())),
+        })?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
             .map_err(|e| MempoolError::io(path, e))?;
-        file.flush().map_err(|e| MempoolError::io(path, e))?;
         Ok((file, 0, DEFAULT_SLOT_CAP, 0, MEM_SCHEMA))
     }
 }

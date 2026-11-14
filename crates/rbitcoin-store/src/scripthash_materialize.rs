@@ -221,8 +221,24 @@ pub fn unsorted_pack_workers() -> usize {
     sh_extract_workers()
 }
 
-pub fn clear_unsorted_shard_dir(dir: &Path) {
-    let _ = fs::remove_dir_all(dir);
+pub fn clear_unsorted_shard_dir(dir: &Path) -> Result<(), StoreError> {
+    if let Some(store) = dir.parent() {
+        crate::scripthash::unlink_unpacked_shard_maps(store)?;
+    }
+    match fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(StoreError::io(dir, e)),
+    }
+    // Map removal syncs the head directory. This directory's removal is a
+    // dirent in the store directory. A crash before that sync can restore
+    // `DONE` after the maps are gone, and the next collect then skips.
+    if let Some(store) = dir.parent() {
+        if !store.as_os_str().is_empty() {
+            crate::file::fsync_parent_dir(store).map_err(|e| StoreError::io(store, e))?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -249,7 +265,11 @@ pub fn plan_unsorted_collect(
 ) -> UnsortedCollectAction {
     match done_last {
         None => UnsortedCollectAction::Full,
-        Some(d) if d >= class_a_last => UnsortedCollectAction::Skip,
+        // Equal means this collect already scanned the live count.
+        Some(d) if d == class_a_last => UnsortedCollectAction::Skip,
+        // Above the live count is a covered-prefix cut. Skip would pack the
+        // old spills and publish that last as the inclusion watermark.
+        Some(d) if d > class_a_last => UnsortedCollectAction::Full,
         Some(_) if any_sealed_shards => UnsortedCollectAction::Skip,
         Some(_) if !keys_present => UnsortedCollectAction::Full,
         Some(d) => UnsortedCollectAction::Append {
@@ -335,6 +355,183 @@ pub fn read_phase_done(
 
 pub fn unsorted_done_last_fk(dir: &Path, n_shards: usize) -> Option<u64> {
     read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards).map(|d| d.last_fk)
+}
+
+fn unsorted_phase_last(dir: &Path, n_shards: usize) -> Option<u64> {
+    let keys = read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards).map(|d| d.last_fk);
+    let posts = read_phase_done(dir, POST_DONE_NAME, POST_DONE_MAGIC, n_shards).map(|d| d.last_fk);
+    keys.max(posts)
+}
+
+fn phase_last_above_count(dir: &Path, n_shards: usize, covered: u64) -> Option<u64> {
+    unsorted_phase_last(dir, n_shards).filter(|old| *old > covered && *old != u64::MAX)
+}
+
+fn note_phase_above_count(store_dir: &Path, covered: u64, old: u64) -> Result<(), StoreError> {
+    crate::scripthash::note_sh_through(store_dir, old)?;
+    crate::scripthash::note_sh_recheck(store_dir, covered, old)
+}
+
+fn remove_phase_marker(dir: &Path, name: &str) -> Result<(), StoreError> {
+    let path = dir.join(name);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StoreError::io(&path, e)),
+    }
+}
+
+fn drop_phase_markers(dir: &Path, names: &[&str]) -> Result<(), StoreError> {
+    for name in names {
+        remove_phase_marker(dir, name)?;
+    }
+    // A crash before this sync can restore `DONE` once the chain has
+    // grown back to that last, and collect then skips a shard with no map.
+    crate::file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
+    Ok(())
+}
+
+/// Equal `DONE` is a finished pass only when every unsealed shard still has
+/// its map. A missing map packs empty, or fails when a post spill opens it.
+fn plan_collect(
+    table: &ScriptHashTable,
+    done_last: Option<u64>,
+    class_a_last: u64,
+    any_sealed_shards: bool,
+    keys_present: bool,
+) -> UnsortedCollectAction {
+    let action = plan_unsorted_collect(done_last, class_a_last, any_sealed_shards, keys_present);
+    if action != UnsortedCollectAction::Skip {
+        return action;
+    }
+    // The body reset can stick while the old map and an equal `DONE` stay.
+    // Skip would mark that map packed over no rows. Pass-1 sets `live_count`,
+    // so a real extract is not this case.
+    if class_a_last > 0 && table.entry_count() == 0 {
+        return UnsortedCollectAction::Full;
+    }
+    let n = table.head_shard_count().max(1);
+    let missing = table
+        .unsealed_main_shards()
+        .into_iter()
+        .any(|si| !MphfHead::exists(&sorted_main_shard_path(table.store_dir(), si, n)));
+    if missing {
+        UnsortedCollectAction::Full
+    } else {
+        action
+    }
+}
+
+/// A phase marker above the live count names creates this open already
+/// dropped. Record it before the collect clears the spills, and before
+/// the first shard sync, so the next open still has the cut span.
+fn note_unsorted_done_above_count(
+    store: &Store,
+    dir: &Path,
+    n_shards: usize,
+) -> Result<(), StoreError> {
+    let covered = store.txs.count();
+    let Some(old) = phase_last_above_count(dir, n_shards, covered) else {
+        return Ok(());
+    };
+    note_phase_above_count(store.path(), covered, old)
+}
+
+fn phase_marker_last(dir: &Path, name: &str, magic: &[u8; 8], n_shards: usize) -> Option<u64> {
+    read_phase_done(dir, name, magic, n_shards)
+        .map(|d| d.last_fk)
+        .filter(|fk| *fk > 0 && *fk != u64::MAX)
+}
+
+/// Direct mode builds the index after the chain can grow back to the old
+/// marker. Record the cut and drop a marker that is still above the count.
+/// `DONE.keys` inside the count is the packed floor. The posts pass does
+/// not store a script that pass saw once, so dropping it makes the next
+/// floor the cut.
+pub(crate) fn record_unsorted_phase_above_count(
+    store_dir: &Path,
+    n_shards: usize,
+    covered: u64,
+) -> Result<(), StoreError> {
+    let dir = unsorted_shard_dir(store_dir);
+    let keys_last = phase_marker_last(&dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards);
+    let posts_last = phase_marker_last(&dir, POST_DONE_NAME, POST_DONE_MAGIC, n_shards);
+    let keys_above = keys_last.filter(|fk| *fk > covered);
+    let posts_above = posts_last.filter(|fk| *fk > covered);
+    let old = match (keys_above, posts_above) {
+        (None, None) => return Ok(()),
+        (Some(k), None) => k,
+        (None, Some(p)) => p,
+        (Some(k), Some(p)) => k.max(p),
+    };
+    note_phase_above_count(store_dir, covered, old)?;
+    // Keep the keys count and the pass-1 maps. The next collect skips a
+    // sealed shard, and the tail backfill starts at this floor.
+    if keys_last.is_some_and(|fk| fk <= covered) {
+        return drop_phase_markers(&dir, &[POST_DONE_NAME]);
+    }
+    // The pass-1 map must be gone before the keys marker is. A crash after
+    // this open, once keys/ and post/ are gone, would otherwise mark it packed.
+    crate::scripthash::unlink_unpacked_shard_maps(store_dir)?;
+    drop_phase_markers(&dir, &[KEYS_DONE_NAME, POST_DONE_NAME])
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static BEFORE_UNSORTED_PACK: std::cell::Cell<Option<fn(u64)>> = const { std::cell::Cell::new(None) };
+    static BEFORE_KEYS_MERGE: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+fn fire_before_unsorted_pack(store_dir: &Path) {
+    let Some(hook) = BEFORE_UNSORTED_PACK.with(|c| c.take()) else {
+        return;
+    };
+    hook(crate::scripthash::load_sh_through(store_dir));
+}
+
+/// One-shot hook immediately before the first unsorted shard sync.
+/// Tests check that `scripthash.through` already names the collect.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_before_unsorted_pack_for_test(hook: Option<fn(u64)>) {
+    BEFORE_UNSORTED_PACK.with(|c| c.set(hook));
+}
+
+#[cfg(debug_assertions)]
+fn fire_before_keys_merge(dir: &Path) {
+    let Some(hook) = BEFORE_KEYS_MERGE.with(|c| c.take()) else {
+        return;
+    };
+    hook(dir);
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static BEFORE_UNSORTED_CLEAR: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+fn fire_before_unsorted_clear(store_dir: &Path) {
+    let Some(hook) = BEFORE_UNSORTED_CLEAR.with(|c| c.take()) else {
+        return;
+    };
+    hook(store_dir);
+}
+
+/// One-shot hook immediately before a pack-complete head drops `DONE`.
+/// Tests check that `include_hwm` is already durable.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_before_unsorted_clear_for_test(hook: Option<fn(&Path)>) {
+    BEFORE_UNSORTED_CLEAR.with(|c| c.set(hook));
+}
+
+/// One-shot hook after key spills are written and before merge unlinks them.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_before_keys_merge_for_test(hook: Option<fn(&Path)>) {
+    BEFORE_KEYS_MERGE.with(|c| c.set(hook));
 }
 
 #[doc(hidden)]
@@ -1133,6 +1330,22 @@ pub fn finish_key_shard(
     Ok(times)
 }
 
+/// A packed shard already has its map. Sealing again would replace that
+/// file with a pass-1 extract and leave the packed body in place.
+fn merge_key_shard(
+    table: &ScriptHashTable,
+    dir: &Path,
+    shard: usize,
+    n_shards: usize,
+    unsealed: &HashSet<usize>,
+) -> Result<(u64, u64, u64), StoreError> {
+    if !unsealed.contains(&shard) {
+        unlink_keys_shard(dir, shard);
+        return Ok((0, 0, 0));
+    }
+    finish_key_shard(table, dir, shard, n_shards)
+}
+
 #[doc(hidden)]
 pub fn spill_shard_map(
     dir: &Path,
@@ -1249,6 +1462,8 @@ pub fn collect_keys_from_txs(
     let last_status = Mutex::new(t0);
     let spans = worker_fk_spans(first, last, workers);
     let live = rbitcoin_log::progress::begin("scripthash keys collect", span_fks);
+    // A packed shard already has its map. Spills for it are unlinked at merge.
+    let unsealed: HashSet<usize> = table.unsealed_main_shards().into_iter().collect();
     std::thread::scope(|scope| {
         let n_workers = spans.len().max(1);
         rbitcoin_log::info!(
@@ -1264,6 +1479,7 @@ pub fn collect_keys_from_txs(
             let live = &live;
             let err = &err;
             let last_status = &last_status;
+            let unsealed = &unsealed;
             scope.spawn(move || {
                 let mut locals: Vec<Key16PackMap> =
                     (0..n_shards).map(|_| Key16PackMap::default()).collect();
@@ -1282,7 +1498,9 @@ pub fn collect_keys_from_txs(
                     let r = txs.for_each_script_hashes_in_fk_span(lo, hi, |fk, sh| {
                         let si = prefix_shard_of(&sh, n_shards);
                         tally.recs = tally.recs.saturating_add(1);
-                        insert_key_pack(&mut locals[si], head_key_from_full(&sh), fk);
+                        if unsealed.contains(&si) {
+                            insert_key_pack(&mut locals[si], head_key_from_full(&sh), fk);
+                        }
                         Ok(())
                     });
                     flush_collect_tally(&mut tally, recs, None, None);
@@ -1333,6 +1551,8 @@ pub fn collect_keys_from_txs(
         return Err(e);
     }
     drop(live);
+    #[cfg(debug_assertions)]
+    fire_before_keys_merge(dir);
     let merge_workers = workers.max(1).min(n_shards.max(1));
     fs::create_dir_all(dir.join(MULTI_SUBDIR)).map_err(|e| StoreError::io(dir, e))?;
     let live_merge = rbitcoin_log::progress::begin("scripthash keys merge", n_shards as u64);
@@ -1344,7 +1564,7 @@ pub fn collect_keys_from_txs(
     if merge_workers <= 1 {
         for (si, slot) in per_shard.iter().enumerate() {
             check_cancel(cancel, "scripthash keys merge")?;
-            let (n, fold_ns, bdz_ns) = finish_key_shard(table, dir, si, n_shards)?;
+            let (n, fold_ns, bdz_ns) = merge_key_shard(table, dir, si, n_shards, &unsealed)?;
             slot.store(n, Ordering::Relaxed);
             live_merge.add_done(1);
             rbitcoin_log::info!(
@@ -1356,6 +1576,7 @@ pub fn collect_keys_from_txs(
     } else {
         let merge_err = Mutex::new(None::<StoreError>);
         let merge_jobs = Mutex::new(VecDeque::from_iter(0..n_shards));
+        let unsealed = &unsealed;
         std::thread::scope(|scope| {
             for _ in 0..merge_workers {
                 let merge_jobs = &merge_jobs;
@@ -1377,7 +1598,7 @@ pub fn collect_keys_from_txs(
                     let Some(si) = si else {
                         break;
                     };
-                    match finish_key_shard(table, dir, si, n_shards) {
+                    match merge_key_shard(table, dir, si, n_shards, unsealed) {
                         Ok((n, fold_ns, bdz_ns)) => {
                             per_shard[si].store(n, Ordering::Relaxed);
                             live_merge.add_done(1);
@@ -1457,11 +1678,12 @@ pub fn collect_unsorted_covering_txs(
     if leftover_legacy_unsorted(dir)
         && read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards).is_none()
     {
-        clear_unsorted_shard_dir(dir);
+        clear_unsorted_shard_dir(dir)?;
     }
     let done = read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards);
     let keys_present = any_unsorted_keys(dir, n_shards);
-    let action = plan_unsorted_collect(
+    let action = plan_collect(
+        table,
         done.as_ref().map(|d| d.last_fk),
         last,
         any_sealed_shards,
@@ -1478,7 +1700,7 @@ pub fn collect_unsorted_covering_txs(
             })
         }
         UnsortedCollectAction::Full => {
-            clear_unsorted_shard_dir(dir);
+            clear_unsorted_shard_dir(dir)?;
             collect_keys_from_txs(txs, table, dir, 1, last, workers, cancel)
         }
         UnsortedCollectAction::Append { first, last } => {
@@ -1706,6 +1928,8 @@ pub fn collect_posts_from_txs(
     let last_status = Mutex::new(t0);
     let spans = worker_fk_spans(first, last, workers);
     let live = rbitcoin_log::progress::begin("scripthash postings collect", span_fks);
+    // Pack walks unsealed shards only. Post spills for a packed shard are discarded.
+    let unsealed: HashSet<usize> = table.unsealed_main_shards().into_iter().collect();
     std::thread::scope(|scope| {
         let n_workers = spans.len().max(1);
         rbitcoin_log::info!(
@@ -1724,6 +1948,7 @@ pub fn collect_posts_from_txs(
             let per = &per;
             let err = &err;
             let last_status = &last_status;
+            let unsealed = &unsealed;
             scope.spawn(move || {
                 let mut locals: Vec<PostPackMap> =
                     (0..n_shards).map(|_| PostPackMap::default()).collect();
@@ -1742,6 +1967,9 @@ pub fn collect_posts_from_txs(
                     let r = txs.for_each_script_hashes_in_fk_span(lo, hi, |fk, sh| {
                         tally.recs = tally.recs.saturating_add(1);
                         let si = prefix_shard_of(&sh, n_shards);
+                        if !unsealed.contains(&si) {
+                            return Ok(());
+                        }
                         let Some(fuse) = fuses[si].as_ref() else {
                             return Ok(());
                         };
@@ -1827,7 +2055,8 @@ pub fn collect_posts_covering(
     let n_shards = table.head_shard_count().max(1);
     let last = txs.count();
     let done = read_phase_done(dir, POST_DONE_NAME, POST_DONE_MAGIC, n_shards);
-    let action = plan_unsorted_collect(
+    let action = plan_collect(
+        table,
         done.as_ref().map(|d| d.last_fk),
         last,
         any_sealed_shards,
@@ -2132,6 +2361,91 @@ pub fn materialize_sh_from_unsorted(
     Ok(out)
 }
 
+/// A packed shard kept its old map, so this scan did not index the tail
+/// on that shard. The lowest recheck start below `publishing` is the cut.
+/// `0` leaves the watermark unset and the tail backfill starts at create 1.
+fn capped_publish_fk(
+    store_dir: &Path,
+    any_sealed: bool,
+    publishing: u64,
+) -> Result<u64, StoreError> {
+    if !any_sealed || publishing == 0 {
+        return Ok(publishing);
+    }
+    let spans = crate::scripthash::sh_recheck_spans(store_dir)?;
+    Ok(spans
+        .into_iter()
+        .filter(|(covered, _)| *covered < publishing)
+        .map(|(covered, _)| covered)
+        .min()
+        .unwrap_or(publishing))
+}
+
+/// Sync the sealed bodies, then store `publish` as `include_hwm`.
+///
+/// `0` does not move a watermark that is already set. The directory clear
+/// has to follow this, or a crash drops `DONE` and the next finalize scans
+/// from create 1.
+#[doc(hidden)]
+pub fn sync_sealed_inclusion_floor(store: &Store, publish: u64) -> Result<(), StoreError> {
+    store.scripthash.flush()?;
+    if publish > 0 {
+        store.scripthash.note_include_hwm(publish)?;
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn clear_unsorted_after_inclusion_floor(store: &Store) -> Result<(), StoreError> {
+    #[cfg(debug_assertions)]
+    fire_before_unsorted_clear(store.path());
+    let dir = unsorted_shard_dir(store.path());
+    clear_unsorted_shard_dir(&dir)?;
+    ColdProgress::clear(store.path());
+    Ok(())
+}
+
+/// Floor for a pack-complete head whose `include_hwm` is still missing.
+///
+/// `0` leaves a watermark that is already set, and leaves a head whose
+/// `scripthash.through` is still 0. A later through is not a floor: a
+/// backfill can name the new tip before those rows exist. `DONE.keys`
+/// still names the creates the pack stored. A through above that count
+/// is the posts-pass scan end, so the floor stops at the keys count.
+#[doc(hidden)]
+pub fn sealed_resume_publish_fk(store_dir: &Path) -> Result<u64, StoreError> {
+    if crate::scripthash::load_include_hwm(store_dir) > 0 {
+        return Ok(0);
+    }
+    let through = crate::scripthash::load_sh_through(store_dir);
+    if through == 0 {
+        return Ok(0);
+    }
+    let keys_last = keys_done_last(&unsorted_shard_dir(store_dir));
+    let publishing = if keys_last > 0 {
+        through.min(keys_last)
+    } else {
+        through
+    };
+    capped_publish_fk(store_dir, true, publishing)
+}
+
+fn keys_done_last(dir: &Path) -> u64 {
+    let buf = match fs::read(dir.join(KEYS_DONE_NAME)) {
+        Ok(buf) => buf,
+        Err(_) => return 0,
+    };
+    if buf.len() < 12 || &buf[0..8] != KEYS_DONE_MAGIC {
+        return 0;
+    }
+    let mut n_bytes = [0u8; 4];
+    n_bytes.copy_from_slice(&buf[8..12]);
+    let n = le_u32!(n_bytes, 0) as usize;
+    read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n)
+        .map(|d| d.last_fk)
+        .unwrap_or(0)
+}
+
 pub fn materialize_sh_unsorted_from_class_a(
     store: &Store,
     collect_workers: usize,
@@ -2154,8 +2468,9 @@ pub fn materialize_sh_unsorted_from_class_a(
 
     let unsealed = table.unsealed_main_shards();
     if unsealed.is_empty() && (!table.head_is_empty() || table.entry_count() > 0) {
-        clear_unsorted_shard_dir(&dir);
-        ColdProgress::clear(store.path());
+        let publish = sealed_resume_publish_fk(store.path())?;
+        sync_sealed_inclusion_floor(store, publish)?;
+        clear_unsorted_after_inclusion_floor(store)?;
         return Ok(ShShardMaterialize {
             creates: table.entry_count(),
             keys: 0,
@@ -2175,6 +2490,7 @@ pub fn materialize_sh_unsorted_from_class_a(
     }
 
     let any_sealed = unsealed.len() < n_shards;
+    note_unsorted_done_above_count(store, &dir, n_shards)?;
     let collected = collect_unsorted_covering_class_a(
         store,
         &dir,
@@ -2183,6 +2499,12 @@ pub fn materialize_sh_unsorted_from_class_a(
         any_sealed,
         cancel,
     )?;
+    // Keys-pass count, before the first shard sync. A lower note does not
+    // move a cut marker that already names the dropped tail. The posts pass
+    // can sync a later create; that one is named after the pack.
+    if collected.last_fk > 0 {
+        crate::scripthash::note_sh_through(store.path(), collected.last_fk)?;
+    }
     let mut mat = materialize_sh_from_unsorted_from_txs(
         table,
         &store.txs,
@@ -2191,10 +2513,26 @@ pub fn materialize_sh_unsorted_from_class_a(
         pack_workers,
         cancel,
     )?;
-    mat.max_fk = mat.max_fk.max(collected.last_fk);
+    // `DONE.post` names the scan end, which can be past the keys pass and
+    // past `pack.max_fk` when a sealed shard took no new row. Name that
+    // end before the file is removed. It is not the floor: the posts pass
+    // stores a create only when the keys pass already saw that script
+    // more than once.
+    let posts_last = read_phase_done(&dir, POST_DONE_NAME, POST_DONE_MAGIC, n_shards)
+        .map(|d| d.last_fk)
+        .unwrap_or(0);
+    let synced = mat.max_fk.max(collected.last_fk).max(posts_last);
+    if synced > 0 {
+        crate::scripthash::note_sh_through(store.path(), synced)?;
+    }
+    // The floor stays at the keys-pass count. A cut still caps it. The
+    // tail backfill appends creates the posts pass did not store.
+    mat.max_fk = capped_publish_fk(store.path(), any_sealed, collected.last_fk)?;
     if table.unsealed_main_shards().is_empty() {
-        clear_unsorted_shard_dir(&dir);
-        ColdProgress::clear(store.path());
+        // Keys-pass count, capped at a cut. Partial packs leave the
+        // watermark and the directory alone.
+        sync_sealed_inclusion_floor(store, mat.max_fk)?;
+        clear_unsorted_after_inclusion_floor(store)?;
     }
     Ok(mat)
 }
@@ -2208,6 +2546,8 @@ pub fn materialize_sh_from_unsorted_from_txs(
     pack_workers: usize,
     cancel: Option<&AtomicBool>,
 ) -> Result<ShShardMaterialize, StoreError> {
+    #[cfg(debug_assertions)]
+    fire_before_unsorted_pack(table.store_dir());
     let n_shards = table.head_shard_count().max(1);
     seal_mphf_from_keys(table, unsorted_dir, n_shards, cancel)?;
     let any_sealed = table.unsealed_main_shards().len() < n_shards;

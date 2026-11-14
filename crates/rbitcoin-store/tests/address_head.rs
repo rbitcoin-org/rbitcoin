@@ -135,6 +135,33 @@ fn hop_scan_page_spills_past_inline_cap() {
 }
 
 #[test]
+fn insert_fk_into_page_buf_replaces_a_different_fingerprint() {
+    let bits = 16u32;
+    let mut old_key = [0u8; 32];
+    old_key[0] = 0x42;
+    let mut new_key = old_key;
+    new_key[16] = 0x7;
+    assert_ne!(fingerprint(&old_key, bits), fingerprint(&new_key, bits));
+    assert_eq!(h1_in_page(&old_key, bits), h1_in_page(&new_key, bits));
+    let page_slots = page_slot_count(bits);
+    let mut buf = vec![0u8; (page_slots as usize) * ENTRY_BYTES as usize];
+    insert_fk_into_page_buf(&mut buf, bits, &old_key, Fk(2)).unwrap();
+    let again = insert_fk_into_page_buf(&mut buf, bits, &new_key, Fk(2)).unwrap();
+    assert!(again.wrote_new, "a reused fk has to rewrite the slot");
+    let rel_mask = (1u64 << bits) - 1;
+    let stored = (0..page_slots).find_map(|i| {
+        let e = entry_from_page_buf(&buf, i).unwrap_or(0);
+        (e & rel_mask == 2).then_some(e)
+    });
+    let stored = stored.expect("slot still names fk 2");
+    assert_eq!(
+        (stored >> bits) as u32,
+        fingerprint(&new_key, bits),
+        "the old fingerprint hides the replacement"
+    );
+}
+
+#[test]
 fn insert_fk_into_page_buf_empty_idempotent_and_second() {
     let bits = 16u32;
     let mut txid = [0u8; 32];

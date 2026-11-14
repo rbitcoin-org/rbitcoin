@@ -8,8 +8,6 @@ use crate::scripthash::ScriptHashTable;
 use crate::spender_table::SpenderTable;
 use crate::tx_table::{InputRecord, OutputRecord, TxRecord, TxTable};
 use rbitcoin_primitives::{schema_file_openable, Fk, Height, SCHEMA_VERSION, STORE_MAGIC};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Sidecar in the hot `{datadir}/store`. Present when the append-only files live
@@ -41,6 +39,7 @@ pub struct StoreLayout {
     pub head_scale: HeadScale,
     pub tx_head_rebuild_seal_bits: Option<u32>,
     pub tx_head_rebuild_workers: Option<usize>,
+    sh_shards: usize,
 }
 
 impl StoreLayout {
@@ -51,6 +50,7 @@ impl StoreLayout {
             head_scale: HeadScale::Mainnet,
             tx_head_rebuild_seal_bits: None,
             tx_head_rebuild_workers: None,
+            sh_shards: HeadScale::Mainnet.sh_main_shards(),
         }
     }
 
@@ -61,7 +61,15 @@ impl StoreLayout {
             head_scale: HeadScale::Tiny,
             tx_head_rebuild_seal_bits: None,
             tx_head_rebuild_workers: None,
+            sh_shards: HeadScale::Tiny.sh_main_shards(),
         }
+    }
+
+    /// Scripthash shard count for tests. Production layouts keep the scale count.
+    #[doc(hidden)]
+    pub fn with_sh_shards(mut self, n: usize) -> Self {
+        self.sh_shards = n.max(1);
+        self
     }
 
     pub fn with_cold_dir(mut self, cold_dir: impl Into<PathBuf>) -> Self {
@@ -84,9 +92,9 @@ impl StoreLayout {
         crate::hashhead::initial_slots_for(self.head_scale)
     }
 
-    /// SH main shard count for this scale (1 Tiny, 64 Mainnet).
+    /// SH main shard count (1 Tiny, 64 Mainnet, or the test override).
     pub fn sh_shard_count(&self) -> usize {
-        self.head_scale.sh_main_shards()
+        self.sh_shards.max(1)
     }
 
     /// `tx.head` bits for this scale.
@@ -347,6 +355,9 @@ pub struct Store {
     pub utxo_view: crate::sync::atomic::AtomicU64,
     /// One publisher at a time. Overlapping holds would make the stamp look even.
     utxo_publish: std::sync::Mutex<()>,
+    /// Create spans `(covered, old]` a covered-prefix cut dropped.
+    /// A spender fk inside one counts only when its input still names that output.
+    pub spend_recheck: Vec<(u64, u64)>,
     /// Confirm readers wait here while a `--datadir-hdd` write holds the spindle.
     /// Flag off never locks, so [`Self::spindle_wait`] returns immediately.
     pub spindle: Spindle,
@@ -503,7 +514,11 @@ impl Store {
             headers: HeaderTable::create_with_scale(&path, layout.head_scale)?,
             txs,
             spenders: SpenderTable::create(&path)?,
-            scripthash: ScriptHashTable::create_with_scale(&path, layout.head_scale)?,
+            scripthash: ScriptHashTable::create_with_n_shards(
+                &path,
+                layout.sh_shard_count(),
+                layout.head_scale,
+            )?,
             confirmed: ConfirmedTable::create(&path)?,
             strong_tx: StrongTxTable::create(&path)?,
             header_txs: HeaderTxsTable::create(&path)?,
@@ -514,6 +529,7 @@ impl Store {
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             utxo_view: crate::sync::atomic::AtomicU64::new(0),
             utxo_publish: std::sync::Mutex::new(()),
+            spend_recheck: Vec::new(),
             spend_marker: std::sync::Mutex::new(()),
             spindle: Spindle::new(),
             datadir_bytes_cache: std::sync::Mutex::new(None),
@@ -532,6 +548,36 @@ impl Store {
 
     pub fn open_tiny(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         Self::open_layout(StoreLayout::tiny(path.into()))
+    }
+
+    /// Record spans a covered-prefix cut must recheck, before readers load them.
+    ///
+    /// A header range can end past the stem the locator cut named. A
+    /// scripthash through-marker can name a create past `include_hwm`.
+    /// The watermark alone does not write a span, including a gap past a
+    /// million creates.
+    fn note_open_cut_spans(
+        path: &Path,
+        txs: &TxTable,
+        header_txs: &HeaderTxsTable,
+        sh_shards: usize,
+    ) -> Result<(), StoreError> {
+        if txs.count() != 0 || txs.bodies_allocated_past_header() {
+            if let Some(end) = Self::max_header_range_end_past(header_txs, txs.count())? {
+                crate::spend_recheck::note_spend_recheck(path, txs.count(), end)?;
+            }
+        }
+        let through = crate::scripthash::load_sh_through(path);
+        if through > txs.count() {
+            let end = through.max(crate::scripthash::load_include_hwm(path));
+            crate::scripthash::note_sh_recheck(path, txs.count(), end)?;
+        }
+        crate::scripthash_materialize::record_unsorted_phase_above_count(
+            path,
+            sh_shards,
+            txs.count(),
+        )?;
+        Ok(())
     }
 
     pub fn open_layout(layout: StoreLayout) -> Result<Self, StoreError> {
@@ -566,7 +612,9 @@ impl Store {
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
         }
+        Self::note_open_cut_spans(&path, &txs, &header_txs, scripthash.head_shard_count())?;
         let cold_path = layout.is_split().then_some(seqsigwit_dir);
+        let spend_recheck = crate::spend_recheck::read_spend_recheck(&path)?;
         let store = Self {
             headers: HeaderTable::open_with_scale(&path, layout.head_scale)?,
             txs,
@@ -582,6 +630,7 @@ impl Store {
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             utxo_view: crate::sync::atomic::AtomicU64::new(0),
             utxo_publish: std::sync::Mutex::new(()),
+            spend_recheck,
             spend_marker: std::sync::Mutex::new(()),
             spindle: Spindle::new(),
             datadir_bytes_cache: std::sync::Mutex::new(None),
@@ -1520,7 +1569,7 @@ impl Store {
         body_range: Option<(u64, u64)>,
         tip: Option<u32>,
     ) -> Result<bool, StoreError> {
-        let (multi, field, _vin) = match body_range {
+        let (multi, field, vin) = match body_range {
             Some((off, len)) => self.txs.get_output_spender_meta_at(off, len, out_index)?,
             None => self.txs.get_output_spender_meta(create_tx_fk, out_index)?,
         };
@@ -1528,7 +1577,7 @@ impl Store {
             return Ok(false);
         }
         if !multi {
-            return self.is_confirmed_strong_at(field, tip);
+            return self.output_has_confirmed_spender(create_tx_fk, out_index, field, vin, tip);
         }
         let mut found = false;
         point_table::for_each_spender_create(
@@ -1536,8 +1585,14 @@ impl Store {
             &self.spenders,
             create_tx_fk,
             out_index,
-            |spending_tx_fk, _vin| {
-                if self.is_confirmed_strong_at(spending_tx_fk, tip)? {
+            |spending_tx_fk, vin| {
+                if self.output_has_confirmed_spender(
+                    create_tx_fk,
+                    out_index,
+                    spending_tx_fk,
+                    vin,
+                    tip,
+                )? {
                     found = true;
                     return Ok(false);
                 }
@@ -1570,18 +1625,18 @@ impl Store {
             }
         };
         let mut unspent = Vec::with_capacity(metas.len());
-        for (v, multi, field, _vin) in metas {
+        for (v, multi, field, vin) in metas {
             if field.is_null() {
                 unspent.push(v);
                 continue;
             }
             if !multi {
-                if !self.is_confirmed_strong_at(field, tip)? {
+                if !self.output_has_confirmed_spender(create_tx_fk, v, field, vin, tip)? {
                     unspent.push(v);
                 }
                 continue;
             }
-            if !self.has_confirmed_strong_spender_create(create_tx_fk, v, body_range)? {
+            if !self.has_confirmed_strong_spender_create_at(create_tx_fk, v, body_range, tip)? {
                 unspent.push(v);
             }
         }
@@ -1682,8 +1737,14 @@ impl Store {
             &self.spenders,
             create_fk,
             out_index,
-            |spending_tx_fk, _vin| {
-                if self.is_confirmed_strong_at(spending_tx_fk, tip)? {
+            |spending_tx_fk, vin| {
+                if self.output_has_confirmed_spender(
+                    create_fk,
+                    out_index,
+                    spending_tx_fk,
+                    vin,
+                    tip,
+                )? {
                     found = true;
                     return Ok(false);
                 }
@@ -1710,13 +1771,91 @@ impl Store {
         out_index: u32,
         tip: Option<u32>,
     ) -> Result<Vec<PointRecord>, StoreError> {
+        let raw = self.spenders_raw(out_txid, out_index)?;
         let mut out = Vec::new();
-        for rec in self.spenders_raw(out_txid, out_index)? {
-            if self.is_confirmed_strong_at(rec.spending_tx_fk, tip)? {
-                out.push(rec);
+        let mut parent = None;
+        for rec in raw {
+            if !self.is_confirmed_strong_at(rec.spending_tx_fk, tip)? {
+                continue;
             }
+            if self.spend_fk_in_recheck(rec.spending_tx_fk) {
+                if parent.is_none() {
+                    parent = Some(self.get_fk_by_txid_tip(out_txid)?.unwrap_or(Fk::NULL));
+                }
+                let create_fk = parent.unwrap_or(Fk::NULL);
+                if create_fk.is_null()
+                    || !self.reused_spender_still_names(
+                        create_fk,
+                        out_index,
+                        rec.spending_tx_fk,
+                        rec.spending_vin,
+                    )?
+                {
+                    continue;
+                }
+            }
+            out.push(rec);
         }
         Ok(out)
+    }
+
+    fn spend_fk_in_recheck(&self, fk: Fk) -> bool {
+        let Some(id) = fk.get() else {
+            return false;
+        };
+        self.spend_recheck
+            .iter()
+            .any(|&(covered, old)| id > covered && id <= old)
+    }
+
+    /// A strong spender counts. Inside a cut span it also has to name this output.
+    fn output_has_confirmed_spender(
+        &self,
+        parent: Fk,
+        vout: u32,
+        spender: Fk,
+        vin: u32,
+        tip: Option<u32>,
+    ) -> Result<bool, StoreError> {
+        if !self.is_confirmed_strong_at(spender, tip)? {
+            return Ok(false);
+        }
+        self.reused_spender_still_names(parent, vout, spender, vin)
+    }
+
+    /// `true` when this spender is outside every cut span, or its input still
+    /// names `parent`/`vout`. A missing input does not.
+    pub fn spender_names_output(
+        &self,
+        parent: Fk,
+        vout: u32,
+        spender: Fk,
+        vin: u32,
+    ) -> Result<bool, StoreError> {
+        self.reused_spender_still_names(parent, vout, spender, vin)
+    }
+
+    /// `true` when this spender is outside every cut span, or its input still
+    /// names `parent`/`vout`. A missing input does not.
+    fn reused_spender_still_names(
+        &self,
+        parent: Fk,
+        vout: u32,
+        spender: Fk,
+        vin: u32,
+    ) -> Result<bool, StoreError> {
+        if !self.spend_fk_in_recheck(spender) {
+            return Ok(true);
+        }
+        let edge = match self.txs.input.edge_at(spender, vin) {
+            Ok(edge) => edge,
+            Err(StoreError::NotFound) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        let Some(edge) = edge else {
+            return Ok(false);
+        };
+        Ok(edge.parent == parent && edge.vout == vout)
     }
 
     /// All annotated spenders on the connected create (including non-strong /
@@ -1742,6 +1881,38 @@ impl Store {
                     spending_tx_fk,
                     spending_vin,
                 });
+                Ok(true)
+            },
+        )?;
+        Ok(out)
+    }
+
+    /// Confirmed-strong spenders of one create outpoint at `tip`.
+    ///
+    /// A fk inside a covered-prefix span counts only when its stored input
+    /// still names this output. `tip` of `None` counts none.
+    pub fn strong_spenders_create(
+        &self,
+        create_tx_fk: Fk,
+        out_index: u32,
+        tip: Option<u32>,
+    ) -> Result<Vec<Fk>, StoreError> {
+        let mut out = Vec::new();
+        point_table::for_each_spender_create(
+            &self.txs,
+            &self.spenders,
+            create_tx_fk,
+            out_index,
+            |spending_tx_fk, vin| {
+                if self.output_has_confirmed_spender(
+                    create_tx_fk,
+                    out_index,
+                    spending_tx_fk,
+                    vin,
+                    tip,
+                )? {
+                    out.push(spending_tx_fk);
+                }
                 Ok(true)
             },
         )?;
@@ -2528,42 +2699,22 @@ fn replaces_incomplete_first_creation(err: &StoreError) -> bool {
 #[doc(hidden)]
 pub fn write_meta(dir: &Path) -> Result<(), StoreError> {
     let path = dir.join("meta");
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|e| StoreError::io(&path, e))?;
-    f.write_all(&STORE_MAGIC)
-        .map_err(|e| StoreError::io(&path, e))?;
-    f.write_all(&SCHEMA_VERSION.to_le_bytes())
-        .map_err(|e| StoreError::io(&path, e))?;
-    f.flush().map_err(|e| StoreError::io(&path, e))?;
-    Ok(())
+    let mut bytes = Vec::with_capacity(6);
+    bytes.extend_from_slice(&STORE_MAGIC);
+    bytes.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    crate::file::write_synced_tmp_rename(&path, &bytes)
 }
 
 /// Overwrite store `meta` with current [`SCHEMA_VERSION`].
 #[doc(hidden)]
 pub fn rewrite_meta_current(dir: &Path) -> Result<(), StoreError> {
     let path = dir.join("meta");
-    let tmp = path.with_extension("meta.tmp");
-    {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)
-            .map_err(|e| StoreError::io(&tmp, e))?;
-        f.write_all(&STORE_MAGIC)
-            .map_err(|e| StoreError::io(&tmp, e))?;
-        f.write_all(&SCHEMA_VERSION.to_le_bytes())
-            .map_err(|e| StoreError::io(&tmp, e))?;
-        f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
-    }
-    std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))?;
     // The rename has to survive a crash before a witness cut. A 26 `meta`
     // next to an empty witness locator is what an older binary truncates.
-    crate::file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
-    Ok(())
+    let mut bytes = Vec::with_capacity(6);
+    bytes.extend_from_slice(&STORE_MAGIC);
+    bytes.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    crate::file::write_synced_tmp_rename(&path, &bytes)
 }
 
 #[doc(hidden)]

@@ -1137,7 +1137,14 @@ impl Query {
             for r in sh_creates {
                 tip_sh_max_fk = tip_sh_max_fk.max(r.create_tx_fk.0);
             }
-            let (n, timing) = self.store.scripthash.put_create_batch_append(sh_creates)?;
+            // The append can seal the ingest head before the advance
+            // below, including on the one-second wait. Name the live
+            // count first. The advance still notes again before its flush.
+            rbitcoin_store::scripthash::note_sh_through(self.store.path(), self.store.txs.count())?;
+            let (n, timing) = self
+                .store
+                .scripthash
+                .put_create_batch_append_through(sh_creates, self.store.txs.count())?;
             crate::note_confirm(&self.confirm_stats().sh_written_n, n as u64);
             let st = self.confirm_stats();
             st.add_sh_part(&st.sh_sort_ns, timing.sort_ns);
@@ -1178,6 +1185,10 @@ impl Query {
         if want <= self.store.scripthash.include_hwm() {
             return Ok(());
         }
+        // Land the marker before the body sync. A crash in between still
+        // names these creates. The watermark stays behind until the flush
+        // returns, so recovery replays them instead of treating them as durable.
+        rbitcoin_store::scripthash::note_sh_through(self.store.path(), want)?;
         let t0 = std::time::Instant::now();
         self.store.scripthash.flush()?;
         let st = self.confirm_stats();
@@ -1222,7 +1233,9 @@ impl Query {
     pub fn recover_sh_writebehind(&self) -> Result<(), QueryError> {
         let recovered = self.recover_sh_indexed_through()?;
         self.set_sh_indexed_through_height(recovered);
-        if !self.store.scripthash.has_durable_index() {
+        // A resume head stays Direct. Queuing here copies creates the tail
+        // backfill also packs, and write-behind never removes those copies.
+        if !self.sh_use_writebehind() {
             return Ok(());
         }
         let Some(tip) = self.tip_height() else {

@@ -74,6 +74,36 @@ fn load_or_create_and_missing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn secret_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir();
+    StoreSecret::from_bytes([3u8; SECRET_LEN])
+        .write_to_store_dir(&dir)
+        .unwrap();
+    let mode = std::fs::metadata(dir.join(SECRET_FILE))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn abandoned_secret_tmp_is_not_a_secret() {
+    let dir = temp_dir();
+    std::fs::write(dir.join("store.secret.tmp"), [9u8; SECRET_LEN]).unwrap();
+    let err = StoreSecret::load_existing(&dir).unwrap_err();
+    assert!(err.to_string().contains("store.secret missing"), "{err}");
+    assert!(!dir.join(SECRET_FILE).exists());
+    let s = StoreSecret::from_bytes([3u8; SECRET_LEN]);
+    s.write_to_store_dir(&dir).unwrap();
+    assert!(!dir.join("store.secret.tmp").exists());
+    assert_eq!(StoreSecret::load_existing(&dir).unwrap(), s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn open_refuses_missing_store_secret() {
     let dir = temp_dir();

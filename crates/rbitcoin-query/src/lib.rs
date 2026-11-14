@@ -509,7 +509,9 @@ pub struct Query {
     /// 0 = unlimited. Electrum + Esplora SH joins refuse above this create count.
     pub max_sh_creates: AtomicU32,
     /// 0 = off. An unpaged SH join above this create count holds
-    /// [`Self::heavy_sh_join`] for its whole walk.
+    /// [`Self::heavy_sh_join`] for the strong list when the count is already
+    /// known, and for the expand either way. A recheck span is counted
+    /// before that lock.
     pub heavy_sh_creates: AtomicU32,
     /// Shared API store-read slots. Tests leave this at `tokio::sync::Semaphore::MAX_PERMITS`.
     /// The node replaces it once at listen from `--store-read-budget`.
@@ -520,6 +522,12 @@ pub struct Query {
     /// Unpaged SH join overlap by kind. Tests only.
     #[cfg(debug_assertions)]
     pub sh_join_probe: crate::scripthash::ShJoinProbe,
+    /// Class A reads inside a lost-tail span check. Tests only.
+    #[cfg(debug_assertions)]
+    pub sh_recheck_class_a_reads: AtomicU64,
+    /// Postings visited by a scripthash walk. Tests only.
+    #[cfg(debug_assertions)]
+    pub sh_posting_notes: AtomicU64,
     /// Packed `tx.body` bytes read by [`Self::load_thin_tweaks`].
     pub thin_tweak_body_bytes: AtomicU64,
     /// Max fk `head_insert_many` has published (0 = never). Load polls this
@@ -914,6 +922,10 @@ impl Query {
             heavy_sh_join: Mutex::new(()),
             #[cfg(debug_assertions)]
             sh_join_probe: crate::scripthash::ShJoinProbe::default(),
+            #[cfg(debug_assertions)]
+            sh_recheck_class_a_reads: AtomicU64::new(0),
+            #[cfg(debug_assertions)]
+            sh_posting_notes: AtomicU64::new(0),
             thin_tweak_body_bytes: AtomicU64::new(0),
             head_drain_fk: AtomicU64::new(head_drained),
             disconnect_height: AtomicU32::new(0),
@@ -948,6 +960,10 @@ impl Query {
             let _ = q.ensure_height_by_hash_index(tip);
         }
         q.seed_published_tip()?;
+        // Write-behind starts before tip finalize. A watermark still above
+        // the covered count would skip those flushes, and recovery would
+        // treat the old floor as already covering the tip.
+        q.repair_lost_sh_tail(crate::catchup::FarSealCopy::NearbyOnly)?;
         q.recover_sh_writebehind()?;
         if let Some(t) = q
             .sp_tweaks
@@ -957,9 +973,50 @@ impl Query {
         {
             q.repair_sp_tweaks(t)?;
         }
+        q.seal_finished_cut_pruneheight()?;
         q.sweep_spill_at_or_below_pruneheight()?;
         q.release_pruned_seqsigwit_stem()?;
         Ok(q)
+    }
+
+    /// A finished stem cut whose height file did not name a prefix has to
+    /// leave a watermark the next block can connect under. A missing prefix
+    /// of the keep window becomes that watermark. The tip file is not
+    /// invented, and a file that is still on disk is not deleted to paper
+    /// over a hole at the tip. A missing tip file with an older keep file
+    /// still on disk refuses open. An empty window sets the watermark to the tip.
+    fn seal_finished_cut_pruneheight(&self) -> Result<(), QueryError> {
+        if !self.prune_seqsigwit() || self.pruneheight().is_some() {
+            return Ok(());
+        }
+        if self.store.txs.seqsigwit_loc.count() != 0 {
+            return Ok(());
+        }
+        let Some(tip) = self.tip_height() else {
+            return Ok(());
+        };
+        let tip = tip.0;
+        let from = self.seqsigwit_keep_lo(tip);
+        let mut h = tip;
+        while self.seqsigwit_spill_file(h)?.is_file() {
+            if h == from {
+                return Ok(());
+            }
+            h -= 1;
+        }
+        // `h` is missing. The tip file is the one case that must not raise
+        // the watermark over older files that are still on disk. The locator
+        // is already 0, so those files cannot be rewritten. Starting would
+        // fail every later seal with this same miss.
+        if h == tip {
+            for height in from..tip {
+                if self.seqsigwit_spill_file(height)?.is_file() {
+                    return Err(StoreError::Corrupt("seqsigwit window miss"));
+                }
+            }
+            return self.set_pruneheight(Some(Height(tip)));
+        }
+        self.set_pruneheight(Some(Height(h)))
     }
 
     /// Rewrite the keep window from the witness stem, then cut that stem
@@ -1046,6 +1103,12 @@ impl Query {
             }
             let mut owned = Vec::with_capacity(fks.len());
             for fk in fks {
+                let id = fk.get().unwrap_or(0);
+                // Open pads a torn locator with an empty row. Those bytes
+                // are not an input, and decoding them fails the stem cut.
+                if self.store.txs.witness_row_is_gap(id) {
+                    continue;
+                }
                 owned.push((fk, self.store.txs.seqsigwit_inputs_from_stem(fk)?));
             }
             let rows: Vec<(Fk, &[InputRecord])> = owned
@@ -1225,10 +1288,11 @@ impl Query {
         let path = store_path.join("seqsigwit.prune");
         match std::fs::read(&path) {
             Ok(bytes) => {
-                let arr: [u8; 4] = bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| StoreError::Corrupt("invariant: seqsigwit.prune size"))?;
+                // A torn write is not a height. The flag and the witness stem
+                // decide prune; this file does not.
+                let Ok(arr) = <[u8; 4]>::try_from(bytes.as_slice()) else {
+                    return Ok((u32::MAX, false));
+                };
                 Ok((u32::from_le_bytes(arr), true))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((u32::MAX, false)),
@@ -1469,8 +1533,23 @@ impl Query {
         self.set_pruneheight(Some(Height(next)))
     }
 
-    /// `false` when this create's connected height is at/below [`Self::pruneheight`].
+    /// `false` when this create's connected height is at/below [`Self::pruneheight`],
+    /// the row is an empty pad, or the stem is still the witness store and
+    /// the locator does not name the create. After the stem cut the locator
+    /// is zero and the keep window holds the witness.
     pub fn seqsigwit_available(&self, fk: Fk) -> Result<bool, QueryError> {
+        let id = fk.get().unwrap_or(0);
+        if self.store.txs.witness_row_is_gap(id) {
+            return Ok(false);
+        }
+        let named = self.store.txs.seqsigwit_loc.count();
+        if !self.store.txs.prune_seqsigwit_mode()
+            && id > 0
+            && id <= self.store.txs.count()
+            && id > named
+        {
+            return Ok(false);
+        }
         let Some(ph) = self.pruneheight() else {
             return Ok(true);
         };
@@ -1815,13 +1894,21 @@ impl Query {
         let built = (|| -> Result<(), QueryError> {
             let mut appended = self.seqsigwit_append_cache.lock().unwrap();
             for &fk in tx_fks {
-                let ins = if let Some(id) = fk.get() {
-                    if let Some(v) = appended.remove(&id) {
+                let id = fk.get().unwrap_or(0);
+                let cached = fk.get().and_then(|id| appended.remove(&id));
+                // The witness this confirm just appended is only in the
+                // cache: prune mode does not advance the locator, and the
+                // stem cut leaves that count at 0. A gap row is the empty
+                // pad and has no keep-file witness. Any other cache miss
+                // has to read the keep file or fail the seal.
+                if cached.is_none() && self.store.txs.witness_row_is_gap(id) {
+                    continue;
+                }
+                let ins = if let Some(v) = cached {
+                    if id != 0 {
                         from_cache.push(id);
-                        v
-                    } else {
-                        self.inputs_for_seal(height, fk)?
                     }
+                    v
                 } else {
                     self.inputs_for_seal(height, fk)?
                 };
@@ -1829,6 +1916,9 @@ impl Query {
                 staged.push((fk, ins, bytes));
             }
             drop(appended);
+            if staged.is_empty() {
+                return Ok(());
+            }
             self.drop_seqsigwit_ram_height(height.0);
             let spill_rows: Vec<(Fk, &[InputRecord])> = staged
                 .iter()

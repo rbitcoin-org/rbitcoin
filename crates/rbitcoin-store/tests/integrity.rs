@@ -809,6 +809,33 @@ fn withheld_create_overflow_header_does_not_seal_when_pruned() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A finished stem cut leaves the witness locator at 0 in this process.
+/// A body header that still names every create must not pull the durable
+/// count to 0, or the tip flush skips for the rest of the process.
+#[test]
+fn finished_cut_seals_the_tip_when_a_body_header_lags() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (_prev, _parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    assert_eq!(s.flush_class_c_tip().unwrap(), Some(Height(0)));
+    s.set_prune_seqsigwit_mode(true);
+    s.txs.cut_seqsigwit_stem_to_header().unwrap();
+    assert_eq!(s.txs.seqsigwit_loc.count(), 0);
+    assert!(s.txs.count() > 0);
+    let end = s.txs.body.body.logical_len();
+    assert!(
+        !s.txs.body.body.publish_end(end.saturating_add(8), false),
+        "the lagging header has to stay behind the RAM length"
+    );
+    assert_eq!(
+        s.flush_class_c_tip().unwrap(),
+        Some(Height(0)),
+        "a finished cut made the durable create count 0"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn connect_fat_witness(
     s: &Store,
     write: &rbitcoin_store::ClassCWrite,
@@ -896,7 +923,7 @@ fn pruned_short_input_skips_the_witness_locator() {
         txstat: &s.txs.txstat,
         input: &s.txs.input,
     };
-    rbitcoin_store::tx_table::repair_class_a_count_skew(stems, true, true).unwrap();
+    rbitcoin_store::tx_table::repair_class_a_count_skew(stems, true, true, None).unwrap();
     drop(disarm);
     assert_eq!(s.txs.count(), 1, "repair stops at the short input");
     assert_eq!(s.txs.input.count(), 1);
@@ -1110,6 +1137,527 @@ fn cleared_tail_range_still_drops_the_sealed_tip() {
     assert!(s.header_txs.has_body(genesis).unwrap());
     assert!(!s.header_txs.has_body(tail).unwrap());
     assert_eq!(s.txs.count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+thread_local! {
+    static SPEND_CUT_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+    static SAW_SPEND_SPAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn snap_spend_span_before_truncate(count: u64) {
+    let dir = SPEND_CUT_DIR.with(|cell| cell.borrow().clone().expect("cut dir"));
+    let bytes = std::fs::read(dir.join("spend.recheck")).expect("span before the truncate");
+    assert_eq!(bytes.len(), 16);
+    let covered = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let old = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    assert!(covered < old);
+    assert_eq!(
+        count, old,
+        "the create locator still names the dropped creates"
+    );
+    SAW_SPEND_SPAN.with(|cell| cell.set(true));
+}
+
+/// The cut span is durable while the locator still names the dropped
+/// creates. A crash after the header pwrite and before this file leaves
+/// the next open with nothing to recheck.
+#[test]
+fn spend_recheck_span_lands_before_the_truncate() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    s.txs.flush().unwrap();
+    let tx_end = on_disk_hwm(&dir.join("txout.body"));
+    let sp_end = on_disk_hwm(&dir.join("spent.body"));
+    let in_end = on_disk_hwm(&dir.join("seqsigwit.body"));
+    connect_coinbase(&s, &write, 1, genesis, parent);
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    let old = s.txs.count();
+    assert!(old > 1);
+    write_hwm(&dir.join("txout.body"), tx_end);
+    write_hwm(&dir.join("spent.body"), sp_end);
+    write_hwm(&dir.join("seqsigwit.body"), in_end);
+    drop(s);
+
+    SPEND_CUT_DIR.with(|cell| *cell.borrow_mut() = Some(dir.clone()));
+    SAW_SPEND_SPAN.with(|cell| cell.set(false));
+    rbitcoin_store::tx_table::set_spend_recheck_before_truncate_for_test(Some(
+        snap_spend_span_before_truncate,
+    ));
+    let s = Store::open_tiny(&dir).unwrap();
+    rbitcoin_store::tx_table::set_spend_recheck_before_truncate_for_test(None);
+    assert!(
+        SAW_SPEND_SPAN.with(|cell| cell.get()),
+        "the truncate hook did not run"
+    );
+    assert_eq!(s.txs.count(), 1);
+    let bytes = std::fs::read(dir.join("spend.recheck")).unwrap();
+    assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 1);
+    assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), old);
+    assert_eq!(s.spend_recheck, vec![(1, old)]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cut inside the chain reuses the dropped spender's fk. The parent
+/// slot still names that fk. A different transaction confirmed there
+/// does not make the parent spent. The real spender does, once it confirms.
+#[test]
+fn reused_spender_fk_does_not_spend_the_parent() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent_hash) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    s.txs.flush().unwrap();
+    let tx_end = on_disk_hwm(&dir.join("txout.body"));
+    let sp_end = on_disk_hwm(&dir.join("spent.body"));
+    let in_end = on_disk_hwm(&dir.join("seqsigwit.body"));
+    let parent_tx = Fk(1);
+    let spender = s
+        .put_tx_full_batch_indexed(
+            &[(
+                TxRecord {
+                    txid: [2u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    parent: rbitcoin_store::tx_table::InputParent::Prevout {
+                        create_fk: parent_tx,
+                        vout: 0,
+                    },
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }],
+                vec![OutputRecord::unspent(1, vec![2])],
+            )],
+            false,
+        )
+        .unwrap()[0];
+    assert_eq!(spender, Fk(2));
+    s.put_spend_create(parent_tx, 0, spender, 0).unwrap();
+    let merkle = rbitcoin_primitives::merkle_root_from_txids(&[[2u8; 32]]);
+    let header = hdr_merkle(genesis, parent_hash, 1, merkle);
+    let header_fk = s.put_header(&header).unwrap();
+    s.header_txs
+        .put_range(&write, header_fk, spender, 1)
+        .unwrap();
+    s.strong_tx.set_strong(&write, spender, header_fk).unwrap();
+    s.confirmed.set(&write, Height(1), header_fk).unwrap();
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    write_hwm(&dir.join("txout.body"), tx_end);
+    write_hwm(&dir.join("spent.body"), sp_end);
+    write_hwm(&dir.join("seqsigwit.body"), in_end);
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+    let other = s.put_tx_full_batch_indexed(&[coinbase(9)], false).unwrap()[0];
+    assert_eq!(other, Fk(2));
+    let other_rec = hdr(genesis, parent_hash, 9);
+    let other_hash = other_rec.hash;
+    let other_header = s.put_header(&other_rec).unwrap();
+    s.header_txs
+        .put_range(&write, other_header, other, 1)
+        .unwrap();
+    s.strong_tx.set_strong(&write, other, other_header).unwrap();
+    s.confirmed.set(&write, Height(1), other_header).unwrap();
+    s.rebuild_height_fence().unwrap();
+    assert!(
+        !s.has_confirmed_strong_spender(&[0u8; 32], 0).unwrap(),
+        "a reused fk is not the old spender"
+    );
+    assert_eq!(
+        s.unspent_create_vouts(parent_tx, &[0], None).unwrap(),
+        vec![0]
+    );
+
+    let real = s
+        .put_tx_full_batch_indexed(
+            &[(
+                TxRecord {
+                    txid: [3u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    parent: rbitcoin_store::tx_table::InputParent::Prevout {
+                        create_fk: parent_tx,
+                        vout: 0,
+                    },
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }],
+                vec![OutputRecord::unspent(1, vec![3])],
+            )],
+            false,
+        )
+        .unwrap()[0];
+    s.put_spend_create(parent_tx, 0, real, 0).unwrap();
+    let real_header = s.put_header(&hdr(other_header, other_hash, 3)).unwrap();
+    s.header_txs
+        .put_range(&write, real_header, real, 1)
+        .unwrap();
+    s.strong_tx.set_strong(&write, real, real_header).unwrap();
+    s.confirmed.set(&write, Height(2), real_header).unwrap();
+    s.rebuild_height_fence().unwrap();
+    assert!(s.has_confirmed_strong_spender(&[0u8; 32], 0).unwrap());
+    assert!(s
+        .unspent_create_vouts(parent_tx, &[0], None)
+        .unwrap()
+        .is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Locators stop at the middle create and the body headers stop at genesis.
+/// The height that spent the parent still names the next fk. The span has
+/// to include that fk, or reusing it spends the parent.
+#[test]
+fn range_past_the_locator_stays_in_the_spend_span() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, hash0) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    s.txs.flush().unwrap();
+    let tx_end = on_disk_hwm(&dir.join("txout.body"));
+    let sp_end = on_disk_hwm(&dir.join("spent.body"));
+    let in_end = on_disk_hwm(&dir.join("seqsigwit.body"));
+    let (mid, hash1) = connect_coinbase(&s, &write, 1, genesis, hash0);
+    let parent_tx = Fk(1);
+    let spender = s
+        .put_tx_full_batch_indexed(
+            &[(
+                TxRecord {
+                    txid: [2u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    parent: rbitcoin_store::tx_table::InputParent::Prevout {
+                        create_fk: parent_tx,
+                        vout: 0,
+                    },
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }],
+                vec![OutputRecord::unspent(1, vec![2])],
+            )],
+            false,
+        )
+        .unwrap()[0];
+    assert_eq!(spender, Fk(3));
+    s.put_spend_create(parent_tx, 0, spender, 0).unwrap();
+    let merkle = rbitcoin_primitives::merkle_root_from_txids(&[[2u8; 32]]);
+    let header = hdr_merkle(mid, hash1, 2, merkle);
+    let header_fk = s.put_header(&header).unwrap();
+    s.header_txs
+        .put_range(&write, header_fk, spender, 1)
+        .unwrap();
+    s.strong_tx.set_strong(&write, spender, header_fk).unwrap();
+    s.confirmed.set(&write, Height(2), header_fk).unwrap();
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    assert_eq!(s.txs.count(), 3);
+    shorten_creates(&s, 2);
+    write_hwm(&dir.join("txout.body"), tx_end);
+    write_hwm(&dir.join("spent.body"), sp_end);
+    write_hwm(&dir.join("seqsigwit.body"), in_end);
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+    assert!(
+        s.spend_recheck
+            .iter()
+            .any(|&(covered, old)| covered < 3 && old >= 3),
+        "span {:?} stops short of the dropped range",
+        s.spend_recheck
+    );
+    let other = s.put_tx_full_batch_indexed(&[coinbase(9)], false).unwrap()[0];
+    assert_eq!(other, Fk(2));
+    let other_rec = hdr(genesis, hash0, 9);
+    let other_hash = other_rec.hash;
+    let other_header = s.put_header(&other_rec).unwrap();
+    s.header_txs
+        .put_range(&write, other_header, other, 1)
+        .unwrap();
+    s.strong_tx.set_strong(&write, other, other_header).unwrap();
+    s.confirmed.set(&write, Height(1), other_header).unwrap();
+    let reused = s.put_tx_full_batch_indexed(&[coinbase(8)], false).unwrap()[0];
+    assert_eq!(reused, Fk(3));
+    let reused_header = s.put_header(&hdr(other_header, other_hash, 8)).unwrap();
+    s.header_txs
+        .put_range(&write, reused_header, reused, 1)
+        .unwrap();
+    s.strong_tx
+        .set_strong(&write, reused, reused_header)
+        .unwrap();
+    s.confirmed.set(&write, Height(2), reused_header).unwrap();
+    s.rebuild_height_fence().unwrap();
+    assert_eq!(
+        s.unspent_create_vouts(parent_tx, &[0], None).unwrap(),
+        vec![0],
+        "a reused fk above the locator is not the old spender"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The stems already agree on genesis. Later header ranges still name the
+/// dropped creates. Open records those ends before it clears the ranges.
+#[test]
+fn matched_counts_still_span_a_high_header_range() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, hash0) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let (mid, hash1) = connect_coinbase(&s, &write, 1, genesis, hash0);
+    connect_coinbase(&s, &write, 2, mid, hash1);
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    assert_eq!(s.txs.count(), 3);
+    shorten_creates(&s, 1);
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    assert!(
+        s.spend_recheck
+            .iter()
+            .any(|&(covered, old)| covered < 3 && old >= 3),
+        "span {:?} missed the range past the matched count",
+        s.spend_recheck
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Body headers name height 0. Locators and a side header still name the
+/// next create. Open shrinks to height 0, drops both ranges past that
+/// create, and the next append does not keep a second copy of height 0.
+#[test]
+fn short_body_header_shrinks_to_the_landed_prefix() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    s.txs.flush().unwrap();
+    let tx_end = on_disk_hwm(&dir.join("txout.body"));
+    let sp_end = on_disk_hwm(&dir.join("spent.body"));
+    let in_end = on_disk_hwm(&dir.join("seqsigwit.body"));
+    let (tail, _) = connect_coinbase(&s, &write, 1, genesis, parent);
+    let side = s.put_header(&hdr(genesis, parent, 9)).unwrap();
+    s.header_txs.put_range(&write, side, Fk(2), 1).unwrap();
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    s.header_txs.flush().unwrap();
+    assert!(on_disk_hwm(&dir.join("txout.body")) > tx_end);
+    write_hwm(&dir.join("txout.body"), tx_end);
+    write_hwm(&dir.join("spent.body"), sp_end);
+    write_hwm(&dir.join("seqsigwit.body"), in_end);
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+    assert!(s.header_txs.has_body(genesis).unwrap());
+    assert!(!s.header_txs.has_body(tail).unwrap());
+    assert!(!s.header_txs.has_body(side).unwrap());
+    let again = s
+        .put_tx_full_batch_indexed(
+            &[(
+                rbitcoin_store::tx_table::TxRecord {
+                    txid: [2u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![rbitcoin_store::tx_table::InputRecord::coinbase(
+                    u32::MAX,
+                    vec![],
+                    vec![],
+                )],
+                vec![rbitcoin_store::tx_table::OutputRecord::unspent(1, vec![2])],
+            )],
+            false,
+        )
+        .unwrap();
+    assert_eq!(again, vec![Fk(2)]);
+    assert_eq!(s.txs.count(), 2);
+    assert_eq!(s.txs.body_txid(Fk(1)).unwrap(), [0u8; 32]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An unstrong orphan owns the create just past the covered prefix.
+/// Confirmed blocks after it still name those dropped creates. Open has
+/// to shrink to the prefix. Clearing their ranges first leaves the tip
+/// in place, and the strong bit of the orphan does not save it.
+#[test]
+fn unstrong_orphan_at_the_cut_still_shrinks_the_tip() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let side_fk = put_coinbase(&s, 9);
+    assert_eq!(side_fk, Fk(2), "the orphan is the create just past genesis");
+    let side = s.put_header(&hdr(genesis, parent, 9)).unwrap();
+    s.header_txs.put_range(&write, side, side_fk, 1).unwrap();
+    let (tail, tail_hash) = connect_coinbase(&s, &write, 1, genesis, parent);
+    let (tip, _) = connect_coinbase(&s, &write, 2, tail, tail_hash);
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    s.header_txs.flush().unwrap();
+    shorten_creates(&s, 1);
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    assert_eq!(
+        s.confirmed.tip_height(),
+        Some(Height(0)),
+        "confirmed blocks past the orphan must not stay"
+    );
+    assert!(s.header_txs.has_body(genesis).unwrap());
+    assert!(!s.header_txs.has_body(tail).unwrap());
+    assert!(!s.header_txs.has_body(tip).unwrap());
+    assert!(!s.header_txs.has_body(side).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The tail ranges were flushed away before the tip shrink landed. The
+/// create just past the prefix is an unstrong orphan, so that strong bit
+/// does not name the cut. Reopen still drops the confirmed tip.
+#[test]
+fn cleared_tail_with_an_unstrong_orphan_still_shrinks_the_tip() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let side_fk = put_coinbase(&s, 9);
+    assert_eq!(side_fk, Fk(2));
+    let side = s.put_header(&hdr(genesis, parent, 9)).unwrap();
+    s.header_txs.put_range(&write, side, side_fk, 1).unwrap();
+    let (tail, tail_hash) = connect_coinbase(&s, &write, 1, genesis, parent);
+    let (tip, _) = connect_coinbase(&s, &write, 2, tail, tail_hash);
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    s.header_txs.flush().unwrap();
+    shorten_creates(&s, 1);
+    s.header_txs.clear_body(&write, tail).unwrap();
+    s.header_txs.clear_body(&write, tip).unwrap();
+    s.header_txs.flush().unwrap();
+    assert_eq!(s.confirmed.tip_height(), Some(Height(2)));
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+    assert!(s.header_txs.has_body(genesis).unwrap());
+    assert!(!s.header_txs.has_body(tail).unwrap());
+    assert!(!s.header_txs.has_body(tip).unwrap());
+    assert!(!s.header_txs.has_body(side).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cut leaves the old tx.head slot. The next create reuses that fk.
+/// When the new txid lands on the same probe slot, the old fingerprint
+/// must not make get_by_txid miss the body.
+#[test]
+fn reused_cut_fk_replaces_the_old_tx_head_fingerprint() {
+    use rbitcoin_store::address_head::{bits_for_scale, fingerprint, h1_in_page, page_index};
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let put = |s: &Store, txid: [u8; 32]| {
+        s.put_tx_full_batch_indexed(
+            &[(
+                TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![InputRecord::coinbase(u32::MAX, vec![1], vec![])],
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            )],
+            true,
+        )
+        .unwrap()[0]
+    };
+    let old = [2u8; 32];
+    assert_eq!(put(&s, [1u8; 32]), Fk(1));
+    assert_eq!(put(&s, old), Fk(2));
+    s.txs.flush().unwrap();
+    assert_eq!(s.txs.get_by_txid(&old).unwrap().map(|p| p.0), Some(Fk(2)));
+    shorten_creates(&s, 1);
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1);
+    let bits = bits_for_scale(s.head_scale());
+    let old_mixed = s.txs.mix_txid_for_head(&old);
+    let page = page_index(&old_mixed, bits);
+    let h1 = h1_in_page(&old_mixed, bits);
+    let old_fp = fingerprint(&old_mixed, bits);
+    let mut neu = [3u8; 32];
+    let mut found = None;
+    for n in 0u32..2_000_000 {
+        neu[0..4].copy_from_slice(&n.to_le_bytes());
+        let mixed = s.txs.mix_txid_for_head(&neu);
+        if page_index(&mixed, bits) == page
+            && h1_in_page(&mixed, bits) == h1
+            && fingerprint(&mixed, bits) != old_fp
+        {
+            found = Some(neu);
+            break;
+        }
+    }
+    let neu = found.expect("a txid that shares the old primary slot");
+    let fk = put(&s, neu);
+    assert_eq!(fk, Fk(2));
+    assert_eq!(
+        s.txs.get_by_txid(&neu).unwrap().map(|p| p.0),
+        Some(Fk(2)),
+        "the replacement body is in the head"
+    );
+    assert!(s.txs.get_by_txid(&old).unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Headers that already match the logical lengths are the commit.
+/// Open does not drop a create.
+#[test]
+fn aligned_class_a_headers_do_not_truncate() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let (tail, _) = connect_coinbase(&s, &write, 1, genesis, parent);
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    drop(s);
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 2);
+    assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
+    assert!(s.header_txs.has_body(genesis).unwrap());
+    assert!(s.header_txs.has_body(tail).unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

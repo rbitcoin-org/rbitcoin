@@ -683,6 +683,13 @@ pub struct TxTable {
     pub rebuild_seal_bits: u32,
     pub rebuild_workers: usize,
     pub prune_seqsigwit_mode: std::sync::atomic::AtomicBool,
+    /// `seqsigwit.prune` was present at open. The witness locator may
+    /// already be shorter than the creates, and a create it does not name
+    /// is not a bad block. Without the file, a missing locator still is.
+    pub witness_stem_may_lag: std::sync::atomic::AtomicBool,
+    /// Empty witness rows. Each span is `(named, through]`. A create
+    /// between two spans still has the witness its locator names.
+    witness_gaps: Vec<(u64, u64)>,
     /// `--datadir-hdd`: Class A body stems are one pwrite wave each.
     pub datadir_hdd: std::sync::atomic::AtomicBool,
     /// Historical spend slots not yet folded into `spent.body`.
@@ -777,18 +784,22 @@ pub fn class_a_skew_target_count(
     if let Some(n) = short_new_layout_input {
         return Some(n);
     }
-    // Count 0 is the finished cut. Min-ing it would drop the chain.
-    // A positive locator that is short of the creates is an unfinished
-    // commit, and the chain truncates to the rows it still names.
-    let witness_cut = prune_seqsigwit_mode && n_seqsigwit_loc == 0;
-    if n_txids == n_loc && (witness_cut || n_seqsigwit_loc == n_loc) {
+    // A torn marker, or a 4-byte height whose locator is already 0, is not
+    // a reason to drop creates. Count 0 is that finished cut: min-ing it
+    // would drop the chain. A 4-byte height with a positive short locator
+    // is the prefix that landed, and the chain truncates to it. Without
+    // the file, a positive locator that is short of the creates is an
+    // unfinished commit.
+    if prune_seqsigwit_mode {
+        if n_txids == n_loc {
+            return None;
+        }
+        return Some(n_loc.min(n_txids));
+    }
+    if n_txids == n_loc && n_seqsigwit_loc == n_loc {
         return None;
     }
-    Some(if witness_cut {
-        n_loc.min(n_txids)
-    } else {
-        n_loc.min(n_txids).min(n_seqsigwit_loc)
-    })
+    Some(n_loc.min(n_txids).min(n_seqsigwit_loc))
 }
 
 #[doc(hidden)]
@@ -815,26 +826,41 @@ pub fn create_prevout_on_inputs(stems: &ClassASkewStems<'_>, fk: Fk) -> Result<b
 
 /// A short `input` that already existed, whose next create is new-layout.
 ///
-/// Legacy inline prevouts stay out of this floor so open can still backfill
-/// them. A fresh `Input::create` this open is not a power-loss tail.
+/// The next create's witness row is named, and its first byte sits past the
+/// body open will read. A torn prune fit ignores that body, so the fitted
+/// count can still include the row.
+fn next_seqsigwit_row_past_body(stems: &ClassASkewStems<'_>, fk: Fk) -> Result<bool, StoreError> {
+    let Some(Some((off, len))) = stems.seqsigwit_loc.range_batch(&[fk])?.into_iter().next() else {
+        return Ok(false);
+    };
+    if len == 0 {
+        return Ok(false);
+    }
+    Ok(off.saturating_add(1) > stems.seqsigwit.body_logical_len())
+}
+
+/// `ceiling` is the count the body headers already cover. The probe reads
+/// the next seqsigwit row, so it does not run past that count. A row past
+/// the witness body cannot rebuild the input, so the input count is the
+/// prefix. Legacy inline prevouts stay out of this floor so open can still
+/// backfill them. A fresh `Input::create` this open is not a power-loss tail.
 #[doc(hidden)]
 pub fn short_new_layout_input(
     stems: &ClassASkewStems<'_>,
-    n_loc: u64,
-    n_txids: u64,
-    n_seqsigwit_loc: u64,
-    prune_seqsigwit_mode: bool,
+    ceiling: u64,
     input_existed: bool,
 ) -> Result<Option<u64>, StoreError> {
-    if !input_existed {
+    if !input_existed || ceiling == 0 {
         return Ok(None);
     }
     let n_in = stems.input.count();
-    let stem = stem_min(n_loc, n_txids, n_seqsigwit_loc, prune_seqsigwit_mode);
-    if n_in >= stem || stem == 0 {
+    if n_in >= ceiling {
         return Ok(None);
     }
     let next = Fk(n_in.saturating_add(1));
+    if next_seqsigwit_row_past_body(stems, next)? {
+        return Ok(Some(n_in));
+    }
     if create_prevout_on_inputs(stems, next)? {
         Ok(Some(n_in))
     } else {
@@ -866,6 +892,51 @@ pub fn pruned_uncovered_input_floor(
         return None;
     }
     Some(n_in)
+}
+
+fn body_headers_cover(
+    stems: &ClassASkewStems<'_>,
+    tx_end: u64,
+    sp_end: u64,
+    in_end: u64,
+    prune_seqsigwit_mode: bool,
+) -> bool {
+    stems.body.body.header_persist_len() >= tx_end
+        && stems.spent.body.header_persist_len() >= sp_end
+        && (prune_seqsigwit_mode || stems.seqsigwit.body.header_persist_len() >= in_end)
+}
+
+/// Largest create `<= n` whose stem ends fit the durable body headers.
+///
+/// Stem ends grow with the create index. Create `0` is the file header.
+/// A failed locator read returns before any truncate.
+#[doc(hidden)]
+pub fn fit_covered_to_body_headers(
+    stems: &ClassASkewStems<'_>,
+    n: u64,
+    prune_seqsigwit_mode: bool,
+) -> Result<(u64, u64, u64, u64), StoreError> {
+    let (tx_end, sp_end, in_end) = class_a_skew_stem_ends(stems, n, prune_seqsigwit_mode)?;
+    if n == 0 || body_headers_cover(stems, tx_end, sp_end, in_end, prune_seqsigwit_mode) {
+        return Ok((n, tx_end, sp_end, in_end));
+    }
+    let zero = class_a_skew_stem_ends(stems, 0, prune_seqsigwit_mode)?;
+    let mut best = (0, zero.0, zero.1, zero.2);
+    let mut lo = 0u64;
+    let mut hi = n - 1;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let (tx_end, sp_end, in_end) = class_a_skew_stem_ends(stems, mid, prune_seqsigwit_mode)?;
+        if body_headers_cover(stems, tx_end, sp_end, in_end, prune_seqsigwit_mode) {
+            best = (mid, tx_end, sp_end, in_end);
+            lo = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(best)
 }
 
 #[doc(hidden)]
@@ -956,16 +1027,264 @@ pub fn class_a_skew_assert_aligned(
     Ok(())
 }
 
+const WITNESS_GAP_FILE: &str = "seqsigwit.gap";
+
+/// A 4-byte `seqsigwit.prune` is the prune height. Any other length, including
+/// a torn 0-byte file, is not. Missing is not an error.
+fn prune_sidecar_is_height(path: &Path) -> Result<bool, StoreError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes.len() == 4),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(StoreError::io(path, e)),
+    }
+}
+
+/// Spans from a previous fill. Missing file means none. Each record is
+/// `named ‖ through`. A short or inverted record is corrupt.
+fn load_witness_gap(dir: &Path) -> Result<Vec<(u64, u64)>, StoreError> {
+    let path = dir.join(WITNESS_GAP_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(StoreError::io(&path, e)),
+    };
+    if bytes.is_empty() || !bytes.len().is_multiple_of(16) {
+        return Err(StoreError::Corrupt("seqsigwit.gap"));
+    }
+    let mut spans = Vec::with_capacity(bytes.len() / 16);
+    for chunk in bytes.chunks_exact(16) {
+        let mut named_bytes = [0u8; 8];
+        let mut through_bytes = [0u8; 8];
+        named_bytes.copy_from_slice(&chunk[..8]);
+        through_bytes.copy_from_slice(&chunk[8..]);
+        let named = u64::from_le_bytes(named_bytes);
+        let through = u64::from_le_bytes(through_bytes);
+        if named >= through {
+            return Err(StoreError::Corrupt("seqsigwit.gap"));
+        }
+        spans.push((named, through));
+    }
+    coalesce_witness_gaps(&mut spans);
+    Ok(spans)
+}
+
+fn store_witness_gap(dir: &Path, spans: &[(u64, u64)]) -> Result<(), StoreError> {
+    let mut bytes = Vec::with_capacity(spans.len() * 16);
+    for &(named, through) in spans {
+        bytes.extend_from_slice(&named.to_le_bytes());
+        bytes.extend_from_slice(&through.to_le_bytes());
+    }
+    crate::file::write_synced_tmp_rename(&dir.join(WITNESS_GAP_FILE), &bytes)
+}
+
+/// Overlapping or touching fills become one span. A fill that starts past
+/// the saved end stays its own span, so the creates between them stay a witness.
+fn merge_witness_gap(saved: &[(u64, u64)], named: u64, through: u64) -> Vec<(u64, u64)> {
+    let mut spans = Vec::with_capacity(saved.len() + 1);
+    spans.extend_from_slice(saved);
+    spans.push((named, through));
+    coalesce_witness_gaps(&mut spans);
+    spans
+}
+
+fn cut_witness_body_to(
+    seqsigwit: &VarTable,
+    loc: &crate::delta_loc::DeltaLoc,
+    creates: u64,
+) -> Result<(), StoreError> {
+    let end = witness_body_end(loc, creates)?;
+    if seqsigwit.body_logical_len() < end {
+        return Err(StoreError::Corrupt(
+            "invariant: seqsigwit body short of covered prefix",
+        ));
+    }
+    seqsigwit.truncate_body_to(creates, end)?;
+    Ok(())
+}
+
+fn witness_body_end(loc: &crate::delta_loc::DeltaLoc, creates: u64) -> Result<u64, StoreError> {
+    if creates == 0 {
+        return Ok(crate::file::FILE_HEADER_LEN as u64);
+    }
+    let (off, len) = loc
+        .range_batch(&[Fk(creates)])?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or(StoreError::Corrupt(
+            "invariant: seqsigwit.loc range for covered prefix",
+        ))?;
+    Ok(off.saturating_add(len))
+}
+
+/// Largest `k` in `0..=named` whose witness row still ends inside `body_len`.
+fn witness_rows_body_covers(
+    loc: &crate::delta_loc::DeltaLoc,
+    named: u64,
+    body_len: u64,
+) -> Result<u64, StoreError> {
+    let mut lo = 0u64;
+    let mut hi = named;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if witness_body_end(loc, mid)? <= body_len {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(lo)
+}
+
+/// A span past the covered create count would mark the next append's fk empty.
+fn clamp_witness_gap_to_count(dir: &Path, creates: u64) -> Result<(), StoreError> {
+    let saved = load_witness_gap(dir)?;
+    let mut kept = Vec::with_capacity(saved.len());
+    for (named, through) in saved.iter().copied() {
+        if named >= creates {
+            continue;
+        }
+        let through = through.min(creates);
+        if named < through {
+            kept.push((named, through));
+        }
+    }
+    if kept == saved {
+        return Ok(());
+    }
+    if kept.is_empty() {
+        let path = dir.join(WITNESS_GAP_FILE);
+        match std::fs::remove_file(&path) {
+            Ok(()) => crate::file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StoreError::io(&path, e)),
+        }
+    } else {
+        store_witness_gap(dir, &kept)
+    }
+}
+
+fn coalesce_witness_gaps(spans: &mut Vec<(u64, u64)>) {
+    if spans.is_empty() {
+        return;
+    }
+    spans.sort_by_key(|span| span.0);
+    let mut merged = Vec::with_capacity(spans.len());
+    let (mut start, mut end) = spans[0];
+    for &(named, through) in spans.iter().skip(1) {
+        if named <= end {
+            end = end.max(through);
+        } else {
+            merged.push((start, end));
+            start = named;
+            end = through;
+        }
+    }
+    merged.push((start, end));
+    *spans = merged;
+}
+
+/// Append one empty witness row per create in `(fill_from, through]`.
+fn fill_witness_gap(
+    seqsigwit: &VarTable,
+    loc: &crate::delta_loc::DeltaLoc,
+    fill_from: u64,
+    through: u64,
+    gap_dir: &Path,
+) -> Result<bool, StoreError> {
+    let n = usize::try_from(through - fill_from)
+        .map_err(|_| StoreError::Corrupt("invariant: seqsigwit gap"))?;
+    let Some(prep) = seqsigwit.prepare_batch_encode(n, n.saturating_mul(8), |_i, _buf| {})? else {
+        return Ok(false);
+    };
+    let lens = prep.aligned_lens();
+    let staged = loc.stage(&prep.starts, &lens)?;
+    crate::var_table::write_prepared_bodies_one_wave(&[(seqsigwit, &prep)], false)?;
+    loc.write_staged(&staged)?;
+    // The locator header is what the next open counts. Record the gap
+    // first, or that open reads these empty rows as a witness and drops
+    // the tip.
+    let spans = merge_witness_gap(&load_witness_gap(gap_dir)?, fill_from, through);
+    store_witness_gap(gap_dir, &spans)?;
+    let (_fks, durable) = publish_prepared_body(seqsigwit, prep, true)?;
+    let _ = loc.commit_staged(staged, durable);
+    Ok(loc.count() == through && seqsigwit.count() == through)
+}
+
+/// A prune file left `seqsigwit.loc` behind the creates. Drop the body tail
+/// that locator does not name, then append one empty row per missing create
+/// so the next append's fk is the new create. A locator of 0 is the finished
+/// stem cut: those empty rows are not a witness, and the keep-window rewrite
+/// stops the cut from finishing. A locator ahead of the covered create count
+/// still names dropped creates, so it is cut back to that count. A body that
+/// does not cover the last named row is cut to the last row it does cover,
+/// then filled from there, including when the locator count already matches
+/// the creates. No covered row refuses the open.
+fn align_short_witness_locator(
+    seqsigwit: &VarTable,
+    loc: &crate::delta_loc::DeltaLoc,
+    named: u64,
+    through: u64,
+    gap_dir: &Path,
+) -> Result<bool, StoreError> {
+    clamp_witness_gap_to_count(gap_dir, through)?;
+    if named == 0 || through == 0 {
+        if named > through {
+            cut_witness_body_to(seqsigwit, loc, through)?;
+            loc.truncate_to_count(through)?;
+        }
+        return Ok(false);
+    }
+    let claim = named.min(through);
+    let end = witness_body_end(loc, claim)?;
+    let body_len = seqsigwit.body_logical_len();
+    if body_len < end {
+        let covered = witness_rows_body_covers(loc, claim, body_len)?;
+        if covered == 0 {
+            return Err(StoreError::Corrupt(
+                "invariant: seqsigwit body covers no witness row",
+            ));
+        }
+        cut_witness_body_to(seqsigwit, loc, covered)?;
+        loc.truncate_to_count(covered)?;
+        return fill_witness_gap(seqsigwit, loc, covered, through, gap_dir);
+    }
+    if named > through {
+        cut_witness_body_to(seqsigwit, loc, through)?;
+        loc.truncate_to_count(through)?;
+        return Ok(false);
+    }
+    if named == through {
+        // The counter can already match while the file still holds a tail
+        // the covered prefix dropped. The next append would start past that
+        // tail, and the locator delta would keep naming the old row.
+        if seqsigwit.count() != through || body_len != end {
+            cut_witness_body_to(seqsigwit, loc, through)?;
+        }
+        return Ok(false);
+    }
+    seqsigwit.truncate_body_to(named, end)?;
+    fill_witness_gap(seqsigwit, loc, named, through, gap_dir)
+}
+
 #[doc(hidden)]
 pub fn repair_class_a_count_skew(
     stems: ClassASkewStems<'_>,
     prune_seqsigwit_mode: bool,
     input_existed: bool,
+    spend_recheck_dir: Option<&Path>,
 ) -> Result<bool, StoreError> {
     let n_loc = stems.create_loc.count();
     let n_txids = stems.txids.count();
     let n_seqsigwit_loc = stems.seqsigwit_loc.count();
-    let short_input = match pruned_uncovered_input_floor(
+    // Fit the body headers before the short-input probe. That probe reads
+    // the next seqsigwit row, which is past a header that does not cover it.
+    let skewed =
+        class_a_skew_target_count(n_loc, n_txids, n_seqsigwit_loc, prune_seqsigwit_mode, None);
+    let n_target = skewed.unwrap_or(n_loc);
+    let (mut n, mut tx_end, mut sp_end, mut in_end) =
+        fit_covered_to_body_headers(&stems, n_target, prune_seqsigwit_mode)?;
+    let floor = match pruned_uncovered_input_floor(
         &stems,
         n_loc,
         n_txids,
@@ -973,36 +1292,19 @@ pub fn repair_class_a_count_skew(
         prune_seqsigwit_mode,
         input_existed,
     ) {
-        Some(n) => Some(n),
-        None => short_new_layout_input(
-            &stems,
-            n_loc,
-            n_txids,
-            n_seqsigwit_loc,
-            prune_seqsigwit_mode,
-            input_existed,
-        )?,
+        Some(floor) => Some(floor),
+        None => short_new_layout_input(&stems, n, input_existed)?,
     };
-    let skewed = class_a_skew_target_count(
-        n_loc,
-        n_txids,
-        n_seqsigwit_loc,
-        prune_seqsigwit_mode,
-        short_input,
-    );
-    let n = skewed.unwrap_or(n_loc);
-    let (tx_end, sp_end, in_end) = class_a_skew_stem_ends(&stems, n, prune_seqsigwit_mode)?;
-    // The locator count is the commit. A body header ahead of it is the crash
-    // before the locator pwrite. A body header short of it was not published.
-    require_body_header(stems.body.body_logical_len(), tx_end)?;
-    require_body_header(stems.spent.body_logical_len(), sp_end)?;
-    if !prune_seqsigwit_mode {
-        require_body_header(stems.seqsigwit.body_logical_len(), in_end)?;
+    if let Some(floor) = floor {
+        if floor < n {
+            n = floor;
+            (tx_end, sp_end, in_end) = class_a_skew_stem_ends(&stems, n, prune_seqsigwit_mode)?;
+        }
     }
     let ahead = stems.body.body_logical_len() > tx_end
         || stems.spent.body_logical_len() > sp_end
         || (!prune_seqsigwit_mode && stems.seqsigwit.body_logical_len() > in_end);
-    if skewed.is_none() && !ahead {
+    if skewed.is_none() && !ahead && n == n_loc {
         return Ok(false);
     }
     let n_input = stems.input.count();
@@ -1010,6 +1312,19 @@ pub fn repair_class_a_count_skew(
         "store: Class A count skew loc={n_loc} seqsigwit.loc={n_seqsigwit_loc} \
          txid.body={n_txids} input={n_input} — truncating to {n}"
     );
+    // Sync the span before the locator header moves. A crash after that
+    // header and before this file reopens with equal counts and forgets
+    // the cut. A crash after the file retries the same span.
+    let dropped_from = n_loc.max(n_txids);
+    if n < dropped_from {
+        if let Some(dir) = spend_recheck_dir {
+            crate::spend_recheck::note_spend_recheck(dir, n, dropped_from)?;
+        }
+    }
+    #[cfg(debug_assertions)]
+    if let Some(hook) = spend_recheck_before_truncate_hook() {
+        hook(stems.create_loc.count());
+    }
     class_a_skew_apply_truncate(
         &stems,
         n,
@@ -1023,14 +1338,22 @@ pub fn repair_class_a_count_skew(
     Ok(true)
 }
 
-fn require_body_header(header: u64, end: u64) -> Result<(), StoreError> {
-    if header < end {
-        Err(StoreError::Corrupt(
-            "invariant: body header short of locator",
-        ))
-    } else {
-        Ok(())
-    }
+#[cfg(debug_assertions)]
+thread_local! {
+    static SPEND_RECHECK_BEFORE_TRUNCATE: std::cell::Cell<Option<fn(u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+fn spend_recheck_before_truncate_hook() -> Option<fn(u64)> {
+    SPEND_RECHECK_BEFORE_TRUNCATE.with(|cell| cell.take())
+}
+
+/// One-shot hook while the create locator still names the dropped prefix.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_spend_recheck_before_truncate_for_test(hook: Option<fn(u64)>) {
+    SPEND_RECHECK_BEFORE_TRUNCATE.with(|cell| cell.set(hook));
 }
 
 fn file_header_behind(file: &crate::file::TableFile) -> bool {
@@ -1219,6 +1542,8 @@ impl TxTable {
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(false),
+            witness_stem_may_lag: std::sync::atomic::AtomicBool::new(false),
+            witness_gaps: Vec::new(),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages: crate::spend_page_log::SpendPageLog::create(dir),
         })
@@ -1279,7 +1604,16 @@ impl TxTable {
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
         crate::store::rename_legacy_input_files(seqsigwit_dir)?;
         // Sidecar lives on the hot store, including when the stem is cold.
-        let prune_seqsigwit_mode = dir.join("seqsigwit.prune").is_file();
+        // A torn file is not a height. A positive short locator must not
+        // drop creates, and the next append still writes the witness stem.
+        // Locator 0 on that torn file is the finished cut with the height
+        // bytes missing. Open stores a 4-byte height so the next append
+        // does not try to extend an empty stem. A 4-byte height is the
+        // prune cut. A positive short locator on it is the prefix that
+        // landed, so open drops the creates past it.
+        let prune_path = dir.join("seqsigwit.prune");
+        let mut prune_seqsigwit_mode = prune_sidecar_is_height(&prune_path)?;
+        let mut torn_marker = prune_path.is_file() && !prune_seqsigwit_mode;
         let (seal_bits, workers) = Self::resolve_open_opts(opts);
         unlink_leftover_class_a_idx(dir)?;
         if seqsigwit_dir != dir {
@@ -1292,9 +1626,22 @@ impl TxTable {
         let create_loc = open_or_create_create_loc(dir)?;
         let seqsigwit_loc = open_or_create_seqsigwit_loc(seqsigwit_dir)?;
         let loc_count = create_loc.count();
-        // The sidecar is prune mode for reads and later appends. The witness
-        // stem still seals the tip until its locator no longer covers creates.
-        let stem_retired = prune_seqsigwit_mode && seqsigwit_loc.count() < loc_count;
+        // The stem cut already zeroed the locator and the 4-byte height
+        // did not land. There is no row to put the next scriptSig in.
+        // u32::MAX is the height this file did not record: nothing in it
+        // names a dropped prefix. An empty chain is not that cut.
+        if torn_marker && seqsigwit_loc.count() == 0 && loc_count > 0 {
+            crate::file::write_synced_tmp_rename(&prune_path, &u32::MAX.to_le_bytes())?;
+            prune_seqsigwit_mode = true;
+            torn_marker = false;
+        }
+        // A file opens the witness body at the short locator. Locator 0 is
+        // the finished cut. A torn marker keeps the creates. A 4-byte height
+        // whose locator is already 0 does too. A positive short locator on
+        // a 4-byte height is the prefix that landed.
+        let stem_retired = prune_path.is_file() && seqsigwit_loc.count() < loc_count;
+        let repair_keeps_short_witness =
+            torn_marker || (prune_seqsigwit_mode && seqsigwit_loc.count() == 0);
         let body = if had_txout {
             VarTable::open_body_only(dir, "txout", TableKind::TxOut, loc_count)?
         } else {
@@ -1366,9 +1713,26 @@ impl TxTable {
                 txstat: &txstat,
                 input: &input,
             },
-            stem_retired,
+            repair_keeps_short_witness,
             input_existed,
+            Some(dir),
         )?;
+        let witness_named = seqsigwit_loc.count();
+        let witness_through = create_loc.count();
+        if repair_keeps_short_witness {
+            align_short_witness_locator(
+                &seqsigwit,
+                &seqsigwit_loc,
+                witness_named,
+                witness_through,
+                dir,
+            )?;
+        }
+        // A 4-byte height with a positive locator does not fill, so align
+        // did not run. A span past the covered count would mark the next
+        // create as an empty pad. Align's own clamp is the fill path.
+        clamp_witness_gap_to_count(dir, create_loc.count())?;
+        let witness_gaps = load_witness_gap(dir)?;
         let n_bodies = create_loc.count();
         if txstat.count() != n_bodies {
             rbitcoin_log::warn!(
@@ -1386,30 +1750,34 @@ impl TxTable {
                     "store: tx.head meta missing with {n_bodies} Class A bodies — rebuild segmented head"
                 );
             }
-            // Wipe legacy mono head if present so create does not refuse after wipe intent.
-            let mono = dir.join("tx.head");
-            if mono.is_file() {
-                let _ = std::fs::remove_file(&mono);
+            // A torn segment directory has no meta to keep. A mono file still
+            // refuses in `create`. Meta is removed until the rebuild flushes,
+            // so a crash mid-rebuild wipes and starts again.
+            if dir.join("tx.head").is_dir() {
+                crate::segmented_head::wipe_segmented_head_files(dir);
             }
-            SegmentedTxHead::create(dir, crate::address_head::default_layout(opts.scale))?
+            let head =
+                SegmentedTxHead::create(dir, crate::address_head::default_layout(opts.scale))?;
+            if need_rebuild {
+                let meta = crate::segmented_head::meta_path(dir);
+                if meta.is_file() {
+                    std::fs::remove_file(&meta).map_err(|e| StoreError::io(&meta, e))?;
+                }
+            }
+            head
         } else {
             match SegmentedTxHead::open(dir) {
                 Ok(h) => {
                     let covered = h.last_inserted_fk();
                     if covered > n_bodies {
-                        // Torn Class A truncate: stale head entries past the
-                        // bodies would fail a later seal — rebuild instead.
+                        // Meta still names the prefix. Shorten the count.
+                        // Wiping here would walk every remaining Class A row.
                         rbitcoin_log::warn!(
                             "store: tx.head leads Class A covered={covered} n={n_bodies} \
-                             — wipe + rebuild"
+                             — shorten the head count"
                         );
-                        drop(h);
-                        crate::segmented_head::wipe_segmented_head_files(dir);
-                        need_rebuild = n_bodies > 0;
-                        SegmentedTxHead::create(
-                            dir,
-                            crate::address_head::default_layout(opts.scale),
-                        )?
+                        h.clamp_to_create_count(n_bodies)?;
+                        h
                     } else {
                         if n_bodies > 0 && h.occupied() == 0 {
                             need_rebuild = true;
@@ -1457,6 +1825,8 @@ impl TxTable {
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
+            witness_stem_may_lag: std::sync::atomic::AtomicBool::new(repair_keeps_short_witness),
+            witness_gaps,
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages: crate::spend_page_log::SpendPageLog::load_clipped(dir, spent_body_end)?,
         };
@@ -1589,13 +1959,38 @@ impl TxTable {
     }
 
     /// Witness locator no longer names every create. Seal and skew ignore it.
+    ///
+    /// A torn 0-byte marker counts. A finished cut does too: prune mode and
+    /// locator 0. A 4-byte height whose locator still names a prefix does not.
     fn seqsigwit_stem_retired(&self) -> bool {
-        self.prune_seqsigwit_mode() && self.seqsigwit_loc.count() < self.count()
+        let loc = self.seqsigwit_loc.count();
+        loc < self.count()
+            && (self.witness_stem_may_lag() || (self.prune_seqsigwit_mode() && loc == 0))
     }
 
     pub fn set_prune_seqsigwit_mode(&self, on: bool) {
         self.prune_seqsigwit_mode
             .store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn witness_stem_may_lag(&self) -> bool {
+        self.witness_stem_may_lag
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// `id` is an empty row open wrote so a later append does not reuse it.
+    pub fn witness_row_is_gap(&self, id: u64) -> bool {
+        self.witness_gaps
+            .iter()
+            .any(|&(named, through)| id > named && id <= through)
+    }
+
+    fn class_a_append_counts_match(&self, base: u64) -> bool {
+        if self.spent.count() != base || self.txstat.count() != base || self.input.count() != base {
+            return false;
+        }
+        self.prune_seqsigwit_mode()
+            || (self.seqsigwit.count() == base && self.seqsigwit_loc.count() == base)
     }
 
     pub fn datadir_hdd(&self) -> bool {
@@ -1793,20 +2188,30 @@ impl TxTable {
         past(&self.body.body) || past(&self.spent.body) || past(&self.seqsigwit.body)
     }
 
-    /// Creates whose locator headers have landed.
+    /// Creates whose durable headers have landed.
     ///
     /// No header is behind: two loads per file and the RAM count. A withheld
-    /// header is the length those headers still name.
+    /// header is the length the locator headers and the body headers still name.
     pub(crate) fn durable_create_count(&self) -> Result<u64, StoreError> {
         if !self.class_a_header_behind() {
             return Ok(self.count());
         }
-        self.locator_header_count()
+        let n = self.locator_header_count()?;
+        let stems = ClassASkewStems {
+            create_loc: &self.create_loc,
+            seqsigwit_loc: &self.seqsigwit_loc,
+            body: &self.body,
+            spent: &self.spent,
+            seqsigwit: &self.seqsigwit,
+            txids: &self.txids,
+            txstat: &self.txstat,
+            input: &self.input,
+        };
+        Ok(fit_covered_to_body_headers(&stems, n, self.prune_seqsigwit_mode())?.0)
     }
 
     /// Create count named by the locator headers, including a withheld
-    /// overflow header. A body header is not part of this count: open
-    /// truncates a body that ran ahead and refuses one that fell short.
+    /// overflow header. Callers min this with the body-header prefix.
     fn locator_header_count(&self) -> Result<u64, StoreError> {
         let prune = self.seqsigwit_stem_retired();
         let mut hi = durable_loc_count(
@@ -3126,11 +3531,7 @@ impl TxTable {
             .map(|(_tx, ins, _outs)| 16 + ins.iter().map(|i| i.encoded_len()).sum::<usize>())
             .sum();
         let base = self.body.count();
-        if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
-            || self.spent.count() != base
-            || self.txstat.count() != base
-            || self.input.count() != base
-        {
+        if !self.class_a_append_counts_match(base) {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
         if items.iter().any(|(_, _, outs)| outs.is_empty()) {
@@ -3270,11 +3671,7 @@ impl TxTable {
         }
         let est_out: usize = pins.iter().map(|pin| pin.packed_outs_est()).sum();
         let base = self.body.count();
-        if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
-            || self.spent.count() != base
-            || self.txstat.count() != base
-            || self.input.count() != base
-        {
+        if !self.class_a_append_counts_match(base) {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
         let mut n_outs = Vec::with_capacity(pins.len());

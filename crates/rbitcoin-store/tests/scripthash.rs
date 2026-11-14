@@ -14,7 +14,7 @@ use rbitcoin_store::scripthash_pages::{
     sh_page_as_array, sh_page_extent, sh_page_set_next, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
 };
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rbitcoin_store::scripthash_layout::SH_HEAD_VALUE_LEN;
 use rbitcoin_store::scripthash_materialize::{
@@ -32,6 +32,84 @@ use rbitcoin_store::scripthash_pages::{
 
 fn tmp() -> rbitcoin_store::testutil::TempDir {
     rbitcoin_store::testutil::TempDir::labeled("sh").expect("temp dir")
+}
+
+static THROUGH_IN_RENAME: AtomicBool = AtomicBool::new(false);
+static THROUGH_RELEASE: AtomicBool = AtomicBool::new(false);
+static THROUGH_SECOND_DONE: AtomicBool = AtomicBool::new(false);
+
+fn stall_through_rename() {
+    THROUGH_IN_RENAME.store(true, Ordering::Release);
+    while !THROUGH_RELEASE.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+}
+
+/// Two notes share `scripthash.through.tmp`. A note that loaded the old
+/// value must not rename a lower count over one the other note already
+/// stored.
+#[test]
+fn note_sh_through_keeps_a_higher_note() {
+    THROUGH_IN_RENAME.store(false, Ordering::Release);
+    THROUGH_RELEASE.store(false, Ordering::Release);
+    THROUGH_SECOND_DONE.store(false, Ordering::Release);
+    let dir = tmp();
+    set_before_through_rename_for_test(Some(stall_through_rename));
+    let low = dir.path().to_path_buf();
+    let high = dir.path().to_path_buf();
+    let first = std::thread::spawn(move || note_sh_through(&low, 10).unwrap());
+    let started = std::time::Instant::now();
+    while !THROUGH_IN_RENAME.load(Ordering::Acquire) {
+        if started.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("the first note never reached the rename");
+        }
+        std::thread::yield_now();
+    }
+    let second = std::thread::spawn(move || {
+        note_sh_through(&high, 30).unwrap();
+        THROUGH_SECOND_DONE.store(true, Ordering::Release);
+    });
+    let overlapped = std::time::Instant::now();
+    while !THROUGH_SECOND_DONE.load(Ordering::Acquire) {
+        if overlapped.elapsed() > std::time::Duration::from_millis(200) {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    THROUGH_RELEASE.store(true, Ordering::Release);
+    first.join().unwrap();
+    second.join().unwrap();
+    set_before_through_rename_for_test(None);
+    assert_eq!(
+        load_sh_through(dir.path()),
+        30,
+        "a lower note replaced the higher scripthash.through"
+    );
+}
+
+/// A crash after the posts-pass note and before the floor file leaves
+/// `scripthash.through` at the scan end. `DONE.keys` still names the
+/// creates the pack stored. That count is the floor.
+#[test]
+fn resume_floor_stops_at_the_keys_pass() {
+    let dir = tmp();
+    let udir = rbitcoin_store::unsorted_shard_dir(dir.path());
+    std::fs::create_dir_all(&udir).unwrap();
+    note_sh_through(dir.path(), 9).unwrap();
+    rbitcoin_store::scripthash_materialize::write_phase_done(
+        &udir,
+        rbitcoin_store::scripthash_materialize::KEYS_DONE_NAME,
+        rbitcoin_store::scripthash_materialize::KEYS_DONE_MAGIC,
+        4,
+        &[0],
+    )
+    .unwrap();
+    let publish =
+        rbitcoin_store::scripthash_materialize::sealed_resume_publish_fk(dir.path()).unwrap();
+    assert_eq!(
+        publish, 4,
+        "resume published the posts-pass through {publish}"
+    );
 }
 
 fn push_chain(session: &mut ScriptHashBulkSession<'_>, key: [u8; 32], entries: &[Fk]) {
@@ -686,6 +764,159 @@ fn page_append_preserves_prefix_and_order() {
         other => panic!("expected extent megakey, got {other:?}"),
     }
     assert_eq!(t.entries(&sh2).unwrap().len(), 600);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A history read can hold the head from before an in-place append.
+/// That mismatch is not a framing fault, so it does not schedule a rebuild.
+/// Repair of the same mismatch still does.
+#[test]
+fn stale_slab_read_does_not_mark_rebuild() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0x11]);
+    let first: Vec<_> = (1..=5u32).map(|v| rec(sh, u64::from(v), v)).collect();
+    t.put_create_batch_append(&first).unwrap();
+    let stale = t.head_value(&sh).unwrap().unwrap();
+    let home = t.key_home(&sh).unwrap();
+    let more: Vec<_> = (6..=7u32).map(|v| rec(sh, u64::from(v), v)).collect();
+    t.put_create_batch_append(&more).unwrap();
+    let err = t
+        .collect_entries_from(t.body_for(&sh, home), &stale)
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt(msg) if msg.contains("slab used")),
+        "{err}"
+    );
+    assert!(
+        !sh_rebuild_marked(&dir),
+        "a stale history read must not schedule scripthash.rebuild"
+    );
+
+    let (class, off, used) = match t.head_value(&sh).unwrap().unwrap() {
+        ShHeadValue::Slab { class, off, used } => (class, off, used),
+        other => panic!("expected slab, got {other:?}"),
+    };
+    assert!(used > 1);
+    t.apply_head_upserts(
+        &[(
+            sh,
+            ShHeadValue::Slab {
+                class,
+                off,
+                used: used - 1,
+            },
+            home,
+        )],
+        false,
+    )
+    .unwrap();
+    let again = rec(sh, 3, 3);
+    let err = t
+        .put_create_batch_append_through(std::slice::from_ref(&again), 4)
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt(msg) if msg.contains("slab used")),
+        "{err}"
+    );
+    assert!(
+        sh_rebuild_marked(&dir),
+        "repair of a stale slab still schedules scripthash.rebuild"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two keys repaired in one batch share a body and a home. Each row must
+/// not flush that home again.
+#[test]
+fn two_repairs_sync_the_home_once() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let a = script_hash(&[0x31]);
+    let b = script_hash(&[0x32]);
+    let rows: Vec<_> = [a, b]
+        .into_iter()
+        .flat_map(|sh| (1..=4u32).map(move |v| rec(sh, u64::from(v), v)))
+        .collect();
+    t.put_create_batch_append(&rows).unwrap();
+    let before = repair_heads_synced_for_test();
+    let again = vec![rec(a, 2, 2), rec(b, 2, 2)];
+    t.put_create_batch_append_through(&again, 2).unwrap();
+    let synced = repair_heads_synced_for_test().saturating_sub(before);
+    assert_eq!(synced, 1, "each repaired row flushed the same home");
+    assert_eq!(t.entries(&a).unwrap().len(), 2);
+    assert_eq!(t.entries(&b).unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cold rebuild resets the overflow body. Sealed overflow heads must
+/// not keep slab words that point into that reset body.
+#[test]
+fn rebuild_drops_sealed_overflow_heads() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0x41]);
+    t.put_create_batch_append(&[rec(sh, 1, 1)]).unwrap();
+    t.seal_ingest().unwrap();
+    assert!(t.head_value(&sh).unwrap().is_some());
+    assert!(sealed_ovf_path(&dir, 0).is_file());
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    t.reinit_empty_for_cold_materialize().unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    let ovf = dir.join("scripthash.ovf");
+    assert!(
+        synced.iter().any(|p| p == &ovf),
+        "the rebuild left the overflow directory unsynced: {synced:?}"
+    );
+    assert!(
+        t.sealed_ovf.lock().unwrap().is_empty(),
+        "the rebuild left a sealed overflow head loaded"
+    );
+    assert!(
+        !sealed_ovf_path(&dir, 0).exists(),
+        "the rebuild left the sealed overflow file"
+    );
+    assert!(
+        t.head_value(&sh).unwrap().is_none(),
+        "the rebuild still serves the overflow key"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A slab read past the file is the same framing fault as a page read.
+#[test]
+fn slab_read_past_logical_end_marks_rebuild() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let body = t.ovf_file();
+    let err = t.read_slab(body, 0, body.logical_len()).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt("pread past logical end")),
+        "{err}"
+    );
+    assert!(
+        sh_rebuild_marked(&dir),
+        "a past-end slab read must schedule scripthash.rebuild"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A page read past the logical end is a framing fault on either backend.
+#[test]
+fn page_read_past_logical_end_marks_rebuild() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let body = t.ovf_file();
+    let mut buf = [0u8; 16];
+    let err = read_sh_page_bytes(body, body.logical_len(), &mut buf).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt("pread past logical end")),
+        "{err}"
+    );
+    assert!(
+        sh_rebuild_marked(&dir),
+        "a past-end page read must schedule scripthash.rebuild"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

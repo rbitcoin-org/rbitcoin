@@ -227,7 +227,8 @@ itself changed.
     block.invalid                    # blocks that failed connect, kept across restart
     txout.body / create.loc / create.off / create.loc.ovf   # Class A outs (hot loc)
     seqsigwit.body / seqsigwit.loc / seqsigwit.off / seqsigwit.loc.ovf       # Class A inputs+witness when unpruned (cold loc). With seqsigwit.prune these four stay at the file header
-    seqsigwit.prune                  # optional: u32 LE pruneheight sidecar (`--prune-seqsigwit`; missing = off). Presence is prune mode
+    seqsigwit.prune                  # optional: u32 LE pruneheight sidecar (`--prune-seqsigwit`; missing = off). A 4-byte file is prune mode. Any other length is not a height
+    seqsigwit.gap                    # optional: one or more u64 LE named ‖ u64 LE through. Each (named, through] is an empty witness pad. A create between spans still has its witness. Length not a multiple of 16, or named >= through, is corrupt. Missing = none. Deleting the file syncs `store/`
     seqsigwit.window/                # prune window: one {height}.bin per kept height. The only witness payload while seqsigwit.prune exists
     seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
@@ -251,6 +252,10 @@ itself changed.
     scripthash.ovf/NNNNNN[.fuse8][.idx]                  # L0 SHSR pack8
     scripthash.ovf/NNNNNN.mphf|.val|.fuse8               # L1 promoted ovf (at most one)
     scripthash.runs              # leftover catalog (key_len=40); discarded at tip
+    scripthash.recheck           # optional: one or more (u64 LE covered ‖ u64 LE old inclusion watermark). History checks creates in each (covered, old] against Class A. Spans are sorted, do not overlap, and a gap stays its own record. Empty, a length that is not a multiple of 16, covered >= old, or an overlap is corrupt. Missing = none
+    scripthash.through           # optional: u64 LE max create fk whose posting bytes may have been synced. Written and synced before the scripthash body flush and before a repaired body sync. Missing, short, or u64::MAX = 0. Never decreases. Open records (create count, max(through, include_hwm)] in scripthash.recheck when through is past the create count. A full rebuild deletes it. No SCHEMA_VERSION bump
+    scripthash.rebuild           # optional: one byte. `1` = wipe on the next finalize (past-end page read or slab-used repair). `2` = that wipe already finished; a crash during the rebuild keeps sealed shards. Any other contents wipe again. Missing = none. A finished rebuild deletes it. No SCHEMA_VERSION bump
+    spend.recheck                # optional: one or more (u64 LE covered ‖ u64 LE old create count). A spender fk in (covered, old] counts only when that create's input at the stored vin still names the parent output. Spans are sorted, do not overlap, and a gap stays its own record. Empty, a length that is not a multiple of 16, covered >= old, or an overlap is corrupt. Missing = none
     scripthash.unsorted/keys/NN/  # pass 1 dir of SHKSP01 spills (000000…); merge identity-map fold + one walk to head+multi fuse, unlinks; DONE.keys=SHKEYS02 last_fk marker
     scripthash.unsorted/multi/NN.fuse8  # throwaway fuse8 of 0xFFFF keys for pass 2
     scripthash.unsorted/post/NN/  # pass 2 dir of SHPST01 spills (000000…); pack folds to one map then slot_for_key16 + 2+ body; DONE.post=SHPOST02 last_fk; unlinked after pack

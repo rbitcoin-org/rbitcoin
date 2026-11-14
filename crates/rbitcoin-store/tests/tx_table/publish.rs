@@ -42,6 +42,13 @@ fn outs(t: &TxTable, fk: u64) -> Vec<rbitcoin_store::tx_table::OutputRecord> {
         .1
 }
 
+fn seqsigwit_bytes(t: &TxTable, fk: u64) -> Vec<u8> {
+    let (off, len) = t.seqsigwit_range(rbitcoin_primitives::Fk(fk)).unwrap();
+    t.seqsigwit
+        .with_bytes_at(off, len, |b| Ok(b.to_vec()))
+        .unwrap()
+}
+
 fn numbered(n: u16) -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
     let mut txid = [0u8; 32];
     txid[..2].copy_from_slice(&n.to_le_bytes());
@@ -58,9 +65,32 @@ fn numbered(n: u16) -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
     )
 }
 
-/// A body header short of the locator count is not a prefix to recover.
+/// Input is short of the creates, and the seqsigwit body header does not
+/// cover the next row. Open fits the body headers before that probe, so
+/// startup truncates instead of refusing.
 #[test]
-fn body_header_short_of_the_locator_is_corrupt() {
+fn short_input_and_a_short_seqsigwit_header_reopen_at_the_prefix() {
+    let dir = super::tempfile_dir("short-input-short-seqsigwit");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let seq_end = on_disk_hwm(&t.seqsigwit.body);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    assert!(on_disk_hwm(&t.seqsigwit.body) > seq_end);
+    let header = FILE_HEADER_LEN as u64;
+    set_disk_hwm(&t.input.loc, header + 2);
+    set_disk_hwm(&t.seqsigwit.body, seq_end);
+    drop(t);
+
+    let t = TxTable::open_tiny(&dir).expect("open truncates instead of refusing");
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.input.count(), 1);
+    assert_eq!(outs(&t, 1)[0].script, vec![1]);
+}
+
+/// A body header short of the locator count is the covered prefix.
+/// Open keeps that create and drops the locator tail.
+#[test]
+fn body_header_short_of_the_locator_reopens_at_that_prefix() {
     let dir = super::tempfile_dir("body-behind-loc");
     let t = TxTable::create_tiny(&dir).unwrap();
     t.put_full_batch_indexed(&[one(1)], false).unwrap();
@@ -73,12 +103,169 @@ fn body_header_short_of_the_locator_is_corrupt() {
     set_disk_hwm(&t.seqsigwit.body, in_end);
     set_disk_hwm(&t.spent.body, sp_end);
     drop(t);
-    match TxTable::open_tiny(&dir) {
-        Err(rbitcoin_store::StoreError::Corrupt(m))
-            if m.contains("body header short of locator") => {}
-        Err(e) => panic!("open returned {e}"),
-        Ok(_) => panic!("open kept a body header short of the locator"),
-    }
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.create_loc.count(), 1);
+    assert_eq!(outs(&t, 1)[0].script, vec![1]);
+    assert!(t.get_meta_and_outputs(rbitcoin_primitives::Fk(2)).is_err());
+}
+
+/// Segment files and no `tx.head/meta` are a torn rebuild. Open wipes that
+/// directory, serves the txid from Class A, and the next open keeps the head.
+#[test]
+fn tx_head_without_meta_rebuilds_from_class_a() {
+    let dir = super::tempfile_dir("head-no-meta");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    let batch = [one(7)];
+    let txid = batch[0].0.txid;
+    t.put_full_batch_indexed(&batch, false).unwrap();
+    t.head.flush().unwrap();
+    drop(t);
+    let root = dir.join("tx.head");
+    std::fs::write(root.join("000000"), b"torn-segment").unwrap();
+    std::fs::remove_file(root.join("meta")).unwrap();
+
+    rbitcoin_log::capture_logs(true);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    let first = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let text = first
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("tx.head rebuild begin"), "{text}");
+    assert_eq!(
+        t.get_by_txid(&txid).unwrap().unwrap().0,
+        rbitcoin_primitives::Fk(1)
+    );
+    drop(t);
+
+    rbitcoin_log::capture_logs(true);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    let second = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let text = second
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !text.contains("tx.head rebuild begin"),
+        "a finished head rebuilds again: {text}"
+    );
+    assert_eq!(
+        t.get_by_txid(&txid).unwrap().unwrap().0,
+        rbitcoin_primitives::Fk(1)
+    );
+}
+
+/// A covered-prefix cut leaves `tx.head/meta` naming creates the body
+/// headers never finished. Open shortens that count. It does not rebuild.
+#[test]
+fn tx_head_past_the_covered_prefix_keeps_its_meta() {
+    let dir = super::tempfile_dir("head-past-prefix");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    let first = one(1);
+    let txid1 = first.0.txid;
+    t.put_full_batch_indexed(&[first], true).unwrap();
+    let tx_end = on_disk_hwm(&t.body.body);
+    let in_end = on_disk_hwm(&t.seqsigwit.body);
+    let sp_end = on_disk_hwm(&t.spent.body);
+    let second = one(2);
+    let txid2 = second.0.txid;
+    t.put_full_batch_indexed(&[second], true).unwrap();
+    t.head.flush().unwrap();
+    assert_eq!(t.head.last_inserted_fk(), 2);
+    set_disk_hwm(&t.body.body, tx_end);
+    set_disk_hwm(&t.seqsigwit.body, in_end);
+    set_disk_hwm(&t.spent.body, sp_end);
+    drop(t);
+
+    rbitcoin_log::capture_logs(true);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    let first_open = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let text = first_open
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !text.contains("tx.head rebuild begin"),
+        "a head that still has meta was rebuilt: {text}"
+    );
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.head.last_inserted_fk(), 1);
+    assert_eq!(
+        t.get_by_txid(&txid1).unwrap().unwrap().0,
+        rbitcoin_primitives::Fk(1)
+    );
+    assert!(t.get_by_txid(&txid2).unwrap().is_none());
+    let third = one(3);
+    let txid3 = third.0.txid;
+    t.put_full_batch_indexed(&[third], true).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(
+        t.get_by_txid(&txid3).unwrap().unwrap().0,
+        rbitcoin_primitives::Fk(2)
+    );
+    assert!(t.get_by_txid(&txid2).unwrap().is_none());
+    drop(t);
+
+    rbitcoin_log::capture_logs(true);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    let second_open = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let text = second_open
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !text.contains("tx.head rebuild begin"),
+        "the shortened head rebuilds on the next open: {text}"
+    );
+    assert_eq!(
+        t.get_by_txid(&txid1).unwrap().unwrap().0,
+        rbitcoin_primitives::Fk(1)
+    );
+    assert_eq!(
+        t.get_by_txid(&txid3).unwrap().unwrap().0,
+        rbitcoin_primitives::Fk(2)
+    );
+}
+
+/// A monolithic `tx.head` file is not a torn segment directory.
+#[test]
+fn legacy_mono_tx_head_still_refuses_open() {
+    let dir = super::tempfile_dir("head-mono");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    drop(t);
+    let root = dir.join("tx.head");
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::write(&root, b"mono").unwrap();
+    let msg = match TxTable::open_tiny(&dir) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("legacy mono head opened"),
+    };
+    assert!(msg.contains("legacy monolithic"), "{msg}");
+}
+
+/// Flat `tx.head.meta` is the pre-directory layout and still refuses.
+#[test]
+fn flat_tx_head_meta_still_refuses_open() {
+    let dir = super::tempfile_dir("head-flat-meta");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    drop(t);
+    std::fs::rename(dir.join("tx.head").join("meta"), dir.join("tx.head.meta")).unwrap();
+    let msg = match TxTable::open_tiny(&dir) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("flat tx.head.meta opened"),
+    };
+    assert!(msg.contains("index refuses flat tx.head.meta"), "{msg}");
 }
 
 /// `create.loc` landed and `seqsigwit.loc` did not. Open cuts back to the
@@ -97,6 +284,305 @@ fn seqsigwit_loc_behind_create_loc_reopens_at_the_shorter_count() {
     assert_eq!(t.count(), 1);
     assert_eq!(t.seqsigwit_loc.count(), 1);
     assert_eq!(outs(&t, 1)[0].script, vec![1]);
+}
+
+/// A torn `seqsigwit.prune` means the witness cut already happened.
+/// Open keeps the creates the short witness locator no longer names.
+#[test]
+fn torn_prune_file_keeps_creates_past_the_witness_stem() {
+    let dir = super::tempfile_dir("torn-prune-stem");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let seq_end = on_disk_hwm(&t.seqsigwit_loc.loc);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    assert!(on_disk_hwm(&t.seqsigwit_loc.loc) > seq_end);
+    set_disk_hwm(&t.seqsigwit_loc.loc, seq_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.create_loc.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 2);
+    assert!(
+        seqsigwit_bytes(&t, 2).iter().all(|&b| b == 0),
+        "the create the short locator did not name has no witness"
+    );
+    let mut third = one(3);
+    third.1[0].script_sig = vec![0xab];
+    t.put_full_batch_indexed(&[third], false).unwrap();
+    assert_eq!(t.count(), 3);
+    assert_eq!(t.seqsigwit_loc.count(), 3);
+    assert!(
+        seqsigwit_bytes(&t, 2).iter().all(|&b| b == 0),
+        "the next append must not reuse the gap slot"
+    );
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(3)).unwrap().1[0].script_sig,
+        vec![0xab]
+    );
+    assert_eq!(outs(&t, 1)[0].script, vec![1]);
+    assert_eq!(outs(&t, 2)[0].script, vec![2]);
+}
+
+/// A second torn locator starts past the first gap. The creates between
+/// those fills already have a witness, so open must not mark them empty.
+#[test]
+fn later_fill_keeps_the_witness_between_two_gaps() {
+    let dir = super::tempfile_dir("gap-between");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let after_first = on_disk_hwm(&t.seqsigwit_loc.loc);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    set_disk_hwm(&t.seqsigwit_loc.loc, after_first);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert!(t.witness_row_is_gap(2));
+    assert!(!t.witness_row_is_gap(1));
+    let mut third = one(3);
+    third.1[0].script_sig = vec![0xab];
+    t.put_full_batch_indexed(&[third], false).unwrap();
+    let after_third = on_disk_hwm(&t.seqsigwit_loc.loc);
+    t.put_full_batch_indexed(&[one(4)], false).unwrap();
+    set_disk_hwm(&t.seqsigwit_loc.loc, after_third);
+    drop(t);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert!(t.witness_row_is_gap(2), "the first empty row stays a gap");
+    assert!(
+        !t.witness_row_is_gap(3),
+        "the witness between the fills is still a witness"
+    );
+    assert!(t.witness_row_is_gap(4), "the new short locator is a gap");
+    assert!(!t.witness_row_is_gap(1));
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(3)).unwrap().1[0].script_sig,
+        vec![0xab]
+    );
+    drop(t);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert!(t.witness_row_is_gap(2));
+    assert!(!t.witness_row_is_gap(3));
+    assert!(t.witness_row_is_gap(4));
+}
+
+/// A short body header cuts the creates. A prune file must not leave the
+/// witness locator, or a gap span, naming the creates that were dropped.
+#[test]
+fn witness_ahead_of_the_covered_prefix_is_cut_back() {
+    let dir = super::tempfile_dir("witness-ahead");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    let mut first = one(1);
+    first.1[0].script_sig = vec![0x11];
+    t.put_full_batch_indexed(&[first], false).unwrap();
+    let tx_end = on_disk_hwm(&t.body.body);
+    let sp_end = on_disk_hwm(&t.spent.body);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    let mut third = one(3);
+    third.1[0].script_sig = vec![0x33];
+    t.put_full_batch_indexed(&[third], false).unwrap();
+    set_disk_hwm(&t.body.body, tx_end);
+    set_disk_hwm(&t.spent.body, sp_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let mut gap = [0u8; 16];
+    gap[..8].copy_from_slice(&1u64.to_le_bytes());
+    gap[8..].copy_from_slice(&3u64.to_le_bytes());
+    std::fs::write(dir.join("seqsigwit.gap"), gap).unwrap();
+
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.seqsigwit_loc.count(), 1);
+    assert!(!t.witness_row_is_gap(1));
+    let mut next = one(4);
+    next.1[0].script_sig = vec![0x44];
+    t.put_full_batch_indexed(&[next], false).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 2);
+    assert!(!t.witness_row_is_gap(2));
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(2)).unwrap().1[0].script_sig,
+        vec![0x44]
+    );
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(1)).unwrap().1[0].script_sig,
+        vec![0x11]
+    );
+    drop(t);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.seqsigwit_loc.count(), 2);
+    assert!(!t.witness_row_is_gap(2));
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(2)).unwrap().1[0].script_sig,
+        vec![0x44]
+    );
+}
+
+/// A 4-byte height skips the empty-row fill. The cut still has to drop a
+/// gap span that names creates past the prefix, or the next create is an
+/// empty pad.
+#[test]
+fn four_byte_prune_drops_a_gap_past_the_covered_prefix() {
+    let dir = super::tempfile_dir("witness-ahead-height");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    let mut first = one(1);
+    first.1[0].script_sig = vec![0x11];
+    t.put_full_batch_indexed(&[first], false).unwrap();
+    let tx_end = on_disk_hwm(&t.body.body);
+    let sp_end = on_disk_hwm(&t.spent.body);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    let mut third = one(3);
+    third.1[0].script_sig = vec![0x33];
+    t.put_full_batch_indexed(&[third], false).unwrap();
+    set_disk_hwm(&t.body.body, tx_end);
+    set_disk_hwm(&t.spent.body, sp_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), u32::MAX.to_le_bytes()).unwrap();
+    let mut gap = [0u8; 16];
+    gap[..8].copy_from_slice(&1u64.to_le_bytes());
+    gap[8..].copy_from_slice(&3u64.to_le_bytes());
+    std::fs::write(dir.join("seqsigwit.gap"), gap).unwrap();
+
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1);
+    assert!(!t.witness_row_is_gap(1));
+    let mut next = one(4);
+    next.1[0].script_sig = vec![0x44];
+    t.put_full_batch_indexed(&[next], false).unwrap();
+    assert_eq!(t.count(), 2);
+    assert!(
+        !t.witness_row_is_gap(2),
+        "the create after the cut is not an empty pad"
+    );
+    assert!(!dir.join("seqsigwit.gap").exists());
+}
+
+/// The witness locator already names the covered prefix. The body counter
+/// was opened at the longer create count and must come back before append.
+#[test]
+fn matched_witness_locator_resets_the_body_count() {
+    let dir = super::tempfile_dir("witness-match");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    let mut first = one(1);
+    first.1[0].script_sig = vec![0x11];
+    t.put_full_batch_indexed(&[first], false).unwrap();
+    let tx_end = on_disk_hwm(&t.body.body);
+    let sp_end = on_disk_hwm(&t.spent.body);
+    let sw_end = on_disk_hwm(&t.seqsigwit_loc.loc);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    set_disk_hwm(&t.body.body, tx_end);
+    set_disk_hwm(&t.spent.body, sp_end);
+    set_disk_hwm(&t.seqsigwit_loc.loc, sw_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.seqsigwit_loc.count(), 1);
+    assert_eq!(t.seqsigwit.count(), 1);
+    let mut next = one(3);
+    next.1[0].script_sig = vec![0x33];
+    t.put_full_batch_indexed(&[next], false).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.seqsigwit.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 2);
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(2)).unwrap().1[0].script_sig,
+        vec![0x33]
+    );
+    assert_eq!(
+        t.get_full(rbitcoin_primitives::Fk(1)).unwrap().1[0].script_sig,
+        vec![0x11]
+    );
+}
+
+/// The witness stem was already cut to an empty locator. Open must not
+/// invent an empty witness row for every create still in the chain.
+#[test]
+fn finished_witness_cut_does_not_fill_empty_rows() {
+    let dir = super::tempfile_dir("witness-cut-zero");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    assert_eq!(t.count(), 2);
+    t.cut_seqsigwit_stem_to_header().unwrap();
+    assert_eq!(t.seqsigwit_loc.count(), 0);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 0);
+    assert_eq!(t.seqsigwit.count(), 0);
+    assert!(!t.witness_row_is_gap(1));
+    assert!(!t.witness_row_is_gap(2));
+    assert!(
+        !dir.join("seqsigwit.gap").exists(),
+        "a finished cut is not an empty-witness span"
+    );
+    drop(t);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 0);
+    assert!(!t.witness_row_is_gap(1));
+    assert!(!t.witness_row_is_gap(2));
+}
+
+/// Locator 0 is the finished cut. The next create has to land, and its
+/// scriptSig is not an empty pad on the stem.
+#[test]
+fn finished_torn_cut_accepts_the_next_create() {
+    let dir = super::tempfile_dir("witness-cut-append");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    t.cut_seqsigwit_stem_to_header().unwrap();
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 0);
+    assert!(t.prune_seqsigwit_mode());
+    assert_eq!(
+        std::fs::read(dir.join("seqsigwit.prune")).unwrap(),
+        u32::MAX.to_le_bytes()
+    );
+    let mut third = one(3);
+    third.1[0].script_sig = vec![0xab];
+    t.put_full_batch_indexed(&[third], false).unwrap();
+    assert_eq!(t.count(), 3);
+    assert_eq!(t.seqsigwit_loc.count(), 0);
+    assert_eq!(t.seqsigwit.count(), 0);
+    assert!(!t.witness_row_is_gap(3));
+    assert!(!dir.join("seqsigwit.gap").exists());
+    assert_eq!(outs(&t, 3)[0].script, vec![3]);
+}
+
+/// Deleting a gap span past the covered count has to sync the directory.
+/// A crash that restores the old dirent would hide a later witness.
+#[test]
+fn removing_a_witness_gap_syncs_the_directory() {
+    let dir = super::tempfile_dir("witness-gap-dir");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let tx_end = on_disk_hwm(&t.body.body);
+    let sp_end = on_disk_hwm(&t.spent.body);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    set_disk_hwm(&t.body.body, tx_end);
+    set_disk_hwm(&t.spent.body, sp_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let mut gap = [0u8; 16];
+    gap[..8].copy_from_slice(&1u64.to_le_bytes());
+    gap[8..].copy_from_slice(&3u64.to_le_bytes());
+    std::fs::write(dir.join("seqsigwit.gap"), gap).unwrap();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1);
+    assert!(!dir.join("seqsigwit.gap").exists());
+    drop(t);
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(
+        synced.iter().any(|p| p == &dir),
+        "the gap dirent delete must be durable; synced {synced:?}"
+    );
 }
 
 /// A 1024-create window whose `create.off` checkpoint did not land opens at
@@ -255,4 +741,156 @@ fn ovf_header_miss_does_not_seal_the_create() {
     assert_eq!(t.count(), 1);
     assert_eq!(outs(&t, 1).len(), 256);
     assert!(t.get_meta_and_outputs(rbitcoin_primitives::Fk(2)).is_err());
+}
+
+/// The locator already names every create. The witness body only covers the
+/// first row. Open cuts to that row, fills the gap, and the next append
+/// does not fail the stem check.
+#[test]
+fn matched_locator_short_witness_body_fills_from_the_covered_row() {
+    let dir = super::tempfile_dir("matched-short-witness-body");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let seq_end = on_disk_hwm(&t.seqsigwit.body);
+    t.put_full_batch_indexed(&[one(2), one(3)], false).unwrap();
+    t.flush().unwrap();
+    set_disk_hwm(&t.seqsigwit.body, seq_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 3);
+    assert_eq!(t.seqsigwit_loc.count(), 3);
+    assert_eq!(t.seqsigwit.count(), 3);
+    assert!(!t.witness_row_is_gap(1));
+    assert!(t.witness_row_is_gap(2));
+    assert!(t.witness_row_is_gap(3));
+    t.put_full_batch_indexed(&[one(4)], false)
+        .expect("the next append must not fail the stem check");
+    assert_eq!(t.count(), 4);
+    assert_eq!(t.seqsigwit.count(), 4);
+}
+
+/// The locator names every create and the witness body covers none of them.
+/// Open refuses instead of filling from an empty stem.
+#[test]
+fn matched_locator_with_no_witness_row_refuses_open() {
+    let dir = super::tempfile_dir("matched-no-witness-row");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1), one(2), one(3)], false)
+        .unwrap();
+    t.flush().unwrap();
+    set_disk_hwm(&t.seqsigwit.body, FILE_HEADER_LEN as u64);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let msg = match TxTable::open_tiny(&dir) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("open kept a witness body that covers no row"),
+    };
+    assert!(
+        msg.contains("seqsigwit body covers no witness row"),
+        "{msg}"
+    );
+}
+
+/// Creates were cut to row 2, the locator still names row 3, and the body
+/// only covers row 1. Open keeps the txout prefix, cuts the witness to row
+/// 1, and fills the one missing row.
+#[test]
+fn short_body_behind_a_long_locator_fills_up_to_the_prefix() {
+    let dir = super::tempfile_dir("ahead-loc-short-body");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let seq_end = on_disk_hwm(&t.seqsigwit.body);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    let tx_end = on_disk_hwm(&t.body.body);
+    let sp_end = on_disk_hwm(&t.spent.body);
+    t.put_full_batch_indexed(&[one(3)], false).unwrap();
+    t.flush().unwrap();
+    set_disk_hwm(&t.seqsigwit.body, seq_end);
+    set_disk_hwm(&t.body.body, tx_end);
+    set_disk_hwm(&t.spent.body, sp_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.seqsigwit_loc.count(), 2);
+    assert_eq!(t.seqsigwit.count(), 2);
+    assert!(!t.witness_row_is_gap(1));
+    assert!(t.witness_row_is_gap(2));
+    t.put_full_batch_indexed(&[one(4)], false)
+        .expect("the next append must not fail the stem check");
+}
+
+/// A torn prune file ignores the short witness body in the fit. The short
+/// input probe must not read the next row past that body.
+#[test]
+fn torn_prune_short_input_does_not_read_past_the_witness_body() {
+    let dir = super::tempfile_dir("torn-short-input-body");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let seq_end = on_disk_hwm(&t.seqsigwit.body);
+    t.put_full_batch_indexed(&[one(2)], false).unwrap();
+    set_disk_hwm(&t.input.loc, FILE_HEADER_LEN as u64 + 2);
+    set_disk_hwm(&t.seqsigwit.body, seq_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+
+    let t = TxTable::open_tiny(&dir).expect("open truncates instead of refusing");
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.input.count(), 1);
+    assert_eq!(outs(&t, 1)[0].script, vec![1]);
+}
+
+/// The torn marker kept the creates. The witness body only covers the first
+/// row the locator names. Open cuts the locator to that row, fills the gap,
+/// and the next append does not fail the stem check.
+#[test]
+fn torn_prune_short_witness_body_fills_from_the_covered_row() {
+    let dir = super::tempfile_dir("torn-short-witness-body");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1)], false).unwrap();
+    let seq_end = on_disk_hwm(&t.seqsigwit.body);
+    t.put_full_batch_indexed(&[one(2), one(3)], false).unwrap();
+    t.flush().unwrap();
+    t.seqsigwit_loc.truncate_to_count(2).unwrap();
+    set_disk_hwm(&t.seqsigwit.body, seq_end);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 3);
+    assert_eq!(t.seqsigwit_loc.count(), 3);
+    assert_eq!(t.seqsigwit.count(), 3);
+    assert!(!t.witness_row_is_gap(1));
+    assert!(t.witness_row_is_gap(2));
+    assert!(t.witness_row_is_gap(3));
+    t.put_full_batch_indexed(&[one(4)], false)
+        .expect("the next append must not fail the stem check");
+    assert_eq!(t.count(), 4);
+    assert_eq!(t.seqsigwit.count(), 4);
+}
+
+/// A torn marker and a witness body that covers no row cannot be filled.
+/// Open refuses instead of leaving a store whose next append fails.
+#[test]
+fn torn_prune_with_no_witness_row_refuses_open() {
+    let dir = super::tempfile_dir("torn-no-witness-row");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(&[one(1), one(2), one(3)], false)
+        .unwrap();
+    t.flush().unwrap();
+    t.seqsigwit_loc.truncate_to_count(2).unwrap();
+    set_disk_hwm(&t.seqsigwit.body, FILE_HEADER_LEN as u64);
+    drop(t);
+    std::fs::write(dir.join("seqsigwit.prune"), []).unwrap();
+    let msg = match TxTable::open_tiny(&dir) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("open kept a witness body that covers no row"),
+    };
+    assert!(
+        msg.contains("seqsigwit body covers no witness row"),
+        "{msg}"
+    );
 }

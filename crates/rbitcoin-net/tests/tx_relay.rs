@@ -936,6 +936,25 @@ fn unbroadcast_survives_reopen_and_logs_confirm_before_broadcast() {
     let _ = std::fs::remove_dir_all(&mp);
 }
 
+/// A temp write that never renames does not replace the live unbroadcast set.
+#[test]
+fn abandoned_unbroadcast_tmp_keeps_the_previous_set() {
+    let dir = std::env::temp_dir().join(format!("rbitcoin-unbroadcast-tmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let previous = Txid::from_byte_array([1u8; 32]);
+    let abandoned = Txid::from_byte_array([2u8; 32]);
+    let mut set = std::collections::HashSet::new();
+    set.insert(previous);
+    persist_unbroadcast_file(&dir, &set);
+    std::fs::write(dir.join("unbroadcast.tmp"), abandoned.to_byte_array()).unwrap();
+    let loaded = load_unbroadcast_file(&dir);
+    assert!(loaded.contains(&previous));
+    assert!(!loaded.contains(&abandoned));
+    assert_eq!(std::fs::read(dir.join("unbroadcast")).unwrap().len(), 32);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `importmempool` logs each Core `LoadMempool` outcome: a fresh admit, a
 /// duplicate, an expired entry, and a tx that cannot enter.
 #[test]

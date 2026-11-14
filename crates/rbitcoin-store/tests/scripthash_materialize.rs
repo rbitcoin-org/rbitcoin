@@ -362,6 +362,14 @@ fn plan_unsorted_collect_appends_only_when_no_shards() {
         UnsortedCollectAction::Skip
     ));
     assert!(matches!(
+        plan_unsorted_collect(Some(11), 10, false, true),
+        UnsortedCollectAction::Full
+    ));
+    assert!(matches!(
+        plan_unsorted_collect(Some(11), 10, true, true),
+        UnsortedCollectAction::Full
+    ));
+    assert!(matches!(
         plan_unsorted_collect(Some(4), 10, false, true),
         UnsortedCollectAction::Append { first: 5, last: 10 }
     ));
@@ -373,6 +381,87 @@ fn plan_unsorted_collect_appends_only_when_no_shards() {
         plan_unsorted_collect(Some(4), 10, false, false),
         UnsortedCollectAction::Full
     ));
+}
+
+fn plant_phase(dir: &std::path::Path, name: &str, magic: &[u8; 8], n: usize, word: u64) {
+    fs::create_dir_all(dir).unwrap();
+    let counts = vec![word; n];
+    write_phase_done(dir, name, magic, 0, &counts).unwrap();
+}
+
+fn touch_every_shard_map(store: &rbitcoin_store::Store) {
+    let n = store.scripthash.head_shard_count();
+    for si in 0..n {
+        let base = rbitcoin_store::scripthash::sorted_main_shard_path(store.path(), si, n);
+        if let Some(parent) = base.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(rbitcoin_store::scripthash_mphf::mphf_path(&base), b"m").unwrap();
+        fs::write(rbitcoin_store::scripthash_mphf::val_path(&base), b"v").unwrap();
+    }
+}
+
+/// `DONE` equals the create count and an unsealed shard has no map.
+/// Skip would report the planted tally and leave that shard empty.
+#[test]
+fn keys_skip_recollects_when_an_unsealed_shard_has_no_map() {
+    let (dir, store) = rbitcoin_store::testutil::tiny_store_labeled("sh-skip-keys-nomap");
+    let n = store.scripthash.head_shard_count();
+    let udir = unsorted_shard_dir(store.path());
+    plant_phase(&udir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n, 999);
+    let got =
+        collect_unsorted_covering_txs(&store.txs, &store.scripthash, &udir, n, 1, false, None)
+            .unwrap();
+    assert_eq!(got.recs, 0, "keys skip kept the planted tally {}", got.recs);
+    let _ = fs::remove_dir_all(dir.path());
+}
+
+#[test]
+fn posts_skip_recollects_when_an_unsealed_shard_has_no_map() {
+    let (dir, store) = rbitcoin_store::testutil::tiny_store_labeled("sh-skip-posts-nomap");
+    let n = store.scripthash.head_shard_count();
+    let udir = unsorted_shard_dir(store.path());
+    plant_phase(&udir, POST_DONE_NAME, POST_DONE_MAGIC, n, 999);
+    let got = collect_posts_covering(&store.txs, &store.scripthash, &udir, 1, false, None).unwrap();
+    assert_eq!(
+        got.recs, 0,
+        "posts skip kept the planted tally {}",
+        got.recs
+    );
+    let _ = fs::remove_dir_all(dir.path());
+}
+
+/// A pass-1 map with `DONE` at the count is a real resume. Skip stays.
+#[test]
+fn keys_skip_stays_when_the_unsealed_map_is_present() {
+    let (dir, store) = rbitcoin_store::testutil::tiny_store_labeled("sh-skip-keys-map");
+    let n = store.scripthash.head_shard_count();
+    touch_every_shard_map(&store);
+    let udir = unsorted_shard_dir(store.path());
+    plant_phase(&udir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n, 999);
+    let got =
+        collect_unsorted_covering_txs(&store.txs, &store.scripthash, &udir, n, 1, false, None)
+            .unwrap();
+    assert_eq!(got.recs, u64::try_from(n).unwrap() * 999);
+    let _ = fs::remove_dir_all(dir.path());
+}
+
+/// Removing the unsorted directory has to sync the store directory.
+/// A crash can otherwise restore `DONE` after the maps are already gone.
+#[test]
+fn clear_unsorted_syncs_the_store_directory() {
+    let (dir, store) = rbitcoin_store::testutil::tiny_store_labeled("sh-clear-fsync");
+    let udir = unsorted_shard_dir(store.path());
+    fs::create_dir_all(&udir).unwrap();
+    fs::write(udir.join("DONE.keys"), b"x").unwrap();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    clear_unsorted_shard_dir(&udir).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(
+        synced.iter().any(|p| p == store.path()),
+        "clear left the store directory unsynced: {synced:?}"
+    );
+    let _ = fs::remove_dir_all(dir.path());
 }
 
 #[test]

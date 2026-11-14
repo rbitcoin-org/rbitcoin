@@ -46,6 +46,16 @@ impl IndexMode {
     }
 }
 
+/// Whether a legacy SEAL that is not a nearby lost tail is copied into
+/// `include_hwm` before the lost-tail check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FarSealCopy {
+    /// Tip finalize. The far seal becomes the inclusion mark.
+    AtFinalize,
+    /// Process open, before write-behind recovery. A far seal stays in SEAL.
+    NearbyOnly,
+}
+
 impl Query {
     /// Current index / spentness mode ([`IndexMode`]).
     ///
@@ -144,8 +154,14 @@ impl Query {
     ///
     /// Residual `scripthash.runs` next to a live head are leftover (cancelled
     /// WarmOnly / crash); they are discarded, not merged.
+    ///
+    /// A resume mark means the pack may not cover Class A yet. Stay Direct
+    /// until finalize backfills. The next block would otherwise publish the
+    /// watermark over creates the pack never scanned.
     pub fn sh_use_writebehind(&self) -> bool {
-        self.sh_index_enabled() && self.store.scripthash.has_durable_index()
+        self.sh_index_enabled()
+            && self.store.scripthash.has_durable_index()
+            && !rbitcoin_store::scripthash::sh_rebuild_resume(self.store.path())
     }
 
     /// True when durable SH already covers Class A through tip (safe to stay in
@@ -171,7 +187,84 @@ impl Query {
         let seal = self.sh_run.sealed_max_create_fk();
         let include_hwm = self.store.scripthash.include_hwm();
         let floor = durable_sh_inclusion_floor(include_hwm, seal);
+        // A watermark just above the stem still names creates this open
+        // dropped. A seal copied far above the stem is not that tail.
+        if Self::sh_lost_tail(include_hwm, tip_max) {
+            return false;
+        }
         floor >= tip_max
+    }
+
+    /// `include_hwm` names creates that are no longer in Class A.
+    ///
+    /// A gap of more than a million creates is the legacy missing-file
+    /// SEAL, not a power-loss tail. That watermark stays put.
+    fn sh_lost_tail(include_hwm: u64, create_count: u64) -> bool {
+        const MAX_TAIL: u64 = 1_000_000;
+        include_hwm > create_count && include_hwm - create_count <= MAX_TAIL
+    }
+
+    /// Drop index rows for creates past the stem, using the same unlink
+    /// disconnect uses. A packed head stores a mix of the key, not the key,
+    /// so a missing output cannot name the row. The watermark and SEAL still
+    /// move to `covered`, and the head stays.
+    fn unlink_sh_tail(&self, covered: u64) -> Result<(), QueryError> {
+        use std::collections::HashMap;
+        let hwm = self.store.scripthash.include_hwm();
+        let mut by_sh: HashMap<[u8; 32], Vec<Fk>> = HashMap::new();
+        for id in covered.saturating_add(1)..=hwm {
+            let outputs = match self.tx_output_run_class_a(Fk(id)) {
+                Ok(v) => v,
+                Err(StoreError::NotFound) => break,
+                Err(e) => return Err(e),
+            };
+            for o in &outputs {
+                by_sh
+                    .entry(script_hash(&o.script))
+                    .or_default()
+                    .push(Fk(id));
+            }
+        }
+        if !by_sh.is_empty() {
+            let groups: Vec<([u8; 32], Vec<Fk>)> = by_sh.into_iter().collect();
+            self.store.scripthash.unlink_creates_batch(&groups)?;
+            self.store.scripthash.commit_deferred_empty_heads()?;
+        }
+        // The cut numbers stay on rows whose outputs were already gone.
+        // History has to check those numbers after the chain reuses them.
+        // A flush can have synced a row past `include_hwm`. The span has to
+        // reach that marker too. The file lands before the watermark moves,
+        // so a crash in between still retries this repair and still has the span.
+        let end = hwm.max(rbitcoin_store::scripthash::load_sh_through(
+            self.store.path(),
+        ));
+        if end > covered {
+            rbitcoin_store::scripthash::note_sh_recheck(self.store.path(), covered, end)?;
+        }
+        // Seal first. A crash before the watermark moves still has the high
+        // mark, so the next start sees the lost tail and tries again. Deleting
+        // the file first looks like a legacy head: the old seal is copied back
+        // and the index never becomes tip-ready.
+        self.sh_run.refresh_seal();
+        if self.sh_run.sealed_max_create_fk() > covered {
+            crate::sh_builder::store_seal(&self.sh_run.runs_dir, covered)?;
+            self.sh_run.refresh_seal();
+        }
+        #[cfg(debug_assertions)]
+        if let Some(hook) = sh_hwm_publish_hook() {
+            hook(self);
+        }
+        if covered > 0 {
+            self.store.scripthash.replace_include_hwm(covered)?;
+        } else {
+            let path = self.store.path().join(rbitcoin_store::INCLUDE_HWM_NAME);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StoreError::io(&path, e)),
+            }
+        }
+        Ok(())
     }
 
     /// Sync SEAL up to durable `include_hwm` when the head is ahead of the run
@@ -222,26 +315,50 @@ impl Query {
     /// from 0 cannot fill a hole under a later append, and on a long chain it
     /// is the slow path. A SEAL still names the prefix when the mark file is
     /// missing. `--sh-index` off leaves the files in place.
+    ///
+    /// Resume byte `2` keeps that head, including when the include mark and
+    /// SEAL were not published yet. A wipe byte finishes the wipe even when
+    /// a later open restored the pack marks and the inclusion watermark.
+    /// The resume byte then replaces it, so the packs written next stay.
     pub fn discard_unproven_scripthash_head(&self) -> Result<(), QueryError> {
-        if !self.sh_index_enabled() || !self.store.scripthash.has_durable_index() {
+        if !self.sh_index_enabled() {
             return Ok(());
         }
-        if self.store.txs.count() == 0 {
+        let path = self.store.path();
+        // Checked before the floor. A resume head can be pack-complete with
+        // both marks still missing, and prepare would turn byte `2` into a wipe.
+        if rbitcoin_store::scripthash::sh_rebuild_resume(path) {
             return Ok(());
         }
-        self.sh_run.refresh_seal();
-        let floor = crate::sh_builder::durable_sh_inclusion_floor(
-            self.store.scripthash.include_hwm(),
-            self.sh_run.sealed_max_create_fk(),
-        );
-        if floor > 0 {
-            return Ok(());
+        let wipe_requested = rbitcoin_store::scripthash::sh_rebuild_marked(path);
+        if !wipe_requested {
+            if !self.store.scripthash.has_durable_index() {
+                return Ok(());
+            }
+            if self.store.txs.count() == 0 {
+                return Ok(());
+            }
+            self.sh_run.refresh_seal();
+            let floor = crate::sh_builder::durable_sh_inclusion_floor(
+                self.store.scripthash.include_hwm(),
+                self.sh_run.sealed_max_create_fk(),
+            );
+            if floor > 0 {
+                return Ok(());
+            }
+            rbitcoin_log::warn!(
+                "scripthash head has no include mark and no SEAL; deleting it so \
+                 tip entry can materialize from Class A"
+            );
+        } else {
+            rbitcoin_log::warn!(
+                "scripthash wipe is unfinished; deleting the head so tip entry \
+                 can materialize from Class A"
+            );
         }
-        rbitcoin_log::warn!(
-            "scripthash head has no include mark and no SEAL; deleting it so \
-             tip entry can materialize from Class A"
-        );
         self.sh_run.prepare_force_full_rebuild(&self.store)?;
+        // Byte `1` would make the following finalize wipe the shards it packs.
+        rbitcoin_store::scripthash::mark_sh_rebuild_resume(path)?;
         self.set_sh_indexed_through_height(None);
         self.sh.applied_max_fk.store(0, Ordering::Release);
         self.sh.pending.lock().unwrap().clear();
@@ -267,53 +384,137 @@ impl Query {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<u64, QueryError> {
         self.discard_unproven_scripthash_head()?;
-        if !self.sh_force_rebuild() && self.sh_use_writebehind() {
-            if self.store.scripthash.unsealed_main_shards().is_empty() {
-                let residual = self.sh_run.on_disk_run_count();
-                self.sh_run.discard_residual_runs();
-                if residual > 0 {
-                    rbitcoin_log::info!(
-                        "node: scripthash durable head — discarding {residual} leftover run(s); \
-                     gap uses write-behind (no Class A recollect / WarmOnly)"
-                    );
-                }
-                // Legacy head without include_hwm: SEAL is the inclusion floor.
-                self.sh_run.refresh_seal();
-                let seal = self.sh_run.sealed_max_create_fk();
-                if self.store.scripthash.include_hwm() == 0 && seal > 0 {
-                    self.store.scripthash.note_include_hwm(seal)?;
-                }
-                self.sync_sh_seal_from_include_hwm()?;
-                if self.sh_is_tip_ready() {
-                    rbitcoin_log::info!(
-                        "node: scripthash already tip-ready (durable head covers tip) — \
-                     skip Class A recollect and bulk materialize"
-                    );
-                    self.mark_sh_indexed_through_tip();
-                } else if self.index_mode()?.is_direct() {
-                    rbitcoin_log::info!(
-                        "node: scripthash durable head with HWM/SEAL lag while Direct — \
-                     Class A tail backfill (write-behind no-ops until Tip)"
-                    );
-                    self.backfill_until_sh_tip_ready(
-                        "scripthash Class A tail backfill left include_hwm short of tip",
-                    )?;
-                    self.mark_sh_indexed_through_tip();
-                } else {
-                    rbitcoin_log::info!(
-                        "node: scripthash durable head with HWM/SEAL lag — skip collect; \
-                     recover/write-behind fills the height gap"
-                    );
-                }
-                return Ok(0);
+        let rebuild = self.repair_lost_sh_tail(FarSealCopy::AtFinalize)?;
+        if rebuild && !self.sh_force_rebuild() {
+            // A fault writes the marker before any wipe. Only the resume
+            // byte, stored after this wipe, keeps sealed shards. A crash
+            // before that byte retries the wipe. An explicit force rebuild
+            // still wipes, then stores the resume byte before the collect.
+            if !rbitcoin_store::scripthash::sh_rebuild_resume(self.store.path()) {
+                self.sh_run.prepare_force_full_rebuild(&self.store)?;
+                rbitcoin_store::scripthash::mark_sh_rebuild_resume(self.store.path())?;
             }
+        }
+        if let Some(done) = self.resume_sealed_writebehind_head(rebuild)? {
+            return Ok(done);
+        }
+
+        let n = self.finalize_sh_unsorted_cancellable(cancel)?;
+        rbitcoin_store::scripthash::clear_sh_rebuild(self.store.path())?;
+        Ok(n)
+    }
+
+    /// A covered-prefix cut can leave the inclusion mark above the stem.
+    /// Write-behind starts before tip finalize, so open repairs that tail
+    /// before recovery. Finalize runs the same repair: a crash between the
+    /// recheck span and the watermark file still retries.
+    ///
+    /// [`FarSealCopy::AtFinalize`] bootstraps a SEAL more than a million
+    /// creates ahead into `include_hwm`. Open uses
+    /// [`FarSealCopy::NearbyOnly`]. Copying that far seal first would make
+    /// catch-up appends skip their flush. A nearby seal is still copied,
+    /// then unlinked.
+    ///
+    /// Resume byte `2` keeps sealed shards. It is not a wipe, so a lost
+    /// tail still comes down. Leaving the high watermark makes the next
+    /// finalize report a create gap and never clear the marker. A wipe
+    /// request still skips the unlink, because that head is replaced.
+    pub(super) fn repair_lost_sh_tail(&self, far_seal: FarSealCopy) -> Result<bool, QueryError> {
+        let path = self.store.path();
+        let force = self.sh_force_rebuild();
+        let resume = rbitcoin_store::scripthash::sh_rebuild_resume(path);
+        let mut marked = rbitcoin_store::scripthash::sh_rebuild_marked(path);
+        let shard_past = self.store.scripthash.shard_offset_past_file()?;
+        // Startup discard runs after this and only looks at the marker.
+        // A torn bump with no byte would enter Tip and die on the next read.
+        if shard_past && !resume && !marked {
+            rbitcoin_store::scripthash::mark_sh_rebuild(path)?;
+            marked = true;
+        }
+        let will_wipe = force || ((marked || shard_past) && !resume);
+        let rebuild = force || marked || shard_past;
+        if far_seal == FarSealCopy::NearbyOnly && self.store.scripthash.include_hwm() == 0 {
+            self.sh_run.refresh_seal();
+            let seal = self.sh_run.sealed_max_create_fk();
+            if !Self::sh_lost_tail(seal, self.store.txs.count()) {
+                return Ok(rebuild);
+            }
+        }
+        self.copy_legacy_seal_before_lost_tail(will_wipe)?;
+        if !will_wipe
+            && Self::sh_lost_tail(self.store.scripthash.include_hwm(), self.store.txs.count())
+        {
+            self.unlink_sh_tail(self.store.txs.count())?;
+        }
+        Ok(rebuild)
+    }
+
+    /// A legacy head keeps the floor in SEAL. Copy it before the
+    /// lost-tail check so a seal within a million creates unlinks on
+    /// this open. A seal farther ahead is not that tail.
+    ///
+    /// `will_wipe` skips the copy. The head is about to be replaced, and
+    /// a resume mark is not that wipe. A resume head stays out of
+    /// write-behind, and this copy still runs. The seal is the only floor,
+    /// and leaving it above the stem sticks the next finalize.
+    fn copy_legacy_seal_before_lost_tail(&self, will_wipe: bool) -> Result<(), QueryError> {
+        let durable = self.sh_index_enabled() && self.store.scripthash.has_durable_index();
+        if will_wipe || !durable || !self.store.scripthash.unsealed_main_shards().is_empty() {
+            return Ok(());
+        }
+        self.sh_run.refresh_seal();
+        let seal = self.sh_run.sealed_max_create_fk();
+        if self.store.scripthash.include_hwm() == 0 && seal > 0 {
+            self.store.scripthash.note_include_hwm(seal)?;
+        }
+        Ok(())
+    }
+
+    /// A sealed write-behind head discards leftover runs, then stays
+    /// tip-ready or backfills. An unsealed shard returns to the unsorted
+    /// materialize. Any other open does too.
+    fn resume_sealed_writebehind_head(&self, rebuild: bool) -> Result<Option<u64>, QueryError> {
+        if rebuild || self.sh_force_rebuild() || !self.sh_use_writebehind() {
+            return Ok(None);
+        }
+        if !self.store.scripthash.unsealed_main_shards().is_empty() {
             rbitcoin_log::info!(
                 "node: scripthash unsorted-shards resume unsealed={} (partial sealed head)",
                 self.store.scripthash.unsealed_main_shards().len()
             );
+            return Ok(None);
         }
-
-        self.finalize_sh_unsorted_cancellable(cancel)
+        let residual = self.sh_run.on_disk_run_count();
+        self.sh_run.discard_residual_runs();
+        if residual > 0 {
+            rbitcoin_log::info!(
+                "node: scripthash durable head — discarding {residual} leftover run(s); \
+                     gap uses write-behind (no Class A recollect / WarmOnly)"
+            );
+        }
+        self.sync_sh_seal_from_include_hwm()?;
+        if self.sh_is_tip_ready() {
+            rbitcoin_log::info!(
+                "node: scripthash already tip-ready (durable head covers tip) — \
+                     skip Class A recollect and bulk materialize"
+            );
+            self.mark_sh_indexed_through_tip();
+        } else if self.index_mode()?.is_direct() {
+            rbitcoin_log::info!(
+                "node: scripthash durable head with HWM/SEAL lag while Direct — \
+                     Class A tail backfill (write-behind no-ops until Tip)"
+            );
+            self.backfill_until_sh_tip_ready(
+                "scripthash Class A tail backfill left include_hwm short of tip",
+            )?;
+            self.mark_sh_indexed_through_tip();
+        } else {
+            rbitcoin_log::info!(
+                "node: scripthash durable head with HWM/SEAL lag — skip collect; \
+                     recover/write-behind fills the height gap"
+            );
+        }
+        Ok(Some(0))
     }
 
     #[doc(hidden)]
@@ -326,9 +527,9 @@ impl Query {
                 "node: scripthash FORCE_REBUILD + unsorted-shards — wipe head then Class A collect"
             );
             self.sh_run.prepare_force_full_rebuild(&self.store)?;
-            rbitcoin_store::clear_unsorted_shard_dir(&rbitcoin_store::unsorted_shard_dir(
-                self.store.path(),
-            ));
+            // Byte `1` would make the next start delete shards and `DONE`
+            // this collect already wrote.
+            rbitcoin_store::scripthash::mark_sh_rebuild_resume(self.store.path())?;
         }
         let tip_max = self.store.txs.count();
         let n = self
@@ -405,6 +606,9 @@ impl Query {
         let mut total = 0u64;
         loop {
             let last = self.store.txs.count();
+            // A wave can seal the ingest head before the flush below.
+            // Name this count first. A later equal note does not write.
+            rbitcoin_store::scripthash::note_sh_through(self.store.path(), last)?;
             self.sh_run.refresh_seal();
             let floor = durable_sh_inclusion_floor(
                 self.store.scripthash.include_hwm(),
@@ -442,11 +646,17 @@ impl Query {
                         })?;
                     if !recs.is_empty() {
                         total = total.saturating_add(recs.len() as u64);
-                        self.store.scripthash.put_create_batch_append(&recs)?;
+                        self.store
+                            .scripthash
+                            .put_create_batch_append_through(&recs, self.store.txs.count())?;
                     }
                     lo = hi.saturating_add(1);
                 }
             }
+            // Same order as the write-behind advance. The marker lands
+            // before the only sync Direct mode has. The watermark stays
+            // behind until that flush returns.
+            rbitcoin_store::scripthash::note_sh_through(self.store.path(), last)?;
             self.store.scripthash.flush()?;
             self.store.scripthash.note_include_hwm(last)?;
             self.sh_run.publish_seal_watermark(last)?;
@@ -473,6 +683,24 @@ impl Query {
     pub fn sh_run_enabled(&self) -> bool {
         self.sh_run.is_enabled()
     }
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SH_HWM_PUBLISH: std::cell::Cell<Option<fn(&Query)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+fn sh_hwm_publish_hook() -> Option<fn(&Query)> {
+    SH_HWM_PUBLISH.with(|c| c.take())
+}
+
+/// One-shot hook just before the lost-tail watermark file is published.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_sh_hwm_publish_for_test(hook: Option<fn(&Query)>) {
+    SH_HWM_PUBLISH.with(|c| c.set(hook));
 }
 
 #[cfg(debug_assertions)]

@@ -359,6 +359,31 @@ The comment to post:
 > proved anchor never replaces it, and the next locator starts at the walk
 > tip.
 
+## A repair and the next review
+
+A review after a fix reads the new commits and the callers they did not
+update. A second pass over the whole pull request waits until that delta
+is quiet. One other model at the end is enough. A full review after every
+green pass restates closed findings, and the next hole waits for the
+following round.
+
+A cut that moves a locator, a watermark, or a seal names its two writes
+before the code lands. The file that explains the cut is synced first. A
+crash between that file and the counter reopens as the same cut.
+[`docs/crash-recovery.md`](./docs/crash-recovery.md) owns the order for each
+file. Every reader of a dropped id uses that explanation in the same
+change: history, a height touch, a subscription status, a count, a
+spentness check. A predicate added for one reader is applied to the others
+before the commit.
+
+A function the change made more branched is split at a named stage in that
+same change, before the CRAP gate in [`TESTING.md`](./TESTING.md). The
+stage is one the caller already had
+([`docs/code-shape.md`](./docs/code-shape.md) rule 8). The answer is not a
+new allowlist row and not a test whose only job is the score.
+
+A follow-up that is a different crash is its own pull request.
+
 ## Code review checklist
 
 - [ ] Behavior covered by a true journey (or a justified unit whose result
@@ -377,7 +402,10 @@ The comment to post:
       in. Fuzz does not
       grow `pub` without considering the binary
       surface.
-- [ ] Store changes respect Class A/B/C and allocate-then-publish
+- [ ] Store changes respect Class A/B/C and allocate-then-publish.
+      A cut syncs its explanation before the counter moves, and every
+      reader of a reused id uses that explanation in the same change
+      ([A repair and the next review](#a-repair-and-the-next-review))
 - [ ] Experimental / milestone honesty preserved in user-facing docs when relevant
 - [ ] No restating `//` comments. Remaining line comments name an invariant,
       protocol, `SAFETY` requirement, or library quirk the types cannot state.

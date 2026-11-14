@@ -103,6 +103,7 @@ pub mod spend_annotate_uring;
 pub mod spend_durable;
 #[doc(hidden)]
 pub mod spend_page_log;
+mod spend_recheck;
 #[doc(hidden)]
 pub mod spender_table;
 #[doc(hidden)]
