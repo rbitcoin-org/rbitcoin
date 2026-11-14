@@ -877,10 +877,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         node.peers.set_p2p_i2p(local);
         info!("i2p STREAM FORWARD to {}", node.local_addr);
     }
-    if let Some(sam) = i2p_sam.as_ref() {
-        rbitcoin_net::install_i2p_dialer(sam.dialer());
-    }
-    let _i2p_sam = i2p_sam;
+    let _i2p_keeper = i2p_sam.map(|sam| {
+        let role = if config.listen.i2p_accept_incoming {
+            rbitcoin_net::I2pRole::Listen(Arc::clone(&node.peers))
+        } else {
+            rbitcoin_net::I2pRole::Dial
+        };
+        rbitcoin_net::I2pKeeper::spawn(sam, role, rbitcoin_net::I2pBackoff::CORE)
+    });
     // Joined at shutdown. A durable Tip head starts now, before catch-up.
     // Direct stays down until materialize enters Tip.
     let mut sh_writebehind = None;
@@ -2804,13 +2808,17 @@ async fn wallet_i2p_forward(
     config: &NodeConfig,
     listener: WalletListener,
     port: u16,
-) -> Result<Option<rbitcoin_net::I2pSam>, NodeError> {
+) -> Result<Option<rbitcoin_net::I2pKeeper>, NodeError> {
     if !listener.i2p(config) {
         return Ok(None);
     }
-    start_i2p_named_forward(sam_addr, config.datadir.path(), listener.name(), port)
-        .await
-        .map(Some)
+    let sam =
+        start_i2p_named_forward(sam_addr, config.datadir.path(), listener.name(), port).await?;
+    Ok(Some(rbitcoin_net::I2pKeeper::spawn(
+        sam,
+        rbitcoin_net::I2pRole::Wallet,
+        rbitcoin_net::I2pBackoff::CORE,
+    )))
 }
 
 pub async fn start_i2p_named_forward(

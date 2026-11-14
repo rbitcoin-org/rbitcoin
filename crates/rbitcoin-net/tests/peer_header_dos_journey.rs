@@ -1605,6 +1605,45 @@ fn self_announce_stays_on_the_link_network() {
 }
 
 #[test]
+fn a_down_i2p_address_is_not_advertised_but_stays_our_own() {
+    let i2p = rbitcoin_net::NetAddr::I2p {
+        dest: [0x11; 32],
+        port: 0,
+    };
+    let other_i2p = rbitcoin_net::NetAddr::I2p {
+        dest: [0x44; 32],
+        port: 0,
+    };
+    let out = rbitcoin_net::peers::PeerConnType::OutboundFullRelay;
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_p2p_i2p(i2p);
+    let lists_i2p = |peers: &rbitcoin_net::peers::PeerHub| {
+        peers
+            .rpc_local_addresses()
+            .iter()
+            .any(|row| row.0 == i2p.host_str())
+    };
+
+    peers.set_p2p_i2p_down(true);
+    assert!(
+        self_announce_nets(&overlay_peer(&peers, other_i2p, out)).is_empty(),
+        "a down I2P address is not announced"
+    );
+    assert!(!lists_i2p(&peers), "getnetworkinfo leaves out a down I2P address");
+    assert!(
+        peers.is_own_address(i2p),
+        "a down I2P address is still filtered from address replies"
+    );
+
+    peers.set_p2p_i2p_down(false);
+    assert_eq!(
+        self_announce_nets(&overlay_peer(&peers, other_i2p, out)),
+        ["i2p"]
+    );
+    assert!(lists_i2p(&peers));
+}
+
+#[test]
 fn a_down_onion_is_not_advertised_but_stays_our_own() {
     let onion: rbitcoin_net::NetAddr =
         "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"

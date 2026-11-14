@@ -747,7 +747,9 @@ impl LivePeer {
         let onion = hub
             .announced_p2p_onion()
             .filter(|_| link == SelfAnnounceLink::Tor);
-        let i2p = hub.p2p_i2p().filter(|_| link == SelfAnnounceLink::I2p);
+        let i2p = hub
+            .announced_p2p_i2p()
+            .filter(|_| link == SelfAnnounceLink::I2p);
         let sock = link.local_socket(&hub, self.reported_local_ip);
         if onion.is_none() && i2p.is_none() && sock.is_none() {
             return None;
@@ -2032,6 +2034,7 @@ pub struct PeerHub {
     tor_wallet_onions: Mutex<Vec<(String, u16)>>,
     tor_onions_down: AtomicBool,
     pub p2p_i2p: Mutex<Option<crate::NetAddr>>,
+    p2p_i2p_down: AtomicBool,
     /// P2P listen port used with advertised external IPs.
     pub listen_port: AtomicU16,
     /// Core `-discover`. Off: never self-announce, even with `--external-ip`.
@@ -2295,6 +2298,7 @@ impl PeerHub {
             tor_wallet_onions: Mutex::new(Vec::new()),
             tor_onions_down: AtomicBool::new(false),
             p2p_i2p: Mutex::new(None),
+            p2p_i2p_down: AtomicBool::new(false),
             listen_port: AtomicU16::new(0),
             discover: AtomicBool::new(true),
             discover_from_peers: AtomicBool::new(false),
@@ -2443,6 +2447,15 @@ impl PeerHub {
         }
     }
 
+    pub fn set_p2p_i2p_down(&self, down: bool) {
+        self.p2p_i2p_down.store(down, Ordering::Relaxed);
+    }
+
+    pub fn announced_p2p_i2p(&self) -> Option<crate::NetAddr> {
+        self.p2p_i2p()
+            .filter(|_| !self.p2p_i2p_down.load(Ordering::Relaxed))
+    }
+
     pub fn p2p_i2p(&self) -> Option<crate::NetAddr> {
         *self.p2p_i2p.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -2542,7 +2555,7 @@ impl PeerHub {
         if let Some(onion) = self.announced_p2p_onion() {
             rows.push((onion.host_str(), onion.port(), LOCAL_MANUAL));
         }
-        if let Some(addr) = self.p2p_i2p() {
+        if let Some(addr) = self.announced_p2p_i2p() {
             rows.push((addr.host_str(), addr.port(), LOCAL_MANUAL));
         }
         if !self.discover.load(Ordering::Relaxed) {

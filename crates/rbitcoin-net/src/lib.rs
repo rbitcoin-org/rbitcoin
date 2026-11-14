@@ -77,7 +77,9 @@ pub use compact::{
 pub use ephemeral::spawn_isolated_broadcast_loop;
 pub use error::NetError;
 pub use eviction::{select_inbound_eviction, InboundEvictCandidate};
-pub use i2p_sam::{i2p_addr_from_sam_b64, I2pSam, SAM_RETRY, SAM_RETRY_TEST};
+pub use i2p_sam::{
+    i2p_addr_from_sam_b64, I2pBackoff, I2pKeeper, I2pRole, I2pSam, SAM_RETRY, SAM_RETRY_TEST,
+};
 pub use most_work::{sum_work, WorkOverflow};
 pub use msg_decode::{
     block_decode_permits, block_decode_permits_for, blocking_pool_size, blocking_pool_size_for,
@@ -118,7 +120,7 @@ pub use serve_perf::{
     format_serve_perf, sample_reset_serve_perf, serve_perf_totals, ServePerfSample,
 };
 pub use service::{P2PNode, REDIAL_INTERVAL, REDIAL_INTERVAL_TEST};
-pub use socks::{install_i2p_dialer, Dialer, NetProxies};
+pub use socks::{Dialer, NetProxies};
 pub use tx_relay::{
     arm_template_prev_sample, sample_template_prev_for_build, CoreDatImport, ElectrumMempoolItem,
     FeeHistoryBackfillStats, MempoolAnnounce, MempoolHub, MempoolPerfSample, MempoolTxSnapEntry,

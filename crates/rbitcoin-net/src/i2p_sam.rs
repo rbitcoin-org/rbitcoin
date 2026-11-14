@@ -2,12 +2,14 @@
 
 use crate::error::NetError;
 use bitcoin::hashes::{sha256, Hash};
+use rbitcoin_log::{debug, info, warn};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot};
 
 /// Pause before a SAM retry. Thirty-two session attempts are about 16s, so a
 /// router that is not accepting yet still comes up. Callers pass this into
@@ -23,8 +25,12 @@ pub static INSTALLED: Mutex<Option<Installed>> = Mutex::new(None);
 #[doc(hidden)]
 pub struct Installed {
     pub dialer: I2pDialer,
-    pub _keepalive: Option<TcpStream>,
-    pub _forward: Option<TcpStream>,
+    rebuild: mpsc::Sender<RebuildAsk>,
+}
+
+struct RebuildAsk {
+    failed: String,
+    reply: oneshot::Sender<Option<I2pDialer>>,
 }
 
 pub struct I2pSam {
@@ -48,34 +54,38 @@ pub struct I2pDialer {
     pub retry: std::time::Duration,
 }
 
-pub fn install(dialer: I2pDialer) {
-    *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Installed {
-        dialer,
-        _keepalive: None,
-        _forward: None,
-    });
-}
-
-#[doc(hidden)]
-pub fn install_kept(dialer: I2pDialer, keepalive: TcpStream, forward: Option<TcpStream>) {
-    *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Installed {
-        dialer,
-        _keepalive: Some(keepalive),
-        _forward: forward,
-    });
+fn install_kept(dialer: I2pDialer, rebuild: mpsc::Sender<RebuildAsk>) {
+    *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Installed { dialer, rebuild });
 }
 
 pub async fn stream_connect_installed(dest_b32: &str) -> Result<TcpStream, NetError> {
-    let first = installed()?;
+    let (first, rebuild) = {
+        let installed = INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = installed.as_ref().ok_or_else(no_dialer)?;
+        (kept.dialer.clone(), kept.rebuild.clone())
+    };
     match first.stream_connect(dest_b32).await {
         Ok(s) => Ok(s),
         Err(e) if session_dead(&e) => {
-            let (fresh, keepalive, forward) = first.recreate_session().await?;
-            install_kept(fresh.clone(), keepalive, forward);
-            fresh.stream_connect(dest_b32).await
+            let (reply, answer) = oneshot::channel();
+            let ask = RebuildAsk {
+                failed: first.session_id.clone(),
+                reply,
+            };
+            if rebuild.send(ask).await.is_err() {
+                return Err(e);
+            }
+            match answer.await {
+                Ok(Some(fresh)) => fresh.stream_connect(dest_b32).await,
+                _ => Err(e),
+            }
         }
         Err(e) => Err(e),
     }
+}
+
+fn no_dialer() -> NetError {
+    NetError::Encode("i2p dial requires SAM (--i2p-sam)".into())
 }
 
 #[doc(hidden)]
@@ -85,7 +95,7 @@ pub fn installed() -> Result<I2pDialer, NetError> {
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map(|s| s.dialer.clone())
-        .ok_or_else(|| NetError::Encode("i2p dial requires SAM (--i2p-sam)".into()))
+        .ok_or_else(no_dialer)
 }
 
 /// Error from the SAM TCP connect that opens a stream. A refused local
@@ -286,10 +296,24 @@ impl I2pSam {
         i2p_addr_from_sam_b64(&self.destination)
     }
 
-    #[doc(hidden)]
-    pub fn into_keepalive(self) -> (I2pDialer, TcpStream) {
-        let dialer = self.dialer();
-        (dialer, self._control)
+    async fn closed(&mut self) {
+        let (control, forward) = (&mut self._control, &mut self._forward);
+        let mut control_buf = [0u8; 256];
+        let mut forward_buf = [0u8; 256];
+        loop {
+            let open = tokio::select! {
+                read = control.read(&mut control_buf) => matches!(read, Ok(n) if n > 0),
+                read = async {
+                    match forward.as_mut() {
+                        Some(forward) => forward.read(&mut forward_buf).await,
+                        None => std::future::pending().await,
+                    }
+                } => matches!(read, Ok(n) if n > 0),
+            };
+            if !open {
+                return;
+            }
+        }
     }
 
     pub async fn stream_forward(&mut self, port: u16) -> Result<(), NetError> {
@@ -378,21 +402,193 @@ impl I2pDialer {
         }
         Ok(s)
     }
+}
 
-    pub async fn recreate_session(&self) -> Result<(Self, TcpStream, Option<TcpStream>), NetError> {
-        let (mut sam, _) =
-            I2pSam::connect_session_dest(self.sam_addr, Some(&self.destination), self.retry)
-                .await?;
-        let forward = match self.forward_port {
-            Some(port) => {
-                sam.stream_forward(port).await?;
-                sam._forward.take()
-            }
-            None => None,
-        };
-        let (dialer, keepalive) = sam.into_keepalive();
-        Ok((dialer, keepalive, forward))
+pub const I2P_RETRY_START: std::time::Duration = std::time::Duration::from_secs(1);
+pub const I2P_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct I2pBackoff {
+    pub first: std::time::Duration,
+    pub max: std::time::Duration,
+}
+
+impl I2pBackoff {
+    pub const CORE: Self = Self {
+        first: I2P_RETRY_START,
+        max: I2P_RETRY_MAX,
+    };
+}
+
+pub fn next_i2p_retry(wait: std::time::Duration, backoff: I2pBackoff) -> std::time::Duration {
+    (wait + backoff.first).min(backoff.max)
+}
+
+pub enum I2pRole {
+    Listen(std::sync::Arc<crate::PeerHub>),
+    Dial,
+    Wallet,
+}
+
+pub struct I2pKeeper {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for I2pKeeper {
+    fn drop(&mut self) {
+        self.task.abort();
     }
+}
+
+impl I2pKeeper {
+    pub fn spawn(sam: I2pSam, role: I2pRole, backoff: I2pBackoff) -> Self {
+        let (asks, rx) = mpsc::channel(8);
+        if !matches!(role, I2pRole::Wallet) {
+            install_kept(sam.dialer(), asks.clone());
+        }
+        let task = tokio::spawn(keep(sam, role, asks, rx, backoff));
+        Self { task }
+    }
+}
+
+async fn keep(
+    sam: I2pSam,
+    role: I2pRole,
+    asks_tx: mpsc::Sender<RebuildAsk>,
+    mut asks: mpsc::Receiver<RebuildAsk>,
+    backoff: I2pBackoff,
+) {
+    let (sam_addr, destination, forward_port, retry) = (
+        sam.sam_addr,
+        sam.destination.clone(),
+        sam.forward_port,
+        sam.retry,
+    );
+    let mut live = Some(sam);
+    let mut up_since = tokio::time::Instant::now();
+    let mut wait = backoff.first;
+    let mut retry_at = up_since;
+    loop {
+        let ask = match live.as_mut() {
+            Some(sam) => tokio::select! {
+                () = sam.closed() => {
+                    warn!("i2p sam {sam_addr}: session {} closed; rebuilding it", sam.session_id);
+                    went_down(&role);
+                    live = None;
+                    let sleep = wait_after_loss(wait, backoff, up_since);
+                    retry_at = tokio::time::Instant::now() + sleep;
+                    wait = next_i2p_retry(sleep, backoff);
+                    continue;
+                }
+                ask = asks.recv() => ask,
+            },
+            None => tokio::select! {
+                () = tokio::time::sleep_until(retry_at) => {
+                    live = restore(sam_addr, destination.clone(), forward_port, retry, &role, asks_tx.clone()).await;
+                    if live.is_some() {
+                        up_since = tokio::time::Instant::now();
+                    } else {
+                        retry_at = tokio::time::Instant::now() + wait;
+                        wait = next_i2p_retry(wait, backoff);
+                    }
+                    continue;
+                }
+                ask = asks.recv() => ask,
+            },
+        };
+        let Some(ask) = ask else {
+            continue;
+        };
+        if live
+            .as_ref()
+            .is_some_and(|sam| sam.session_id == ask.failed)
+        {
+            warn!(
+                "i2p sam {sam_addr}: session {} is gone; rebuilding it",
+                ask.failed
+            );
+            went_down(&role);
+            live = None;
+            let sleep = wait_after_loss(wait, backoff, up_since);
+            retry_at = tokio::time::Instant::now() + sleep;
+            wait = next_i2p_retry(sleep, backoff);
+        }
+        if live.is_none() {
+            live = restore(
+                sam_addr,
+                destination.clone(),
+                forward_port,
+                retry,
+                &role,
+                asks_tx.clone(),
+            )
+            .await;
+            if live.is_some() {
+                up_since = tokio::time::Instant::now();
+            }
+        }
+        let _ = ask.reply.send(live.as_ref().map(I2pSam::dialer));
+    }
+}
+
+#[doc(hidden)]
+pub fn wait_after_loss(
+    wait: std::time::Duration,
+    backoff: I2pBackoff,
+    up_since: tokio::time::Instant,
+) -> std::time::Duration {
+    if up_since.elapsed() >= backoff.max {
+        backoff.first
+    } else {
+        wait
+    }
+}
+
+fn went_down(role: &I2pRole) {
+    if let I2pRole::Listen(peers) = role {
+        peers.set_p2p_i2p_down(true);
+    }
+}
+
+async fn restore(
+    sam_addr: SocketAddr,
+    destination: String,
+    forward_port: Option<u16>,
+    retry: std::time::Duration,
+    role: &I2pRole,
+    asks_tx: mpsc::Sender<RebuildAsk>,
+) -> Option<I2pSam> {
+    let sam = match rebuild_session(sam_addr, &destination, forward_port, retry).await {
+        Ok(sam) => sam,
+        Err(e) => {
+            debug!("i2p sam {sam_addr}: rebuild failed: {e}");
+            return None;
+        }
+    };
+    if !matches!(role, I2pRole::Wallet) {
+        install_kept(sam.dialer(), asks_tx);
+    }
+    if let I2pRole::Listen(peers) = role {
+        peers.set_p2p_i2p_down(false);
+    }
+    info!("i2p sam {sam_addr}: session {} rebuilt", sam.session_id);
+    Some(sam)
+}
+
+async fn rebuild_session(
+    sam_addr: SocketAddr,
+    destination: &str,
+    forward_port: Option<u16>,
+    retry: std::time::Duration,
+) -> Result<I2pSam, NetError> {
+    let (mut sam, _) =
+        I2pSam::connect_session_dest_once(sam_addr, Some(destination), retry).await?;
+    if let Some(port) = forward_port {
+        let forward = sam.stream_forward_once(port).await?;
+        sam.forward_port = Some(port);
+        sam._forward = Some(forward);
+    }
+    Ok(sam)
 }
 
 // Ed25519 (7), not the SAM DSA_SHA1 default. leaseSetEncType 6 is ML-KEM-768

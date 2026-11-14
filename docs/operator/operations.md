@@ -278,6 +278,14 @@ on `getnetworkinfo.localaddresses` and in addrv2, including with
 unless `--listen-onion` provides a loopback accept. NixOS:
 `services.rbitcoin.i2p.sam` / `i2p.acceptIncoming`; the unit `After`/`Wants`
 `i2pd.service` when SAM is set. Do not start i2pd from this module.
+If i2pd closes a SAM session (for example it restarts), or a dial gets a reply
+that the session is gone, the node rebuilds that session with the same
+destination and forward. Until it is back the P2P destination is not announced
+or listed in `getnetworkinfo.localaddresses`, but it stays an own address. A
+failed rebuild, or a rebuilt session that drops again soon, is tried again
+1 s later, then 1 s longer each time up to 300 s, as Core's I2P accept loop
+does. The wait starts again at 1 s only after a session stayed up for 300 s.
+This covers the P2P session and the Electrum and Esplora sessions.
 
 `--cjdns-reachable` treats BIP155 `fc00::/8` as the kernel CJDNS overlay: dial
 with ordinary TCP (OS routing), advertise a `--listen` on that IPv6, keep

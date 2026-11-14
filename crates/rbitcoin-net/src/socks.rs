@@ -7,10 +7,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub fn install_i2p_dialer(dialer: crate::i2p_sam::I2pDialer) {
-    crate::i2p_sam::install(dialer);
-}
-
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProxyCreds {
     pub username: Vec<u8>,

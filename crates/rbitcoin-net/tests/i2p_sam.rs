@@ -448,7 +448,7 @@ async fn i2p_sam_reconnects_after_invalid_id() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let (addr, live) = fake_sam(true, Arc::clone(&log)).await;
     let sam = I2pSam::connect(addr, SAM_RETRY_TEST).await.unwrap();
-    rbitcoin_net::socks::install_i2p_dialer(sam.dialer());
+    let _keeper = I2pKeeper::spawn(sam, I2pRole::Dial, FAST);
     let peer = rbitcoin_net::NetAddr::I2p {
         dest: [0u8; 32],
         port: 8333,
@@ -500,7 +500,7 @@ async fn i2p_sam_recreates_session_when_router_resets_stream() {
     )
     .await;
     let sam = I2pSam::connect(addr, SAM_RETRY_TEST).await.unwrap();
-    rbitcoin_net::socks::install_i2p_dialer(sam.dialer());
+    let _keeper = I2pKeeper::spawn(sam, I2pRole::Dial, FAST);
     let peer = rbitcoin_net::NetAddr::I2p {
         dest: [0u8; 32],
         port: 0,
@@ -534,7 +534,7 @@ async fn i2p_sam_recreate_restores_forward() {
     let (addr, live) = fake_sam(true, Arc::clone(&log)).await;
     let mut sam = I2pSam::connect(addr, SAM_RETRY_TEST).await.unwrap();
     sam.stream_forward(18444).await.unwrap();
-    rbitcoin_net::socks::install_i2p_dialer(sam.dialer());
+    let _keeper = I2pKeeper::spawn(sam, I2pRole::Dial, FAST);
     let peer = rbitcoin_net::NetAddr::I2p {
         dest: [0u8; 32],
         port: 0,
@@ -782,16 +782,14 @@ async fn stream_status_error_is_not_retried() {
     assert!(err.to_string().contains("i2p sam forward"), "{err}");
 }
 
-#[test]
-fn clear_installed_drops_the_dialer() {
-    let dialer = I2pDialer {
-        sam_addr: "127.0.0.1:1".parse().unwrap(),
-        session_id: "cleared".into(),
-        destination: "dest".into(),
-        forward_port: None,
-        retry: std::time::Duration::ZERO,
-    };
-    install(dialer);
+#[tokio::test]
+async fn clear_installed_drops_the_dialer() {
+    let _gate = INSTALL_GATE.lock().await;
+    let router = FakeRouter::start().await;
+    let sam = I2pSam::connect_session(router.addr, Some("savedkey"), SAM_RETRY_TEST)
+        .await
+        .unwrap();
+    let _keeper = I2pKeeper::spawn(sam, I2pRole::Dial, FAST);
     assert!(installed().is_ok());
     clear_installed();
     assert!(installed().is_err(), "clear_installed drops the dialer");
@@ -972,4 +970,498 @@ fn sam_kv_skips_a_token_with_a_wide_char_at_the_key_boundary() {
     assert_eq!(sam_kv(reply, "DESTINATION"), Some("abc"));
     assert_eq!(sam_kv("DESTINATIONé", "DESTINATION"), None);
     assert_eq!(sam_kv("destination=abc", "DESTINATION"), Some("abc"));
+}
+
+const FAST: I2pBackoff = I2pBackoff {
+    first: std::time::Duration::from_millis(10),
+    max: std::time::Duration::from_secs(3),
+};
+
+struct FakeRouter {
+    addr: SocketAddr,
+    log: Arc<Mutex<Vec<String>>>,
+    live: Arc<Mutex<HashSet<String>>>,
+    generation: Arc<tokio::sync::watch::Sender<u64>>,
+    up: Arc<std::sync::atomic::AtomicBool>,
+    refuse_forwards: Arc<std::sync::atomic::AtomicBool>,
+    flaps: Arc<std::sync::atomic::AtomicUsize>,
+    created_at: Arc<Mutex<Vec<tokio::time::Instant>>>,
+    turned_away_at: Arc<Mutex<Vec<tokio::time::Instant>>>,
+    seen: Arc<tokio::sync::Notify>,
+}
+
+impl FakeRouter {
+    async fn start() -> Self {
+        use std::sync::atomic::Ordering;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let live = Arc::new(Mutex::new(HashSet::new()));
+        let generation = Arc::new(tokio::sync::watch::Sender::new(0u64));
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let refuse_forwards = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flaps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let created_at = Arc::new(Mutex::new(Vec::new()));
+        let turned_away_at = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(tokio::sync::Notify::new());
+        let (created_a, away_a, seen_a) = (
+            Arc::clone(&created_at),
+            Arc::clone(&turned_away_at),
+            Arc::clone(&seen),
+        );
+        let (log_a, live_a, gen_a, up_a, refuse_a, flap_a) = (
+            Arc::clone(&log),
+            Arc::clone(&live),
+            Arc::clone(&generation),
+            Arc::clone(&up),
+            Arc::clone(&refuse_forwards),
+            Arc::clone(&flaps),
+        );
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                if !up_a.load(Ordering::SeqCst) {
+                    away_a.lock().unwrap().push(tokio::time::Instant::now());
+                    seen_a.notify_one();
+                    continue;
+                }
+                let (log, live) = (Arc::clone(&log_a), Arc::clone(&live_a));
+                let (generation, refuse, flap) = (
+                    Arc::clone(&gen_a),
+                    Arc::clone(&refuse_a),
+                    Arc::clone(&flap_a),
+                );
+                let (created, seen) = (Arc::clone(&created_a), Arc::clone(&seen_a));
+                let mut restarted = gen_a.subscribe();
+                restarted.borrow_and_update();
+                tokio::spawn(async move {
+                    loop {
+                        let line = tokio::select! {
+                            line = read_line(&mut s) => match line {
+                                Ok(line) => line,
+                                Err(_) => break,
+                            },
+                            _ = restarted.changed() => break,
+                        };
+                        let up = line.to_ascii_uppercase();
+                        if up.starts_with("HELLO VERSION") {
+                            let _ = write_line(&mut s, "HELLO REPLY RESULT=OK VERSION=3.1").await;
+                            continue;
+                        }
+                        log.lock().unwrap().push(line.clone());
+                        let id = sam_kv(&line, "ID").unwrap_or("").to_string();
+                        if up.starts_with("SESSION CREATE") {
+                            created.lock().unwrap().push(tokio::time::Instant::now());
+                            seen.notify_one();
+                            live.lock().unwrap().insert(id);
+                            let dest = sam_kv(&line, "DESTINATION").unwrap_or("TRANSIENT");
+                            let dest = if dest.eq_ignore_ascii_case("TRANSIENT") {
+                                FAKE_DEST
+                            } else {
+                                dest
+                            };
+                            let _ = write_line(
+                                &mut s,
+                                &format!("SESSION STATUS RESULT=OK DESTINATION={dest}"),
+                            )
+                            .await;
+                        } else if up.starts_with("STREAM FORWARD") && refuse.load(Ordering::SeqCst)
+                        {
+                            break;
+                        } else if live.lock().unwrap().contains(&id) {
+                            let _ = write_line(&mut s, "STREAM STATUS RESULT=OK").await;
+                            if up.starts_with("STREAM FORWARD")
+                                && flap
+                                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                        n.checked_sub(1)
+                                    })
+                                    .is_ok()
+                            {
+                                live.lock().unwrap().clear();
+                                generation.send_modify(|g| *g += 1);
+                            }
+                        } else {
+                            let _ = write_line(&mut s, "STREAM STATUS RESULT=INVALID_ID").await;
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        Self {
+            addr,
+            log,
+            live,
+            generation,
+            up,
+            refuse_forwards,
+            flaps,
+            created_at,
+            turned_away_at,
+            seen,
+        }
+    }
+
+    fn restart(&self) {
+        self.live.lock().unwrap().clear();
+        self.generation.send_modify(|g| *g += 1);
+    }
+
+    fn set_up(&self, up: bool) {
+        self.up.store(up, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn lines(&self, prefix: &str) -> Vec<String> {
+        stream_lines(&self.log, prefix)
+    }
+}
+
+async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !done() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "{what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+async fn forwarding_session(router: &FakeRouter) -> I2pSam {
+    let mut sam = I2pSam::connect_session(router.addr, Some("savedkey"), SAM_RETRY_TEST)
+        .await
+        .unwrap();
+    sam.stream_forward(18444).await.unwrap();
+    sam
+}
+
+fn our_i2p() -> rbitcoin_net::NetAddr {
+    rbitcoin_net::NetAddr::I2p {
+        dest: [0x11; 32],
+        port: 0,
+    }
+}
+
+#[tokio::test]
+async fn i2pd_restart_brings_the_i2p_address_and_forward_back() {
+    let _gate = INSTALL_GATE.lock().await;
+    clear_installed();
+    let router = FakeRouter::start().await;
+    let sam = forwarding_session(&router).await;
+    let first = sam.session_id.clone();
+    let peers = rbitcoin_net::PeerHub::new();
+    peers.set_p2p_i2p(our_i2p());
+    let _keeper = I2pKeeper::spawn(sam, I2pRole::Listen(Arc::clone(&peers)), FAST);
+    assert_eq!(installed().unwrap().session_id, first);
+
+    router.set_up(false);
+    router.restart();
+    wait_for(
+        "a closed SAM session stops announcing the I2P address",
+        || peers.announced_p2p_i2p().is_none(),
+    )
+    .await;
+    assert!(peers.is_own_address(our_i2p()));
+
+    router.set_up(true);
+    wait_for(
+        "the I2P address is announced again once i2pd is back",
+        || peers.announced_p2p_i2p() == Some(our_i2p()),
+    )
+    .await;
+    let creates = router.lines("SESSION CREATE");
+    assert_eq!(creates.len(), 2, "{creates:?}");
+    assert!(
+        creates[1].contains("DESTINATION=savedkey"),
+        "{}",
+        creates[1]
+    );
+    let fresh = sam_kv(&creates[1], "ID").unwrap().to_string();
+    let forwards = router.lines("STREAM FORWARD");
+    assert_eq!(forwards.len(), 2, "{forwards:?}");
+    assert!(
+        forwards[1].contains(&format!("ID={fresh} ")) && forwards[1].contains("PORT=18444"),
+        "{}",
+        forwards[1]
+    );
+    assert!(forwards[1].contains("SILENT=true"), "{}", forwards[1]);
+    assert_eq!(
+        installed().unwrap().session_id,
+        fresh,
+        "dials use the new session"
+    );
+    clear_installed();
+}
+
+#[tokio::test]
+async fn a_half_rebuilt_i2p_session_is_not_announced() {
+    let _gate = INSTALL_GATE.lock().await;
+    clear_installed();
+    let router = FakeRouter::start().await;
+    let sam = forwarding_session(&router).await;
+    let peers = rbitcoin_net::PeerHub::new();
+    peers.set_p2p_i2p(our_i2p());
+    let _keeper = I2pKeeper::spawn(sam, I2pRole::Listen(Arc::clone(&peers)), FAST);
+
+    router
+        .refuse_forwards
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    router.restart();
+    wait_for("two rebuilds lose their forward", || {
+        router.lines("STREAM FORWARD").len() >= 3
+    })
+    .await;
+    assert_eq!(
+        peers.announced_p2p_i2p(),
+        None,
+        "a session without its forward must not be announced"
+    );
+    router
+        .refuse_forwards
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    wait_for("a rebuild with its forward brings the address back", || {
+        peers.announced_p2p_i2p() == Some(our_i2p())
+    })
+    .await;
+    clear_installed();
+}
+
+#[tokio::test]
+async fn a_dial_on_a_forgotten_session_rebuilds_it_once() {
+    let _gate = INSTALL_GATE.lock().await;
+    clear_installed();
+    let router = FakeRouter::start().await;
+    let sam = I2pSam::connect_session(router.addr, Some("savedkey"), SAM_RETRY_TEST)
+        .await
+        .unwrap();
+    let _keeper = I2pKeeper::spawn(sam, I2pRole::Dial, FAST);
+    let peer = rbitcoin_net::NetAddr::I2p {
+        dest: [0u8; 32],
+        port: 0,
+    };
+    rbitcoin_net::socks::Dialer::Direct
+        .connect_net(peer)
+        .await
+        .unwrap();
+
+    router.live.lock().unwrap().clear();
+    rbitcoin_net::socks::Dialer::Direct
+        .connect_net(peer)
+        .await
+        .expect("INVALID_ID makes the keeper rebuild the session, then the dial retries");
+    rbitcoin_net::socks::Dialer::Direct
+        .connect_net(peer)
+        .await
+        .unwrap();
+    let creates = router.lines("SESSION CREATE");
+    assert_eq!(creates.len(), 2, "one rebuild: {creates:?}");
+    assert!(
+        creates[1].contains("DESTINATION=savedkey"),
+        "{}",
+        creates[1]
+    );
+    clear_installed();
+}
+
+#[tokio::test]
+async fn a_wallet_i2p_session_comes_back_without_a_dialer() {
+    let _gate = INSTALL_GATE.lock().await;
+    clear_installed();
+    let router = FakeRouter::start().await;
+    let sam = forwarding_session(&router).await;
+    let _keeper = I2pKeeper::spawn(sam, I2pRole::Wallet, FAST);
+    router.restart();
+    wait_for("the wallet forward is set up again", || {
+        router.lines("STREAM FORWARD").len() == 2
+    })
+    .await;
+    assert!(
+        installed().is_err(),
+        "a wallet session is not the dial session"
+    );
+    clear_installed();
+}
+
+#[test]
+fn i2p_retry_waits_grow_like_core() {
+    use std::time::Duration;
+    assert_eq!(I2pBackoff::CORE.first, Duration::from_secs(1));
+    assert_eq!(I2pBackoff::CORE.max, Duration::from_secs(300));
+    let core = I2pBackoff::CORE;
+    assert_eq!(next_i2p_retry(core.first, core), Duration::from_secs(2));
+    assert_eq!(
+        next_i2p_retry(Duration::from_secs(2), core),
+        Duration::from_secs(3)
+    );
+    let mut wait = core.first;
+    for _ in 0..400 {
+        wait = next_i2p_retry(wait, core);
+    }
+    assert_eq!(wait, core.max);
+}
+
+async fn tries(
+    router: &FakeRouter,
+    times: &Mutex<Vec<tokio::time::Instant>>,
+    n: usize,
+) -> Vec<tokio::time::Instant> {
+    loop {
+        let more = router.seen.notified();
+        if times.lock().unwrap().len() >= n {
+            return times.lock().unwrap()[..n].to_vec();
+        }
+        more.await;
+    }
+}
+
+fn gaps(from: tokio::time::Instant, times: &[tokio::time::Instant]) -> Vec<std::time::Duration> {
+    std::iter::once(from)
+        .chain(times.iter().copied())
+        .zip(times)
+        .map(|(before, at)| *at - before)
+        .collect()
+}
+
+const STEP: std::time::Duration = std::time::Duration::from_millis(5);
+
+fn steps(from: u32, to: u32) -> Vec<std::time::Duration> {
+    (from..=to).map(|k| STEP * k).collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_flapping_session_waits_one_step_longer_each_time() {
+    let _gate = INSTALL_GATE.lock().await;
+    clear_installed();
+    let router = FakeRouter::start().await;
+    let sam = forwarding_session(&router).await;
+    let backoff = I2pBackoff {
+        first: STEP,
+        max: std::time::Duration::from_secs(3),
+    };
+    let _keeper = I2pKeeper::spawn(sam, I2pRole::Dial, backoff);
+    router
+        .flaps
+        .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+    let restart = tokio::time::Instant::now();
+    router.restart();
+    let created = tries(&router, &router.created_at, 6).await;
+    assert_eq!(gaps(restart, &created[1..]), steps(1, 5));
+    clear_installed();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_router_that_stays_down_is_tried_one_step_later_each_time() {
+    let _gate = INSTALL_GATE.lock().await;
+    clear_installed();
+    let router = FakeRouter::start().await;
+    let sam = forwarding_session(&router).await;
+    let backoff = I2pBackoff {
+        first: STEP,
+        max: std::time::Duration::from_secs(3),
+    };
+    let _keeper = I2pKeeper::spawn(sam, I2pRole::Dial, backoff);
+    router.set_up(false);
+    let restart = tokio::time::Instant::now();
+    router.restart();
+    let turned_away = tries(&router, &router.turned_away_at, 5).await;
+    assert_eq!(gaps(restart, &turned_away), steps(1, 5));
+    clear_installed();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_that_stayed_up_starts_the_wait_again_and_flaps_grow_it() {
+    use std::sync::atomic::Ordering;
+    let _gate = INSTALL_GATE.lock().await;
+    clear_installed();
+    let router = FakeRouter::start().await;
+    let sam = forwarding_session(&router).await;
+    let backoff = I2pBackoff {
+        first: STEP,
+        max: STEP * 10,
+    };
+    let _keeper = I2pKeeper::spawn(sam, I2pRole::Dial, backoff);
+
+    router.flaps.store(2, Ordering::SeqCst);
+    let first_restart = tokio::time::Instant::now();
+    router.restart();
+    let created = tries(&router, &router.created_at, 4).await;
+    assert_eq!(gaps(first_restart, &created[1..]), steps(1, 3));
+    let kept = sam_kv(&router.lines("SESSION CREATE")[3], "ID")
+        .unwrap()
+        .to_string();
+    while installed().ok().map(|d| d.session_id) != Some(kept.clone()) {
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::advance(backoff.max).await;
+    router.flaps.store(2, Ordering::SeqCst);
+    let second_restart = tokio::time::Instant::now();
+    router.restart();
+    let created = tries(&router, &router.created_at, 7).await;
+    assert_eq!(
+        gaps(second_restart, &created[4..]),
+        steps(1, 3),
+        "a session that stayed up starts the wait again; the flaps after it grow it"
+    );
+    clear_installed();
+}
+
+#[test]
+fn a_loss_sleeps_the_current_wait_unless_the_session_stayed_up() {
+    use std::time::Duration;
+    let core = I2pBackoff::CORE;
+    let now = tokio::time::Instant::now();
+    assert_eq!(
+        wait_after_loss(core.first, core, now - Duration::from_secs(10)),
+        Duration::from_secs(1),
+        "the first retry waits 1s, as in Core"
+    );
+    assert_eq!(
+        wait_after_loss(Duration::from_secs(5), core, now - Duration::from_secs(10)),
+        Duration::from_secs(5),
+        "a session lost soon after it was built keeps the grown wait"
+    );
+    assert_eq!(
+        wait_after_loss(Duration::from_secs(5), core, now - Duration::from_secs(300)),
+        core.first,
+        "a session that stayed up the longest wait starts again at 1s"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_rebuilt_for_a_dial_counts_as_new() {
+    use std::sync::atomic::Ordering;
+    let _gate = INSTALL_GATE.lock().await;
+    clear_installed();
+    let router = FakeRouter::start().await;
+    let sam = forwarding_session(&router).await;
+    let backoff = I2pBackoff {
+        first: STEP,
+        max: STEP * 10,
+    };
+    let _keeper = I2pKeeper::spawn(sam, I2pRole::Dial, backoff);
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(backoff.max).await;
+
+    router.live.lock().unwrap().clear();
+    let peer = rbitcoin_net::NetAddr::I2p {
+        dest: [0u8; 32],
+        port: 0,
+    };
+    rbitcoin_net::socks::Dialer::Direct
+        .connect_net(peer)
+        .await
+        .expect("the dial rebuilds the forgotten session");
+
+    router.flaps.store(1, Ordering::SeqCst);
+    let restart = tokio::time::Instant::now();
+    router.restart();
+    let created = tries(&router, &router.created_at, 4).await;
+    assert_eq!(
+        gaps(restart, &created[2..]),
+        steps(2, 3),
+        "the session the dial rebuilt is new, so losing it keeps the grown wait"
+    );
+    clear_installed();
 }
