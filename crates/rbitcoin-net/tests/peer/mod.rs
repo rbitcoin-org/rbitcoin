@@ -2111,6 +2111,223 @@ async fn witness_reconstruct_fail_asks_another_peer() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `block` with a BIP141 commitment (zero nonce) mined again, and the same
+/// block with another coinbase nonce. One hash and one txid merkle root;
+/// only the first matches its witness commitment.
+fn witness_committed_pair(block: &bitcoin::Block) -> (bitcoin::Block, bitcoin::Block) {
+    let mut good = block.clone();
+    good.txdata[0].input[0].witness = bitcoin::Witness::from_slice(&[vec![0u8; 32]]);
+    rbitcoin_consensus::block::apply_witness_commitment(&mut good);
+    rbitcoin_consensus::grind_regtest_pow(&mut good.header);
+    let mut bad = good.clone();
+    bad.txdata[0].input[0].witness = bitcoin::Witness::from_slice(&[vec![7u8; 32]]);
+    assert_eq!(bad.block_hash(), good.block_hash());
+    (good, bad)
+}
+
+/// A high-bandwidth peer that has the tip and was not sent `hash`.
+fn hb_relay_target(
+    peers: &Arc<rbitcoin_net::peers::PeerHub>,
+    hub: &ChainHub,
+    port: u16,
+) -> (
+    Arc<rbitcoin_net::peers::LivePeer>,
+    mpsc::UnboundedReceiver<PeerOut>,
+) {
+    hub.mempool().unwrap().set_relay_enabled(true);
+    let target = live_peer(peers, port, u64::from(port), false);
+    target.set_hb_from(true);
+    target.note_best_known(hub.tip_hash().unwrap());
+    let (tx, rx) = mpsc::unbounded_channel();
+    target.attach_out(tx);
+    (target, rx)
+}
+
+fn announced(msgs: &[NetworkMessage], hash: BlockHash) -> bool {
+    msgs.iter().any(|m| match m {
+        NetworkMessage::CmpctBlock(c) => c.compact_block.header.block_hash() == hash,
+        NetworkMessage::Headers(h) => h.iter().any(|h| h.block_hash() == hash),
+        NetworkMessage::Inv(inv) => inv
+            .iter()
+            .any(|i| matches!(i, Inventory::Block(h) | Inventory::WitnessBlock(h) if *h == hash)),
+        _ => false,
+    })
+}
+
+fn sent_cmpct(msgs: &[NetworkMessage], hash: BlockHash) -> bool {
+    msgs.iter().any(
+        |m| matches!(m, NetworkMessage::CmpctBlock(c) if c.compact_block.header.block_hash() == hash),
+    )
+}
+
+/// Core relays a compact block only after the body passes its witness
+/// commitment. A full block whose coinbase nonce breaks that commitment is
+/// not announced, and the real block from another peer still is.
+#[tokio::test]
+async fn witness_mutated_block_is_not_relayed() {
+    let (dir, hub) = open_genesis_announce("relay-wit-block", true);
+    let (good, bad) = witness_committed_pair(&hb_tip_child(&hub));
+    let hash = good.block_hash();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let (_target, mut target_rx) = hb_relay_target(&peers, &hub, 18491);
+
+    let liar = outbound_test_peer(&peers, 18492);
+    let (liar_tx, _liar_rx) = mpsc::unbounded_channel();
+    liar.attach_out(liar_tx.clone());
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(hash);
+    on_block(&hub, &liar_tx, &mut follow, Some(liar.as_ref()), &bad)
+        .await
+        .unwrap();
+    assert!(
+        !announced(&sent(&mut target_rx), hash),
+        "a body that fails its witness commitment is not announced"
+    );
+    assert_ne!(hub.tip_hash(), Some(hash));
+
+    let honest = outbound_test_peer(&peers, 18493);
+    let (honest_tx, _honest_rx) = mpsc::unbounded_channel();
+    honest.attach_out(honest_tx.clone());
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(hash);
+    on_block(&hub, &honest_tx, &mut follow, Some(honest.as_ref()), &good)
+        .await
+        .unwrap();
+    assert!(
+        sent_cmpct(&sent(&mut target_rx), hash),
+        "the real block is announced to the high-bandwidth peer"
+    );
+    assert_eq!(hub.tip_hash(), Some(hash));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A compact block that reconstructs to a body failing its witness
+/// commitment is not announced. The real compact block still is.
+#[tokio::test]
+async fn witness_mutated_cmpct_reconstruct_is_not_relayed() {
+    let (dir, hub) = open_genesis_announce("relay-wit-cmpct", true);
+    let (good, bad) = witness_committed_pair(&hb_tip_child(&hub));
+    let hash = good.block_hash();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let (_target, mut target_rx) = hb_relay_target(&peers, &hub, 18494);
+
+    for (port, block, real) in [(18495, &bad, false), (18496, &good, true)] {
+        let peer = inbound_test_peer(&peers, port);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        peer.attach_out(tx.clone());
+        let mut follow = PeerFollowState::new();
+        follow.cmpct_version = 2;
+        let hsi = HeaderAndShortIds::from_block(block, 0xbeef, 2, &[]).unwrap();
+        assert!(hsi.short_ids.is_empty(), "the coinbase is the whole block");
+        on_cmpctblock(
+            &hub,
+            &tx,
+            &mut follow,
+            Some(peer.as_ref()),
+            &CmpctBlock { compact_block: hsi },
+        )
+        .await
+        .unwrap();
+        let msgs = sent(&mut target_rx);
+        if real {
+            assert!(sent_cmpct(&msgs, hash), "the real block is announced");
+            assert_eq!(hub.tip_hash(), Some(hash));
+        } else {
+            assert!(
+                !announced(&msgs, hash),
+                "a reconstruct that fails its witness commitment is not announced"
+            );
+            assert_ne!(hub.tip_hash(), Some(hash));
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `cmpctblock` that waits on one transaction, then the `blocktxn` with it.
+async fn cmpct_then_blocktxn(
+    hub: &ChainHub,
+    peers: &Arc<rbitcoin_net::peers::PeerHub>,
+    port: u16,
+    block: &bitcoin::Block,
+) {
+    let peer = inbound_test_peer(peers, port);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    peer.attach_out(tx.clone());
+    let mut follow = PeerFollowState::new();
+    follow.cmpct_version = 2;
+    let hsi = HeaderAndShortIds::from_block(block, 0xbeef, 2, &[]).unwrap();
+    on_cmpctblock(
+        hub,
+        &tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &CmpctBlock { compact_block: hsi },
+    )
+    .await
+    .unwrap();
+    assert!(
+        sent(&mut rx)
+            .iter()
+            .any(|m| matches!(m, NetworkMessage::GetBlockTxn(_))),
+        "the spend is asked by getblocktxn"
+    );
+    let bt = BlockTransactions {
+        block_hash: block.block_hash(),
+        transactions: vec![block.txdata[1].clone()],
+    };
+    on_blocktxn(hub, &tx, &mut follow, Some(peer.as_ref()), &bt)
+        .await
+        .unwrap();
+}
+
+/// A `blocktxn` that completes a body failing its witness commitment is not
+/// announced. A real completion still is. That `blocktxn` feeds the extra
+/// pool, so the real `a` then rebuilds without one; the next block is the
+/// `blocktxn` control.
+#[tokio::test]
+async fn witness_mutated_blocktxn_fill_is_not_relayed() {
+    let (dir, hub, [a, mut b]) = compact_spend_pair("relay-wit-blocktxn");
+    let (good_a, bad_a) = witness_committed_pair(&a);
+    let hash_a = good_a.block_hash();
+    b.header.prev_blockhash = hash_a;
+    let (good_b, _) = witness_committed_pair(&b);
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let (_target, mut target_rx) = hb_relay_target(&peers, &hub, 18497);
+
+    cmpct_then_blocktxn(&hub, &peers, 18498, &bad_a).await;
+    assert!(
+        !announced(&sent(&mut target_rx), hash_a),
+        "a blocktxn fill that fails its witness commitment is not announced"
+    );
+    assert_ne!(hub.tip_hash(), Some(hash_a));
+
+    let peer = inbound_test_peer(&peers, 18499);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    peer.attach_out(tx.clone());
+    let mut follow = PeerFollowState::new();
+    follow.cmpct_version = 2;
+    let hsi = HeaderAndShortIds::from_block(&good_a, 0xbeef, 2, &[]).unwrap();
+    on_cmpctblock(
+        &hub,
+        &tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &CmpctBlock { compact_block: hsi },
+    )
+    .await
+    .unwrap();
+    assert!(sent_cmpct(&sent(&mut target_rx), hash_a));
+    assert_eq!(hub.tip_hash(), Some(hash_a));
+
+    cmpct_then_blocktxn(&hub, &peers, 18500, &good_b).await;
+    assert!(
+        sent_cmpct(&sent(&mut target_rx), good_b.block_hash()),
+        "a real blocktxn fill is announced"
+    );
+    assert_eq!(hub.tip_hash(), Some(good_b.block_hash()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A header-path body ask stays with the announcing peer. Another
 /// high-bandwidth peer is not asked.
 #[tokio::test]

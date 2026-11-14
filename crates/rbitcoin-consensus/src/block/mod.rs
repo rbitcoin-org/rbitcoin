@@ -312,7 +312,24 @@ pub fn reject_witness_malleation(
     ctx: &ValidationContext<'_>,
     pres: &[TxPrecompute],
 ) -> Result<(), ConsensusError> {
-    let has_witness_data = block_has_witness_from_pres(pres);
+    reject_witness_malleation_wtxids(
+        block,
+        ctx,
+        block_has_witness_from_pres(pres),
+        pres.iter().skip(1).map(|p| p.wtxid),
+    )
+}
+
+/// [`reject_witness_malleation`] from wtxids already hashed: `non_cb_wtxids`
+/// is `txdata[1..]` in order. They are collected only when a commitment is
+/// checked.
+#[doc(hidden)]
+pub fn reject_witness_malleation_wtxids(
+    block: &Block,
+    ctx: &ValidationContext<'_>,
+    has_witness_data: bool,
+    non_cb_wtxids: impl IntoIterator<Item = [u8; 32]>,
+) -> Result<(), ConsensusError> {
     let has_commitment = coinbase_has_witness_commitment(block);
     if has_witness_data && ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
         return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
@@ -320,7 +337,7 @@ pub fn reject_witness_malleation(
     if (has_witness_data || has_commitment)
         && (ctx.params.segwit_active_at(ctx.height.0) || !ctx.enforce_height_gates)
     {
-        let non_cb: Vec<[u8; 32]> = pres.iter().skip(1).map(|p| p.wtxid).collect();
+        let non_cb: Vec<[u8; 32]> = non_cb_wtxids.into_iter().collect();
         check_witness_commitment_with_wtxids(block, &non_cb)?;
     }
     Ok(())

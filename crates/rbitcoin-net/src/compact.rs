@@ -4,7 +4,9 @@
 //! built from live mempool (and optional extra txs). On incomplete fill,
 //! returns missing absolute indexes for `getblocktxn`.
 
-use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId};
+use bitcoin::bip152::{
+    BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, PrefilledTransaction, ShortId,
+};
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message::NetworkMessage;
@@ -36,6 +38,68 @@ pub fn short_id_for_tx(tx: &Transaction, version: u32, keys: (u64, u64)) -> Shor
         1 => ShortId::with_siphash_keys(&tx.compute_txid().to_raw_hash(), keys),
         _ => ShortId::with_siphash_keys(&tx.compute_wtxid().to_raw_hash(), keys),
     }
+}
+
+/// The hash each transaction's short id is taken from, in block order:
+/// txid for version 1, wtxid otherwise.
+pub fn short_id_hashes(block: &Block, version: u32) -> Vec<[u8; 32]> {
+    block
+        .txdata
+        .iter()
+        .map(|tx| match version {
+            1 => tx.compute_txid().to_byte_array(),
+            _ => tx.compute_wtxid().to_byte_array(),
+        })
+        .collect()
+}
+
+/// `HeaderAndShortIds::from_block` from hashes already in hand: `ids` is
+/// [`short_id_hashes`] for `version`. The coinbase is always prefilled.
+/// `None` for a version other than 1 or 2, or a `prefill` that is not
+/// ascending indexes into the block.
+pub fn header_and_short_ids(
+    block: &Block,
+    ids: &[[u8; 32]],
+    nonce: u64,
+    version: u32,
+    prefill: &[usize],
+) -> Option<HeaderAndShortIds> {
+    if !(1..=2).contains(&version) || ids.len() != block.txdata.len() {
+        return None;
+    }
+    let keys = ShortId::calculate_siphash_keys(&block.header, nonce);
+    let mut rest = prefill;
+    let mut next_idx = 0usize;
+    let mut prefilled_txs = Vec::with_capacity(prefill.len() + 1);
+    let mut short_ids = Vec::with_capacity(block.txdata.len().saturating_sub(prefill.len()));
+    for (idx, (tx, id)) in block.txdata.iter().zip(ids).enumerate() {
+        let listed = rest.first() == Some(&idx);
+        if listed {
+            rest = &rest[1..];
+        }
+        if !listed && idx != 0 {
+            short_ids.push(ShortId::with_siphash_keys(id, keys));
+            continue;
+        }
+        let mut tx = tx.clone();
+        if version == 1 {
+            tx.input.iter_mut().for_each(|i| i.witness.clear());
+        }
+        prefilled_txs.push(PrefilledTransaction {
+            idx: u16::try_from(idx - next_idx).ok()?,
+            tx,
+        });
+        next_idx = idx + 1;
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(HeaderAndShortIds {
+        header: block.header,
+        nonce,
+        short_ids,
+        prefilled_txs,
+    })
 }
 
 /// Consensus-decode BIP152 `HeaderAndShortIds`.
