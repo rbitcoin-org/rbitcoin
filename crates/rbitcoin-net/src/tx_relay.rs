@@ -5471,6 +5471,34 @@ impl MempoolHub {
         inbound: bool,
         now: u64,
     ) {
+        let mut g = self.parent_req.lock().unwrap_or_else(|e| e.into_inner());
+        self.schedule_parents_locked(&mut g, missing, peer, inbound, now);
+    }
+
+    /// Another announcer of the orphan is asked only while the tracker still
+    /// holds its session. `unregister` forgets a peer before it leaves the
+    /// live list, and a row added in that gap would never be taken.
+    pub fn schedule_announcer_parents(
+        &self,
+        missing: &BTreeSet<Txid>,
+        peer: u64,
+        inbound: bool,
+        now: u64,
+    ) {
+        let mut g = self.parent_req.lock().unwrap_or_else(|e| e.into_inner());
+        if g.sessions.contains(&peer) {
+            self.schedule_parents_locked(&mut g, missing, peer, inbound, now);
+        }
+    }
+
+    fn schedule_parents_locked(
+        &self,
+        g: &mut parent_req::ParentTracker,
+        missing: &BTreeSet<Txid>,
+        peer: u64,
+        inbound: bool,
+        now: u64,
+    ) {
         let delay = TXID_RELAY_DELAY_SECS
             + if inbound {
                 NONPREF_PEER_TX_DELAY_SECS
@@ -5479,7 +5507,6 @@ impl MempoolHub {
             };
         let reqtime = now.saturating_add(delay);
         let preferred = !inbound;
-        let mut g = self.parent_req.lock().unwrap();
         for p in missing {
             if self.parent_already_have(p) {
                 continue;
@@ -5491,8 +5518,7 @@ impl MempoolHub {
     /// `wtxid` records that this announcement is a wtxid inv.
     /// [`ParentNote::RequestNow`] is the one in-flight getdata.
     /// [`ParentNote::Deferred`] is recorded and not asked yet.
-    /// [`ParentNote::PeerCapped`] is this peer's own cap. [`ParentNote::GlobalFull`]
-    /// skips the row and is not misbehavior.
+    /// [`ParentNote::PeerCapped`] is this peer's own cap.
     pub fn note_inv_tx_requested(
         &self,
         peer: u64,

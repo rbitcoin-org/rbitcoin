@@ -55,3 +55,31 @@ fn inflight_wtxid_of_the_same_hash_is_not_requested_again_as_txid() {
     assert_eq!(due[0].hash, missing);
     assert!(!due[0].wtxid, "the other parent stays a txid request");
 }
+
+/// RAM bound: rows stop at the per-peer cap, and a peer's rows and index
+/// entries leave with it, so the table is at most the cap times the live
+/// sessions. A hash one peer announced holds one announcement, not spare
+/// capacity.
+#[test]
+fn rows_are_bounded_per_live_peer() {
+    let mut t = ParentTracker::new();
+    let peers = 3u64;
+    for p in 0..peers {
+        for i in 0..=MAX_PARENT_ANN_PER_PEER as u32 {
+            let mut h = [0u8; 32];
+            h[0] = p as u8;
+            h[1..5].copy_from_slice(&i.to_le_bytes());
+            t.note_inv(p, h, true, 1_000 + u64::from(i / 1_000), true);
+        }
+    }
+    assert_eq!(t.announcements, peers as usize * MAX_PARENT_ANN_PER_PEER);
+    assert!(t.by_hash.values().all(|slot| slot.anns.capacity() == 1));
+    for p in 0..peers {
+        t.forget_peer(p);
+    }
+    assert_eq!(t.announcements, 0);
+    assert!(t.by_hash.is_empty());
+    assert!(t.due_by_peer.is_empty() && t.inflight_by_peer.is_empty());
+    assert!(t.hashes_by_peer.is_empty() && t.ann_per_peer.is_empty());
+    assert!(t.sessions.is_empty());
+}

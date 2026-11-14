@@ -7009,18 +7009,19 @@ async fn second_wtxid_inv_waits_while_first_request_is_inflight() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A full process-wide parent table skips a new announcement. The peer stays
-/// connected, and getdata / getheaders already collected in that inv still go out.
+/// Rows other peers hold under their own cap do not skip a fresh peer's
+/// announcement: it is recorded and asked for in the same inv as its block
+/// and its already-asked hash.
 #[tokio::test]
-async fn full_parent_table_keeps_headers_and_collected_getdata() {
+async fn other_peers_rows_do_not_skip_a_fresh_announcement() {
     use bitcoin::hashes::Hash;
     use bitcoin::Txid;
 
-    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parent-global");
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parent-other-peers");
     hub.ensure_genesis().unwrap();
     let t = hub.tip_header().unwrap().time;
     hub.clock.set_mock(i64::from(t) + 1);
-    assert!(!hub.in_ibd(), "parent-cap inv pin is not IBD");
+    assert!(!hub.in_ibd(), "parent-row inv pin is not IBD");
     let mp =
         rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), std::sync::Arc::clone(&hub.query))
             .unwrap();
@@ -7034,28 +7035,15 @@ async fn full_parent_table_keeps_headers_and_collected_getdata() {
         mp.note_inv_tx_requested(peer.id, keep, true, 1_000, false),
         rbitcoin_net::tx_relay::ParentNote::RequestNow
     );
+    let per_peer = rbitcoin_net::tx_relay::parent_req::MAX_PARENT_ANN_PER_PEER as u32 - 100;
     let mut n = 0u32;
-    let mut filler = peer.id.saturating_add(1);
-    let mut per_peer = 0u32;
-    loop {
-        let mut hash = [0u8; 32];
-        hash[..4].copy_from_slice(&n.to_le_bytes());
-        match mp.note_inv_tx_requested(filler, hash, false, 1_000, false) {
-            rbitcoin_net::tx_relay::ParentNote::RequestNow => {
-                n += 1;
-                per_peer += 1;
-                if per_peer == 5_000 {
-                    filler += 1;
-                    per_peer = 0;
-                }
-            }
-            rbitcoin_net::tx_relay::ParentNote::Deferred => {
-                panic!("a fresh hash is the in-flight request");
-            }
-            rbitcoin_net::tx_relay::ParentNote::GlobalFull => break,
-            rbitcoin_net::tx_relay::ParentNote::PeerCapped => {
-                panic!("filler peer {filler} hit its own cap before the table filled")
-            }
+    for filler in 1..=41u64 {
+        for _ in 0..per_peer {
+            let mut hash = [0u8; 32];
+            hash[..4].copy_from_slice(&n.to_le_bytes());
+            hash[31] = 0xf1;
+            mp.note_inv_tx_requested(peer.id.saturating_add(filler), hash, true, 1_000, true);
+            n += 1;
         }
     }
     let (out_tx, mut rx) = mpsc::unbounded_channel();
@@ -7073,7 +7061,7 @@ async fn full_parent_table_keeps_headers_and_collected_getdata() {
     .unwrap();
     assert_eq!(
         follow.ban_score, 0,
-        "a full process-wide table is not this peer's misbehavior"
+        "other peers' rows are not this peer's misbehavior"
     );
     let mut saw_headers = false;
     let mut getdata = Vec::new();
@@ -7085,22 +7073,64 @@ async fn full_parent_table_keeps_headers_and_collected_getdata() {
         }
     }
     assert!(saw_headers, "block inv still requests headers");
-    assert!(
-        getdata.is_empty(),
-        "an in-flight announcement is not asked again, and a full table skips the new one"
+    assert_eq!(
+        getdata,
+        vec![fresh],
+        "the in-flight hash is not asked again, and the fresh one is asked"
     );
-    let keep_txid = Txid::from_byte_array(keep);
     let fresh_txid = Txid::from_byte_array([0x77; 32]);
-    let mp = hub.mempool().unwrap();
-    assert!(
-        mp.announcer_peers_for(&keep_txid, &bitcoin::Wtxid::from_byte_array(keep))
-            .contains(&peer.id),
-        "the announcement recorded before the table filled stays"
+    assert_eq!(
+        mp.announcer_peers_for(&fresh_txid, &bitcoin::Wtxid::from_byte_array([0x77; 32])),
+        vec![peer.id],
+        "the fresh announcement is recorded"
     );
-    assert!(
-        mp.announcer_peers_for(&fresh_txid, &bitcoin::Wtxid::from_byte_array([0x77; 32]))
-            .is_empty(),
-        "a full table does not record the new announcement"
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `unregister` forgets a peer's rows before the peer leaves the live list.
+/// An orphan's other announcer seen in that gap takes no parent row, so no
+/// row outlives its session.
+#[tokio::test]
+async fn forgotten_announcer_takes_no_orphan_parent_row() {
+    use bitcoin::hashes::Hash;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parent-forgotten");
+    hub.ensure_genesis().unwrap();
+    let mp =
+        rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), std::sync::Arc::clone(&hub.query))
+            .unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(mp).is_ok());
+    let mp = hub.mempool().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let sender = inbound_peer(&peers);
+    let gone = inbound_peer(&peers);
+    assert_ne!(sender.id, gone.id);
+    let parent = bitcoin::Txid::from_byte_array([0x55; 32]);
+    let orphan = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint::new(parent, 0),
+            ..Default::default()
+        }],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    };
+    let wtxid = orphan.compute_wtxid();
+    assert_eq!(
+        mp.note_inv_tx_requested(gone.id, wtxid.to_byte_array(), true, 1_000, true),
+        rbitcoin_net::tx_relay::ParentNote::RequestNow
+    );
+    mp.forget_parent_anns_for_peer(gone.id);
+    assert!(peers.get(gone.id).is_some(), "still on the live list");
+    schedule_orphan_parent_getdata(mp, &orphan, Some(&sender), &[gone.id]);
+    assert_eq!(
+        mp.announcer_peers_for(&parent, &bitcoin::Wtxid::from_byte_array([0x55; 32])),
+        vec![sender.id],
+        "the forgotten announcer has no row left to clean"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

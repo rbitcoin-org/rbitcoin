@@ -5155,9 +5155,7 @@ pub fn on_inv_txid(
         match mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now(), false)
         {
             crate::tx_relay::ParentNote::RequestNow => {}
-            crate::tx_relay::ParentNote::Deferred | crate::tx_relay::ParentNote::GlobalFull => {
-                return None;
-            }
+            crate::tx_relay::ParentNote::Deferred => return None,
             crate::tx_relay::ParentNote::PeerCapped => {
                 *parent_capped = true;
                 return None;
@@ -5204,9 +5202,7 @@ pub fn on_inv_wtxid(
                 true,
             ) {
                 crate::tx_relay::ParentNote::RequestNow => {}
-                crate::tx_relay::ParentNote::Deferred | crate::tx_relay::ParentNote::GlobalFull => {
-                    return None;
-                }
+                crate::tx_relay::ParentNote::Deferred => return None,
                 crate::tx_relay::ParentNote::PeerCapped => {
                     *parent_capped = true;
                     return None;
@@ -6836,7 +6832,7 @@ pub fn schedule_orphan_parent_getdata(
             continue;
         }
         if let Some(p) = ph.live_peers().into_iter().find(|p| p.id == *id) {
-            mp.schedule_orphan_parents(&missing, p.id, p.inbound, now);
+            mp.schedule_announcer_parents(&missing, p.id, p.inbound, now);
         }
     }
 }
