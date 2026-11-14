@@ -1335,6 +1335,44 @@ fn reused_cut_fk_stays_out_of_touch_and_create_count() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A posting inside a lost-tail span that this block did not touch is not a
+/// Class A read. Membership is the cheap test; the span check runs on a hit.
+#[cfg(debug_assertions)]
+#[test]
+fn touch_skips_class_a_for_a_posting_the_block_missed() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-touch-class-a");
+    q.enter_direct_index_mode().unwrap();
+    // The block pays a different script, so this hash's durable row is only
+    // the span posting. The hit is pending and comes second.
+    let script = [0x51u8, 0xab];
+    let other = [0x51u8, 0xee];
+    connect_spk(&q, 0, Fk::NULL, None, &other);
+    q.finalize_sh_runs().unwrap();
+    let sh = rbitcoin_store::script_hash(&script);
+    q.store
+        .scripthash
+        .put_create_batch_append(&[ScriptHashRecord::from_fk(sh, Fk(3))])
+        .unwrap();
+    q.sh.ram_head.lock().unwrap().insert(sh, vec![Fk(1)]);
+    let mut mark = [0u8; 16];
+    mark[..8].copy_from_slice(&2u64.to_le_bytes());
+    mark[8..].copy_from_slice(&3u64.to_le_bytes());
+    std::fs::write(q.store.path().join("scripthash.recheck"), mark).unwrap();
+    let before = q.sh_recheck_class_a_read_count();
+    let touch = q.block_touch(Height(0)).unwrap();
+    assert!(q.scripthash_touched_by(&sh, &touch).unwrap());
+    assert_eq!(
+        q.scripthash_tx_fks_at_height(&sh, Height(0)).unwrap(),
+        vec![Fk(1)]
+    );
+    let reads = q.sh_recheck_class_a_read_count() - before;
+    assert_eq!(
+        reads, 0,
+        "a posting the block missed paid {reads} Class A reads"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// No recheck span and a count above `--max-sh-creates` refuses from the
 /// packed counter. The strong list is not built.
 #[cfg(debug_assertions)]

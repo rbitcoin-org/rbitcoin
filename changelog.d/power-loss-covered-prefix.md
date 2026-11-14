@@ -60,7 +60,9 @@ Fixed
   seal with an empty append cache reads that keep file. A height at or
   below the prune height, and a missing keep file, fail the seal.
   Turning prune on skips an empty pad instead of decoding it as an input. A `tx.head` that still has
-  `meta` is shortened to that count. Its slots stay, and open does not
+  `meta` is shortened to that count. A segment that starts past that count
+  is unlinked (open-address file, `.mphf`, and `.fuse8`). A segment that
+  stays keeps its slots, and open does not
   rebuild it from Class A. A later create that reuses one of those fks
   replaces that slot when the new txid's probe reaches it. A probe that
   stops earlier leaves the old slot, and the new txid still resolves.

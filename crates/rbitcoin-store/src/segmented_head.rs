@@ -258,18 +258,22 @@ impl SegmentedTxHead {
     /// Shorten the head to creates `1..=n`.
     ///
     /// `meta` is a synced rename. Body headers are not, so a covered-prefix
-    /// cut leaves this head naming creates the body dropped. Slot bytes and
-    /// sealed packs stay. A segment that starts past `n` leaves the list so
-    /// the next open still sees one contiguous span. Probes ignore a relative
-    /// fk above the shortened count.
+    /// cut leaves this head naming creates the body dropped. A segment that
+    /// starts past `n` leaves the list, then its open-address file and sealed
+    /// packs are unlinked once `meta` no longer names it. A shortened segment
+    /// that stays keeps its slot bytes and sealed packs. Probes ignore a
+    /// relative fk above the shortened count. The next roll in this process
+    /// reuses the lowest dropped file id.
     pub fn clamp_to_create_count(&self, n: u64) -> Result<(), StoreError> {
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let segs = self.segments_snapshot();
         let mut list = Vec::with_capacity(segs.len());
+        let mut dropped = Vec::new();
         let mut changed = false;
         for s in segs.iter() {
             if n == 0 || s.first_fk > n {
                 changed = true;
+                dropped.push(s.file_id);
                 continue;
             }
             let c = s.count.load(Ordering::Relaxed);
@@ -287,6 +291,31 @@ impl SegmentedTxHead {
         }
         if changed {
             self.persist_meta_locked()?;
+        }
+        let Some(&min_id) = dropped.iter().min() else {
+            return Ok(());
+        };
+        for file_id in &dropped {
+            self.unlink_segment_files(*file_id)?;
+        }
+        self.next_file_id.fetch_min(min_id, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Drop one segment's open-address file and sealed packs. A missing file
+    /// is the seal path, which already unlinked the open-address table.
+    fn unlink_segment_files(&self, file_id: u32) -> Result<(), StoreError> {
+        let base = segment_head_path(&self.dir, file_id);
+        for path in [
+            base.clone(),
+            crate::tx_head_mphf::mphf_path(&base),
+            segment_fuse_path(&self.dir, file_id),
+        ] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StoreError::io(path, e)),
+            }
         }
         Ok(())
     }
