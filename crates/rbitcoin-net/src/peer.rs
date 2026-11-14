@@ -4681,7 +4681,7 @@ pub enum CompactServe {
 }
 
 /// Reconstruct and, when the block is near the tip, build the compact
-/// announcement. Store reads and `from_block` stay off the session task.
+/// announcement. Store reads and short ids stay off the session task.
 #[doc(hidden)]
 pub fn compact_serve_outcome(
     cache: &BlockCache,
@@ -4701,15 +4701,16 @@ pub fn compact_serve_outcome(
     if block_h.is_some_and(|h| tip_h.saturating_sub(h) > MAX_CMPCTBLOCK_DEPTH) {
         return Ok(CompactServe::Full(block));
     }
-    match HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &pref) {
-        Ok(hsi) => {
+    let ids = crate::compact::short_id_hashes(&block, ver);
+    match crate::compact::header_and_short_ids(&block, &ids, rand_nonce(), ver, &pref) {
+        Some(hsi) => {
             rbitcoin_log::info!(
                 "{}",
                 crate::compact::cmpct_send_line(block.block_hash(), block.txdata.len(), &hsi)
             );
             Ok(CompactServe::Cmpct(hsi))
         }
-        Err(_) => Ok(CompactServe::Full(block)),
+        None => Ok(CompactServe::Full(block)),
     }
 }
 
@@ -7216,15 +7217,22 @@ pub fn cmpct_announce_from_block(
     let pref = hub
         .cmpct_prefill_indexes(&block.block_hash())
         .unwrap_or_else(|| vec![0]);
-    cmpct_from_parts(block, rand_nonce(), ver, &pref)
+    let ids = crate::compact::short_id_hashes(block, ver);
+    cmpct_from_parts(block, &ids, rand_nonce(), ver, &pref)
 }
 
-/// Short ids for a block already in hand. No store read.
-fn cmpct_from_parts(block: &Block, nonce: u64, ver: u32, pref: &[usize]) -> Option<NetworkMessage> {
+/// Short ids for a block already in hand. No store read. `ids` is
+/// [`crate::compact::short_id_hashes`] for `ver`.
+fn cmpct_from_parts(
+    block: &Block,
+    ids: &[[u8; 32]],
+    nonce: u64,
+    ver: u32,
+    pref: &[usize],
+) -> Option<NetworkMessage> {
     crate::reactor::assert_not_reactor("cmpct short ids");
-    let hsi = HeaderAndShortIds::from_block(block, nonce, ver, pref)
-        .or_else(|_| HeaderAndShortIds::from_block(block, nonce, ver, &[0]))
-        .ok()?;
+    let hsi = crate::compact::header_and_short_ids(block, ids, nonce, ver, pref)
+        .or_else(|| crate::compact::header_and_short_ids(block, ids, nonce, ver, &[0]))?;
     rbitcoin_log::info!(
         "{}",
         crate::compact::cmpct_send_line(block.block_hash(), block.txdata.len(), &hsi)
@@ -7241,7 +7249,8 @@ async fn cmpct_from_parts_cpu(
     pref: Vec<usize>,
 ) -> Result<Option<NetworkMessage>, NetError> {
     match rbitcoin_consensus::script_pool::run_cpu(move || {
-        cmpct_from_parts(&block, nonce, ver, &pref)
+        let ids = crate::compact::short_id_hashes(&block, ver);
+        cmpct_from_parts(&block, &ids, nonce, ver, &pref)
     })
     .await
     {
@@ -7299,53 +7308,89 @@ async fn cmpct_tip_announce(
     cmpct_from_parts_cpu(block, nonce, ver, pref).await
 }
 
-/// Header persist and prefill for a block already in hand, then short ids.
+/// Header persist and prefill for a block already in hand, then the body
+/// check and short ids.
 ///
-/// An `Arc` hub persists the header on the blocking pool and builds short
-/// ids on `rbtc-scripts-*`. A stack hub (tests) does both inline.
-/// `Ok(None)` is a header the store refused or a body that did not become
-/// a compact message. A closed permit or a failed join is `Err`, the same
-/// class as [`cmpct_tip_announce`].
+/// An `Arc` hub persists the header on the blocking pool and hashes the
+/// body on `rbtc-scripts-*`. A stack hub (tests) does both inline.
+/// `Ok(None)` is a header the store refused, a mutated body, or a body that
+/// did not become a compact message. A closed permit or a failed join is
+/// `Err`, the same class as [`cmpct_tip_announce`].
 async fn cmpct_announce_off_session(
     hub: &ChainHub,
     block: Block,
-    cmpct_version: u32,
+    height: u32,
 ) -> Result<Option<NetworkMessage>, NetError> {
     let Some(owned) = hub.shared_arc() else {
-        return Ok(hb_relay_message(hub, &block, cmpct_version));
+        return Ok(hb_relay_message(hub, &block, height));
     };
+    let cpu_hub = Arc::clone(&owned);
     let permit = block_reconstruct_permit().await?;
     let joined = tokio::task::spawn_blocking(move || {
         let _region = crate::reactor::BlockingRegion::enter();
         let _permit = permit;
-        hb_relay_prepare(owned.as_ref(), block, cmpct_version)
+        hb_relay_prepare(owned.as_ref(), block)
     })
     .await;
-    let Some((block, ver, pref, nonce)) = map_cmpct_relay_join(joined)? else {
+    let Some((block, pref, nonce)) = map_cmpct_relay_join(joined)? else {
         return Ok(None);
     };
-    cmpct_from_parts_cpu(block, nonce, ver, pref).await
+    rbitcoin_consensus::script_pool::run_cpu(move || {
+        hb_relay_cmpct(cpu_hub.as_ref(), &block, height, nonce, &pref)
+    })
+    .await
+    .ok_or(NetError::Protocol("cmpct relay join failed"))
 }
 
-fn hb_relay_prepare(
-    hub: &ChainHub,
-    block: Block,
-    cmpct_version: u32,
-) -> Option<(Block, u32, Vec<usize>, u64)> {
+fn hb_relay_prepare(hub: &ChainHub, block: Block) -> Option<(Block, Vec<usize>, u64)> {
     if ensure_peer_header(hub, &block.header).is_err() {
         return None;
     }
     hub.remember_cmpct_prefill_from_block(&block);
-    let ver = cmpct_version.clamp(1, 2);
     let pref = hub
         .cmpct_prefill_indexes(&block.block_hash())
         .unwrap_or_else(|| vec![0]);
-    Some((block, ver, pref, rand_nonce()))
+    Some((block, pref, rand_nonce()))
 }
 
-fn hb_relay_message(hub: &ChainHub, block: &Block, cmpct_version: u32) -> Option<NetworkMessage> {
-    let (block, ver, pref, nonce) = hb_relay_prepare(hub, block.clone(), cmpct_version)?;
-    cmpct_from_parts(&block, nonce, ver, &pref)
+fn hb_relay_message(hub: &ChainHub, block: &Block, height: u32) -> Option<NetworkMessage> {
+    let (block, pref, nonce) = hb_relay_prepare(hub, block.clone())?;
+    hb_relay_cmpct(hub, &block, height, nonce, &pref)
+}
+
+/// Core sends this from `NewPoWValidBlock`, after `CheckBlock` and
+/// `ContextualCheckBlock`. Callers check the txid merkle root and the
+/// 64-byte mutation where the body arrives. The witness commitment is not
+/// in the block hash, so a peer can change a witness or the coinbase nonce
+/// and keep the header. That check (Core `IsBlockMutated` with the witness
+/// root, which reads the coinbase) runs here on the wtxids the short ids
+/// use, so they are hashed once.
+fn hb_relay_cmpct(
+    hub: &ChainHub,
+    block: &Block,
+    height: u32,
+    nonce: u64,
+    pref: &[usize],
+) -> Option<NetworkMessage> {
+    if !block.txdata.first().is_some_and(Transaction::is_coinbase) {
+        return None;
+    }
+    let wtxids = crate::compact::short_id_hashes(block, 2);
+    let ctx = rbitcoin_consensus::ValidationContext::at(&hub.params, Height(height), hub.milestone);
+    if let Err(e) = rbitcoin_consensus::block::reject_witness_malleation_wtxids(
+        block,
+        &ctx,
+        rbitcoin_consensus::block::block_has_witness(block),
+        wtxids.iter().skip(1).copied(),
+    ) {
+        rbitcoin_log::debug!(
+            "p2p: no compact relay of mutated block {}: {}",
+            block.block_hash(),
+            rbitcoin_consensus::block_reject_reason(&e)
+        );
+        return None;
+    }
+    cmpct_from_parts(block, &wtxids, nonce, 2, pref)
 }
 
 /// A panicked or cancelled blocking job is not "no compact message".
@@ -7376,9 +7421,10 @@ fn hb_peer_offered_block(
 
 /// Send `cmpctblock` to peers who asked for high-bandwidth announcements
 /// (`hb_from`: they sent `sendcmpct` announce=1) as soon as a reconstructed
-/// or received body has a PoW-valid header that extends our tip, **before**
-/// `tip-accept` connect. The body is staged for `getblocktxn` before that
-/// message is queued. Does not mark the block connected.
+/// or received body has a PoW-valid header that extends our tip and the
+/// body matches its witness commitment, **before** `tip-accept` connect.
+/// The body is staged for `getblocktxn` before that message is queued.
+/// Does not mark the block connected.
 ///
 /// The compact message is built only when one of those peers would be
 /// offered the block. No such peer returns before the clone and the
@@ -7386,7 +7432,8 @@ fn hb_peer_offered_block(
 ///
 /// Core `NewPoWValidBlock`: the peer already has the parent header and not
 /// this one. `hb_to` is the opposite direction (we asked them to announce
-/// to us). Only the current tip-child (not a reorg branch). Sender is skipped.
+/// to us). Only the current tip-child (not a reorg branch), and only once
+/// segwit is active at its height. Sender is skipped.
 #[doc(hidden)]
 pub async fn relay_new_pow_valid_block(
     hub: &ChainHub,
@@ -7422,7 +7469,13 @@ pub async fn relay_new_pow_valid_block(
     if targets.is_empty() {
         return;
     }
-    let msg = match cmpct_announce_off_session(hub, block.clone(), 2).await {
+    let Some(height) = hub.header_height(&prev).map(|h| h.saturating_add(1)) else {
+        return;
+    };
+    if !hub.params.segwit_active_at(height) {
+        return;
+    }
+    let msg = match cmpct_announce_off_session(hub, block.clone(), height).await {
         Ok(Some(msg)) => msg,
         Ok(None) => return,
         Err(e) => {

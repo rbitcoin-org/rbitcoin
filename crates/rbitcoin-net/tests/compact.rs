@@ -97,6 +97,29 @@ fn spend(n: u8) -> Transaction {
     }
 }
 
+/// The relay hashes wtxids once and builds short ids from them. The message
+/// is the one `HeaderAndShortIds::from_block` builds, for both versions,
+/// and an index list `from_block` refuses is refused here too.
+#[test]
+fn short_ids_from_hashes_match_from_block() {
+    let mut cb = coinbase();
+    cb.input[0].witness = Witness::from_slice(&[vec![0u8; 32]]);
+    let block = sealed_block(vec![cb, spend(1), spend(2), spend(3), spend(4)]);
+    for version in [1, 2] {
+        let ids = short_id_hashes(&block, version);
+        for prefill in [&[][..], &[0], &[2], &[1, 3], &[0, 4], &[5], &[3, 1]] {
+            assert_eq!(
+                header_and_short_ids(&block, &ids, 0xbeef, version, prefill),
+                HeaderAndShortIds::from_block(&block, 0xbeef, version, prefill).ok(),
+                "version {version} prefill {prefill:?}"
+            );
+        }
+    }
+    let ids = short_id_hashes(&block, 2);
+    assert!(header_and_short_ids(&block, &ids, 0xbeef, 3, &[]).is_none());
+    assert!(header_and_short_ids(&block, &ids[1..], 0xbeef, 2, &[]).is_none());
+}
+
 #[test]
 fn reconstruct_rejects_tx_count_above_weight_ratio() {
     assert_eq!(
