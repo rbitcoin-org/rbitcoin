@@ -307,26 +307,6 @@ fn u64_identity_hasher_is_raw_key_and_map_roundtrips_pack_scale() {
     assert_eq!(m.get(&(n + 1)), None);
 }
 
-#[test]
-fn vacant_insert_does_not_arcswap_until_compose() {
-    let mut bp = BatchParents::new();
-    bp.insert_owned(
-        Fk(1),
-        tx(1),
-        vec![(0, out(10))],
-        vec![0],
-        Some(false),
-        None,
-        Vec::new(),
-    );
-    let pin = bp.pins.get(&1).expect("vacant pin");
-    let outs = pin.load_outs();
-    assert!(outs.covers_need(&[0]));
-    assert_eq!(outs.get_parts(0).expect("vout 0").0, 10);
-    pin.merge_outs(vec![], &[0]);
-    assert_eq!(pin.load_outs().get_parts(0).expect("vout 0").0, 10);
-}
-
 /// Q-M3: empty checked / already-covered live must not publish a new outs Arc.
 #[test]
 fn merge_outs_empty_checked_keeps_outs_arc() {
@@ -341,15 +321,24 @@ fn merge_outs_empty_checked_keeps_outs_arc() {
         Vec::new(),
     );
     let pin = Arc::clone(bp.pins.get(&1).unwrap());
-    assert_eq!(pin.load_outs().get_parts(0).expect("vout 0").0, 10);
+    let first = pin.load_outs();
+    assert!(first.covers_need(&[0]));
+    assert_eq!(first.get_parts(0).expect("vout 0").0, 10);
+    pin.merge_outs(vec![], &[0]);
+    assert!(
+        Arc::ptr_eq(&pin.load_outs(), &first),
+        "covered checked no-op keeps the outs Arc"
+    );
     pin.merge_outs(vec![], &[]);
-    assert_eq!(
-        pin.load_outs().get_parts(0).expect("vout 0").0,
-        10,
-        "empty checked no-op keeps the prevout"
+    assert!(
+        Arc::ptr_eq(&pin.load_outs(), &first),
+        "empty checked no-op keeps the outs Arc"
     );
     pin.merge_outs(vec![(0, out(10))], &[]);
-    assert_eq!(pin.load_outs().get_parts(0).expect("vout 0").0, 10);
+    assert!(
+        Arc::ptr_eq(&pin.load_outs(), &first),
+        "already-held live keeps the outs Arc"
+    );
 
     bp.insert_owned(
         Fk(1),
@@ -411,6 +400,100 @@ fn compose_adds_vout_without_mutating_old_snap() {
     assert_eq!(old.checked(), &[0]);
     assert!(new.covers_need(&[0, 1]));
     assert_eq!(new.get_parts(1).expect("vout 1").0, 20);
+    assert_eq!(
+        Arc::strong_count(&old),
+        1,
+        "the pin must not keep the narrower outs after a widen"
+    );
+}
+
+/// A publish frees the snapshot it replaced after the half's lock is
+/// released: a reader gets the half while that free is still running.
+#[test]
+fn a_reader_does_not_wait_for_the_free_of_a_superseded_snapshot() {
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// With a gate, `Drop` says it started and waits for the gate to open.
+    struct SlowFree(Option<(Sender<()>, Mutex<Receiver<()>>)>);
+    impl Drop for SlowFree {
+        fn drop(&mut self) {
+            if let Some((started, open)) = &self.0 {
+                let _ = started.send(());
+                let _ = open.lock().unwrap_or_else(|e| e.into_inner()).recv();
+            }
+        }
+    }
+
+    let (started_tx, started) = channel();
+    let (open, gate) = channel();
+    let half = Arc::new(PinHalf::new(SlowFree(Some((started_tx, Mutex::new(gate))))));
+    let publisher = std::thread::spawn({
+        let half = Arc::clone(&half);
+        move || half.publish(|_| Some(SlowFree(None)))
+    });
+    started
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the publish frees the snapshot it replaced");
+    let (read_tx, read) = channel();
+    let reader = std::thread::spawn({
+        let half = Arc::clone(&half);
+        move || {
+            let _ = read_tx.send(half.load().0.is_none());
+        }
+    });
+    let got = read.recv_timeout(Duration::from_secs(5));
+    open.send(()).unwrap();
+    publisher.join().unwrap();
+    reader.join().unwrap();
+    assert_eq!(
+        got,
+        Ok(true),
+        "a reader waited for the free of the superseded snapshot"
+    );
+}
+
+/// A layout publish leaves the superseded snapshot to its readers. The pin
+/// holds one layout after its first publish and after a later one.
+#[test]
+fn layout_publish_releases_the_superseded_snapshot() {
+    let mut bp = BatchParents::new();
+    bp.insert_owned(
+        Fk(1),
+        tx(1),
+        vec![(0, out(10))],
+        vec![0],
+        Some(false),
+        None,
+        Vec::new(),
+    );
+    let pin = Arc::clone(bp.pins.get(&1).unwrap());
+    let inserted = pin.load_layout();
+    bp.set_body_range_only(Fk(1), (100, 50));
+    let with_body = pin.load_layout();
+    bp.set_spent_range_only(Fk(1), (1000, 24));
+    assert_eq!(
+        Arc::strong_count(&inserted),
+        1,
+        "pin kept the insert layout"
+    );
+    assert_eq!(
+        Arc::strong_count(&with_body),
+        1,
+        "pin kept the body-only layout"
+    );
+    assert_eq!(inserted.body_range, None);
+    assert_eq!(with_body.spent_range, None);
+    let now = pin.load_layout();
+    assert_eq!(now.body_range, Some((100, 50)));
+    assert_eq!(now.spent_range, Some((1000, 24)));
+    bp.set_body_range_only(Fk(1), (100, 50));
+    bp.set_spent_range_only(Fk(1), (1000, 24));
+    assert!(
+        Arc::ptr_eq(&pin.load_layout(), &now),
+        "same ranges keep the layout Arc"
+    );
 }
 
 /// Prep∥write on one SharedParentPin: write set_layout_for_need must not
@@ -555,6 +638,8 @@ fn covered_insert_keeps_outs_arc_identity() {
         vec![(0, 10)],
     );
     let pin = Arc::clone(bp.pins.get(&1).unwrap());
+    let outs_before = pin.load_outs();
+    let lay_before = pin.load_layout();
     bp.insert_owned(
         Fk(1),
         tx(1),
@@ -566,6 +651,8 @@ fn covered_insert_keeps_outs_arc_identity() {
     );
     let outs_after = pin.load_outs();
     let lay_after = pin.load_layout();
+    assert!(Arc::ptr_eq(&outs_after, &outs_before));
+    assert!(Arc::ptr_eq(&lay_after, &lay_before));
     assert_eq!(outs_after.get_parts(0).expect("vout 0").0, 10);
     assert_eq!(lay_after.body_range, Some((100, 50)));
     assert_eq!(lay_after.spender_rels, vec![(0, 10)]);
@@ -585,9 +672,11 @@ fn layout_only_write_keeps_outs_arc() {
         vec![(0, 10)],
     );
     let pin = Arc::clone(bp.pins.get(&1).unwrap());
+    let outs_before = pin.load_outs();
     bp.set_layout_for_need(Fk(1), (500, 80), &[10, 20], &[]);
     let outs_after = pin.load_outs();
     let lay = pin.load_layout();
+    assert!(Arc::ptr_eq(&outs_after, &outs_before));
     assert_eq!(outs_after.get_parts(0).expect("vout 0").0, 10);
     assert_eq!(outs_after.get_parts(1).expect("vout 1").0, 20);
     assert_eq!(lay.body_range, Some((500, 80)));

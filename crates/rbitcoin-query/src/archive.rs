@@ -585,6 +585,55 @@ pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
     n
 }
 
+/// Packed row of each planned create id.
+///
+/// The planner hands out one ascending run, `next_tx_start.max(1)` and up,
+/// and the row of an id in such a list is `id - first`. Neither
+/// [`ArchiveWritePlan::append`] nor
+/// [`ArchiveWritePlan::retain_headers_needing_body`] checks that the list
+/// is still a run, so [`Self::from_fks`] does.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct PlannedRows {
+    first: u64,
+    len: u64,
+}
+
+/// Planned fks the appender cannot return: it hands out `count+1, count+2, …`.
+const PLAN_FK_MISMATCH: StoreError =
+    StoreError::Corrupt("tx put_full_batch fk mismatch (plan not committed in order)");
+
+impl PlannedRows {
+    /// `fks` must be `first, first + 1, …` with no null fk. Any other list
+    /// fails the commit's fk comparison, so it gets that error here, where
+    /// a commit has not appended yet.
+    pub fn from_fks(fks: &[Fk]) -> Result<Self, StoreError> {
+        let first = fks
+            .first()
+            .and_then(|fk| fk.get())
+            .ok_or(PLAN_FK_MISMATCH)?;
+        let one_run = fks
+            .iter()
+            .zip(0u64..)
+            .all(|(fk, i)| fk.get().is_some_and(|id| first.checked_add(i) == Some(id)));
+        if !one_run {
+            return Err(PLAN_FK_MISMATCH);
+        }
+        Ok(Self {
+            first,
+            len: fks.len() as u64,
+        })
+    }
+
+    #[inline]
+    pub fn row(&self, create_id: u64) -> Option<usize> {
+        create_id
+            .checked_sub(self.first)
+            .filter(|i| *i < self.len)
+            .map(|i| i as usize)
+    }
+}
+
 /// Write-ready plan batch from lookup/load to commit (writer).
 ///
 /// Planned create fks match `txs.count()+1…` at plan time; commit fails if the
@@ -737,18 +786,10 @@ impl ArchiveWritePlan {
         if image.create_count() == 0 {
             return Ok(image);
         }
-        let mut idx: crate::U64Map<usize> = crate::U64Map::default();
-        for (i, fk) in self.planned_fks.iter().enumerate() {
-            if let Some(id) = fk.get() {
-                idx.insert(id, i);
-            }
-        }
+        let rows = PlannedRows::from_fks(&self.planned_fks)?;
         for eds in self.edges.values() {
             for e in eds {
-                let Some(cid) = e.create_fk.get() else {
-                    continue;
-                };
-                let Some(&i) = idx.get(&cid) else {
+                let Some(i) = e.create_fk.get().and_then(|cid| rows.row(cid)) else {
                     continue;
                 };
                 image.place(i, e.vout, e.spend_fk, e.vin)?;
@@ -1141,13 +1182,8 @@ pub fn stamp_wire_plan_txstat(
     if plan.packed.is_empty() {
         return Ok(());
     }
-    let mut idx: crate::U64Map<usize> = crate::U64Map::default();
-    for (i, fk) in plan.planned_fks.iter().enumerate() {
-        if let Some(id) = fk.get() {
-            idx.insert(id, i);
-        }
-    }
-    let vals = store_prevout_values(query, plan, &idx)?;
+    let rows = PlannedRows::from_fks(&plan.planned_fks)?;
+    let vals = store_prevout_values(query, plan, &rows)?;
     let mut fees = Vec::with_capacity(plan.packed.len());
     let mut sizes = Vec::with_capacity(plan.packed.len());
     for i in 0..plan.packed.len() {
@@ -1160,7 +1196,7 @@ pub fn stamp_wire_plan_txstat(
         let in_sum = if is_cb {
             None
         } else {
-            Some(txstat_in_sum(plan, &idx, &vals, i, n_in)?)
+            Some(txstat_in_sum(plan, &rows, &vals, i, n_in)?)
         };
         let row = plan.packed[i]
             .0
@@ -1185,7 +1221,7 @@ pub fn stamp_wire_plan_txstat(
 pub fn store_prevout_values(
     query: &Query,
     plan: &ArchiveWritePlan,
-    idx: &crate::U64Map<usize>,
+    rows: &PlannedRows,
 ) -> Result<std::collections::HashMap<(u64, u32), u64>, QueryError> {
     let mut by_parent: std::collections::HashMap<u64, Vec<u32>> = std::collections::HashMap::new();
     for fk in &plan.planned_fks {
@@ -1199,7 +1235,7 @@ pub fn store_prevout_values(
             let Some(cid) = e.create_fk.get() else {
                 continue;
             };
-            if idx.get(&cid).is_some() {
+            if rows.row(cid).is_some() {
                 continue;
             }
             by_parent.entry(cid).or_default().push(e.vout);
@@ -1219,7 +1255,7 @@ pub fn store_prevout_values(
 #[doc(hidden)]
 pub fn txstat_in_sum(
     plan: &ArchiveWritePlan,
-    idx: &crate::U64Map<usize>,
+    rows: &PlannedRows,
     vals: &std::collections::HashMap<(u64, u32), u64>,
     i: usize,
     n_in: usize,
@@ -1241,7 +1277,7 @@ pub fn txstat_in_sum(
         if e.create_fk.is_null() {
             return Err(StoreError::Corrupt("invariant: spend missing create_fk"));
         }
-        let val = prevout_value_at(plan, idx, vals, e.create_fk, e.vout)?;
+        let val = prevout_value_at(plan, rows, vals, e.create_fk, e.vout)?;
         in_sum = in_sum
             .checked_add(val)
             .ok_or(StoreError::Corrupt("txstat in_sum overflow"))?;
@@ -1254,7 +1290,7 @@ pub fn txstat_in_sum(
 #[doc(hidden)]
 pub fn prevout_value_at(
     plan: &ArchiveWritePlan,
-    idx: &crate::U64Map<usize>,
+    rows: &PlannedRows,
     vals: &std::collections::HashMap<(u64, u32), u64>,
     create_fk: Fk,
     vout: u32,
@@ -1262,7 +1298,7 @@ pub fn prevout_value_at(
     let Some(cid) = create_fk.get() else {
         return Err(StoreError::Corrupt("invariant: spend missing create_fk"));
     };
-    if let Some(&i) = idx.get(&cid) {
+    if let Some(i) = rows.row(cid) {
         let val = plan.packed[i]
             .0
             .with_out_parts(vout, |val, _| val)
@@ -1921,9 +1957,7 @@ impl Query {
             return Err(StoreError::Corrupt("invariant: append loc length"));
         }
         if got_tx_fks != plan.planned_fks {
-            return Err(StoreError::Corrupt(
-                "tx put_full_batch fk mismatch (plan not committed in order)",
-            ));
+            return Err(PLAN_FK_MISMATCH);
         }
         if self.prune_seqsigwit() {
             let ins = seqsigwit_rows_for_prune(&mut plan)?;
