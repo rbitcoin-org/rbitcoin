@@ -190,25 +190,59 @@ pub fn load_sh_through(store_dir: &Path) -> u64 {
     }
 }
 
+fn sh_through_lock() -> &'static Mutex<()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    &LOCK
+}
+
 /// Remember a create whose posting bytes may have been synced.
 ///
 /// Monotonic. A lower value, zero, and `u64::MAX` do not write. The ordinary
-/// append path passes `u64::MAX` and must not poison this file.
+/// append path passes `u64::MAX` and must not poison this file. The lock
+/// covers the load and the rename: the tail backfill and write-behind share
+/// `scripthash.through.tmp`.
 pub fn note_sh_through(store_dir: &Path, max_create_fk: u64) -> Result<(), StoreError> {
     if max_create_fk == 0 || max_create_fk == u64::MAX {
         return Ok(());
     }
+    let _guard = sh_through_lock().lock().unwrap();
     if max_create_fk <= load_sh_through(store_dir) {
         return Ok(());
     }
+    #[cfg(debug_assertions)]
+    fire_before_through_rename();
     crate::file::write_synced_tmp_rename(
         &store_dir.join(SH_THROUGH_NAME),
         &max_create_fk.to_le_bytes(),
     )
 }
 
+#[cfg(debug_assertions)]
+fn before_through_rename() -> &'static Mutex<Option<fn()>> {
+    static HOOK: Mutex<Option<fn()>> = Mutex::new(None);
+    &HOOK
+}
+
+#[cfg(debug_assertions)]
+fn fire_before_through_rename() {
+    let hook = before_through_rename().lock().unwrap().take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// One-shot hook after the monotonic check and before the rename.
+///
+/// Process-wide: the two notes under test run on different threads.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_before_through_rename_for_test(hook: Option<fn()>) {
+    *before_through_rename().lock().unwrap() = hook;
+}
+
 /// Drop the flushed-tail marker. A full rebuild has no old posting to name.
 pub fn clear_sh_through(dir: &Path) -> Result<(), StoreError> {
+    let _guard = sh_through_lock().lock().unwrap();
     let path = dir.join(SH_THROUGH_NAME);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),

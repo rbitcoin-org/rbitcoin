@@ -2449,8 +2449,9 @@ pub fn materialize_sh_unsorted_from_class_a(
         any_sealed,
         cancel,
     )?;
-    // The fks about to be packed. A lower note does not move a cut marker
-    // that already names the dropped tail.
+    // Keys-pass count, before the first shard sync. A lower note does not
+    // move a cut marker that already names the dropped tail. The posts pass
+    // can sync a later create; that one is named after the pack.
     if collected.last_fk > 0 {
         crate::scripthash::note_sh_through(store.path(), collected.last_fk)?;
     }
@@ -2462,10 +2463,19 @@ pub fn materialize_sh_unsorted_from_class_a(
         pack_workers,
         cancel,
     )?;
-    mat.max_fk = mat.max_fk.max(collected.last_fk);
+    // `DONE.post` names the scan end, which can be past the keys pass and
+    // past `pack.max_fk` when a sealed shard took no new row. Name that
+    // end before the cap replaces it and before the file is removed.
+    let posts_last = read_phase_done(&dir, POST_DONE_NAME, POST_DONE_MAGIC, n_shards)
+        .map(|d| d.last_fk)
+        .unwrap_or(0);
+    let synced = mat.max_fk.max(collected.last_fk).max(posts_last);
+    if synced > 0 {
+        crate::scripthash::note_sh_through(store.path(), synced)?;
+    }
     // The packed shard did not take this scan. Leave the watermark at the
     // cut so the tail backfill appends the creates that arrived after it.
-    mat.max_fk = capped_publish_fk(store.path(), any_sealed, mat.max_fk)?;
+    mat.max_fk = capped_publish_fk(store.path(), any_sealed, synced)?;
     if table.unsealed_main_shards().is_empty() {
         // The capped create, not the raw `DONE` last. Partial packs leave
         // both the watermark and the directory alone.

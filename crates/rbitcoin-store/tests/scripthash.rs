@@ -14,7 +14,7 @@ use rbitcoin_store::scripthash_pages::{
     sh_page_as_array, sh_page_extent, sh_page_set_next, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
 };
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rbitcoin_store::scripthash_layout::SH_HEAD_VALUE_LEN;
 use rbitcoin_store::scripthash_materialize::{
@@ -32,6 +32,59 @@ use rbitcoin_store::scripthash_pages::{
 
 fn tmp() -> rbitcoin_store::testutil::TempDir {
     rbitcoin_store::testutil::TempDir::labeled("sh").expect("temp dir")
+}
+
+static THROUGH_IN_RENAME: AtomicBool = AtomicBool::new(false);
+static THROUGH_RELEASE: AtomicBool = AtomicBool::new(false);
+static THROUGH_SECOND_DONE: AtomicBool = AtomicBool::new(false);
+
+fn stall_through_rename() {
+    THROUGH_IN_RENAME.store(true, Ordering::Release);
+    while !THROUGH_RELEASE.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+}
+
+/// Two notes share `scripthash.through.tmp`. A note that loaded the old
+/// value must not rename a lower count over one the other note already
+/// stored.
+#[test]
+fn note_sh_through_keeps_a_higher_note() {
+    THROUGH_IN_RENAME.store(false, Ordering::Release);
+    THROUGH_RELEASE.store(false, Ordering::Release);
+    THROUGH_SECOND_DONE.store(false, Ordering::Release);
+    let dir = tmp();
+    set_before_through_rename_for_test(Some(stall_through_rename));
+    let low = dir.path().to_path_buf();
+    let high = dir.path().to_path_buf();
+    let first = std::thread::spawn(move || note_sh_through(&low, 10).unwrap());
+    let started = std::time::Instant::now();
+    while !THROUGH_IN_RENAME.load(Ordering::Acquire) {
+        if started.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("the first note never reached the rename");
+        }
+        std::thread::yield_now();
+    }
+    let second = std::thread::spawn(move || {
+        note_sh_through(&high, 30).unwrap();
+        THROUGH_SECOND_DONE.store(true, Ordering::Release);
+    });
+    let overlapped = std::time::Instant::now();
+    while !THROUGH_SECOND_DONE.load(Ordering::Acquire) {
+        if overlapped.elapsed() > std::time::Duration::from_millis(200) {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    THROUGH_RELEASE.store(true, Ordering::Release);
+    first.join().unwrap();
+    second.join().unwrap();
+    set_before_through_rename_for_test(None);
+    assert_eq!(
+        load_sh_through(dir.path()),
+        30,
+        "a lower note replaced the higher scripthash.through"
+    );
 }
 
 fn push_chain(session: &mut ScriptHashBulkSession<'_>, key: [u8; 32], entries: &[Fk]) {

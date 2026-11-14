@@ -1004,6 +1004,61 @@ fn inclusion_floor_lands_before_done_is_dropped() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A block can connect after the keys pass and before the posts pass.
+/// The pack syncs that later create, then drops `DONE.post`. `through`
+/// has to name it first. The inclusion floor stays at the cut.
+#[test]
+fn posts_pass_names_through_before_done_is_dropped() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("q-sh-posts-through").unwrap();
+    let layout = StoreLayout::tiny(dir.path()).with_sh_shards(2);
+    let q = Query::open_or_create_layout(layout).unwrap();
+    let open_script = script_on_shard(2, 1, 0x61);
+    connect_coinbase_paying(&q, script_on_shard(2, 0, 0x62));
+    connect_coinbase_paying(&q, open_script.clone());
+    let n_shards = q.store.scripthash.head_shard_count();
+    assert_eq!(n_shards, 2);
+    let udir = rbitcoin_store::unsorted_shard_dir(q.store.path());
+    rbitcoin_store::collect_unsorted_shard_files(&q.store, &udir, n_shards, 1, None).unwrap();
+    let keys_last = rbitcoin_store::unsorted_done_last_fk(&udir, n_shards).unwrap();
+    rbitcoin_store::scripthash_materialize::pack_one_extract_shard(&q.store.scripthash, &udir, 0)
+        .unwrap();
+    rbitcoin_store::scripthash::note_sh_recheck(q.store.path(), 1, keys_last).unwrap();
+    PACK_QUERY.with(|c| c.set(&q as *const Query));
+    POSTS_COUNT.with(|c| c.set(0));
+    THROUGH_AT_CLEAR.with(|c| c.set((0, 0, false)));
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_pack_for_test(Some(
+        grow_open_shard_before_posts,
+    ));
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_clear_for_test(Some(
+        snap_through_before_unsorted_clear,
+    ));
+    let result = q.finalize_sh_runs();
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_pack_for_test(None);
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_clear_for_test(None);
+    PACK_QUERY.with(|c| c.set(std::ptr::null()));
+    result.unwrap();
+    let posts = POSTS_COUNT.with(|c| c.get());
+    let (through, hwm, done_post) = THROUGH_AT_CLEAR.with(|c| c.get());
+    assert!(
+        posts > keys_last,
+        "the posts pass did not see a later create ({posts} vs keys {keys_last})"
+    );
+    assert!(
+        done_post,
+        "DONE.post was already gone when through was checked"
+    );
+    assert!(
+        through >= posts,
+        "through was {through} while the posts pass synced create {posts}"
+    );
+    assert_eq!(
+        hwm, 1,
+        "the cut was not the inclusion floor (through {through})"
+    );
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Resume byte `2` keeps a pack-complete head whose watermark was never
 /// published. The tail scan has to start at that packed floor. Create 1
 /// is already in its row.
@@ -2520,6 +2575,28 @@ fn snap_floor_before_unsorted_clear(dir: &Path) {
         .join(rbitcoin_store::scripthash_materialize::KEYS_DONE_NAME)
         .is_file();
     FLOOR_BEFORE_CLEAR.with(|c| c.set((hwm, done)));
+}
+
+thread_local! {
+    static PACK_QUERY: Cell<*const Query> = const { Cell::new(std::ptr::null()) };
+    static POSTS_COUNT: Cell<u64> = const { Cell::new(0) };
+    static THROUGH_AT_CLEAR: Cell<(u64, u64, bool)> = const { Cell::new((0, 0, false)) };
+}
+
+fn grow_open_shard_before_posts(_: u64) {
+    // SAFETY: the hook runs on the finalize thread while `q` is still borrowed.
+    let q = unsafe { &*PACK_QUERY.with(|c| c.get()) };
+    connect_coinbase_paying(q, script_on_shard(2, 1, 0x61));
+    POSTS_COUNT.with(|c| c.set(q.store.txs.count()));
+}
+
+fn snap_through_before_unsorted_clear(dir: &Path) {
+    let through = rbitcoin_store::scripthash::load_sh_through(dir);
+    let hwm = rbitcoin_store::scripthash::load_include_hwm(dir);
+    let done_post = rbitcoin_store::unsorted_shard_dir(dir)
+        .join(rbitcoin_store::scripthash_materialize::POST_DONE_NAME)
+        .is_file();
+    THROUGH_AT_CLEAR.with(|c| c.set((through, hwm, done_post)));
 }
 
 thread_local! {

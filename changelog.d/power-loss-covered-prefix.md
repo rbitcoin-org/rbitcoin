@@ -103,7 +103,11 @@ Fixed
   directory. A later finalize of that head, when the watermark is still
   missing, stores the capped `scripthash.through` and SEAL before that
   removal and does not raise a watermark that is already set. The tail
-  backfill then starts after that floor. The inclusion watermark stays at the cut until the tail
+  backfill then starts after that floor. Before that removal,
+  `scripthash.through` names the create the posts pass synced, including
+  when the inclusion watermark stays at the cut. `note_sh_through` holds
+  one lock across the load and the rename, so a tail backfill and
+  write-behind cannot replace a higher mark or lose the tmp file. The inclusion watermark stays at the cut until the tail
   backfill appends the new creates.
   Open records `(covered, through]` in `scripthash.recheck` when
   that value is past the create count, including when `include_hwm` is not.
