@@ -87,6 +87,31 @@ fn note_sh_through_keeps_a_higher_note() {
     );
 }
 
+/// A crash after the posts-pass note and before the floor file leaves
+/// `scripthash.through` at the scan end. `DONE.keys` still names the
+/// creates the pack stored. That count is the floor.
+#[test]
+fn resume_floor_stops_at_the_keys_pass() {
+    let dir = tmp();
+    let udir = rbitcoin_store::unsorted_shard_dir(dir.path());
+    std::fs::create_dir_all(&udir).unwrap();
+    note_sh_through(dir.path(), 9).unwrap();
+    rbitcoin_store::scripthash_materialize::write_phase_done(
+        &udir,
+        rbitcoin_store::scripthash_materialize::KEYS_DONE_NAME,
+        rbitcoin_store::scripthash_materialize::KEYS_DONE_MAGIC,
+        4,
+        &[0],
+    )
+    .unwrap();
+    let publish =
+        rbitcoin_store::scripthash_materialize::sealed_resume_publish_fk(dir.path()).unwrap();
+    assert_eq!(
+        publish, 4,
+        "resume published the posts-pass through {publish}"
+    );
+}
+
 fn push_chain(session: &mut ScriptHashBulkSession<'_>, key: [u8; 32], entries: &[Fk]) {
     let mut fks: Vec<u64> = entries
         .iter()

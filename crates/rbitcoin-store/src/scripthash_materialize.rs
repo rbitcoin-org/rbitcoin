@@ -2386,14 +2386,41 @@ pub fn clear_unsorted_after_inclusion_floor(store: &Store) -> Result<(), StoreEr
 ///
 /// `0` leaves a watermark that is already set, and leaves a head whose
 /// `scripthash.through` is still 0. A later through is not a floor: a
-/// backfill can name the new tip before those rows exist.
+/// backfill can name the new tip before those rows exist. `DONE.keys`
+/// still names the creates the pack stored. A through above that count
+/// is the posts-pass scan end, so the floor stops at the keys count.
 #[doc(hidden)]
 pub fn sealed_resume_publish_fk(store_dir: &Path) -> Result<u64, StoreError> {
     if crate::scripthash::load_include_hwm(store_dir) > 0 {
         return Ok(0);
     }
     let through = crate::scripthash::load_sh_through(store_dir);
-    capped_publish_fk(store_dir, true, through)
+    if through == 0 {
+        return Ok(0);
+    }
+    let keys_last = keys_done_last(&unsorted_shard_dir(store_dir));
+    let publishing = if keys_last > 0 {
+        through.min(keys_last)
+    } else {
+        through
+    };
+    capped_publish_fk(store_dir, true, publishing)
+}
+
+fn keys_done_last(dir: &Path) -> u64 {
+    let buf = match fs::read(dir.join(KEYS_DONE_NAME)) {
+        Ok(buf) => buf,
+        Err(_) => return 0,
+    };
+    if buf.len() < 12 || &buf[0..8] != KEYS_DONE_MAGIC {
+        return 0;
+    }
+    let mut n_bytes = [0u8; 4];
+    n_bytes.copy_from_slice(&buf[8..12]);
+    let n = le_u32!(n_bytes, 0) as usize;
+    read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n)
+        .map(|d| d.last_fk)
+        .unwrap_or(0)
 }
 
 pub fn materialize_sh_unsorted_from_class_a(
@@ -2465,7 +2492,9 @@ pub fn materialize_sh_unsorted_from_class_a(
     )?;
     // `DONE.post` names the scan end, which can be past the keys pass and
     // past `pack.max_fk` when a sealed shard took no new row. Name that
-    // end before the cap replaces it and before the file is removed.
+    // end before the file is removed. It is not the floor: the posts pass
+    // stores a create only when the keys pass already saw that script
+    // more than once.
     let posts_last = read_phase_done(&dir, POST_DONE_NAME, POST_DONE_MAGIC, n_shards)
         .map(|d| d.last_fk)
         .unwrap_or(0);
@@ -2473,12 +2502,12 @@ pub fn materialize_sh_unsorted_from_class_a(
     if synced > 0 {
         crate::scripthash::note_sh_through(store.path(), synced)?;
     }
-    // The packed shard did not take this scan. Leave the watermark at the
-    // cut so the tail backfill appends the creates that arrived after it.
-    mat.max_fk = capped_publish_fk(store.path(), any_sealed, synced)?;
+    // The floor stays at the keys-pass count. A cut still caps it. The
+    // tail backfill appends creates the posts pass did not store.
+    mat.max_fk = capped_publish_fk(store.path(), any_sealed, collected.last_fk)?;
     if table.unsealed_main_shards().is_empty() {
-        // The capped create, not the raw `DONE` last. Partial packs leave
-        // both the watermark and the directory alone.
+        // Keys-pass count, capped at a cut. Partial packs leave the
+        // watermark and the directory alone.
         sync_sealed_inclusion_floor(store, mat.max_fk)?;
         clear_unsorted_after_inclusion_floor(store)?;
     }

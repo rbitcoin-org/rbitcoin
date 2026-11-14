@@ -1059,6 +1059,59 @@ fn posts_pass_names_through_before_done_is_dropped() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A fresh pack has no sealed shard, so nothing caps the floor. A create
+/// that arrives after the keys pass is not in the multi fuse. The floor
+/// has to stay at the keys-pass count or the tail backfill skips it.
+#[test]
+fn fresh_pack_floor_stays_at_the_keys_pass() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("q-sh-fresh-floor").unwrap();
+    let layout = StoreLayout::tiny(dir.path()).with_sh_shards(1);
+    let q = Query::open_or_create_layout(layout).unwrap();
+    connect_coinbase_paying(&q, script_on_shard(1, 0, 0x62));
+    let fresh = script_on_shard(1, 0, 0x71);
+    PACK_QUERY.with(|c| c.set(&q as *const Query));
+    KEYS_BEFORE_POSTS.with(|c| c.set(0));
+    POSTS_COUNT.with(|c| c.set(0));
+    THROUGH_AT_CLEAR.with(|c| c.set((0, 0, false)));
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_pack_for_test(Some(
+        grow_unpacked_script_before_posts,
+    ));
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_clear_for_test(Some(
+        snap_through_before_unsorted_clear,
+    ));
+    let result = q.finalize_sh_runs();
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_pack_for_test(None);
+    rbitcoin_store::scripthash_materialize::set_before_unsorted_clear_for_test(None);
+    PACK_QUERY.with(|c| c.set(std::ptr::null()));
+    result.unwrap();
+    let keys = KEYS_BEFORE_POSTS.with(|c| c.get());
+    let posts = POSTS_COUNT.with(|c| c.get());
+    let (through, hwm, done_post) = THROUGH_AT_CLEAR.with(|c| c.get());
+    assert!(
+        posts > keys,
+        "the posts pass did not see a later create ({posts} vs keys {keys})"
+    );
+    assert!(
+        done_post,
+        "DONE.post was already gone when the floor was checked"
+    );
+    assert!(
+        through >= posts,
+        "through was {through} while the posts pass synced create {posts}"
+    );
+    assert_eq!(
+        hwm, keys,
+        "the posts-pass scan end {posts} was the inclusion floor"
+    );
+    let sh = rbitcoin_store::script_hash(&fresh);
+    assert!(
+        !q.scripthash_history(&sh).unwrap().is_empty(),
+        "the create that arrived between the passes was not indexed"
+    );
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Resume byte `2` keeps a pack-complete head whose watermark was never
 /// published. The tail scan has to start at that packed floor. Create 1
 /// is already in its row.
@@ -2580,6 +2633,7 @@ fn snap_floor_before_unsorted_clear(dir: &Path) {
 thread_local! {
     static PACK_QUERY: Cell<*const Query> = const { Cell::new(std::ptr::null()) };
     static POSTS_COUNT: Cell<u64> = const { Cell::new(0) };
+    static KEYS_BEFORE_POSTS: Cell<u64> = const { Cell::new(0) };
     static THROUGH_AT_CLEAR: Cell<(u64, u64, bool)> = const { Cell::new((0, 0, false)) };
 }
 
@@ -2587,6 +2641,14 @@ fn grow_open_shard_before_posts(_: u64) {
     // SAFETY: the hook runs on the finalize thread while `q` is still borrowed.
     let q = unsafe { &*PACK_QUERY.with(|c| c.get()) };
     connect_coinbase_paying(q, script_on_shard(2, 1, 0x61));
+    POSTS_COUNT.with(|c| c.set(q.store.txs.count()));
+}
+
+fn grow_unpacked_script_before_posts(_: u64) {
+    // SAFETY: the hook runs on the finalize thread while `q` is still borrowed.
+    let q = unsafe { &*PACK_QUERY.with(|c| c.get()) };
+    KEYS_BEFORE_POSTS.with(|c| c.set(q.store.txs.count()));
+    connect_coinbase_paying(q, script_on_shard(1, 0, 0x71));
     POSTS_COUNT.with(|c| c.set(q.store.txs.count()));
 }
 
