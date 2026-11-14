@@ -6,11 +6,15 @@
 //! is asked before each sealed segment and each identity shot. Hits ride the
 //! wave as
 //! [`crate::BatchParentIds`] (fk + body_range + spent_range). Does not
-//! claim, structure, or stamp. Same-wave creates are omitted from TipOnly need.
+//! claim, structure, or stamp. Creates above the wave's drain+fence snapshot
+//! ([`UndrainedCreates`]: this wave's, and earlier waves' of the same re-arm
+//! generation) are omitted from TipOnly need.
 
 use super::*;
-use crate::{BatchParentIds, IdMap, ResolvedWire, TxPrecompute, TxidHasher, U32Map, U64Map};
-use std::collections::{HashMap, HashSet};
+use crate::{
+    BatchParentIds, IdMap, ResolvedWire, TxPrecompute, TxidHasher, TxidMap, U32Map, U64Map,
+};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
@@ -32,6 +36,196 @@ pub const BQ_RESOLVE_WAVE_MAX_INPUTS: u32 = 64_000;
 pub const BQ_RESOLVE_WAVE_MIN_INPUTS: u32 = 8000;
 /// Safety cap so one megablock run cannot stall the wave.
 pub const BQ_RESOLVE_WAVE_MAX_KEYS: usize = 256_000;
+
+/// Txids one map of [`UndrainedCreates`] takes. The block that would pass
+/// it starts the next map.
+#[doc(hidden)]
+pub const UNDRAINED_MAP_TXIDS: usize = 450_000;
+/// Maps [`UndrainedCreates`] keeps. The block that needs a third pushes the
+/// older map out whole, and spends of its creates are read from `tx.head`
+/// as before.
+#[doc(hidden)]
+pub const UNDRAINED_MAPS: usize = 2;
+
+/// What a map stores for a txid: the height that created it plus one. Zero
+/// is left for a txid whose height was decoded again.
+fn level(height: u32) -> u32 {
+    height.saturating_add(1)
+}
+
+const FORGOTTEN: u32 = 0;
+
+/// Creates of blocks this lookup thread has decoded that the `tx.head`
+/// drain and the fence have not passed.
+///
+/// A prev txid the set holds is not TipOnly need. Load binds it from
+/// in-flight, which keeps every pack at or above a wave's drain+fence
+/// snapshot until that wave's last batch has read it. The set holds only
+/// heights above the same snapshot. Load clears in-flight when the re-arm
+/// generation changes, and the set empties on the same change. Holding a
+/// txid only removes a key from the store read. It binds nothing, and a
+/// txid the set does not hold is read as before.
+///
+/// The keys are whole txids. A prev held by mistake is left to an in-flight
+/// bind that cannot happen, which is `parent create_fk unresolved`, so the
+/// set never answers from a shortened hash.
+///
+/// RAM for CPU. A txid is stored once, with its level, in a map that only
+/// fills and is freed whole. Nothing removes a txid by itself: a height the
+/// snapshot has reached or that was decoded again is dead where it lies,
+/// and a map goes when its last height is dead. Dead txids count toward a
+/// map's fill, so the set always holds the newest [`UNDRAINED_MAP_TXIDS`]
+/// and at most twice that. By [`Self::approx_bytes`] a full map is 18.5 MiB
+/// and both are 37 MiB. A miss probes each map, and a height decoded again
+/// walks the one map it lies in. The set saves a probe of every sealed
+/// `tx.head` segment per txid it holds.
+#[derive(Debug, Default)]
+pub struct UndrainedCreates {
+    gen: Option<u32>,
+    /// Ascending by height. Only the last one takes blocks.
+    runs: VecDeque<CreateRun>,
+    /// A [`level`] at or below it is dead.
+    dead_through: u32,
+}
+
+/// The creates of the heights `first..=top`, each with its [`level`].
+#[derive(Debug)]
+struct CreateRun {
+    first: u32,
+    top: u32,
+    levels: TxidMap<u32>,
+}
+
+impl UndrainedCreates {
+    /// A create of `txid` is recorded at a height above the last snapshot.
+    #[doc(hidden)]
+    pub fn holds(&self, txid: &[u8; 32]) -> bool {
+        let live = |level: &u32| *level > self.dead_through;
+        self.runs
+            .iter()
+            .rev()
+            .any(|run| run.levels.get(txid).is_some_and(live))
+    }
+
+    /// Estimated heap the set holds: every map's slots, each a 32 B txid,
+    /// its level, and a control byte, eight slots for every seven of
+    /// capacity.
+    #[doc(hidden)]
+    pub fn approx_bytes(&self) -> usize {
+        let slot = std::mem::size_of::<([u8; 32], u32)>().saturating_add(1);
+        self.runs
+            .iter()
+            .map(|run| match run.levels.capacity() {
+                0 => 0,
+                capacity => (capacity.saturating_mul(8) / 7).next_power_of_two(),
+            })
+            .fold(0usize, |slots, n| slots.saturating_add(n))
+            .saturating_mul(slot)
+    }
+
+    /// Empty the set unless it was filled under re-arm generation `gen`.
+    #[doc(hidden)]
+    pub fn rearm(&mut self, gen: u32) {
+        if self.gen == Some(gen) {
+            return;
+        }
+        *self = Self {
+            gen: Some(gen),
+            ..Self::default()
+        };
+    }
+
+    /// Mark the heights a drain+fence snapshot has reached dead, and free
+    /// the maps that hold no other height. `None` keeps all.
+    #[doc(hidden)]
+    pub fn drop_through(&mut self, hi: Option<u32>) {
+        let Some(hi) = hi else {
+            return;
+        };
+        self.dead_through = self.dead_through.max(level(hi));
+        while self
+            .runs
+            .front()
+            .is_some_and(|run| level(run.top) <= self.dead_through)
+        {
+            self.runs.pop_front();
+        }
+    }
+
+    /// Record the block decoded at `height`. It replaces that height and
+    /// every height above it: lookup decodes in ascending order, so a
+    /// height seen again means the rows from there up were queued again.
+    #[doc(hidden)]
+    pub fn note_block(&mut self, height: u32, txids: impl ExactSizeIterator<Item = [u8; 32]>) {
+        self.forget_from(height);
+        let fits = self
+            .runs
+            .back()
+            .is_some_and(|run| run.levels.len().saturating_add(txids.len()) <= UNDRAINED_MAP_TXIDS);
+        if !fits {
+            if self.runs.len() >= UNDRAINED_MAPS {
+                self.runs.pop_front();
+            }
+            self.runs.push_back(CreateRun {
+                first: height,
+                top: height,
+                levels: TxidMap::default(),
+            });
+        }
+        let Some(run) = self.runs.back_mut() else {
+            return;
+        };
+        run.top = height;
+        run.levels.extend(txids.map(|txid| (txid, level(height))));
+    }
+
+    /// Forget `height` and every height above it. A map that starts there
+    /// or above leaves whole. The one map that starts below keeps its
+    /// txids and has those heights marked.
+    fn forget_from(&mut self, height: u32) {
+        while self.runs.back().is_some_and(|run| run.first >= height) {
+            self.runs.pop_back();
+        }
+        let Some(run) = self.runs.back_mut() else {
+            return;
+        };
+        if run.top < height {
+            return;
+        }
+        for at in run.levels.values_mut() {
+            if *at > height {
+                *at = FORGOTTEN;
+            }
+        }
+        run.top = height.saturating_sub(1);
+    }
+}
+
+/// One wave's TipOnly need and the prevs left out of it.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct WaveKeys {
+    pub need: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>,
+    /// One entry per input whose prev was in the skip set at collect.
+    pub skipped: Vec<[u8; 32]>,
+}
+
+impl WaveKeys {
+    /// Move every skipped prev that `skip` no longer holds back into the
+    /// need. Returns the inputs still left out.
+    #[doc(hidden)]
+    pub fn readmit(&mut self, skip: &UndrainedCreates) -> u32 {
+        let mut left_out = 0u32;
+        for prev in self.skipped.drain(..) {
+            if skip.holds(&prev) {
+                left_out = left_out.saturating_add(1);
+            } else {
+                self.need.insert(prev);
+            }
+        }
+        left_out
+    }
+}
 
 /// Stop before another height once the key cap is hit and this wave already
 /// has a height. An empty `done` still emits the height that filled the cap.
@@ -143,20 +337,24 @@ pub struct BqResolveWaveStats {
     /// TipOnly `create.loc` fill is inside [`Self::head_ns`] (`idx_ns`): one
     /// batch after the sealed walk, not on the held probe ring.
     pub spent_ns: u64,
+    /// Inputs whose prev stayed out of the TipOnly need: its create is
+    /// above this wave's drain+fence snapshot.
+    pub undrained_skip: u32,
 }
 
 /// Push external prev_txids (+ pre-BIP34 create txids) into the wave TipOnly set.
 ///
-/// Spend keys record every non-coinbase prev (including same-wave creates) so
-/// a later load chunk can bind in-flight. TipOnly `keys` still omit `skip`.
+/// Spend keys record every non-coinbase prev (including the ones `skip`
+/// holds) so a later load chunk can bind in-flight. A prev `skip` holds goes
+/// to [`WaveKeys::skipped`], not the need.
 #[doc(hidden)]
 pub fn push_resolve_keys(
     params: &ChainParams,
     height: u32,
     block: &Block,
     pres: &[TxPrecompute],
-    skip: &HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>,
-    keys: &mut HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>,
+    skip: &UndrainedCreates,
+    keys: &mut WaveKeys,
     n_inputs: u32,
 ) -> Vec<([u8; 32], u32)> {
     let bip34 = params.bip34_active_at(height);
@@ -171,12 +369,14 @@ pub fn push_resolve_keys(
                 continue;
             }
             spends.push((prev, inp.previous_output.vout));
-            if !skip.contains(&prev) {
-                keys.insert(prev);
+            if skip.holds(&prev) {
+                keys.skipped.push(prev);
+            } else {
+                keys.need.insert(prev);
             }
         }
-        if !bip34 && !skip.contains(&p.txid) {
-            keys.insert(p.txid);
+        if !bip34 && !skip.holds(&p.txid) {
+            keys.need.insert(p.txid);
         }
     }
     spends
@@ -189,7 +389,8 @@ pub fn push_resolve_keys(
 /// [`BqResolveWave::undecodable`]. Marks each
 /// processed height resolve-complete even when some keys miss (same-batch /
 /// in-flight remainder is load's job). Connected-only (fence) resolve.
-/// `max_blocks` / `max_inputs` cap emit (remaining loadq).
+/// `max_blocks` / `max_inputs` cap emit (remaining loadq). `undrained` is
+/// the calling lookup thread's set, carried from wave to wave.
 pub fn confirm_bq_resolve_wave_capped(
     query: &Query,
     params: &ChainParams,
@@ -197,14 +398,19 @@ pub fn confirm_bq_resolve_wave_capped(
     heights: &[u32],
     max_blocks: usize,
     max_inputs: u32,
+    undrained: &mut UndrainedCreates,
 ) -> Result<BqResolveWave, ConfirmError> {
     let t0 = Instant::now();
+    // The caller read the generation before it selected heights and takes
+    // this wave's rows under that value. A re-arm between its read and this
+    // one fills the set under the new generation from the old selection,
+    // and the take then fails. The next wave starts at or below those
+    // heights, and a height walked again replaces itself and every height
+    // above it.
+    undrained.rearm(query.lookup_taken_gen());
     let mut stats = BqResolveWaveStats::default();
     let mut done: Vec<u32> = Vec::new();
-    let mut all_keys: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
-        HashSet::with_hasher(BuildHasherDefault::default());
-    let mut wave_creates: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
-        HashSet::with_hasher(BuildHasherDefault::default());
+    let mut keys = WaveKeys::default();
     let mut wires: Vec<(u32, [u8; 32], ResolvedWire)> = Vec::new();
 
     let intake = query.block_queue_wave_intake(heights);
@@ -282,7 +488,7 @@ pub fn confirm_bq_resolve_wave_capped(
 
     let mut undecodable = None;
     for &h in &selected {
-        if stop_for_key_cap(all_keys.len(), done.len()) {
+        if stop_for_key_cap(keys.need.len(), done.len()) {
             break;
         }
         let hash = query.block_queue_hash_at_height(h).unwrap_or([0u8; 32]);
@@ -328,16 +534,14 @@ pub fn confirm_bq_resolve_wave_capped(
             continue;
         };
         let t_col = Instant::now();
-        for p in pres.iter() {
-            wave_creates.insert(p.txid);
-        }
+        undrained.note_block(h, pres.iter().map(|p| p.txid));
         let spends = push_resolve_keys(
             params,
             h,
             block.as_ref(),
             pres.as_ref(),
-            &wave_creates,
-            &mut all_keys,
+            undrained,
+            &mut keys,
             n_inputs_at.get(&h).copied().unwrap_or(0),
         );
         if let Some((_, _, w)) = wires.last_mut() {
@@ -349,14 +553,20 @@ pub fn confirm_bq_resolve_wave_capped(
         done.push(h);
     }
 
-    stats.keys = all_keys.len() as u32;
+    let t_settle = Instant::now();
+    let drain_fence_hi = query.drain_and_fence_hi();
+    undrained.drop_through(drain_fence_hi);
+    stats.undrained_skip = keys.readmit(undrained);
+    stats.collect_ns = stats
+        .collect_ns
+        .saturating_add(t_settle.elapsed().as_nanos() as u64);
+    stats.keys = keys.need.len() as u32;
     let mut layer = IdMap::default();
     let mut spent = U64Map::default();
     let mut n_out = U64Map::default();
-    let need: Vec<[u8; 32]> = all_keys.into_iter().collect();
+    let need: Vec<[u8; 32]> = keys.need.into_iter().collect();
     let t_head = Instant::now();
 
-    let drain_fence_hi = query.drain_and_fence_hi();
     if let Some(&hi) = selected.last() {
         query.note_lookup_tiponly_start(hi);
     }
@@ -407,6 +617,9 @@ pub fn confirm_bq_resolve_wave_capped(
         stats.head_ns,
         stats.spent_ns,
     );
+    query
+        .confirm_stats()
+        .note_wave_undrained_skip(u64::from(stats.undrained_skip));
     Ok(BqResolveWave {
         stats,
         items,
