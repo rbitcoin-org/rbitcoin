@@ -328,6 +328,25 @@ pub fn rate_limit_disconnect(session: Option<&crate::peers::LivePeer>) -> NetErr
     NetError::Protocol("peer rate limit")
 }
 
+/// Count one tip-follow frame in the session's rate window. A `block` this
+/// session asked for stays off it, as in IBD: the getdata window already
+/// bounds those bytes, and a full window of large bodies served at link
+/// speed is more than a second of budget.
+#[doc(hidden)]
+pub fn note_frame_rate(
+    rate: &mut PeerRateLimiter,
+    requested_blocks: &HashSet<BlockHash>,
+    frame: &FramedMessage,
+) -> bool {
+    if frame
+        .block_hash_from_header()
+        .is_some_and(|h| requested_blocks.contains(&h))
+    {
+        return true;
+    }
+    rate.note(frame.payload_len())
+}
+
 /// Heavy frames (`block`, `headers`, `notfound`) already read while a decode
 /// permit is held. Tip-follow asks for [`MAX_SERVE_BLOCKS`] bodies, and the
 /// reader can take one more message before that front decode is popped.
@@ -2564,8 +2583,7 @@ pub async fn peer_session_with(
                     if let Some(ref sess) = session {
                         sess.note_recv(&framed_cmd(&frame), frame.payload_len() as u64);
                     }
-                    let frame_len = frame.payload_len();
-                    if !rate.note(frame_len) {
+                    if !note_frame_rate(&mut rate, &follow.requested_blocks, &frame) {
                         follow.ban_score = follow.ban_score.saturating_add(RATE_LIMIT_BAN_SCORE);
                         rbitcoin_log::warn!(
                             "p2p: {peer_s} rate limit exceeded misbehavior={}",
