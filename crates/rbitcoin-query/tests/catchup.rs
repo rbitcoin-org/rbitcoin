@@ -2211,6 +2211,141 @@ fn reopen_layout(dir: &std::path::Path, shards: usize) -> Query {
     Query::open_or_create_layout(layout).unwrap()
 }
 
+/// The keys pass can finish inside the covered count while the posts pass
+/// scans past a later cut. One shard is already packed. Open has to keep
+/// that keys marker, or the next floor is the cut and a one-seen script
+/// paid again on the packed shard never enters the index.
+#[test]
+fn open_keeps_the_keys_floor_when_only_the_posts_marker_is_past_the_cut() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("q-sh-keys-floor-open").unwrap();
+    let n_shards = 2;
+    let layout = StoreLayout::tiny(dir.path()).with_sh_shards(n_shards);
+    let q = Query::open_or_create_layout(layout).unwrap();
+    assert_eq!(q.store.scripthash.head_shard_count(), n_shards);
+    let once = script_on_shard(n_shards, 0, 0x71);
+    let other = script_on_shard(n_shards, 1, 0x73);
+    let past = script_on_shard(n_shards, 1, 0x72);
+    connect_coinbase_paying(&q, once.clone());
+    connect_coinbase_paying(&q, other);
+    let keys = q.store.txs.count();
+    let udir = rbitcoin_store::unsorted_shard_dir(q.store.path());
+    rbitcoin_store::collect_unsorted_shard_files(&q.store, &udir, n_shards, 1, None).unwrap();
+    assert_eq!(
+        rbitcoin_store::unsorted_done_last_fk(&udir, n_shards).unwrap(),
+        keys
+    );
+    connect_coinbase_paying(&q, once.clone());
+    let gap = q.store.txs.count();
+    connect_coinbase_paying(&q, past.clone());
+    connect_coinbase_paying(&q, past.clone());
+    let posts = q.store.txs.count();
+    assert!(
+        keys < gap && gap < posts,
+        "keys {keys}, gap {gap}, posts {posts}"
+    );
+    rbitcoin_store::scripthash_materialize::collect_posts_covering(
+        &q.store.txs,
+        &q.store.scripthash,
+        &udir,
+        1,
+        false,
+        None,
+    )
+    .unwrap();
+    rbitcoin_store::scripthash_materialize::pack_one_extract_shard(&q.store.scripthash, &udir, 0)
+        .unwrap();
+    assert!(
+        !q.store.scripthash.unsealed_main_shards().contains(&0),
+        "shard 0 did not pack"
+    );
+    cut_creates_to(&q, gap);
+    let path = dir.path().to_path_buf();
+    drop(q);
+    let q = reopen_layout(&path, n_shards);
+    assert_eq!(q.store.txs.count(), gap);
+    assert!(
+        udir.join(rbitcoin_store::scripthash_materialize::KEYS_DONE_NAME)
+            .is_file(),
+        "open dropped DONE.keys while it was still inside the cut"
+    );
+    q.finalize_sh_runs().unwrap();
+    let hist = q
+        .scripthash_history(&rbitcoin_store::script_hash(&once))
+        .unwrap();
+    assert!(
+        hist.len() >= 2,
+        "the create between the keys pass and the cut was not indexed: {hist:?}"
+    );
+    assert!(
+        q.scripthash_history(&rbitcoin_store::script_hash(&past))
+            .unwrap()
+            .is_empty(),
+        "a create past the cut stayed in history"
+    );
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Same cut, with every shard already packed and no inclusion watermark.
+/// Open has to keep `DONE.keys`, or the resume publishes the cut.
+#[test]
+fn open_keeps_the_keys_floor_on_a_packed_resume() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("q-sh-keys-floor-resume").unwrap();
+    let n_shards = 2;
+    let layout = StoreLayout::tiny(dir.path()).with_sh_shards(n_shards);
+    let q = Query::open_or_create_layout(layout).unwrap();
+    let once = script_on_shard(n_shards, 0, 0x71);
+    let other = script_on_shard(n_shards, 1, 0x73);
+    let past = script_on_shard(n_shards, 1, 0x72);
+    connect_coinbase_paying(&q, once.clone());
+    connect_coinbase_paying(&q, other);
+    let keys = q.store.txs.count();
+    let udir = rbitcoin_store::unsorted_shard_dir(q.store.path());
+    rbitcoin_store::collect_unsorted_shard_files(&q.store, &udir, n_shards, 1, None).unwrap();
+    connect_coinbase_paying(&q, once.clone());
+    let gap = q.store.txs.count();
+    connect_coinbase_paying(&q, past.clone());
+    connect_coinbase_paying(&q, past);
+    rbitcoin_store::scripthash_materialize::collect_posts_covering(
+        &q.store.txs,
+        &q.store.scripthash,
+        &udir,
+        1,
+        false,
+        None,
+    )
+    .unwrap();
+    for shard in 0..n_shards {
+        rbitcoin_store::scripthash_materialize::pack_one_extract_shard(
+            &q.store.scripthash,
+            &udir,
+            shard,
+        )
+        .unwrap();
+    }
+    assert!(q.store.scripthash.unsealed_main_shards().is_empty());
+    assert_eq!(q.store.scripthash.include_hwm(), 0);
+    cut_creates_to(&q, gap);
+    let path = dir.path().to_path_buf();
+    drop(q);
+    let q = reopen_layout(&path, n_shards);
+    assert!(
+        udir.join(rbitcoin_store::scripthash_materialize::KEYS_DONE_NAME)
+            .is_file(),
+        "open dropped DONE.keys while it was still inside the cut"
+    );
+    q.finalize_sh_runs().unwrap();
+    let hist = q
+        .scripthash_history(&rbitcoin_store::script_hash(&once))
+        .unwrap();
+    assert!(
+        hist.len() >= 2,
+        "the create between the keys pass {keys} and the cut was not indexed: {hist:?}"
+    );
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Direct mode collects scripthash after IBD. A `DONE` last above the cut
 /// has to be recorded while the count is still short, or a chain that grows
 /// back to that last packs the pre-cut spills and skips the new creates.

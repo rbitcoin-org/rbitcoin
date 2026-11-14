@@ -372,17 +372,20 @@ fn note_phase_above_count(store_dir: &Path, covered: u64, old: u64) -> Result<()
     crate::scripthash::note_sh_recheck(store_dir, covered, old)
 }
 
-fn drop_phase_markers(dir: &Path) -> Result<(), StoreError> {
-    for name in [KEYS_DONE_NAME, POST_DONE_NAME] {
-        let path = dir.join(name);
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(StoreError::io(&path, e)),
-        }
+fn remove_phase_marker(dir: &Path, name: &str) -> Result<(), StoreError> {
+    let path = dir.join(name);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StoreError::io(&path, e)),
     }
-    // The map removal already synced the head directory. These unlinks live
-    // here. A crash before this sync can restore `DONE` once the chain has
+}
+
+fn drop_phase_markers(dir: &Path, names: &[&str]) -> Result<(), StoreError> {
+    for name in names {
+        remove_phase_marker(dir, name)?;
+    }
+    // A crash before this sync can restore `DONE` once the chain has
     // grown back to that last, and collect then skips a shard with no map.
     crate::file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
     Ok(())
@@ -434,23 +437,43 @@ fn note_unsorted_done_above_count(
     note_phase_above_count(store.path(), covered, old)
 }
 
+fn phase_marker_last(dir: &Path, name: &str, magic: &[u8; 8], n_shards: usize) -> Option<u64> {
+    read_phase_done(dir, name, magic, n_shards)
+        .map(|d| d.last_fk)
+        .filter(|fk| *fk > 0 && *fk != u64::MAX)
+}
+
 /// Direct mode builds the index after the chain can grow back to the old
-/// marker. Record the cut and drop both markers while the count is still
-/// short, so that later collect scans the new creates.
+/// marker. Record the cut and drop a marker that is still above the count.
+/// `DONE.keys` inside the count is the packed floor. The posts pass does
+/// not store a script that pass saw once, so dropping it makes the next
+/// floor the cut.
 pub(crate) fn record_unsorted_phase_above_count(
     store_dir: &Path,
     n_shards: usize,
     covered: u64,
 ) -> Result<(), StoreError> {
     let dir = unsorted_shard_dir(store_dir);
-    let Some(old) = phase_last_above_count(&dir, n_shards, covered) else {
-        return Ok(());
+    let keys_last = phase_marker_last(&dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards);
+    let posts_last = phase_marker_last(&dir, POST_DONE_NAME, POST_DONE_MAGIC, n_shards);
+    let keys_above = keys_last.filter(|fk| *fk > covered);
+    let posts_above = posts_last.filter(|fk| *fk > covered);
+    let old = match (keys_above, posts_above) {
+        (None, None) => return Ok(()),
+        (Some(k), None) => k,
+        (None, Some(p)) => p,
+        (Some(k), Some(p)) => k.max(p),
     };
     note_phase_above_count(store_dir, covered, old)?;
-    // The pass-1 map must be gone before the markers are. A crash after
+    // Keep the keys count and the pass-1 maps. The next collect skips a
+    // sealed shard, and the tail backfill starts at this floor.
+    if keys_last.is_some_and(|fk| fk <= covered) {
+        return drop_phase_markers(&dir, &[POST_DONE_NAME]);
+    }
+    // The pass-1 map must be gone before the keys marker is. A crash after
     // this open, once keys/ and post/ are gone, would otherwise mark it packed.
     crate::scripthash::unlink_unpacked_shard_maps(store_dir)?;
-    drop_phase_markers(&dir)
+    drop_phase_markers(&dir, &[KEYS_DONE_NAME, POST_DONE_NAME])
 }
 
 #[cfg(debug_assertions)]

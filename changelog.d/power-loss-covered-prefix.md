@@ -112,6 +112,11 @@ Fixed
   one lock across the load and the rename, so a tail backfill and
   write-behind cannot replace a higher mark or lose the tmp file. The inclusion watermark stays at the cut until the tail
   backfill appends the new creates.
+  Open drops a `DONE` marker that is still above the create count. When
+  `DONE.keys` is inside that count and only `DONE.post` is past it, open
+  keeps `DONE.keys` and the pass-1 maps. The next floor stays at that
+  keys-pass count, so a one-seen script paid again on an already packed
+  shard is still appended.
   Open records `(covered, through]` in `scripthash.recheck` when
   that value is past the create count, including when `include_hwm` is not.
   That repair records the cut span before the watermark moves.
