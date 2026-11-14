@@ -259,8 +259,8 @@ impl SegmentedTxHead {
     ///
     /// `meta` is a synced rename. Body headers are not, so a covered-prefix
     /// cut leaves this head naming creates the body dropped. A segment that
-    /// starts past `n` leaves the list, then its open-address file and sealed
-    /// packs are unlinked once `meta` no longer names it. A shortened segment
+    /// starts past `n` leaves the list. Its maps are closed, then the
+    /// open-address file and sealed packs are unlinked. A shortened segment
     /// that stays keeps its slot bytes and sealed packs. Probes ignore a
     /// relative fk above the shortened count. The next roll in this process
     /// reuses the lowest dropped file id.
@@ -292,6 +292,8 @@ impl SegmentedTxHead {
         if changed {
             self.persist_meta_locked()?;
         }
+        // Last owner of a dropped segment. Close the maps before unlink.
+        drop(segs);
         let Some(&min_id) = dropped.iter().min() else {
             return Ok(());
         };
@@ -311,6 +313,7 @@ impl SegmentedTxHead {
             crate::tx_head_mphf::mphf_path(&base),
             segment_fuse_path(&self.dir, file_id),
         ] {
+            refuse_mapped_unlink(&path)?;
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1244,6 +1247,36 @@ pub fn ensure_head_layout(dir: &Path) -> Result<(), StoreError> {
         return Ok(());
     }
     std::fs::create_dir_all(&root).map_err(|e| StoreError::io(&root, e))?;
+    Ok(())
+}
+
+/// Windows will not delete a file that still has a mapped view. Debug Linux
+/// builds refuse the same case so a clamp that still holds the segment fails
+/// here instead of only on Windows.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn refuse_mapped_unlink(path: &Path) -> Result<(), StoreError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let Ok(want) = path.canonicalize() else {
+        return Ok(());
+    };
+    let Ok(dir) = std::fs::read_dir("/proc/self/fd") else {
+        return Ok(());
+    };
+    for ent in dir.flatten() {
+        let Ok(target) = std::fs::read_link(ent.path()) else {
+            continue;
+        };
+        if target == want {
+            return Err(StoreError::Corrupt("tx.head unlink while mapped"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(all(debug_assertions, target_os = "linux")))]
+fn refuse_mapped_unlink(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 

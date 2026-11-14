@@ -61,7 +61,9 @@ Fixed
   below the prune height, and a missing keep file, fail the seal.
   Turning prune on skips an empty pad instead of decoding it as an input. A `tx.head` that still has
   `meta` is shortened to that count. A segment that starts past that count
-  is unlinked (open-address file, `.mphf`, and `.fuse8`). A segment that
+  is unlinked (open-address file, `.mphf`, and `.fuse8`). Its maps are
+  closed first, so the unlink still works while this process had the
+  segment open. A segment that
   stays keeps its slots, and open does not
   rebuild it from Class A. A later create that reuses one of those fks
   replaces that slot when the new txid's probe reaches it. A probe that
