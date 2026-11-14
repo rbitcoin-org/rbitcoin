@@ -1123,7 +1123,7 @@ fn open_or_init_meta_reads_written_fields_and_rejects_bad_files() {
     }
     fs::write(&path, b"rBMP").unwrap();
     match open_or_init_meta(&path) {
-        Err(MempoolError::Io { .. }) => {}
+        Err(MempoolError::Corrupt(m)) => assert!(m.contains("mempool meta short"), "{m}"),
         Err(err) => panic!("{err}"),
         Ok(_) => panic!("short meta opened"),
     }
