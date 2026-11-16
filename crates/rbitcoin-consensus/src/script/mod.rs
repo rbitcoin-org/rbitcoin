@@ -886,10 +886,12 @@ pub mod crypto {
         // every call site that reaches consensus verification).
         let mut compressed = [0u8; 33];
         match pubkey.serialize()[0] {
-            0x02 | 0x03 => compressed[..].copy_from_slice(&pubkey.serialize()),
+            2 | 3 => compressed[..].copy_from_slice(&pubkey.serialize()),
             _ => {
                 let full = pubkey.serialize_uncompressed();
-                compressed[0] = if full[64] % 2 == 0 { 0x02 } else { 0x03 };
+                // Parity prefix: 2 for even y, 3 for odd y — last byte of the
+                // uncompressed form carries y's parity.
+                compressed[0] = 2 + u8::from(full[64] % 2 == 1);
                 compressed[1..33].copy_from_slice(&full[1..33]);
             }
         }
