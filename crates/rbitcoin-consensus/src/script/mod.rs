@@ -889,9 +889,10 @@ pub mod crypto {
             2 | 3 => compressed[..].copy_from_slice(&pubkey.serialize()),
             _ => {
                 let full = pubkey.serialize_uncompressed();
-                // Parity prefix: 2 for even y, 3 for odd y — last byte of the
-                // uncompressed form carries y's parity.
-                compressed[0] = 2 + u8::from(full[64] % 2 == 1);
+                // Parity is a mask (structural bit movement); the prefix byte
+                // comes from cursed_secp256k1's parity table — no arithmetic.
+                compressed[0] =
+                    cursed_secp256k1::constants::PARITY_PREFIX[usize::from(full[64] & 1)];
                 compressed[1..33].copy_from_slice(&full[1..33]);
             }
         }
