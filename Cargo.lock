@@ -162,6 +162,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "binary_sv2"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da5780623ef9b581d954185b52460da113c14604ad877c7cd10f688dd0843abc"
+dependencies = [
+ "derive_codec_sv2",
+]
+
+[[package]]
 name = "bip324"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -364,7 +373,7 @@ version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27fa7e278b547a7793e352ec2d9346147758a45d7f6e0354762c632a5ef1022b"
 dependencies = [
- "binary_sv2",
+ "binary_sv2 7.0.0",
  "buffer_sv2",
  "framing_sv2",
  "noise_sv2",
@@ -377,7 +386,7 @@ version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fc74eef0c73f31e57bbe5ecbda80629bc98b2dd5ca8ba7fc9a145ec22166c6"
 dependencies = [
- "binary_sv2",
+ "binary_sv2 7.0.0",
 ]
 
 [[package]]
@@ -498,7 +507,7 @@ version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8cedad16f0ac769b23506b19b0b1004a40d822d30b35106ffb51845e3b8da405"
 dependencies = [
- "binary_sv2",
+ "binary_sv2 7.0.0",
 ]
 
 [[package]]
@@ -1230,7 +1239,7 @@ dependencies = [
 name = "rbitcoin-sv2"
 version = "0.9.99"
 dependencies = [
- "binary_sv2",
+ "binary_sv2 7.0.0",
  "bitcoin",
  "codec_sv2",
  "common_messages_sv2",
@@ -1250,7 +1259,7 @@ name = "rbitcoin-test"
 version = "0.9.99"
 dependencies = [
  "base64",
- "binary_sv2",
+ "binary_sv2 7.0.0",
  "bitcoin",
  "rbitcoin-cli",
  "rbitcoin-consensus",
@@ -1601,11 +1610,11 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
 name = "template_distribution_sv2"
-version = "7.0.0"
+version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "859d37310c5802cfafdc1423c1e8fb0fec287a95ee19ac648424f3c811e98152"
+checksum = "7599da308c9c40336a3b241ba97abc8e567182a93344f5415e4663fec6eb26f0"
 dependencies = [
- "binary_sv2",
+ "binary_sv2 8.0.0",
 ]
 
 [[package]]
