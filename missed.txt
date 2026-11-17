@@ -2263,3 +2263,8 @@ MISSED   crates/rbitcoin-net/src/listen.rs:75:13: replace > with >= in listener_
 MISSED   crates/rbitcoin-net/src/listen.rs:75:20: replace + with - in listener_fd_reserve in 6s build + 53s test
 MISSED   crates/rbitcoin-net/src/listen.rs:75:20: replace + with * in listener_fd_reserve in 6s build + 53s test
 MISSED   crates/rbitcoin-net/src/listen.rs:78:15: replace / with % in listener_fd_reserve in 6s build + 53s test
+# 44047683844 2 32ab03fab4734cb0ace1ef3111a7b7ad8030e766
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:69:19: replace match guard session_dead(&e) with true in stream_connect_installed in 76s build + 47s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:504:13: delete match arm b'A'..= b'Z' in decode_i2p_name in 3s build + 20s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:504:30: replace - with + in decode_i2p_name in 3s build + 20s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:504:30: replace - with / in decode_i2p_name in 3s build + 20s test
