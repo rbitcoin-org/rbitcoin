@@ -415,6 +415,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cursed_arithmetic"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16d30083d6651c1f6128f498f4d6e56c7f46e970f671de6e163b4cf124333cdd"
+
+[[package]]
+name = "cursed_secp256k1"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "801e9346c615f8ab66b5271be62c37f4edd308596f8cda8f461a4573af599ef1"
+dependencies = [
+ "cursed_arithmetic",
+]
+
+[[package]]
 name = "derive_codec_sv2"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -976,6 +991,7 @@ dependencies = [
  "arc-swap",
  "bitcoin",
  "bitcoin_hashes 0.14.101",
+ "cursed_secp256k1",
  "loom",
  "mutants",
  "rbitcoin-primitives",

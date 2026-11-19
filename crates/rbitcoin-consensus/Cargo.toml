@@ -27,6 +27,7 @@ rbitcoin-primitives = { workspace = true }
 arc-swap = { workspace = true }
 bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
+cursed_secp256k1 = "0.1.2"
 # Corpus rows are JSON. The node build leaves this feature off.
 serde_json = { workspace = true, optional = true }
 # Attribute only. cargo-mutants reads it; it does not change compiled code.

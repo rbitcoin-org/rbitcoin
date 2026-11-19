@@ -40,3 +40,5 @@ apilog*.jsonl
 
 # cargo mutants output
 mutants.out/
+__pycache__/
+*.pyc
