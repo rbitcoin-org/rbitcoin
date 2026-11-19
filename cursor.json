@@ -1,14 +1,14 @@
 {
   "new_base": "8e62e4ce4d60c30abc851cb0893e4b80149ac9e4",
   "new_skip": 3560,
-  "old_index": 10220,
-  "old_name": "crates/rbitcoin-net/src/peer.rs:8167:5: replace announced_work_cmp -> Option<std::cmp::Ordering> with Some(Default::default())",
+  "old_index": 10704,
+  "old_name": "crates/rbitcoin-net/src/peers.rs:1807:5: replace rand_ping_nonce -> u64 with 0",
   "new_cap_used": true,
   "run_id": "44483845560",
   "new_len": 9828,
   "new_remaining": 6268,
   "old_len": 27465,
-  "old_remaining": 27265,
-  "completed_new": 200,
-  "completed_old": 200
+  "old_remaining": 26981,
+  "completed_new": 0,
+  "completed_old": 484
 }
