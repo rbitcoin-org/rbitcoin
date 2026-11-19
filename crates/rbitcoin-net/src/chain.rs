@@ -694,8 +694,9 @@ pub struct ChainHub {
     /// See [`Self::set_rpc_wait_tip_idle`].
     pub rpc_wait_tip_idle: AtomicBool,
     pub prefill_plan: std::sync::Mutex<Option<crate::compact::PrefillPlan>>,
-    /// Block hashes we already issued getdata for (any peer).
-    pub asked_blocks: RwLock<HashSet<BlockHash>>,
+    /// Block hashes we already issued getdata for (any peer), with the
+    /// session that owns the ask (`None`: no session, or not yet sent).
+    pub asked_blocks: RwLock<HashMap<BlockHash, Option<u64>>>,
     /// `prefix[h] = work through height h` on the best chain. Process cache;
     /// rebuilt from wire headers when short, truncated on disconnect.
     pub chain_work_prefix: RwLock<Vec<Work>>,
@@ -892,7 +893,7 @@ impl ChainHub {
             prefill_compact: AtomicBool::new(false),
             rpc_wait_tip_idle: AtomicBool::new(false),
             prefill_plan: std::sync::Mutex::new(None),
-            asked_blocks: RwLock::new(HashSet::new()),
+            asked_blocks: RwLock::new(HashMap::new()),
             chain_work_prefix: RwLock::new(Vec::new()),
             finished_ibd: AtomicBool::new(false),
             blocks_only: AtomicBool::new(false),
@@ -918,11 +919,16 @@ impl ChainHub {
     }
 
     pub fn note_asked_block(&self, hash: BlockHash) {
+        self.note_asked_block_by(hash, None);
+    }
+
+    /// Record a sent getdata for `hash`. The last session to ask owns it.
+    pub fn note_asked_block_by(&self, hash: BlockHash, owner: Option<u64>) {
         let mut g = self.asked_blocks.write().unwrap();
-        if g.len() >= 4096 {
+        if g.len() >= 4096 && !g.contains_key(&hash) {
             g.clear();
         }
-        g.insert(hash);
+        g.insert(hash, owner);
     }
 
     /// One in-flight body ask. Connected and held bodies are not claims.
@@ -934,23 +940,66 @@ impl ChainHub {
             return false;
         }
         let mut g = self.asked_blocks.write().unwrap();
-        if g.contains(hash) {
+        if g.contains_key(hash) {
             return false;
         }
         if g.len() >= 4096 {
             g.clear();
         }
-        g.insert(*hash)
+        g.insert(*hash, None).is_none()
     }
 
+    /// Core `FetchBlock` drops prior requests before it asks: `owner` takes
+    /// the ask for `hash`. Returns the session that held it before, if it
+    /// was another one.
+    #[doc(hidden)]
+    pub fn move_block_ask(&self, hash: BlockHash, owner: u64) -> Option<u64> {
+        let mut g = self.asked_blocks.write().unwrap();
+        if g.len() >= 4096 && !g.contains_key(&hash) {
+            g.clear();
+        }
+        g.insert(hash, Some(owner))
+            .flatten()
+            .filter(|prev| *prev != owner)
+    }
+
+    /// The session that owns the ask for `hash`, if a session does.
+    pub fn block_ask_owner(&self, hash: &BlockHash) -> Option<u64> {
+        self.asked_blocks
+            .read()
+            .unwrap()
+            .get(hash)
+            .copied()
+            .flatten()
+    }
+
+    /// Another session than `session` now owns the ask for `hash`.
+    pub fn block_ask_moved_from(&self, hash: &BlockHash, session: Option<u64>) -> bool {
+        self.block_ask_owner(hash)
+            .is_some_and(|o| Some(o) != session)
+    }
+
+    /// Release the ask for `hash` once its body is in, or failed.
     pub fn forget_asked_block(&self, hash: &BlockHash) {
         self.asked_blocks.write().unwrap().remove(hash);
+    }
+
+    /// Release the ask for `hash` that `session` gives up. The entry goes
+    /// only when `session` owns it or no session does, so an ask another
+    /// session has taken over (`getblockfrompeer`) stays.
+    pub fn forget_asked_block_by(&self, hash: &BlockHash, session: Option<u64>) {
+        let mut g = self.asked_blocks.write().unwrap();
+        if g.get(hash)
+            .is_some_and(|owner| owner.is_none() || *owner == session)
+        {
+            g.remove(hash);
+        }
     }
 
     pub fn already_have_or_asked_block(&self, hash: &BlockHash) -> bool {
         self.is_connected(hash)
             || self.held_body(hash).is_some()
-            || self.asked_blocks.read().unwrap().contains(hash)
+            || self.asked_blocks.read().unwrap().contains_key(hash)
     }
 
     /// Core `BlockAssembler::m_last_block_weight` and `m_last_block_num_txs`:
@@ -4307,7 +4356,7 @@ impl ChainHub {
                 }
             }
         }
-        let keep = self.asked_blocks.read().unwrap().clone();
+        let keep: HashSet<BlockHash> = self.asked_blocks.read().unwrap().keys().copied().collect();
         self.held_bodies
             .write()
             .unwrap()

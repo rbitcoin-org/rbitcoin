@@ -234,6 +234,32 @@ pub fn disconnectnode(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
     Err(rpc_error(ERR_INVALID_PARAMS, "address or nodeid required"))
 }
 
+/// Core `getblockfrompeer "blockhash" peer_id`: ask one peer for a block
+/// whose header we have and whose body we do not. Returns `{}` once the ask is
+/// queued on that session; the body arrives later on the normal receive path.
+///
+/// This does not restore `--prune-seqsigwit` data: a pruned block is still a
+/// stored body, so it is "Block already downloaded".
+pub fn getblockfrompeer(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["blockhash", "peer_id"])?;
+    let hash_hex = params.req_str(0, "blockhash")?;
+    let peer_id: i64 = params.req_core_int(1, "peer_id")?;
+    let hash = parse_hash32_display(hash_hex)?;
+    if !chain::knows_header(ctx, &hash) {
+        return Err(rpc_error(ERR_MISC, "Block header missing"));
+    }
+    if chain::block_body_available(ctx, &hash) {
+        return Err(rpc_error(ERR_MISC, "Block already downloaded"));
+    }
+    let no_peer = || rpc_error(ERR_MISC, rbitcoin_net::FetchBlockError::NoPeer.message());
+    let hub = ctx.peers.as_deref().ok_or_else(no_peer)?;
+    let id = u64::try_from(peer_id).map_err(|_| no_peer())?;
+    use bitcoin::hashes::Hash;
+    hub.fetch_block_from(id, bitcoin::BlockHash::from_byte_array(hash))
+        .map_err(|e| rpc_error(ERR_MISC, e.message()))?;
+    Ok(json!({}))
+}
+
 pub fn addconnection(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["address", "connection_type", "v2transport"])?;
     let hub = require_peers(ctx)?;

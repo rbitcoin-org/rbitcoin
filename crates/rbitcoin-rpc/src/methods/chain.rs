@@ -1221,8 +1221,25 @@ pub fn getblock_unknown_hash(
     Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))
 }
 
+/// `getblock` would serve this body: active chain, archived (once-confirmed
+/// and disconnected), held side-branch body, or the live tip body cache.
+pub(crate) fn block_body_available(ctx: &RpcContext, hash: &[u8; 32]) -> bool {
+    if ctx.query.height_of_hash(hash).ok().flatten().is_some() {
+        return true;
+    }
+    let typed = BlockHash::from_byte_array(*hash);
+    if ctx
+        .chain
+        .as_ref()
+        .is_some_and(|c| c.already_have(typed) || c.held_body(&typed).is_some())
+    {
+        return true;
+    }
+    matches!(ctx.query.reconstruct_archived_block(hash), Ok(Some(_)))
+}
+
 /// A header row, or a side-branch body held in RAM.
-fn knows_header(ctx: &RpcContext, hash: &[u8; 32]) -> bool {
+pub(crate) fn knows_header(ctx: &RpcContext, hash: &[u8; 32]) -> bool {
     let typed = BlockHash::from_byte_array(*hash);
     ctx.chain.as_ref().is_some_and(|c| c.knows_header(&typed))
         || ctx.query.get_header_by_hash(hash).ok().flatten().is_some()

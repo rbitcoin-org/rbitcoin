@@ -9626,3 +9626,129 @@ fn submitblock_reads_each_spent_parent_once_and_only_its_spent_outputs() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Handshaken session with a writer, as `getblockfrompeer` needs.
+fn fetch_peer(
+    hub: &Arc<rbitcoin_net::PeerHub>,
+    services: bitcoin::p2p::ServiceFlags,
+) -> (
+    Arc<rbitcoin_net::LivePeer>,
+    tokio::sync::mpsc::UnboundedReceiver<rbitcoin_net::PeerOut>,
+) {
+    use rbitcoin_net::PeerConnType;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+    let mut ver = test_version(0, 0);
+    ver.services = services;
+    let p = hub.register(addr, bind, &ver, false, PeerConnType::BlockRelay);
+    p.mark_handshake_complete();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    p.attach_out(tx);
+    (p, rx)
+}
+
+/// A block one past the tip whose header is stored and whose body is not.
+fn header_only_child(ctx: &RpcContext, chain: &rbitcoin_net::ChainHub) -> bitcoin::Block {
+    let b = rbitcoin_consensus::mine_regtest_paying(
+        chain.tip_hash().unwrap(),
+        chain.tip_header().unwrap().time + 60,
+        chain.tip_height().unwrap() + 1,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    );
+    dispatch(ctx, "submitheader", vec![json!(block_hex(&b))]).unwrap();
+    b
+}
+
+#[test]
+fn getblockfrompeer_queues_one_ask_for_a_header_only_block() {
+    use bitcoin::p2p::ServiceFlags;
+    let (mut ctx, dir, chain) = ctx_regtest_hub();
+    let peers = rbitcoin_net::PeerHub::new();
+    let (p, mut rx) = fetch_peer(&peers, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    ctx.peers = Some(Arc::clone(&peers));
+    let b = header_only_child(&ctx, &chain);
+    let hash = b.block_hash().to_string();
+
+    let before = dispatch(&ctx, "getblock", vec![json!(hash)]).unwrap_err();
+    assert_eq!(
+        rpc_message(&before),
+        "Block not available (not fully downloaded)"
+    );
+    let r = dispatch(&ctx, "getblockfrompeer", vec![json!(hash), json!(p.id)]).unwrap();
+    assert_eq!(r, json!({}));
+    // A tight loop does not stack asks.
+    for _ in 0..50 {
+        dispatch(&ctx, "getblockfrompeer", vec![json!(hash), json!(p.id)]).unwrap();
+    }
+    assert_eq!(p.take_block_fetches(), vec![b.block_hash()]);
+    assert!(
+        rx.try_recv().is_err(),
+        "the RPC only queues; the session heartbeat writes getdata"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn getblockfrompeer_errors_match_core_and_queue_nothing() {
+    use bitcoin::p2p::ServiceFlags;
+    let (mut ctx, dir, chain) = ctx_regtest_hub();
+    let peers = rbitcoin_net::PeerHub::new();
+    let (p, _rx) = fetch_peer(&peers, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    ctx.peers = Some(Arc::clone(&peers));
+
+    let unknown = "11".repeat(32);
+    let e = dispatch(&ctx, "getblockfrompeer", vec![json!(unknown), json!(p.id)]).unwrap_err();
+    assert_eq!(e["code"], json!(ERR_MISC));
+    assert_eq!(rpc_message(&e), "Block header missing");
+
+    let genesis = chain.tip_hash().unwrap().to_string();
+    let e = dispatch(&ctx, "getblockfrompeer", vec![json!(genesis), json!(p.id)]).unwrap_err();
+    assert_eq!(e["code"], json!(ERR_MISC));
+    assert_eq!(rpc_message(&e), "Block already downloaded");
+
+    let b = header_only_child(&ctx, &chain);
+    let hash = b.block_hash().to_string();
+    for bad in [json!(p.id + 1), json!(-1)] {
+        let e = dispatch(&ctx, "getblockfrompeer", vec![json!(hash), bad]).unwrap_err();
+        assert_eq!(e["code"], json!(ERR_MISC));
+        assert_eq!(rpc_message(&e), "Peer does not exist");
+    }
+    assert!(p.take_block_fetches().is_empty(), "no error path queues");
+
+    peers.disconnect_id(p.id);
+    let e = dispatch(&ctx, "getblockfrompeer", vec![json!(hash), json!(p.id)]).unwrap_err();
+    assert_eq!(rpc_message(&e), "Peer does not exist", "a leaving peer");
+    assert!(p.take_block_fetches().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn getblockfrompeer_refuses_pre_segwit_and_writerless_peers() {
+    use bitcoin::p2p::ServiceFlags;
+    let (mut ctx, dir, chain) = ctx_regtest_hub();
+    let peers = rbitcoin_net::PeerHub::new();
+    let (legacy, _rx) = fetch_peer(&peers, ServiceFlags::NETWORK);
+    ctx.peers = Some(Arc::clone(&peers));
+    let hash = header_only_child(&ctx, &chain).block_hash().to_string();
+    let e = dispatch(
+        &ctx,
+        "getblockfrompeer",
+        vec![json!(hash), json!(legacy.id)],
+    )
+    .unwrap_err();
+    assert_eq!(rpc_message(&e), "Pre-SegWit peer");
+
+    let (quiet, _rx2) = fetch_peer(&peers, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+    quiet.clear_out_tx();
+    let e = dispatch(&ctx, "getblockfrompeer", vec![json!(hash), json!(quiet.id)]).unwrap_err();
+    assert_eq!(rpc_message(&e), "Peer not fully connected");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn getblockfrompeer_is_listed_and_has_help() {
+    assert!(METHOD_LIST.contains(&"getblockfrompeer"));
+    assert!(method_help("getblockfrompeer").starts_with("getblockfrompeer \"blockhash\" peer_id"));
+}

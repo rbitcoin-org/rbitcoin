@@ -1849,6 +1849,7 @@ pub async fn on_heartbeat(
         s.request_disconnect();
     }
     let now = s.clock_now();
+    release_moved_block_asks(hub, follow, session);
     s.sync_block_download(now, |h| follow.block_in_flight(h));
     // Blocks in flight, or a frame already read and waiting to decode,
     // suspend the ping timeout. A due ping still sends. The next TCP read
@@ -1878,6 +1879,7 @@ pub async fn on_heartbeat(
         ph.note_heartbeat_lap();
         ph.on_session_heartbeat();
     }
+    queue_operator_block_fetches(hub, out_tx, follow, s)?;
     // A block or compact frame already sits in `decode_q`. Expiring the
     // ask here forgets it before that frame is applied.
     if !decode_queued {
@@ -2351,6 +2353,7 @@ pub async fn peer_session_with(
     let mut owned_follow = SessionFollow {
         hub: hub.clone(),
         state: PeerFollowState::new(),
+        session_id: meta.session.as_ref().map(|s| s.id),
     };
     let follow = &mut owned_follow.state;
     if let Some(s) = meta.session.as_ref() {
@@ -3150,7 +3153,7 @@ pub fn maybe_expire_block_requests(
     }
     for h in stale {
         requested.remove(&h);
-        hub.forget_asked_block(&h);
+        hub.forget_asked_block_by(&h, session.map(|s| s.id));
         if let Some(s) = session {
             s.release_cmpct_taken(h);
         }
@@ -3192,6 +3195,48 @@ pub fn maybe_expire_pending_cmpct(
     Ok(true)
 }
 
+/// `getblockfrompeer` asks queued on `session` since the last heartbeat.
+///
+/// Each goes out through [`queue_block_getdata`], so the body is a block this
+/// session requested: the normal receive path checks and accepts it, and the
+/// stall timeout applies. A body we already have, or one already in flight
+/// from this session, is not asked again. An ask another session holds is
+/// moved here, as Core's `FetchBlock` calls `RemoveBlockRequest(hash,
+/// std::nullopt)` first: the hub records this session as the owner and the
+/// previous owner's download window drops the hash at once. That session
+/// drops it from its own blocks in flight through
+/// [`release_moved_block_asks`], and its drop no longer releases the ask.
+#[doc(hidden)]
+pub fn queue_operator_block_fetches(
+    hub: &ChainHub,
+    out: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: &crate::peers::LivePeer,
+) -> Result<(), NetError> {
+    for hash in session.take_block_fetches() {
+        if hub.already_have(hash) || hub.held_body(&hash).is_some() || follow.block_in_flight(&hash)
+        {
+            continue;
+        }
+        rbitcoin_log::info!("p2p: getblockfrompeer {hash} from peer={}", session.id);
+        if let Some(prev) = hub.move_block_ask(hash, session.id) {
+            if let Some(p) = session.peer_hub().and_then(|ph| ph.get(prev)) {
+                p.drop_block_request(&hash);
+                p.note_block_ask_moved(hash);
+            }
+        }
+        queue_block_getdata(
+            hub,
+            out,
+            Some(session),
+            &mut follow.requested_blocks,
+            &[hash],
+            false,
+        )?;
+    }
+    Ok(())
+}
+
 #[doc(hidden)]
 pub fn queue_block_getdata(
     hub: &ChainHub,
@@ -3216,9 +3261,12 @@ pub fn queue_block_getdata(
         .collect();
     for h in want {
         requested_blocks.insert(*h);
-        hub.note_asked_block(*h);
+        hub.note_asked_block_by(*h, session.map(|s| s.id));
     }
     if let Some(s) = session {
+        for h in want {
+            s.clear_block_ask_moved(h);
+        }
         s.note_blocks_requested(want);
     }
     for chunk in inv.chunks(MAX_INV_SIZE.min(500)) {
@@ -3228,9 +3276,14 @@ pub fn queue_block_getdata(
 }
 
 #[doc(hidden)]
-pub fn take_requested_block(hub: &ChainHub, requested: &mut HashSet<BlockHash>, hash: &BlockHash) {
+pub fn take_requested_block(
+    hub: &ChainHub,
+    requested: &mut HashSet<BlockHash>,
+    session: Option<&crate::peers::LivePeer>,
+    hash: &BlockHash,
+) {
     requested.remove(hash);
-    hub.forget_asked_block(hash);
+    hub.forget_asked_block_by(hash, session.map(|s| s.id));
 }
 
 #[doc(hidden)]
@@ -3634,18 +3687,78 @@ pub struct PeerFollowState {
 /// A live session's follow state. Dropping it, including when
 /// `PeerHub::disconnect_id` aborts the session task, releases the body asks
 /// the peer never answered: `asked_blocks` is hub-wide, so a held ask would
-/// keep every other peer from fetching that body.
+/// keep every other peer from fetching that body. An ask another session
+/// has since taken over (`getblockfrompeer`) is that session's to release.
 #[doc(hidden)]
 pub struct SessionFollow {
     pub hub: Arc<ChainHub>,
     pub state: PeerFollowState,
+    /// `LivePeer::id` of the session, `None` without one.
+    pub session_id: Option<u64>,
 }
 
 impl Drop for SessionFollow {
     fn drop(&mut self) {
         for h in self.state.requested_blocks.drain() {
-            self.hub.forget_asked_block(&h);
+            self.hub.forget_asked_block_by(&h, self.session_id);
         }
+    }
+}
+
+/// Core `RemoveBlockRequest(hash, std::nullopt)` as the session that lost
+/// the ask sees it: another session took `hash` over, so it leaves this
+/// session's blocks in flight and download window. A body this session
+/// receives afterwards is unrequested. The session's own mark decides, so
+/// the release still happens once the new owner has dropped the hub entry;
+/// a hub owner that is another session also counts. `true` when `hash` was
+/// released.
+#[doc(hidden)]
+pub fn release_moved_block_ask(
+    hub: &ChainHub,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+    hash: BlockHash,
+) -> bool {
+    let marked = session.is_some_and(|s| s.block_ask_moved(&hash));
+    if !follow.block_in_flight(&hash) {
+        if marked {
+            session.inspect(|s| s.clear_block_ask_moved(&hash));
+        }
+        return false;
+    }
+    if !marked && !hub.block_ask_moved_from(&hash, session.map(|s| s.id)) {
+        return false;
+    }
+    follow.requested_blocks.remove(&hash);
+    if follow.pending_cmpct.contains_key(&hash) {
+        drop_pending_cmpct(follow, session, hash);
+    }
+    if let Some(s) = session {
+        s.drop_block_request(&hash);
+        s.clear_block_ask_moved(&hash);
+    }
+    true
+}
+
+/// [`release_moved_block_ask`] for every block this session has in flight.
+#[doc(hidden)]
+pub fn release_moved_block_asks(
+    hub: &ChainHub,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) {
+    let id = session.map(|s| s.id);
+    let moved: Vec<BlockHash> = follow
+        .requested_blocks
+        .iter()
+        .chain(follow.pending_cmpct.keys())
+        .copied()
+        .filter(|h| {
+            session.is_some_and(|s| s.block_ask_moved(h)) || hub.block_ask_moved_from(h, id)
+        })
+        .collect();
+    for h in moved {
+        release_moved_block_ask(hub, follow, session, h);
     }
 }
 
@@ -5641,10 +5754,11 @@ fn retarget_stored_header_asks(
     last: BlockHash,
     requested_before: &HashSet<BlockHash>,
     have_bodies: &HashSet<BlockHash>,
+    session_id: Option<u64>,
 ) {
     let keep = connecting_header_path(hub, pending, last);
     let mut requested = requested_before.clone();
-    release_asks_off_path(hub, &mut requested, &keep);
+    release_asks_off_path_by(hub, &mut requested, session_id, &keep);
     apply.drop_asks = requested_before
         .iter()
         .copied()
@@ -5759,6 +5873,7 @@ fn classify_headers(
     requested_before: &HashSet<BlockHash>,
     have_bodies: &HashSet<BlockHash>,
     noban: bool,
+    session_id: Option<u64>,
 ) -> HeadersApply {
     let n = headers.len();
     let mut pending = pending_before.clone();
@@ -5914,6 +6029,7 @@ fn classify_headers(
                         last,
                         requested_before,
                         have_bodies,
+                        session_id,
                     );
                 }
             }
@@ -6237,12 +6353,24 @@ pub async fn on_headers(
     headers: &[bitcoin::block::Header],
 ) -> Result<(), NetError> {
     let noban = session.is_some_and(|s| s.session_noban());
+    let session_id = session.map(|s| s.id);
+    // An ask `getblockfrompeer` moved to another session is not this
+    // session's to drop when the header walk leaves it.
+    release_moved_block_asks(hub, follow, session);
     let pending = follow.pending_headers.clone();
     let requested = follow.requested_blocks.clone();
     let have_bodies: HashSet<BlockHash> = follow.pending_blocks.keys().copied().collect();
     let headers = headers.to_vec();
     let apply = run_header_job(hub, move |hub| {
-        classify_headers(hub, &headers, &pending, &requested, &have_bodies, noban)
+        classify_headers(
+            hub,
+            &headers,
+            &pending,
+            &requested,
+            &have_bodies,
+            noban,
+            session_id,
+        )
     })
     .await?;
     let accepted = !apply.misbehave;
@@ -6264,22 +6392,23 @@ pub async fn on_block(
     block: &Block,
 ) -> Result<(), NetError> {
     let hash = block.block_hash();
+    release_moved_block_ask(hub, follow, session, hash);
     let merkle = crate::compact::block_txid_merkle(&block.txdata);
     if merkle.is_none_or(|(root, _)| root != block.header.merkle_root.to_byte_array()) {
         rbitcoin_log::info!("Block mutated: bad-txnmrklroot, hashMerkleRoot mismatch");
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        take_requested_block(hub, &mut follow.requested_blocks, session, &hash);
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
     if merkle.is_some_and(|(_, mutated)| mutated) {
         rbitcoin_log::info!("Block mutated: bad-txns-duplicate");
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        take_requested_block(hub, &mut follow.requested_blocks, session, &hash);
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
     if rbitcoin_consensus::block_mutated_without_coinbase(block) {
         rbitcoin_log::info!("Block mutated: 64-byte transaction without a coinbase");
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        take_requested_block(hub, &mut follow.requested_blocks, session, &hash);
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
@@ -6297,7 +6426,7 @@ pub async fn on_block(
     // return. A duplicate must not take the process-wide tip-accept lane.
     if hub.already_have(hash) {
         drop_pending_cmpct(follow, session, hash);
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        take_requested_block(hub, &mut follow.requested_blocks, session, &hash);
         hub.drop_held(hash);
         return drain_after_accept(hub, out_tx, follow, session, hash, false).await;
     }
@@ -6483,6 +6612,7 @@ pub async fn on_cmpctblock(
 ) -> Result<(), NetError> {
     let hsi = cb.compact_block.clone();
     let hash = hsi.header.block_hash();
+    release_moved_block_ask(hub, follow, session, hash);
     if on_cmpctblock_reject_early(hub, follow, session, &hsi, hash)? {
         return Ok(());
     }
@@ -6500,12 +6630,12 @@ pub async fn on_cmpctblock(
         return Ok(());
     }
     let keep = keep_pending_connecting_paths(hub, &follow.pending_headers);
-    release_asks_off_path(hub, &mut follow.requested_blocks, &keep);
+    release_asks_off_path(hub, &mut follow.requested_blocks, session, &keep);
     on_cmpctblock_queue_ancestors(hub, out_tx, follow, session, hash)?;
     if hub.header_below_anti_dos(&hsi.header) && !follow.requested_blocks.contains(&hash) {
         let id = session.map(|s| s.id).unwrap_or(0);
         rbitcoin_log::info!("p2p: ignore low-work compact block from peer {id}");
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        take_requested_block(hub, &mut follow.requested_blocks, session, &hash);
         return Ok(());
     }
     // Process the compact block's header before trying reconstruction, as Core
@@ -6528,7 +6658,7 @@ pub async fn on_cmpctblock(
         }
     }
     if hub.has_block(&hash) {
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        take_requested_block(hub, &mut follow.requested_blocks, session, &hash);
         return Ok(());
     }
     if !follow.requested_blocks.contains(&hash)
@@ -6614,7 +6744,7 @@ pub fn on_cmpctblock_reject_early(
     if !hub.header_claimed_pow_ok(&hsi.header) {
         rbitcoin_log::info!("{}", crate::chain::accept_block_header_nodos_log(hash));
         misbehaving(&mut follow.ban_score, session);
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        take_requested_block(hub, &mut follow.requested_blocks, session, &hash);
         return Ok(true);
     }
     if let Some(s) = session {
@@ -6875,7 +7005,7 @@ pub async fn on_blocktxn_got_block(
     relay_new_pow_valid_block(hub, &block, session).await;
     match accept_received_from_peer(hub, block.clone(), session).await {
         Ok(AcceptOutcome::Accepted { .. }) => {
-            take_requested_block(hub, &mut follow.requested_blocks, &hash);
+            take_requested_block(hub, &mut follow.requested_blocks, session, &hash);
             if let Some(s) = session {
                 if let Some(h) = hub.tip_height() {
                     s.clear_block_inflight(h);
@@ -6896,7 +7026,7 @@ pub async fn on_blocktxn_got_block(
             .await
         }
         Ok(_) => {
-            take_requested_block(hub, &mut follow.requested_blocks, &hash);
+            take_requested_block(hub, &mut follow.requested_blocks, session, &hash);
             if let Some(s) = session {
                 s.release_cmpct_taken(hash);
             }
@@ -6912,7 +7042,7 @@ pub async fn on_blocktxn_got_block(
             .await
         }
         Err(e) if net_error_needs_parent(&e) => {
-            take_requested_block(hub, &mut follow.requested_blocks, &hash);
+            take_requested_block(hub, &mut follow.requested_blocks, session, &hash);
             follow.pending_blocks.insert(hash, block);
             maybe_select_hb_if_relay(hub, session);
             if let Some(s) = session {
@@ -8614,6 +8744,19 @@ pub fn keep_pending_connecting_paths(
 pub fn release_asks_off_path(
     hub: &ChainHub,
     requested: &mut HashSet<BlockHash>,
+    session: Option<&crate::peers::LivePeer>,
+    path: &[BlockHash],
+) {
+    release_asks_off_path_by(hub, requested, session.map(|s| s.id), path);
+}
+
+/// [`release_asks_off_path`] for a caller that holds only the session id,
+/// such as the header job.
+#[doc(hidden)]
+pub fn release_asks_off_path_by(
+    hub: &ChainHub,
+    requested: &mut HashSet<BlockHash>,
+    session_id: Option<u64>,
     path: &[BlockHash],
 ) {
     if path.is_empty() {
@@ -8625,7 +8768,8 @@ pub fn release_asks_off_path(
         .filter(|h| !path.contains(h))
         .collect();
     for h in drop {
-        take_requested_block(hub, requested, &h);
+        requested.remove(&h);
+        hub.forget_asked_block_by(&h, session_id);
     }
 }
 
@@ -8652,7 +8796,7 @@ pub async fn drain_pending(
     let keep = keep_pending_connecting_paths(hub, pending_headers);
     let better = pending_leaf_paths(hub, pending_headers, PathWorkMemo::better_path_connects);
     let mut missing = fetchable_bodies(hub, better, pending_blocks, requested_blocks);
-    release_asks_off_path(hub, requested_blocks, &keep);
+    release_asks_off_path(hub, requested_blocks, session, &keep);
     missing.retain(|h| !requested_blocks.contains(h));
     for h in hub.held_missing_parents() {
         if !missing.contains(&h) {

@@ -79,6 +79,38 @@ pub fn outbound_queued_bytes(out: &PeerOut) -> usize {
     }
 }
 
+/// `getblockfrompeer` asks one session holds before its heartbeat drains them.
+pub const MAX_BLOCK_FETCHES: usize = 16;
+
+/// Moved-ask marks one session keeps. The heartbeat drains them, so this is
+/// only a bound; the hub owner still releases a mark lost to the clear.
+const MAX_MOVED_BLOCK_ASKS: usize = 1024;
+
+/// Why [`PeerHub::fetch_block_from`] did not queue a block ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchBlockError {
+    /// No live, handshaken session with that id.
+    NoPeer,
+    /// The peer did not signal `NODE_WITNESS`.
+    PreSegwit,
+    /// The session has no writer yet, or has lost it.
+    NotFullyConnected,
+    /// [`MAX_BLOCK_FETCHES`] asks already wait on this session.
+    QueueFull,
+}
+
+impl FetchBlockError {
+    /// Core's `getblockfrompeer` message for this case.
+    pub fn message(self) -> &'static str {
+        match self {
+            FetchBlockError::NoPeer => "Peer does not exist",
+            FetchBlockError::PreSegwit => "Pre-SegWit peer",
+            FetchBlockError::NotFullyConnected => "Peer not fully connected",
+            FetchBlockError::QueueFull => "Too many block requests queued for this peer",
+        }
+    }
+}
+
 /// Session writer payload: application messages or pre-encoded v2 block bytes.
 #[derive(Debug)]
 pub enum PeerOut {
@@ -516,6 +548,13 @@ pub struct LivePeer {
     pub v2_transport_ready: AtomicBool,
     /// Block hashes this session already asked other high-bandwidth peers to send.
     hb_body_fanned: Mutex<HashSet<BlockHash>>,
+    /// Asks this session made that `getblockfrompeer` moved to another
+    /// session. The session drops them from its blocks in flight even once
+    /// the hub no longer lists the ask.
+    moved_block_asks: Mutex<HashSet<BlockHash>>,
+    /// `getblockfrompeer` hashes the session has not asked for yet. The
+    /// session heartbeat drains them through its own getdata path.
+    block_fetches: Mutex<Vec<BlockHash>>,
     /// Plain v1 framing on a `v1@` wallet-sync listener.
     pub v1_transport: AtomicBool,
     /// Peer sent BIP155 `sendaddrv2` (use `addrv2` for self-announce / GETADDR).
@@ -1473,6 +1512,25 @@ impl LivePeer {
         true
     }
 
+    /// Queue an operator `getblockfrompeer` ask. A hash already queued is not
+    /// queued twice. `false` when [`MAX_BLOCK_FETCHES`] are already waiting.
+    pub fn queue_block_fetch(&self, hash: BlockHash) -> bool {
+        let mut g = self.block_fetches.lock().unwrap_or_else(|e| e.into_inner());
+        if g.contains(&hash) {
+            return true;
+        }
+        if g.len() >= MAX_BLOCK_FETCHES {
+            return false;
+        }
+        g.push(hash);
+        true
+    }
+
+    /// Operator asks queued since the last heartbeat, oldest first.
+    pub fn take_block_fetches(&self) -> Vec<BlockHash> {
+        std::mem::take(&mut *self.block_fetches.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// CIDR/bind table plus operator `--trusted`.
     pub fn session_noban(&self) -> bool {
         self.peer_hub().is_some_and(|h| h.is_noban())
@@ -1566,6 +1624,59 @@ impl LivePeer {
         } else if front_left {
             d.since = Some(since.max(now));
         }
+    }
+
+    /// Core `RemoveBlockRequest(hash, std::nullopt)` for this peer: another
+    /// session took over the ask for `hash`, so it leaves this download
+    /// window. The oldest block leaving restarts the window at `now`; the
+    /// last one ends it.
+    pub fn drop_block_request(&self, hash: &BlockHash) {
+        let now = self.clock_now();
+        let mut d = self
+            .block_download
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(i) = d.queue.iter().position(|h| h == hash) else {
+            return;
+        };
+        d.queue.remove(i);
+        let Some(since) = d.since else {
+            return;
+        };
+        if d.queue.is_empty() {
+            drop(d);
+            self.end_block_download();
+        } else if i == 0 {
+            d.since = Some(since.max(now));
+        }
+    }
+
+    /// Another session took over this session's ask for `hash`.
+    pub fn note_block_ask_moved(&self, hash: BlockHash) {
+        let mut g = self
+            .moved_block_asks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if g.len() >= MAX_MOVED_BLOCK_ASKS {
+            g.clear();
+        }
+        g.insert(hash);
+    }
+
+    /// `hash` was moved off this session and not asked here again since.
+    pub fn block_ask_moved(&self, hash: &BlockHash) -> bool {
+        self.moved_block_asks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(hash)
+    }
+
+    /// This session dropped `hash`, or asks for it again.
+    pub fn clear_block_ask_moved(&self, hash: &BlockHash) {
+        self.moved_block_asks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(hash);
     }
 
     pub fn end_block_download(&self) {
@@ -3509,6 +3620,8 @@ impl PeerHub {
             handshake_complete: AtomicBool::new(false),
             v2_transport_ready: AtomicBool::new(false),
             hb_body_fanned: Mutex::new(HashSet::new()),
+            moved_block_asks: Mutex::new(HashSet::new()),
+            block_fetches: Mutex::new(Vec::new()),
             v1_transport: AtomicBool::new(false),
             wants_addrv2: AtomicBool::new(false),
             wtxid_relay: AtomicBool::new(false),
@@ -4380,6 +4493,29 @@ impl PeerHub {
             .collect();
         rows.sort_unstable_by_key(|(id, _)| *id);
         rows.into_iter().map(|(_, a)| a).collect()
+    }
+
+    /// Core `PeerManager::FetchBlock`: queue a `getdata` for `hash` on the
+    /// session `id` (`getpeerinfo.id`). The session's heartbeat sends it, so
+    /// the ask joins that session's blocks in flight and the body takes the
+    /// normal receive path. The caller checks the header and the body.
+    pub fn fetch_block_from(&self, id: u64, hash: BlockHash) -> Result<(), FetchBlockError> {
+        let Some(p) = self.get(id) else {
+            return Err(FetchBlockError::NoPeer);
+        };
+        if p.stop.load(Ordering::SeqCst) || !p.handshake_complete() {
+            return Err(FetchBlockError::NoPeer);
+        }
+        if p.services & bitcoin::p2p::ServiceFlags::WITNESS.to_u64() == 0 {
+            return Err(FetchBlockError::PreSegwit);
+        }
+        if p.writer().is_none() {
+            return Err(FetchBlockError::NotFullyConnected);
+        }
+        if !p.queue_block_fetch(hash) {
+            return Err(FetchBlockError::QueueFull);
+        }
+        Ok(())
     }
 
     pub fn disconnect_id(&self, id: u64) -> bool {

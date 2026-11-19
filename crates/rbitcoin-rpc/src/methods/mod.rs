@@ -823,6 +823,7 @@ pub fn dispatch_inner(ctx: &RpcContext, method: &str, params: RpcParams) -> Resu
             addnode(ctx, hub, &params)
         }
         "disconnectnode" => disconnectnode(ctx, &params),
+        "getblockfrompeer" => getblockfrompeer(ctx, &params),
         "addconnection" => addconnection(ctx, &params),
         "addpeeraddress" => addpeeraddress(ctx, &params),
         "getnodeaddresses" => getnodeaddresses(ctx, &params),
@@ -994,6 +995,7 @@ pub const METHOD_LIST: &[&str] = &[
     "ping",
     "addnode",
     "disconnectnode",
+    "getblockfrompeer",
     "addconnection",
     "addpeeraddress",
     "getnodeaddresses",
@@ -1184,6 +1186,14 @@ pub const NAMED_HELP: &[(&str, &str)] = &[
         "getpeerinfo\n\
          Returns data about each connected network node as a json array of objects.\n\
          Valid networks: (ipv4, ipv6, onion, i2p, cjdns, not_publicly_routable)",
+    ),
+    (
+        "getblockfrompeer",
+        "getblockfrompeer \"blockhash\" peer_id\n\
+         Attempt to fetch block from a given peer. The header must already be \
+         known (submitheader or headers sync) and the body must be missing. \
+         Returns {} once the getdata is queued; the block arrives later and is \
+         validated like any other. Does not restore --prune-seqsigwit data.",
     ),
     (
         "getorphantxs",
