@@ -1,14 +1,14 @@
 {
   "new_base": "8e62e4ce4d60c30abc851cb0893e4b80149ac9e4",
-  "new_skip": 3360,
-  "old_index": 10020,
-  "old_name": "crates/rbitcoin-net/src/peer.rs:5008:20: replace > with == in on_inv",
+  "new_skip": 3560,
+  "old_index": 10220,
+  "old_name": "crates/rbitcoin-net/src/peer.rs:8167:5: replace announced_work_cmp -> Option<std::cmp::Ordering> with Some(Default::default())",
   "new_cap_used": true,
-  "run_id": "44263099185",
-  "new_len": 9612,
-  "new_remaining": 6252,
-  "old_len": 27611,
-  "old_remaining": 27194,
-  "completed_new": 0,
-  "completed_old": 417
+  "run_id": "44483845560",
+  "new_len": 9828,
+  "new_remaining": 6268,
+  "old_len": 27465,
+  "old_remaining": 27265,
+  "completed_new": 200,
+  "completed_old": 200
 }

@@ -2412,3 +2412,51 @@ MISSED   crates/rbitcoin-net/src/peer.rs:4545:41: replace != with == in getheade
 MISSED   crates/rbitcoin-net/src/peer.rs:4547:12: delete ! in getheaders_apply in 7s build + 59s test
 MISSED   crates/rbitcoin-net/src/peer.rs:4564:32: replace > with >= in on_getblocks in 8s build + 59s test
 MISSED   crates/rbitcoin-net/src/peer.rs:4646:70: replace && with || in serve_getdata_tail in 5s build + 30s test
+# 44483845560 1 5123cad677f5433ba4242dff0f904317518748df
+MISSED   crates/rbitcoin-net/src/peer.rs:4647:20: replace match guard session .is_some_and(|s| s.conn_type == crate::peers::PeerConnType::BlockRelay) with false in serve_getdata_tail in 112s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:4650:52: replace match guard *inv_type & 0x3fff_ffff == 3 with false in serve_getdata_tail in 14s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:4650:62: replace & with | in serve_getdata_tail in 8s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:4650:62: replace & with ^ in serve_getdata_tail in 8s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:4701:17: replace || with && in serve_getdata_full_block in 8s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5397:58: replace && with || in evict_pending_for_room in 8s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5397:31: delete ! in evict_pending_for_room in 7s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5449:12: delete ! in drop_hashes_until_fit in 7s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5503:17: replace && with || in disconnected_pending in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5502:20: replace != with == in disconnected_pending in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5508:50: replace && with || in disconnected_pending in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5508:24: delete ! in disconnected_pending in 7s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5508:53: delete ! in disconnected_pending in 7s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5605:46: replace && with || in retarget_stored_header_asks in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5672:12: delete ! in add_pending_ancestors in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5694:57: replace >= with < in pending_root in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5777:23: replace && with || in classify_headers in 8s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5777:62: replace > with >= in classify_headers in 7s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5788:52: replace > with < in classify_headers in 7s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6139:51: delete ! in ask_other_hb_for_block in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6452:32: delete ! in on_cmpctblock in 8s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6455:9: replace && with || in on_cmpctblock in 8s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6454:9: replace && with || in on_cmpctblock in 8s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6457:55: replace > with == in on_cmpctblock in 8s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6457:55: replace > with < in on_cmpctblock in 8s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6457:55: replace > with >= in on_cmpctblock in 8s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6463:21: replace && with || in on_cmpctblock in 9s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6665:40: replace match guard !net_error_is_store_not_found(&e) with true in on_cmpct_got_block in 8s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5120:9: replace && with || in on_inv in 108s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5215:28: replace || with && in on_inv_block_needs_headers in 7s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5755:13: replace || with && in classify_headers in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:5809:18: replace < with <= in classify_headers in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6302:29: replace != with == in on_block_unrequested_skip in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6304:12: delete ! in on_block_unrequested_skip in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6320:49: replace && with || in on_block_unrequested_skip in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6320:52: delete ! in on_block_unrequested_skip in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6351:19: replace match guard net_error_is_store_not_found(&e) with false in on_block_accept in 8s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6443:50: delete ! in on_cmpctblock in 7s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6654:9: delete match arm Ok(AcceptOutcome::Accepted{..}) in on_cmpct_got_block in 8s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6662:9: delete match arm Ok(_) in on_cmpct_got_block in 7s build + 59s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6680:16: delete ! in on_cmpct_got_block in 8s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6972:16: replace == with != in schedule_orphan_parent_getdata in 8s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6975:68: replace == with != in schedule_orphan_parent_getdata in 7s build + 57s test
+MISSED   crates/rbitcoin-net/src/peer.rs:7305:19: replace match guard hub.tip_hash() == Some(ev.hash) with false in tip_event_for_announce in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8036:17: replace < with <= in pending_walk in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8138:31: replace || with && in header_announcement_connects in 7s build + 58s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8157:59: replace < with <= in announced_tip_is_hopeless in 4s build + 29s test
