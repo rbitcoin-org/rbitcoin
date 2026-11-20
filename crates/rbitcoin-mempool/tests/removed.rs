@@ -153,6 +153,26 @@ fn a_replaced_conflict_and_its_descendant_name_the_replacement() {
 }
 
 #[test]
+fn evict_nonfinal_writes_a_reorg_row() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(1);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let orphaned = spend(ops[0], 99_000);
+    mp.accept_tx(&orphaned, &utxos, TIP_OK).expect("orphaned");
+    let mut reorged = MapUtxoProvider {
+        map: utxos.map.clone(),
+    };
+    reorged.map.remove(&ops[0]);
+    let at = mp.mempool_sequence();
+    mp.evict_nonfinal(&reorged, TIP_OK);
+    assert_eq!(
+        mp.removed_rows().rows.last(),
+        Some(&row(at, &orphaned, RemovalReason::Reorg)),
+        "an input the reorg took away"
+    );
+}
+
+#[test]
 fn a_replacement_that_does_not_commit_leaves_no_replaced_row() {
     let dir = tmp_dir();
     let (ops, utxos) = chain_coins(1);
