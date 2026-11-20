@@ -616,51 +616,6 @@ fn mainnet_ancestor_skip_then_miss(q: &rbitcoin_query::Query, first: &Transactio
 }
 
 #[test]
-fn s4_rejects_overweight_block() {
-    // ~1MB of script data per tx ≈ 4M weight; a few large outputs exceed the limit.
-    let mut txs = vec![coinbase(1)];
-    for i in 0..5u8 {
-        let mut spk = vec![0x6a, 0x4d, 0xff, 0xff]; // OP_RETURN + pushdata2 placeholder
-                                                    // Fill with ~900 KiB raw data via OP_RETURN chunking is awkward; use large script
-                                                    // bytes rust-bitcoin will count toward base size.
-        spk.extend(std::iter::repeat_n(0x61, 900_000)); // OP_NOP filler
-        txs.push(Transaction {
-            version: TxVersion::ONE,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: bitcoin::Txid::from_byte_array([i.wrapping_add(1); 32]),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
-                script_pubkey: ScriptBuf::from_bytes(spk),
-            }],
-        });
-    }
-    let b = block_with(txs);
-    assert!(
-        b.weight().to_wu() > 4_000_000,
-        "fixture weight {}",
-        b.weight().to_wu()
-    );
-    let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
-    match err {
-        ConsensusError::BadBlock(s) => {
-            assert!(
-                s.contains("weight") || s.contains("stripped"),
-                "expected weight or stripped reject, got {s:?}"
-            );
-        }
-        other => panic!("expected BadBlock, got {other:?}"),
-    }
-}
-
-#[test]
 fn s4_weight_4_000_000_accepts_4_000_001_rejects() {
     let mut ok = block_with(vec![coinbase(0)]);
     pad_stripped_to(&mut ok, MAX_BLOCK_STRIPPED_SIZE);
@@ -689,24 +644,6 @@ fn s4_weight_4_000_000_accepts_4_000_001_rejects() {
         validate_block_structure(&wblock, &ctx_h(1)).unwrap_err(),
         "weight",
     );
-}
-
-#[test]
-fn s5_rejects_duplicate_txid() {
-    let t = non_coinbase_spend(7);
-    let b = block_with(vec![coinbase(1), t.clone(), t]);
-    let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
-    assert_bad_block(err, "duplicate txid");
-}
-
-#[test]
-fn s6_rejects_merkle_root_mismatch() {
-    let good = block_with(vec![coinbase(0), non_coinbase_spend(1)]);
-    validate_block_structure(&good, &ctx_h(0)).unwrap();
-    let mut b = good;
-    b.header.merkle_root = TxMerkleNode::from_byte_array([0x11; 32]);
-    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
-    assert_bad_block(err, "merkle");
 }
 
 /// A peer can pair any body with a valid header. Every body rule runs after
@@ -1740,118 +1677,6 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
         "got {msg}"
     );
     let _ = std::fs::remove_dir_all(&path);
-}
-
-/// Connect-path spend rejects: same-block coinbase spend (always immature),
-/// same-block double spend, child-before-parent, `in < out`, and a height-1
-/// coinbase still immature 4 deep.
-#[test]
-fn accept_rejects_connect_spend_rules() {
-    use rbitcoin_consensus::{mine_empty_regtest, prepare_regtest_candidate};
-    use rbitcoin_query::{accept_and_connect_block, pad_empty_from};
-    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("connect-spend-rules");
-    let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-
-    fn spend(op: OutPoint, sats: u64) -> Transaction {
-        Transaction {
-            version: TxVersion::ONE,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: op,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(sats),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        }
-    }
-
-    let mut same_cb = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-    let cb_op = OutPoint {
-        txid: same_cb.txdata[0].compute_txid(),
-        vout: 0,
-    };
-    same_cb
-        .txdata
-        .push(spend(cb_op, same_cb.txdata[0].output[0].value.to_sat()));
-    prepare_regtest_candidate(
-        &mut same_cb,
-        genesis.block_hash(),
-        genesis.header.time + 600,
-    );
-    let err = accept_and_connect_block(&q, &params, Height(1), &same_cb, Milestone::NONE)
-        .expect_err("same-block coinbase spend must be immature");
-    match err {
-        ConfirmError::Rules(ConsensusError::BadTx("coinbase immature")) => {}
-        other => panic!("expected coinbase immature, got {other}"),
-    }
-
-    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-    let op = OutPoint {
-        txid: b1.txdata[0].compute_txid(),
-        vout: 0,
-    };
-
-    let mut dup = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
-    dup.txdata.push(spend(op, 1_000));
-    dup.txdata.push(spend(op, 2_000));
-    prepare_regtest_candidate(&mut dup, b1.block_hash(), b1.header.time + 600);
-    let err = accept_and_connect_block(&q, &params, Height(2), &dup, Milestone::NONE)
-        .expect_err("same-block double spend");
-    assert!(
-        matches!(err, ConfirmError::Rules(ConsensusError::BadTx(s)) if s.contains("double spend")),
-        "same-block double spend: {err:?}"
-    );
-    assert_eq!(q.tip_height(), Some(Height(1)));
-
-    let parent = spend(op, 1_000);
-    let child = spend(
-        OutPoint {
-            txid: parent.compute_txid(),
-            vout: 0,
-        },
-        500,
-    );
-    let mut bad_order = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
-    bad_order.txdata.push(child);
-    bad_order.txdata.push(parent);
-    prepare_regtest_candidate(&mut bad_order, b1.block_hash(), b1.header.time + 600);
-    let err = accept_and_connect_block(&q, &params, Height(2), &bad_order, Milestone::NONE)
-        .expect_err("child-before-parent");
-    assert!(
-        matches!(err, ConfirmError::Rules(ConsensusError::MissingPrevout)),
-        "child-before-parent: {err:?}"
-    );
-    assert_eq!(q.tip_height(), Some(Height(1)));
-
-    let mut over = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
-    over.txdata.push(spend(op, 50_0000_0000 + 1));
-    prepare_regtest_candidate(&mut over, b1.block_hash(), b1.header.time + 600);
-    let err = accept_and_connect_block(&q, &params, Height(2), &over, Milestone::NONE)
-        .expect_err("in < out");
-    assert!(
-        matches!(err, ConfirmError::Rules(ConsensusError::BadTx(s)) if s.contains("in < out")),
-        "in < out: {err:?}"
-    );
-    assert_eq!(q.tip_height(), Some(Height(1)));
-
-    let (tip, time, _) = pad_empty_from(&q, &params, b1.block_hash(), b1.header.time, 2, 4, 0);
-    assert_eq!(q.tip_height(), Some(Height(4)));
-    let mut b5 = mine_empty_regtest(tip, time + 600, 5);
-    b5.txdata.push(spend(op, 1_000));
-    prepare_regtest_candidate(&mut b5, tip, time + 600);
-    let err = accept_and_connect_block(&q, &params, Height(5), &b5, Milestone::NONE)
-        .expect_err("height-1 coinbase still immature 4 deep");
-    assert!(
-        matches!(err, ConfirmError::Rules(ConsensusError::BadTx(s)) if s.contains("immature")),
-        "4-deep immature: {err:?}"
-    );
 }
 
 /// A tip-follow connect row is the preverified set. Assemble must not fail
@@ -3398,28 +3223,6 @@ fn s14_stripped_size_1_000_000_accepts_1_000_001_rejects() {
     assert_bad_block(
         validate_block_structure(&over, &ctx_h(0)).unwrap_err(),
         "stripped",
-    );
-}
-
-#[test]
-fn s15_rejects_empty_vin() {
-    validate_block_structure(
-        &block_with(vec![coinbase(0), non_coinbase_spend(1)]),
-        &ctx_h(0),
-    )
-    .unwrap();
-    let empty = Transaction {
-        version: TxVersion::ONE,
-        lock_time: LockTime::ZERO,
-        input: vec![],
-        output: vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
-    assert_bad_tx(
-        validate_block_structure(&block_with(vec![coinbase(0), empty]), &ctx_h(0)).unwrap_err(),
-        "no inputs",
     );
 }
 

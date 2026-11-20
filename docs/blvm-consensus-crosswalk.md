@@ -128,7 +128,7 @@ compiled. A regtest node with those features on would disagree with us.
 | Regtest: no retarget, halving every 150 | `ChainParams::regtest`, `block_subsidy` | `params.rs` network asserts; `p1_block_subsidy_halvings` |
 | Genesis hash | `check_header` → `check_genesis_hash` | `header_and_spending_boundaries`; `validate_header_genesis_and_bad_prev` |
 | Only the first transaction is a coinbase | `reject_bad_block_tx_layout` | consensus-tests S3, `rpc_regtest_from_genesis` |
-| Duplicate txids, even when they are not an adjacent merkle pair | `validate_block_structure_with_pres` | `s5_rejects_duplicate_txid` |
+| Duplicate txids, even when they are not an adjacent merkle pair | `validate_block_structure_with_pres` | consensus-tests S5, `rpc_regtest_mature_chain_ops` |
 | Coinbase-less body that contains a 64-byte stripped tx is mutated (Core `IsBlockMutated`). The block is already invalid. This is not the BIP54 ban | `reject_bad_block_tx_layout` | `no_coinbase_with_a_64_byte_tx_is_mutated` |
 | Genesis coinbase is not a coin | `facts::reject_genesis_coinbase_spend` | `header_and_spending_boundaries` |
 | `OP_RETURN`, or a script longer than 10,000 bytes, is not a coin | `policy::is_unspendable`, `facts::reject_unspendable_prevout` | `spending_an_unspendable_output_is_missing_prevout` |
@@ -172,7 +172,7 @@ Paths are under `crates/`. Tests are `#[test]` functions unless noted.
 | BLK-006 | Coinbase value ≤ subsidy + fees | `block_subsidy` plus the connect value check | `rejects_coinbase_excess_value_fast`; `p1_block_subsidy_halvings` | match |
 | BLK-007 | Weight ≤ 4,000,000 | `validate_block_structure_with_pres` | `s4_weight_4_000_000_accepts_4_000_001_rejects` | match |
 | BLK-008 | Sigop cost ≤ 80,000 | same walk, `MAX_BLOCK_SIGOPS_COST` | `sigop_cost_tests`; S11/S12 in `rpc_regtest_from_genesis` | match |
-| BLK-009 | Merkle root matches txids | `merkle_root_mutated` before other body rules | `s6_rejects_merkle_root_mismatch`; `body_rules_run_after_the_header_merkle_check` | match |
+| BLK-009 | Merkle root matches txids | `merkle_root_mutated` before other body rules | consensus-tests S6, `rpc_regtest_from_genesis`; `body_rules_run_after_the_header_merkle_check` | match |
 | BLK-010 | Reject adjacent duplicate hashes (CVE-2012-2459) | `rbitcoin-primitives` `merkle_root_mutated` | `merkle_mutation_flags_a_repeated_tail_at_any_level` | match |
 | BLK-011 | SegWit commitment and weight when witness rules apply | witness-commitment scan in the structure walk | `s8_accepts_witness_commitment_with_reserved_value`; `s8_last_witness_commitment_output_wins`; `s8_rejects_nonce_lengths_beside_32` | match |
 | BLK-012 | After BIP54, ≤ 2,500 sigops per non-coinbase tx | `reject_bip54_sigops` when `enforce_bip54` | `bip54_sigops_vectors` | match |
@@ -183,7 +183,7 @@ Paths are under `crates/`. Tests are `#[test]` functions unless noted.
 
 | ID | Their rule | Production | Test | Result |
 |----|------------|------------|------|---|
-| TX-001 | ≥ 1 input and ≥ 1 output | `check_tx_shape` | `s15_rejects_empty_vin`; S13 | match |
+| TX-001 | ≥ 1 input and ≥ 1 output | `check_tx_shape` | S15, `rpc_regtest_from_genesis`; S13 | match |
 | TX-002 | Each output in `0 ..= MAX_MONEY` | `tx_value_out` | S10, `rpc_regtest_from_genesis` | match |
 | TX-003 | Output sum ≤ MAX_MONEY | `tx_value_out` | S10 | match |
 | TX-004 | No repeated outpoint inside one tx | `reject_duplicate_outpoints` | S17 | match |
