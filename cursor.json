@@ -1,14 +1,14 @@
 {
   "new_base": "8e62e4ce4d60c30abc851cb0893e4b80149ac9e4",
-  "new_skip": 3560,
-  "old_index": 10704,
-  "old_name": "crates/rbitcoin-net/src/peers.rs:1807:5: replace rand_ping_nonce -> u64 with 0",
+  "new_skip": 3760,
+  "old_index": 10909,
+  "old_name": "crates/rbitcoin-net/src/peers.rs:3908:9: replace PeerHub::trust_label -> Option<String> with Some(\"xyzzy\".into())",
   "new_cap_used": true,
-  "run_id": "44483845560",
-  "new_len": 9828,
-  "new_remaining": 6268,
-  "old_len": 27465,
-  "old_remaining": 26981,
-  "completed_new": 0,
-  "completed_old": 484
+  "run_id": "44697741335",
+  "new_len": 11192,
+  "new_remaining": 7432,
+  "old_len": 27228,
+  "old_remaining": 27023,
+  "completed_new": 200,
+  "completed_old": 205
 }
