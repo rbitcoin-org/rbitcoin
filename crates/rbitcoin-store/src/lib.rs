@@ -149,7 +149,7 @@ pub use create_loc::CreateLocPair;
 pub use error::StoreError;
 pub use file::ensure_nofile_budget;
 pub use hashhead::{HeadOpenOpts, HeadScale};
-pub use head_resolve_stats::{leftover_probe_diag_ready, leftover_probe_diag_recorded};
+pub use head_resolve_stats::leftover_probe_diag_ready;
 pub use header_table::{block_header_hash, HeaderRecord};
 pub use height_fence::HeightFence;
 pub use idx_body_pipeline::run_idx_body_pipeline;

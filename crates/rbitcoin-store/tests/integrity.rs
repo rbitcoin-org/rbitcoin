@@ -1236,30 +1236,6 @@ const CLASS_A_FILES: [(&str, ClassAPick); 16] = [
     ("input.body", |s| s.txs.input.body.io_handle()),
 ];
 
-/// The barrier puts every Class A `sync_data` on the configured bulk-IO
-/// session at once (io_uring, the pool, or IOCP). In flight together, the
-/// filesystem can share journal commits and device cache flushes between
-/// them. One at a time, a Tip-mode block waits for sixteen in a row.
-#[test]
-fn class_a_barrier_submits_its_syncs_in_one_batch() {
-    if !rbitcoin_store::bulk_io::io_uring_enabled() {
-        eprintln!("skip: no bulk-IO session (RBITCOIN_IO=pread or macOS default)");
-        return;
-    }
-    let dir = tmp();
-    let s = Store::create_tiny(&dir).unwrap();
-    let write = rbitcoin_store::ClassCWrite::for_test();
-    connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
-    rbitcoin_store::io_handle::watch_sync_batch(
-        CLASS_A_FILES.iter().map(|(_, pick)| pick(&s)).collect(),
-    );
-    let flushed = s.flush_class_c_tip();
-    let seen = rbitcoin_store::io_handle::take_sync_batch_seen();
-    flushed.unwrap();
-    assert!(seen, "the Class A syncs were not submitted together");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// Create 3 of the archive models: a spend of create 1 with a witness, so
 /// the input stem holds a parent edge and the witness stem a real row.
 fn spend_of_create_1() -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {

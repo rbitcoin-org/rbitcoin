@@ -609,10 +609,6 @@ pub fn sync_data_batch_on_session(
             }
             next += 1;
         }
-        #[cfg(debug_assertions)]
-        if next == n && completed == 0 {
-            crate::io_handle::note_sync_batch(handles);
-        }
         session.sync_submission();
         let cqes = match session.harvest_ready() {
             Ok(c) => c,

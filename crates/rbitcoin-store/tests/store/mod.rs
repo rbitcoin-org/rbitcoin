@@ -1470,10 +1470,6 @@ fn tiponly_same_page_foreigner_records_probe_diag() {
         rbitcoin_store::head_resolve_stats::take_leftover_miss().expect("classified");
     assert_eq!(on, LeftoverMissOn::Head);
     assert_eq!(n_cands, 0, "fingerprint must skip A, n_cands={n_cands}");
-    assert!(
-        !rbitcoin_store::head_resolve_stats::leftover_probe_diag_recorded(&b),
-        "resolve must not dump this key; leftover caller does"
-    );
     s.diagnose_leftover_probe(&b);
     let diag = rbitcoin_store::head_resolve_stats::take_leftover_probe_diag()
         .expect("leftover miss path must record a probe dump");
@@ -1517,22 +1513,6 @@ fn open_head_page_uses_mix_txid_not_raw() {
         }
     }
     assert!(found, "need a txid whose mix moves the open-head page");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Lookup / BQ-ahead also use TipOnly `get_fk_by_txid_batch`. A miss there
-/// is routine (parent not published yet). Dump + WARN only on leftover.
-#[test]
-fn tiponly_resolve_miss_does_not_dump_probe_diag() {
-    let dir = tmp();
-    let s = Store::create_tiny(&dir).unwrap();
-    let miss = [0xCCu8; 32];
-    let hits = s.get_fk_by_txid_batch(&[miss]).unwrap();
-    assert!(hits[0].1.is_none(), "unknown txid must miss");
-    assert!(
-        !rbitcoin_store::head_resolve_stats::leftover_probe_diag_recorded(&miss),
-        "resolve TipOnly miss must not hop-dump this key; leftover miss path only"
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

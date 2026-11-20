@@ -553,7 +553,8 @@ fn inflight_binds_after_drain_before_fence() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Leftover miss (unknown parent) hop-dumps once. Lookup TipOnly does not.
+/// Leftover miss (unknown parent) names that parent on the reject line and
+/// sets its `diag=1` hop-dump flag.
 #[test]
 fn leftover_miss_dumps_probe_diag() {
     let (dir, q) = temp_query("leftover-miss-diag");
@@ -561,9 +562,10 @@ fn leftover_miss_dumps_probe_diag() {
     let ghost = [0xDDu8; 32];
     let need = vec![(Fk(1), vec![child_spend(ghost, 0xaa)])];
     let _ = plan_applies(&q, &need, 1, &empty, None);
+    assert_eq!(q.confirm_stats().last_union_miss().txid, Some(ghost));
     assert!(
-        rbitcoin_store::leftover_probe_diag_recorded(&ghost),
-        "leftover miss must hop-dump this parent"
+        rbitcoin_store::leftover_probe_diag_ready(),
+        "leftover miss must hop-dump"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

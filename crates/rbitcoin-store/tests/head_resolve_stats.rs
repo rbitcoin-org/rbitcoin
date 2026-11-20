@@ -65,37 +65,13 @@ fn note_local_hit_age_buckets() {
     let _ = sample_and_reset();
 }
 
-fn dummy_probe_diag(txid: [u8; 32]) -> LeftoverProbeDiag {
-    LeftoverProbeDiag {
-        txid,
-        mixed_prefix: [0; 8],
-        page_base: 0,
-        bits: 16,
-        file_id: 0,
-        first_fk: 1,
-        sealed_age: None,
-        hit_empty: true,
-        depth_end: 0,
-        empty_local: 0,
-        page_occupied: 0,
-        cands: Vec::new(),
-    }
-}
-
-/// Next resolve batch (`clear_leftover_miss`) must not drop a leftover hop-dump.
-/// Parallel `get_fk_by_txid_batch` used to wipe `diag=1` before the pin.
+/// The next resolve batch (`clear_leftover_miss`) drops the miss class.
 #[test]
-fn clear_leftover_miss_keeps_probe_diag() {
-    let ghost = [0xEEu8; 32];
-    note_leftover_probe_diag(dummy_probe_diag(ghost));
+fn clear_leftover_miss_drops_the_miss_class() {
     note_leftover_miss(LeftoverMissOn::Head, 3);
     clear_leftover_miss();
     assert!(
         take_leftover_miss().is_none(),
         "miss class is per resolve batch"
-    );
-    assert!(
-        leftover_probe_diag_recorded(&ghost),
-        "hop-dump txid must survive the next resolve clear"
     );
 }

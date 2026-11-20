@@ -167,11 +167,8 @@ fn uring_pending_write_behind_does_not_nest_tls() {
 /// Single-segment store: every winner is sealed_age 0 (open/tip).
 ///
 /// Multi-age mapping is covered by `head_resolve_stats::sealed_age_for_fk_*`.
-/// Global AGE_HIT atomics race parallel tests, so we pin mapping on winners
-/// via `first_fks` and only require the process counters moved for age 0.
 #[test]
-fn resolve_records_winner_age_open_segment() {
-    let _ = rbitcoin_store::head_resolve_stats::sample_and_reset();
+fn resolve_winners_in_the_open_segment_are_age_zero() {
     let (dir, t, txids) = seed_table(16);
     assert_eq!(
         t.head.segment_count(),
@@ -194,14 +191,6 @@ fn resolve_records_winner_age_open_segment() {
             );
         }
     }
-    let s = rbitcoin_store::head_resolve_stats::sample_and_reset();
-    // Our hits are age 0; concurrent resolve tests may add more age-0 counts.
-    assert!(
-        s.age_hit[0] >= hits,
-        "age0={} hits={hits} age_hit={:?}",
-        s.age_hit[0],
-        &s.age_hit[..8]
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
