@@ -650,6 +650,14 @@ fn s4_weight_4_000_000_accepts_4_000_001_rejects() {
 /// the merkle check, so a body the header does not commit to fails as a
 /// merkle mismatch, never as a rule the hash could be blamed for.
 #[test]
+fn s5_rejects_duplicate_txid() {
+    let t = non_coinbase_spend(7);
+    let b = block_with(vec![coinbase(1), t.clone(), t]);
+    let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
+    assert_bad_block(err, "duplicate txid");
+}
+
+#[test]
 fn body_rules_run_after_the_header_merkle_check() {
     let cb = coinbase(1);
     let (a, b) = (non_coinbase_spend(1), non_coinbase_spend(2));

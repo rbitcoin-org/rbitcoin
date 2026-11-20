@@ -128,7 +128,7 @@ compiled. A regtest node with those features on would disagree with us.
 | Regtest: no retarget, halving every 150 | `ChainParams::regtest`, `block_subsidy` | `params.rs` network asserts; `p1_block_subsidy_halvings` |
 | Genesis hash | `check_header` → `check_genesis_hash` | `header_and_spending_boundaries`; `validate_header_genesis_and_bad_prev` |
 | Only the first transaction is a coinbase | `reject_bad_block_tx_layout` | consensus-tests S3, `rpc_regtest_from_genesis` |
-| Duplicate txids, even when they are not an adjacent merkle pair | `validate_block_structure_with_pres` | consensus-tests S5, `rpc_regtest_mature_chain_ops` |
+| Duplicate txids, even when they are not an adjacent merkle pair | `validate_block_structure_with_pres` | `s5_rejects_duplicate_txid` |
 | Coinbase-less body that contains a 64-byte stripped tx is mutated (Core `IsBlockMutated`). The block is already invalid. This is not the BIP54 ban | `reject_bad_block_tx_layout` | `no_coinbase_with_a_64_byte_tx_is_mutated` |
 | Genesis coinbase is not a coin | `facts::reject_genesis_coinbase_spend` | `header_and_spending_boundaries` |
 | `OP_RETURN`, or a script longer than 10,000 bytes, is not a coin | `policy::is_unspendable`, `facts::reject_unspendable_prevout` | `spending_an_unspendable_output_is_missing_prevout` |
