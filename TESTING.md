@@ -116,7 +116,7 @@ Tests assert shipped behavior via session or table instance stats or on-disk
 file state, not thread-local hot-path IO probes. Do not:
 
 - Put HOLD / wait hooks in a shipped function other tests also call (`confirm_scripts_phase`).
-- Assert process-global last-writer meters as the contract. Confirm / query / IBD window meters are instance-owned (`Query::confirm_stats`, take-and-reset). Pin two engines, not crate-root atomics. Store head-resolve window meters and `last_union_miss` / leftover probe diag remain process-global; use pin/layout, error strings, or a pure formatter.
+- Assert process-global last-writer meters as the contract. Confirm / query / IBD window meters are instance-owned (`Query::confirm_stats`, take-and-reset). Pin two engines, not crate-root atomics. `last_union_miss` is instance-owned too (`Query::confirm_stats().last_union_miss()`). Store head-resolve window meters and the leftover probe diag (`leftover_probe_diag_ready`, `take_leftover_probe_diag`) remain process-global; use pin/layout, error strings, the captured WARN line, or a pure formatter.
 - Thread-local `test_take_*` IO probes on store hot paths (example of the rule above; assert session/table instance stats or file state). Class A three-stem append is the bytes on disk after the append, not `test_take_pwrite_waves` or an SQE counter (`tls_take_max_batch_pwrite_n`).
 - `std::env::set_var` without the crate lock (or pass the knob as an argument).
 - Bind a fixed port (use `:0`) or share a `/tmp` path (use `rbitcoin_store::testutil::TempDir` / `tiny_store`, `rbitcoin_query::testutil::tiny_query`, net `tiny_regtest_hub`, or `rbitcoin_test::TestDatadir`). Bind a Unix socket in `TempDir::for_socket`: macOS `sun_path` is 104 bytes and its default `TMPDIR` takes about half.

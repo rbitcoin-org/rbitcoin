@@ -1830,6 +1830,54 @@ fn reclaim_folds_in_rounds_and_carries_nothing_it_may_fold() {
     }
 }
 
+/// A checkpoint that hot-folds many pages over many rounds folds each
+/// page's latest note: every page reads its round-2 value, before and
+/// after a reopen.
+#[test]
+fn many_fold_rounds_keep_each_pages_latest_note() {
+    const FOLD_PAGES: u64 = 64;
+    let d = dir();
+    let mut body = spent_body(FOLD_PAGES);
+    let policy = Policy {
+        fold_round_pages: 8,
+        ..Policy::DEFAULT
+    };
+    let log = SpendPageLog::create_with(&d, policy).unwrap();
+    log.adopt_v29(Vec::new(), 0, &body).unwrap();
+    let note = |round: u8| {
+        let notes: Vec<(u64, [u8; 8])> = (0..FOLD_PAGES)
+            .map(|page| (page * 4096 + 16, page_meta(page, round)))
+            .collect();
+        log.note_slots(&notes).unwrap();
+    };
+    note(1);
+    folding_commit(&log, 1, |_| Ok(true), &mut body, None).unwrap();
+    note(2);
+    let r = reporting_commit(&log, 2, |_| Ok(true), &mut body, Some(u32::MAX)).unwrap();
+    // Page 0 holds the `spent.body` header and never folds.
+    assert_eq!(r.hot_folds, FOLD_PAGES - 1, "{r:?}");
+    assert!(r.fold_rounds >= (FOLD_PAGES - 1) / 8, "{r:?}");
+    // The fold writes each page's committed record into `spent.body`;
+    // round 2's notes are the checkpoint's new record.
+    for page in 1..FOLD_PAGES {
+        assert_eq!(body.slot(page * 4096 + 16), page_meta(page, 1));
+    }
+    for page in 0..FOLD_PAGES {
+        assert_eq!(
+            read_through(&log, &body, page * 4096 + 16),
+            page_meta(page, 2)
+        );
+    }
+    drop(log);
+    let log = SpendPageLog::load_with(&d, &mut body, policy).unwrap();
+    for page in 0..FOLD_PAGES {
+        assert_eq!(
+            read_through(&log, &body, page * 4096 + 16),
+            page_meta(page, 2)
+        );
+    }
+}
+
 /// A checkpoint merges each touched page's notes over its committed
 /// record into one record: it keeps every committed slot, before, between
 /// and after the notes, and a note wins over the committed slot it rewrites.
@@ -2651,6 +2699,7 @@ fn folds_run_in_rounds() {
     assert_eq!(body.syncs - syncs, 3);
     for page in 1..6 {
         assert_eq!(body.slot(page * 4096 + 8), page_meta(page, 1));
+        assert_eq!(read_through(&log, &body, page * 4096 + 400 * 8), [9u8; 8]);
     }
 }
 
