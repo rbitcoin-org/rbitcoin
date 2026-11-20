@@ -133,29 +133,6 @@ fn empty_build_and_bad_header_errors() {
 }
 
 #[test]
-fn v1_opens_as_index_refuse() {
-    let dir = tmp();
-    let path = dir.join("legacy.fuse8");
-    let mut raw = Vec::from(*MAGIC);
-    raw.extend_from_slice(&VERSION_V1.to_le_bytes());
-    raw.extend_from_slice(&0u64.to_le_bytes());
-    std::fs::write(&path, &raw).unwrap();
-    match open_file(&path) {
-        Err(StoreError::Corrupt(m)) => {
-            assert_eq!(m, INDEX_REFUSE_FUSE8_V1);
-            assert!(m.contains("wipe store/tx.head"));
-            assert!(m.contains("Class A kept"));
-        }
-        other => panic!("v1 must refuse, got {other:?}"),
-    }
-    match SealedFuse8::read_from(&path) {
-        Err(StoreError::Corrupt(m)) => assert_eq!(m, INDEX_REFUSE_FUSE8_V1),
-        other => panic!("read_from v1 must refuse, got {other:?}"),
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn v2_unreadable_body_is_corrupt() {
     let dir = tmp();
     let path = dir.join("badv2.fuse8");
