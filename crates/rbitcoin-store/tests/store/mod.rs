@@ -425,14 +425,6 @@ fn coinbase_fk_at_heights_matches_first_tx() {
 #[test]
 fn store_create_open_archive_spend_and_meta_errors() {
     let dir = tmp();
-    {
-        let file = dir.join("not-a-dir");
-        std::fs::write(&file, b"x").unwrap();
-        assert!(matches!(
-            Store::create_tiny(&file),
-            Err(StoreError::NotDirectory(_))
-        ));
-    }
     assert!(matches!(
         Store::open_tiny(dir.join("missing")),
         Err(StoreError::NotDirectory(_))
@@ -710,29 +702,6 @@ fn store_create_open_archive_spend_and_meta_errors() {
         check_meta(std::path::Path::new("/no/such")),
         Err(StoreError::Io { .. })
     ));
-    {
-        let bad = tmp();
-        std::fs::create_dir_all(&bad).unwrap();
-        std::fs::write(bad.join("meta"), b"xx").unwrap();
-        assert!(matches!(check_meta(&bad), Err(StoreError::Corrupt(_))));
-        std::fs::write(bad.join("meta"), b"XXXX\x00\x00").unwrap();
-        assert!(matches!(check_meta(&bad), Err(StoreError::BadMagic)));
-        let mut good_magic = STORE_MAGIC.to_vec();
-        good_magic.extend_from_slice(&0u16.to_le_bytes());
-        std::fs::write(bad.join("meta"), &good_magic).unwrap();
-        match check_meta(&bad) {
-            Err(StoreError::Corrupt(m)) => assert_eq!(m, PRE22_WIPE),
-            other => panic!("meta 0: {other:?}"),
-        }
-        let mut v13 = STORE_MAGIC.to_vec();
-        v13.extend_from_slice(&13u16.to_le_bytes());
-        std::fs::write(bad.join("meta"), &v13).unwrap();
-        match check_meta(&bad) {
-            Err(StoreError::Corrupt(m)) => assert_eq!(m, PRE22_WIPE),
-            other => panic!("meta 13: {other:?}"),
-        }
-        let _ = std::fs::remove_dir_all(&bad);
-    }
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
 }

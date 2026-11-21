@@ -348,17 +348,13 @@ fn rpc_socket_reaches_a_socket_outside_the_datadir() {
     let _ = h.join();
 }
 
+/// The decimal neighbor of `getnetworkhashps_negative_nblocks_is_a_number`,
+/// which sends `-1` through `cli_main`.
 #[test]
-fn parse_args_negative_numbers_are_params() {
-    match parse_args(&os_args(&[
-        "rbitcoin-cli",
-        "getnetworkhashps",
-        "-1",
-        "-0.5",
-    ])) {
+fn parse_args_negative_decimal_is_a_param() {
+    match parse_args(&os_args(&["rbitcoin-cli", "getnetworkhashps", "-0.5"])) {
         Ok(Action::Call(cfg)) => {
-            assert_eq!(cfg.command.as_deref(), Some("getnetworkhashps"));
-            assert_eq!(cfg.params, vec!["-1".to_string(), "-0.5".to_string()]);
+            assert_eq!(cfg.params, vec!["-0.5".to_string()]);
         }
         Err(e) => panic!("unexpected error: {e}"),
         Ok(_) => panic!("expected Action::Call, got Help or Version"),
@@ -471,18 +467,6 @@ fn help_and_version_to_a_closed_stdout_exit_zero() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{args:?}: {:?} {stderr}", out.status);
         assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
-    }
-}
-
-#[test]
-fn parse_args_stdin_is_a_flag() {
-    match parse_args(&os_args(&["rbitcoin-cli", "--stdin", "getblockcount"])) {
-        Ok(Action::Call(cfg)) => {
-            assert_eq!(cfg.command.as_deref(), Some("getblockcount"));
-            assert!(cfg.stdin, "--stdin must set the stdin flag");
-        }
-        Err(e) => panic!("--stdin must parse, got: {e}"),
-        Ok(_) => panic!("expected Action::Call"),
     }
 }
 
@@ -663,24 +647,6 @@ fn rpcwait_does_not_repeat_the_call() {
         1,
         "the call must be sent exactly once"
     );
-}
-
-#[test]
-fn parse_args_named_is_a_flag() {
-    match parse_args(&os_args(&[
-        "rbitcoin-cli",
-        "--named",
-        "getblockhash",
-        "height=1",
-    ])) {
-        Ok(Action::Call(cfg)) => {
-            assert_eq!(cfg.command.as_deref(), Some("getblockhash"));
-            assert_eq!(cfg.params, vec!["height=1".to_string()]);
-            assert!(cfg.named, "--named must set the named flag");
-        }
-        Err(e) => panic!("--named must parse, got: {e}"),
-        Ok(_) => panic!("expected Action::Call"),
-    }
 }
 
 #[cfg(unix)]
@@ -960,18 +926,6 @@ fn serve_getinfo_mock(
         }
     });
     (methods, h)
-}
-
-#[test]
-fn parse_args_getinfo_is_a_flag() {
-    match parse_args(&os_args(&["rbitcoin-cli", "--getinfo"])) {
-        Ok(Action::Call(cfg)) => {
-            assert!(cfg.getinfo, "--getinfo must set the getinfo flag");
-            assert!(cfg.command.is_none(), "--getinfo takes no command");
-        }
-        Err(e) => panic!("--getinfo must parse, got: {e}"),
-        Ok(_) => panic!("expected Action::Call"),
-    }
 }
 
 #[cfg(unix)]

@@ -546,6 +546,8 @@ fn v1_fuse_and_mono_head_refuse_open() {
     match SegmentedTxHead::open(&dir) {
         Err(StoreError::Corrupt(m)) => {
             assert_eq!(m, rbitcoin_store::fuse8_filter::INDEX_REFUSE_FUSE8_V1);
+            assert!(m.contains("wipe store/tx.head"), "{m}");
+            assert!(m.contains("Class A kept"), "{m}");
         }
         Ok(_) => panic!("v1 fuse must refuse SegmentedTxHead::open"),
         Err(other) => panic!("expected INDEX_REFUSE_FUSE8_V1, got {other}"),

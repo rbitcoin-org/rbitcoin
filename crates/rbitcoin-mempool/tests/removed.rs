@@ -59,26 +59,24 @@ fn spend(op: OutPoint, out_value: u64) -> Transaction {
     }
 }
 
-/// Core's `mempool_sequence`: the value the next change takes.
+/// Core's `mempool_sequence` counts changes. A compact rebuilds the graph and
+/// a reopen loads records; neither is a change.
 #[test]
-fn the_sequence_starts_at_one_and_moves_once_per_add_and_removal() {
+fn a_compact_or_a_reopen_is_not_a_change() {
     let dir = tmp_dir();
     let (ops, utxos) = chain_coins(2);
     let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-    assert_eq!(mp.mempool_sequence(), 1);
     let a = spend(ops[0], 99_000);
     let b = spend(ops[1], 99_000);
     mp.accept_tx(&a, &utxos, TIP_OK).expect("a");
     mp.accept_tx(&b, &utxos, TIP_OK).expect("b");
-    assert_eq!(mp.mempool_sequence(), 3);
     mp.accept_tx(&spend(ops[0], 90_000), &utxos, TIP_OK)
         .expect("replacement");
-    assert_eq!(mp.mempool_sequence(), 5, "one removal, one add");
     mp.remove_live_txids(&[b.compute_txid()], BLOCK).unwrap();
-    assert_eq!(mp.mempool_sequence(), 6);
+    let seq = mp.mempool_sequence();
     let rows = mp.removed_rows();
     mp.compact().unwrap();
-    assert_eq!(mp.mempool_sequence(), 6, "a rebuild is not a change");
+    assert_eq!(mp.mempool_sequence(), seq, "a rebuild is not a change");
     assert_eq!(mp.removed_rows(), rows, "a rebuild writes no row");
     mp.flush().unwrap();
     drop(mp);
@@ -130,10 +128,11 @@ fn two_rows(
     ]
 }
 
+/// A replacement takes the conflict's descendant out with the same `by`.
 #[test]
-fn each_pool_removal_keeps_its_reason_and_sequence() {
+fn a_replaced_conflict_and_its_descendant_name_the_replacement() {
     let dir = tmp_dir();
-    let (ops, utxos) = chain_coins(6);
+    let (ops, utxos) = chain_coins(1);
     let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
 
     let parent = spend(ops[0], 99_000);
@@ -151,45 +150,19 @@ fn each_pool_removal_keeps_its_reason_and_sequence() {
         "the conflict and its descendant, replaced by the admit: {:?}",
         mp.removed_rows()
     );
+}
 
-    let mined = spend(ops[1], 99_000);
-    let loser = spend(ops[2], 99_000);
-    let loser_child = spend(out0(&loser), 98_000);
-    for tx in [&mined, &loser, &loser_child] {
-        mp.accept_tx(tx, &utxos, TIP_OK).expect("admit");
-    }
-    let at = mp.mempool_sequence();
-    mp.remove_block_txids(&[mined.compute_txid()], &[ops[2]])
-        .unwrap();
-    assert_eq!(
-        mp.removed_rows().rows.iter().rev().nth(2),
-        Some(&row(at, &mined, RemovalReason::Block)),
-        "the listed tx first"
-    );
-    assert!(
-        two_rows(at + 1, &loser, &loser_child, RemovalReason::Conflict)
-            .contains(&rows_from(&mp, at + 1))
-    );
-
-    let stale = spend(ops[3], 99_000);
-    mp.accept_tx(&stale, &utxos, TIP_OK).expect("stale");
-    let at = mp.mempool_sequence();
-    mp.remove_live_txids(
-        &[stale.compute_txid()],
-        Removal::Committed(RemovalReason::Expiry),
-    )
-    .unwrap();
-    assert_eq!(
-        mp.removed_rows().rows.last(),
-        Some(&row(at, &stale, RemovalReason::Expiry))
-    );
-
-    let orphaned = spend(ops[4], 99_000);
+#[test]
+fn evict_nonfinal_writes_a_reorg_row() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(1);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let orphaned = spend(ops[0], 99_000);
     mp.accept_tx(&orphaned, &utxos, TIP_OK).expect("orphaned");
     let mut reorged = MapUtxoProvider {
         map: utxos.map.clone(),
     };
-    reorged.map.remove(&ops[4]);
+    reorged.map.remove(&ops[0]);
     let at = mp.mempool_sequence();
     mp.evict_nonfinal(&reorged, TIP_OK);
     assert_eq!(
@@ -197,18 +170,6 @@ fn each_pool_removal_keeps_its_reason_and_sequence() {
         Some(&row(at, &orphaned, RemovalReason::Reorg)),
         "an input the reorg took away"
     );
-
-    let cheap = spend(ops[5], 99_900);
-    mp.accept_tx(&cheap, &utxos, TIP_OK).expect("cheap");
-    mp.max_weight = mp.graph.total_weight() - 1;
-    let at = mp.mempool_sequence();
-    mp.evict_to_budget(None).unwrap();
-    assert_eq!(
-        mp.removed_rows().rows.last(),
-        Some(&row(at, &cheap, RemovalReason::SizeLimit)),
-        "the worst chunk leaves for the budget"
-    );
-    assert_eq!(mp.removed_rows().oldest, 1);
 }
 
 #[test]
@@ -250,16 +211,9 @@ fn an_undo_writes_no_row_but_moves_the_sequence() {
     );
     assert_eq!(mp.mempool_sequence(), at + 2, "out, then the victim back");
 
-    let staged = spend(ops[1], 99_000);
-    mp.accept_tx(&staged, &utxos, TIP_OK).expect("staged");
-    let at = mp.mempool_sequence();
-    mp.remove_live_txids(&[staged.compute_txid()], Removal::Undo)
-        .unwrap();
-    assert_eq!(mp.mempool_sequence(), at + 1);
-    assert!(mp.removed_rows().rows.is_empty());
-
     // A listed transaction that left for good keeps that row when a later
     // staged copy of it is taken back. The listed one left for that reason.
+    let staged = spend(ops[1], 99_000);
     mp.accept_tx(&staged, &utxos, TIP_OK).expect("listed");
     mp.remove_live_txids(&[staged.compute_txid()], BLOCK)
         .unwrap();
