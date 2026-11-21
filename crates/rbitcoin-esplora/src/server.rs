@@ -1703,6 +1703,13 @@ pub fn tx_body_source(
     }
 }
 
+/// Parse a `/scripthash/:hash` segment or POST entry: SHA256(scriptPubKey)
+/// hex in digest order, as electrs `parse_scripthash` reads it. Not reversed.
+#[allow(clippy::result_unit_err)] // bad hex is (); callers map it to not found
+pub fn parse_scripthash(s: &str) -> Result<[u8; 32], ()> {
+    rbitcoin_primitives::parse_hash32_hex(s).map_err(|_| ())
+}
+
 pub fn mempool_wire(st: &AppState, txid: &[u8; 32]) -> Option<bitcoin::Transaction> {
     use bitcoin::hashes::Hash;
     let tid = bitcoin::Txid::from_byte_array(*txid);

@@ -8,7 +8,7 @@ use crate::server::{
     stored_tx_listing, AppState,
 };
 #[cfg(unix)]
-use crate::server::{not_found, AsOf};
+use crate::server::{not_found, parse_scripthash, AsOf};
 #[cfg(unix)]
 use crate::tx_json::{
     build_tx_json, build_tx_json_from_tx, build_tx_json_from_tx_with_status, tx_status_json,
@@ -360,7 +360,7 @@ pub async fn get_internal_scripthash(
     Path(sh_hex): Path<String>,
     AsOf(asof): AsOf,
 ) -> Response {
-    let Ok(sh) = parse_hash32(&sh_hex) else {
+    let Ok(sh) = parse_scripthash(&sh_hex) else {
         return not_found();
     };
     spawn_join(move || {
@@ -395,7 +395,7 @@ pub async fn get_internal_scripthash_history(
     Path(sh_hex): Path<String>,
     AsOf(asof): AsOf,
 ) -> Response {
-    let Ok(sh) = parse_hash32(&sh_hex) else {
+    let Ok(sh) = parse_scripthash(&sh_hex) else {
         return not_found();
     };
     sh_history_stream(st, sh, asof).await

@@ -1,5 +1,5 @@
 async fn cap_refuses_three_creates(q: &Query, app: &Router) {
-    let h51 = block_hash_hex(&script_hash(&[0x51]));
+    let h51 = hex_encode(script_hash(&[0x51]));
     q.set_max_sh_creates(2);
     let (st, body) = oneshot_http(app, get_with_client(&format!("/scripthash/{h51}"), "cap")).await;
     assert_eq!(st, 503, "{body}");
@@ -31,7 +31,7 @@ async fn cap_refuses_three_creates(q: &Query, app: &Router) {
 
 async fn casa_reuses_last_slot(app: &Router, cache: &Mutex<JoinCache>) {
     let sh = script_hash(&[0x51]);
-    let h51 = block_hash_hex(&sh);
+    let h51 = hex_encode(sh);
     let (st, body) = oneshot_http(app, get_with_client(&format!("/scripthash/{h51}"), "casa")).await;
     assert_eq!(st, 200, "{body}");
     let info: Value = serde_json::from_str(&body).unwrap();
@@ -63,8 +63,8 @@ async fn two_addresses_each_have_one_utxo(app: &Router, a1: &str, a2: &str) {
 }
 
 async fn last1_and_second_client(app: &Router, cache: &Mutex<JoinCache>, sh1: [u8; 32], sh2: [u8; 32]) {
-    let h1hex = block_hash_hex(&sh1);
-    let h2hex = block_hash_hex(&sh2);
+    let h1hex = hex_encode(sh1);
+    let h2hex = hex_encode(sh2);
     let (st, body) = oneshot_http(app, get_with_client(&format!("/scripthash/{h1hex}"), "c1")).await;
     assert_eq!(st, 200, "{body}");
     assert_eq!(cache.lock().unwrap().last_sh_key("c1"), Some(sh1));
@@ -96,8 +96,8 @@ async fn bulk_page_leaves_wallet_slot_empty(
     sh1: [u8; 32],
     sh2: [u8; 32],
 ) {
-    let h1hex = block_hash_hex(&sh1);
-    let h2hex = block_hash_hex(&sh2);
+    let h1hex = hex_encode(sh1);
+    let h2hex = hex_encode(sh2);
     let t1 = block_hash_hex(&[
         0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0xaa,
@@ -196,8 +196,8 @@ fn row_txids(rows: &[Value]) -> Vec<&str> {
 async fn multi_page_is_one_newest_window_per_script() {
     let (_a, spk_a) = regtest_p2wpkh();
     let (_b, spk_b) = regtest_p2wpkh_sk(9);
-    let sh_a = block_hash_hex(&script_hash(spk_a.as_bytes()));
-    let sh_b = block_hash_hex(&script_hash(spk_b.as_bytes()));
+    let sh_a = hex_encode(script_hash(spk_a.as_bytes()));
+    let sh_b = hex_encode(script_hash(spk_b.as_bytes()));
     let (dir, q) = temp_query("multi-window");
     let (h0, cb0) = coinbase(0, Fk::NULL, None);
     let mut prev = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
@@ -265,7 +265,7 @@ fn same_height_pay(mark: u8, second: u8, spk: bitcoin::ScriptBuf) -> TxApply {
 #[tokio::test]
 async fn multi_page_same_height_follows_internal_txid() {
     let (_a, spk) = regtest_p2wpkh();
-    let sh = block_hash_hex(&script_hash(spk.as_bytes()));
+    let sh = hex_encode(script_hash(spk.as_bytes()));
     let (dir, q) = temp_query("same-height-page");
     let (h0, cb0) = coinbase(0, Fk::NULL, None);
     let prev = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
@@ -288,7 +288,7 @@ async fn multi_page_same_height_follows_internal_txid() {
 }
 
 async fn untrusted_header_is_ignored(q: Arc<Query>, sh1: [u8; 32]) {
-    let h1hex = block_hash_hex(&sh1);
+    let h1hex = hex_encode(sh1);
     let public = Arc::new(Mutex::new(JoinCache::default()));
     let pub_app = app_with_join(Arc::clone(&q), Arc::clone(&public), false);
     let plain = axum::http::Request::builder()
@@ -461,7 +461,7 @@ async fn address_page_under_cap_matches_summary() {
 /// and every other script answers 503 too until the rebuild publishes a head.
 #[tokio::test]
 async fn torn_key_read_is_503_for_every_script_until_rebuilt() {
-    use rbitcoin_primitives::scripthash_display_hex as display;
+    let display = |s: &[u8]| hex_encode(script_hash(s));
     use rbitcoin_query::testutil::{heavy_sh_extent_query, tear_sh_extent_head, SH_HEAVY_SCRIPT};
     let (dir, q, key) = heavy_sh_extent_query("esplora-torn", 0);
     let q = Arc::new(q);

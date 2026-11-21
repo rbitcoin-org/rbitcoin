@@ -12,6 +12,7 @@ use rbitcoin_electrum::ServeLimits;
 use rbitcoin_esplora::handlers;
 use rbitcoin_esplora::server::*;
 use rbitcoin_esplora::tx_json::tx_status_json;
+use rbitcoin_primitives::hex_encode;
 use rbitcoin_primitives::Fk;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
@@ -668,7 +669,7 @@ async fn with_sh_join_last1_clone_visible_to_overlapping_get() {
         .unwrap();
     let q = Arc::new(q);
     let sh1 = script_hash(spk1.as_bytes());
-    let h1hex = block_hash_hex(&sh1);
+    let h1hex = hex_encode(sh1);
     let cache = Arc::new(Mutex::new(JoinCache::default()));
     let app = app_with_join(Arc::clone(&q), Arc::clone(&cache), true);
     let (st, body) =
@@ -1521,8 +1522,7 @@ async fn block_raw_summary_status_and_mempool_routes() {
     assert_eq!(st, 200, "no mempool, no rows: {body}");
     assert_eq!(body, r#"{"oldest":1,"removed":[]}"#);
 
-    let sh = rbitcoin_store::script_hash(&[0x51]);
-    let sh_hex = block_hash_hex(&sh);
+    let sh_hex = hex_encode(rbitcoin_store::script_hash(&[0x51]));
     let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/mempool")).await;
     assert_eq!(st, 200, "{body}");
     assert_eq!(body, "[]");

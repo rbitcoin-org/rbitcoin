@@ -23,6 +23,14 @@ fn us(nanos: u64) -> u64 {
     nanos / 1000
 }
 
+/// Targets are Electrum (display-order) scripthashes. Esplora's path takes
+/// the SHA-256 digest unreversed.
+fn esplora_sh(target: &str) -> Result<String, String> {
+    rbitcoin_primitives::parse_display_hash32(target)
+        .map(rbitcoin_primitives::hex_encode)
+        .map_err(|e| format!("scripthash {target}: {e}"))
+}
+
 fn fill_key_meta(row: &mut KeyRow, hist: &Value, utxo: &Value, txs: u64, utxos: u64) {
     let (lo, hi) = jsonrpc::height_span(hist);
     row.oldest_tx = lo;
@@ -148,10 +156,15 @@ pub async fn esplora_casa(
             scripthash: sh.clone(),
             ..KeyRow::default()
         };
+        let path_sh = esplora_sh(sh)?;
         for pass in 0..total {
-            let (info, ins) = client.get_json(&format!("/scripthash/{sh}")).await?;
-            let (txs, tns) = client.get_json(&format!("/scripthash/{sh}/txs")).await?;
-            let (utxo, uns) = client.get_json(&format!("/scripthash/{sh}/utxo")).await?;
+            let (info, ins) = client.get_json(&format!("/scripthash/{path_sh}")).await?;
+            let (txs, tns) = client
+                .get_json(&format!("/scripthash/{path_sh}/txs"))
+                .await?;
+            let (utxo, uns) = client
+                .get_json(&format!("/scripthash/{path_sh}/utxo"))
+                .await?;
             let history_n = info
                 .pointer("/chain_stats/tx_count")
                 .and_then(|v| v.as_u64())
@@ -499,9 +512,14 @@ async fn esplora_one_wallet(
         let t0 = Instant::now();
         let mut probed: Vec<(String, u64, u64)> = Vec::with_capacity(keys.len());
         for sh in &keys {
-            let (info, ins) = client.get_json(&format!("/scripthash/{sh}")).await?;
-            let (txs_v, tns) = client.get_json(&format!("/scripthash/{sh}/txs")).await?;
-            let (utxo, uns) = client.get_json(&format!("/scripthash/{sh}/utxo")).await?;
+            let path_sh = esplora_sh(sh)?;
+            let (info, ins) = client.get_json(&format!("/scripthash/{path_sh}")).await?;
+            let (txs_v, tns) = client
+                .get_json(&format!("/scripthash/{path_sh}/txs"))
+                .await?;
+            let (utxo, uns) = client
+                .get_json(&format!("/scripthash/{path_sh}/utxo"))
+                .await?;
             let hn = info
                 .pointer("/chain_stats/tx_count")
                 .and_then(|v| v.as_u64())
@@ -998,5 +1016,33 @@ mod tests {
             2
         );
         assert_eq!(out.clients.len(), 2);
+    }
+
+    /// Targets are Electrum order. Esplora takes the digest unreversed, so
+    /// `00ff…ff` is asked for as `ff…ff00`, which the mock serves as fat.
+    #[tokio::test]
+    async fn esplora_clients_send_digest_order() {
+        let url = spawn_esplora_many().await;
+        let small = "aa".repeat(32);
+        let fat = format!("00{}", "ff".repeat(31));
+        let progress = Arc::new(Mutex::new(Progress::start("esplora order", 2)));
+        let out = esplora_clients(
+            &url,
+            Duration::from_secs(2),
+            vec![vec![small, fat]],
+            &ClientsOpts {
+                warmup: 0,
+                passes: 2,
+                batch: 50,
+                max_txs: 1000,
+                max_utxos: 100,
+            },
+            progress,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.clients.len(), 1);
+        assert_eq!(out.clients[0].n_keys, 1);
+        assert_eq!(out.clients[0].txs, 1);
     }
 }

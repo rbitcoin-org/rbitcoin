@@ -43,8 +43,13 @@ GARBAGE_TX = "01000000000000000000"
 
 
 def electrum_scripthash(script: bytes) -> str:
-    """Electrum / Esplora display-order scripthash: reverse(sha256(script))."""
+    """Electrum display-order scripthash: reverse(sha256(script))."""
     return hashlib.sha256(script).digest()[::-1].hex()
+
+
+def esplora_scripthash(script: bytes) -> str:
+    """Esplora scripthash: sha256(script) hex, not reversed (electrs)."""
+    return hashlib.sha256(script).hexdigest()
 
 
 def ms_since(t0: float) -> int:
@@ -307,7 +312,7 @@ def run_esplora(r: Results, base: str, timeout: float) -> None:
     if last:
         get(f"/address/{aq}/txs/chain/{last}")
 
-    sh = electrum_scripthash(bytes([0x51]))
+    sh = esplora_scripthash(bytes([0x51]))
     get(f"/scripthash/{sh}")
     get(f"/scripthash/{sh}/utxo")
     get(f"/scripthash/{sh}/txs")

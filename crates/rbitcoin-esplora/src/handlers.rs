@@ -2,8 +2,8 @@
 
 use crate::server::{
     block_hash_hex, json_reply_here, json_reply_shared, maybe_attach_view, not_found, parse_hash32,
-    pin_or_reject, plain_ok, store_err, stored_tx_listing, tx_body_source, AppState, AsOf,
-    GbtCache, JoinClient, TxBody,
+    parse_scripthash, pin_or_reject, plain_ok, store_err, stored_tx_listing, tx_body_source,
+    AppState, AsOf, GbtCache, JoinClient, TxBody,
 };
 use crate::tx_json::{
     build_tx_json, build_tx_json_from_tx, history_items_to_tx_json, pool_settle, tx_status_json_in,
@@ -1106,7 +1106,7 @@ pub async fn scripthash_info(
     AsOf(asof): AsOf,
     JoinClient(client): JoinClient,
 ) -> Response {
-    let Ok(sh) = parse_hash32(&sh_hex) else {
+    let Ok(sh) = parse_scripthash(&sh_hex) else {
         return not_found();
     };
     spawn_join(move || sh_info_reply(&st, &sh, None, Some(&sh_hex), asof, client.as_deref())).await
@@ -1146,7 +1146,7 @@ pub async fn scripthash_utxo(
     AsOf(asof): AsOf,
     JoinClient(client): JoinClient,
 ) -> Response {
-    let Ok(sh) = parse_hash32(&sh_hex) else {
+    let Ok(sh) = parse_scripthash(&sh_hex) else {
         return not_found();
     };
     spawn_join(move || utxo_response(&st, &sh, asof, client.as_deref())).await
@@ -1319,7 +1319,7 @@ pub async fn scripthash_txs(
     AxumQuery(q): AxumQuery<AfterTxidQuery>,
     JoinClient(client): JoinClient,
 ) -> Response {
-    let Ok(sh) = parse_hash32(&sh_hex) else {
+    let Ok(sh) = parse_scripthash(&sh_hex) else {
         return not_found();
     };
     let after = match parse_after_txid_query(q) {
@@ -1354,7 +1354,7 @@ pub fn chain_page(
     asof: Option<[u8; 32]>,
     client: Option<&str>,
 ) -> Response {
-    let Ok(sh) = parse_hash32(sh_hex) else {
+    let Ok(sh) = parse_scripthash(sh_hex) else {
         return not_found();
     };
     chain_page_sh(st, &sh, after, asof, client)
@@ -1431,7 +1431,7 @@ pub fn summary_page(
     asof: Option<[u8; 32]>,
     client: Option<&str>,
 ) -> Response {
-    let Ok(sh) = parse_hash32(sh_hex) else {
+    let Ok(sh) = parse_scripthash(sh_hex) else {
         return not_found();
     };
     summary_page_sh(st, &sh, after, asof, client)
@@ -1647,7 +1647,7 @@ pub fn parse_multi_scripts(
     for s in parsed {
         let sh = match kind {
             MultiKind::Address => resolve_address_sh(&s, network).ok(),
-            MultiKind::Scripthash => parse_hash32(&s).ok(),
+            MultiKind::Scripthash => parse_scripthash(&s).ok(),
         };
         if let Some(sh) = sh {
             if seen.insert(sh) {
@@ -2148,7 +2148,7 @@ pub async fn scripthash_txs_mempool(
     State(st): State<AppState>,
     Path(sh_hex): Path<String>,
 ) -> Response {
-    let Ok(sh) = parse_hash32(&sh_hex) else {
+    let Ok(sh) = parse_scripthash(&sh_hex) else {
         return not_found();
     };
     spawn_join(move || mempool_txs_for_sh(&st, &sh)).await

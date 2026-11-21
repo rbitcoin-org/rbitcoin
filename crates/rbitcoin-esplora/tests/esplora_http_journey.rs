@@ -132,7 +132,7 @@ async fn wallet_pages_after_txid(addr: SocketAddr, sh1: &str) {
 /// stays off the body. A mempool cursor keeps only the mempool tail, then
 /// that same confirmed page. An unknown cursor stays 422.
 async fn chain_cursor_matches_chain_page(pad: &HttpPad, mempool_tx: &bitcoin::Transaction) {
-    let sh = block_hash_hex(&script_hash(&[0x51]));
+    let sh = hex_encode(script_hash(&[0x51]));
     let mem_hex = display_txid(mempool_tx.compute_txid());
     let confirmed = block_hash_hex(pad.cbs.last().expect("tip coinbase"));
 
@@ -249,6 +249,27 @@ async fn wallet_posts_scripthashes(addr: SocketAddr, a: [&str; 2], sh: [&str; 2]
     assert!(resp.contains("body too long"), "{resp}");
 }
 
+/// electrs reads `/scripthash/:hash` as `sha256(scriptPubKey)` hex in digest
+/// order. The byte-reversed (Electrum) spelling names another script.
+async fn scripthash_path_is_digest_order(addr: SocketAddr, address: &str, spk: &[u8]) {
+    let digest = script_hash(spk);
+    let mut reversed = digest;
+    reversed.reverse();
+    let tx_count = |body: &str| {
+        let v: Value = serde_json::from_str(body).unwrap();
+        v["chain_stats"]["tx_count"].as_u64().unwrap()
+    };
+    let (st, by_address) = http_get(addr, &format!("/address/{address}")).await;
+    assert_eq!(st, 200, "{by_address}");
+    let (st, plain) = http_get(addr, &format!("/scripthash/{}", hex_encode(digest))).await;
+    assert_eq!(st, 200, "{plain}");
+    let (st, flipped) = http_get(addr, &format!("/scripthash/{}", hex_encode(reversed))).await;
+    assert_eq!(st, 200, "{flipped}");
+    assert!(tx_count(&by_address) > 0, "{by_address}");
+    assert_eq!(tx_count(&plain), tx_count(&by_address), "{plain}");
+    assert_eq!(tx_count(&flipped), 0, "{flipped}");
+}
+
 async fn cursor_outside_one_script_is_422(
     addr: SocketAddr,
     address: &str,
@@ -272,7 +293,7 @@ async fn cursor_outside_one_script_is_422(
 async fn tip_height_overlaps_scripthash_txs(pad: &HttpPad) {
     let addr = pad.addr;
     let t0 = Instant::now();
-    let txs_path = format!("/scripthash/{}/txs", block_hash_hex(&script_hash(&[0x51])));
+    let txs_path = format!("/scripthash/{}/txs", hex_encode(script_hash(&[0x51])));
     let h_txs = tokio::spawn(async move { http_get(addr, &txs_path).await });
     let h_tip = tokio::spawn(async move { http_get(addr, "/blocks/tip/height").await });
     let (txs, tip) = tokio::join!(h_txs, h_tip);
@@ -319,7 +340,7 @@ async fn mempool_spend_is_full_json(pad: &HttpPad) -> bitcoin::Transaction {
         pad.hub.is_local_origin(&spend.compute_txid()),
         "POST /tx is a local submit"
     );
-    let sh_hex = block_hash_hex(&script_hash(&[0x51]));
+    let sh_hex = hex_encode(script_hash(&[0x51]));
 
     let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/mempool")).await;
     assert_eq!(st, 200, "{body}");
@@ -436,7 +457,7 @@ async fn junk_paths_asof_and_post(addr: SocketAddr, genesis: &[u8; 32]) {
         }
     }
 
-    let sh = block_hash_hex(&script_hash(&[0x51]));
+    let sh = hex_encode(script_hash(&[0x51]));
     let (st, body) = http_get(
         addr,
         &format!("/scripthash/{sh}/txs/summary?asof={h0hex}"),
@@ -469,7 +490,7 @@ async fn same_height_replace_restamps(pad: &mut HttpPad) {
     assert_eq!(before["status"]["block_hash"], old_hash, "{before}");
     assert_eq!(before["scriptpubkey"], "51", "{before}");
 
-    let sh_hex = block_hash_hex(&script_hash(&[0x51]));
+    let sh_hex = hex_encode(script_hash(&[0x51]));
     let path = format!("/scripthash/{sh_hex}/utxo");
     let (st, raw_a, _) = http_get_raw(pad.addr, &path).await;
     assert_eq!(st, 200, "utxo A");
@@ -615,7 +636,7 @@ async fn mempool_cursor_past_the_page_is_the_confirmed_page() {
     for _ in 0..152u32 {
         pad.connect(Vec::new());
     }
-    let sh = block_hash_hex(&script_hash(&[0x51]));
+    let sh = hex_encode(script_hash(&[0x51]));
     let mut admitted = Vec::new();
     for i in 0..51u32 {
         let tx = Transaction {
@@ -689,7 +710,7 @@ async fn mempool_cursor_past_the_page_is_the_confirmed_page() {
     .await;
     assert_eq!(st, 200, "{posted}");
     assert_eq!(posted, chain, "a chain cursor drops the mempool page");
-    let foreign = block_hash_hex(&script_hash(&[0x00]));
+    let foreign = hex_encode(script_hash(&[0x00]));
     let (st, missing) = http_post(
         pad.addr,
         &format!("/scripthashes/txs?after_txid={first}"),
@@ -850,8 +871,8 @@ async fn batch_outputs_keep_order(pad: &HttpPad) {
 async fn esplora_tcp_wallet_mempool_and_replace() {
     let (a1, spk1) = regtest_p2wpkh();
     let (a2, spk2) = regtest_p2wpkh_sk(9);
-    let sh1 = block_hash_hex(&script_hash(spk1.as_bytes()));
-    let sh2 = block_hash_hex(&script_hash(spk2.as_bytes()));
+    let sh1 = hex_encode(script_hash(spk1.as_bytes()));
+    let sh2 = hex_encode(script_hash(spk2.as_bytes()));
 
     let (dir, q) = temp_query("esplora-tcp");
     let q = Arc::new(q);
@@ -885,6 +906,7 @@ async fn esplora_tcp_wallet_mempool_and_replace() {
     tip_headers_and_powered_by(&pad).await;
     wallet_pages_after_txid(pad.addr, &sh1).await;
     wallet_posts_scripthashes(pad.addr, [&a1, &a2], [&sh1, &sh2]).await;
+    scripthash_path_is_digest_order(pad.addr, &a1, spk1.as_bytes()).await;
     tip_height_overlaps_scripthash_txs(&pad).await;
     let spend = mempool_spend_is_full_json(&pad).await;
     chain_cursor_matches_chain_page(&pad, &spend).await;

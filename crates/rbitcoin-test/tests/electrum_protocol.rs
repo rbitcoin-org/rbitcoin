@@ -2108,6 +2108,8 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     );
 
     let sh = electrum_scripthash_hex(create_spk.as_bytes());
+    let esplora_sh =
+        rbitcoin_primitives::hex_encode(rbitcoin_store::script_hash(create_spk.as_bytes()));
     let asof_create = create_blk.block_hash().to_string();
     let asof_spend = spend_blk.block_hash().to_string();
     let tag_create = format!("asof:{asof_create}");
@@ -2256,7 +2258,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
 
     assert_esplora_asof_hides_later_spend(
         esplora.local_addr,
-        &sh,
+        &esplora_sh,
         &asof_create,
         &asof_spend,
         &create_hex,
@@ -2347,7 +2349,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     );
     let (st, raw, body) = http_get_raw(
         esplora.local_addr,
-        &format!("/scripthash/{sh}/utxo?asof={asof_spend}"),
+        &format!("/scripthash/{esplora_sh}/utxo?asof={asof_spend}"),
     )
     .await;
     assert_eq!(st, 200, "asof at SH watermark utxo body={body}");
@@ -2357,7 +2359,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     );
     assert_esplora_asof_dead(
         esplora.local_addr,
-        &format!("/scripthash/{sh}/utxo?asof={asof_lag}"),
+        &format!("/scripthash/{esplora_sh}/utxo?asof={asof_lag}"),
     )
     .await;
 
@@ -2448,7 +2450,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     );
     assert_esplora_asof_dead(
         esplora.local_addr,
-        &format!("/scripthash/{sh}/utxo?asof={asof_spend}"),
+        &format!("/scripthash/{esplora_sh}/utxo?asof={asof_spend}"),
     )
     .await;
     assert_esplora_asof_dead(
@@ -2538,7 +2540,11 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
         "asof of disconnected spend hash: {asof_dead}"
     );
 
-    let (st, raw, body) = http_get_raw(esplora.local_addr, &format!("/scripthash/{sh}/utxo")).await;
+    let (st, raw, body) = http_get_raw(
+        esplora.local_addr,
+        &format!("/scripthash/{esplora_sh}/utxo"),
+    )
+    .await;
     assert_eq!(st, 200, "live utxo after disconnect spend body={body}");
     let utxos: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(utxos.as_array().unwrap().len(), 1, "{body}");
@@ -2574,7 +2580,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     assert_eq!(st, 404, "spend status after disconnect={body}");
     assert_esplora_asof_dead(
         esplora.local_addr,
-        &format!("/scripthash/{sh}/utxo?asof={asof_spend}"),
+        &format!("/scripthash/{esplora_sh}/utxo?asof={asof_spend}"),
     )
     .await;
     assert_esplora_asof_dead(

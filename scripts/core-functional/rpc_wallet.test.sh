@@ -275,7 +275,7 @@ key.set(data[:32], True)
 pub = key.get_pubkey().get_bytes()
 p2pkh = key_to_p2pkh(pub)
 spk = bytes(address_to_scriptpubkey(p2pkh))
-sh = hashlib.sha256(spk).digest()[::-1].hex()
+sh = hashlib.sha256(spk).hexdigest()
 TXID = "22" * 32
 COOKIE = "__cookie__:secret"
 TIP = 200

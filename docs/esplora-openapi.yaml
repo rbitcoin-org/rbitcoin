@@ -12,7 +12,8 @@ info:
 
     ## Hashes
     Every txid and block hash is 64 hex characters in display order (the
-    order Core and Esplora print). `a-f` and `A-F` are both accepted, as is an
+    order Core and Esplora print). A scripthash is SHA256(scriptPubKey) in
+    digest order, not reversed. `a-f` and `A-F` are both accepted, as is an
     optional `0x` or `0X` prefix. A malformed hash in a path or in `?asof=`
     returns **404** `Not Found`.
 
@@ -1141,8 +1142,8 @@ components:
       name: scripthash
       in: path
       required: true
-      description: Electrum scripthash (SHA256 of the scriptPubKey, byte-reversed hex)
-      schema: { $ref: "#/components/schemas/Hash" }
+      description: SHA256 of the scriptPubKey, hex in digest order, as electrs reads it. Not reversed like an Electrum scripthash.
+      schema: { $ref: "#/components/schemas/Scripthash" }
     LastSeenTxid:
       { name: last_seen_txid, in: path, required: true, schema: { $ref: "#/components/schemas/Hash" } }
     AfterTxid:
@@ -1176,10 +1177,11 @@ components:
         application/json:
           schema: { type: array, maxItems: 300, items: { type: string } }
     ScripthashArray:
+      description: Scripthashes in the same form as the `scripthash` path parameter (digest order).
       required: true
       content:
         application/json:
-          schema: { type: array, maxItems: 300, items: { $ref: "#/components/schemas/Hash" } }
+          schema: { type: array, maxItems: 300, items: { $ref: "#/components/schemas/Scripthash" } }
     TxidArray:
       required: true
       content:
@@ -1268,6 +1270,10 @@ components:
     Hash:
       type: string
       description: Display-order hex. Uppercase and an optional `0x` / `0X` prefix are accepted.
+      pattern: "^(?:0[xX])?[0-9a-fA-F]{64}$"
+    Scripthash:
+      type: string
+      description: SHA256 of the scriptPubKey, hex in digest order (not reversed). Uppercase and an optional `0x` / `0X` prefix are accepted.
       pattern: "^(?:0[xX])?[0-9a-fA-F]{64}$"
     Block:
       type: object
@@ -1399,7 +1405,7 @@ components:
       required: [chain_stats, mempool_stats]
       properties:
         address: { type: string, description: present on /address/ }
-        scripthash: { $ref: "#/components/schemas/Hash" }
+        scripthash: { $ref: "#/components/schemas/Scripthash" }
         chain_stats: { $ref: "#/components/schemas/Stats" }
         mempool_stats: { $ref: "#/components/schemas/Stats" }
     TxSummary:

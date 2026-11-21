@@ -1001,7 +1001,7 @@ async fn pin_esplora_tx_json_unknown_coinbase(esplora_addr: SocketAddr, cb_txid:
 async fn pin_esplora_scripthash_pages(esplora_addr: SocketAddr) {
     use rbitcoin_store::script_hash;
 
-    let sh_hex = rbitcoin_primitives::display_hash_hex(script_hash(&[0x51]));
+    let sh_hex = rbitcoin_primitives::hex_encode(script_hash(&[0x51]));
     let (st, body) = http_get(esplora_addr, &format!("/scripthash/{sh_hex}")).await;
     assert_eq!(st, 200, "{body}");
     let info: Value = serde_json::from_str(&body).unwrap();

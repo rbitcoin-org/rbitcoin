@@ -42,23 +42,32 @@ pub fn display_hash_hex(mut h: [u8; 32]) -> String {
     encode(h)
 }
 
-/// Electrum / Esplora scripthash: SHA256(scriptPubKey) in display order.
+/// Electrum scripthash: SHA256(scriptPubKey) in display order.
 ///
 /// `sha256::Hash`'s `Display` prints internal byte order. `Txid` display
-/// does not. This is the spelling a client sends.
+/// does not. This is the spelling an Electrum client sends. Esplora takes
+/// the digest unreversed ([`parse_hash32_hex`]).
 #[inline]
 pub fn scripthash_display_hex(script: &[u8]) -> String {
     display_hash_hex(sha256::Hash::hash(script).to_byte_array())
 }
 
-/// Parse display-order 32-byte hex → internal byte order.
+/// Parse 32-byte hex in the order it is written (no reversal).
 ///
 /// `0x` / `0X` is stripped here. Any other failure is [`HexToArrayError`]:
 /// a length other than 64 characters, including a short non-hex id, is
 /// reported as a length error before the digits are read.
 #[inline]
+pub fn parse_hash32_hex(hex: &str) -> Result<[u8; 32], HexToArrayError> {
+    <[u8; 32]>::from_hex(strip_0x(hex))
+}
+
+/// Parse display-order 32-byte hex → internal byte order.
+///
+/// Same input rules as [`parse_hash32_hex`], then the bytes are reversed.
+#[inline]
 pub fn parse_display_hash32(hex: &str) -> Result<[u8; 32], HexToArrayError> {
-    let mut raw = <[u8; 32]>::from_hex(strip_0x(hex))?;
+    let mut raw = parse_hash32_hex(hex)?;
     raw.reverse();
     Ok(raw)
 }

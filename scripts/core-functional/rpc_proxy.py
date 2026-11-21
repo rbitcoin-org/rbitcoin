@@ -359,7 +359,7 @@ def shim_miniwallet_scantxoutset(
         if not ready:
             wait_esplora_tip(esplora, tip_height)
             ready = True
-        sh = hashlib.sha256(script).digest()[::-1].hex()
+        sh = hashlib.sha256(script).hexdigest()
         rows = esplora(f"/scripthash/{sh}/utxo")
         if not isinstance(rows, list):
             raise RpcError(-1, "esplora utxo was not a list")

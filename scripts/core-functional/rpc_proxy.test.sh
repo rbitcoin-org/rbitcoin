@@ -117,7 +117,7 @@ seq = {
 import hashlib
 
 script = bytes.fromhex("51")
-sh = hashlib.sha256(script).digest()[::-1].hex()
+sh = hashlib.sha256(script).hexdigest()
 txid = "ab" * 32
 genesis = "22" * 32
 seen = []
