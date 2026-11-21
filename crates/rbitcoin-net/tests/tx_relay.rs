@@ -6771,6 +6771,8 @@ fn mempool_tx_snapshot_refresh_reuses_tx_arc() {
 /// A non-final tx from the trusted session stays through hub reorg eviction.
 /// A local submit of the same shape is rejected and stays out of the pool.
 /// The coin is on the chain, so this is `evict_after_reorg`, not a private utxo map.
+/// An unmarked tx that a one-block reorg makes non-final leaves with a
+/// `reorg` row, or a template would carry it into a `bad-txns-nonfinal` block.
 /// Once a reorg takes that coin away, the marked tx leaves.
 #[test]
 fn trust_peer_reorg_evict_keeps_nonfinal() {
@@ -6817,6 +6819,33 @@ fn trust_peer_reorg_evict_keeps_nonfinal() {
         "a local non-final tx is not in the pool after the sweep"
     );
     assert!(hub.try_contains(&txid));
+
+    let mut unmarked = spend_true(cbs[2], 1_000, ScriptBuf::from_bytes(vec![0x53]));
+    unmarked.lock_time = LockTime::from_height(tip).unwrap();
+    unmarked.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+    hub.accept_tx(&unmarked).expect("final at tip + 1");
+    let unmarked_id = unmarked.compute_txid();
+    assert!(!hub.lock_read().trust_kept.contains(&unmarked_id));
+    q.disconnect_tip().unwrap();
+    hub.evict_after_reorg();
+    assert!(
+        !hub.try_contains(&unmarked_id),
+        "an unmarked tx the lower tip makes non-final must leave"
+    );
+    let left: BTreeSet<(Txid, rbitcoin_mempool::RemovalReason)> = hub
+        .removed_rows()
+        .rows
+        .iter()
+        .map(|r| (r.txid, r.reason))
+        .collect();
+    assert_eq!(
+        left,
+        BTreeSet::from([(unmarked_id, rbitcoin_mempool::RemovalReason::Reorg)])
+    );
+    assert!(
+        hub.try_contains(&txid),
+        "the mark keeps the non-final tx through the same sweep"
+    );
 
     while q.tip_height().map(|h| h.0).unwrap_or(0) > 0 {
         q.disconnect_tip().unwrap();
