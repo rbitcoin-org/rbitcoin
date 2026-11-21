@@ -3602,13 +3602,15 @@ const SP_MISS_SCAN: &str = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594
 const SP_MISS_SPEND: &str = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
 
 /// A pruned height whose keep file is gone is an error. A start there is
-/// refused in the reply. A scan that reaches it ends with an error note: it
-/// must not report progress 1.0 with an empty history, or the client walks
-/// past the height.
+/// refused in the reply, and starts no scan and takes no slot: with one scan
+/// slot, the next connection's subscribe is accepted. A scan that reaches
+/// the height ends with an error note: it must not report progress 1.0 with
+/// an empty history, or the client walks past the height.
 #[tokio::test]
 async fn pruned_scan_miss_is_not_an_empty_history() {
     let (dir, q) = sp_pruned_chain_missing_height_1();
-    let mut s = sp_session(&q);
+    let cfg = sp_cfg_slots(1);
+    let mut s = sp_session_with(&q, cfg.clone(), 1 << 16);
     let refused = s
         .ask(&[sp_subscribe_line(
             7,
@@ -3620,14 +3622,15 @@ async fn pruned_scan_miss_is_not_an_empty_history() {
     sp_refused(&refused[0], "window miss");
 
     // Height 0 reads, so the scan starts.
-    let reply = s
+    let mut next = sp_session_with(&q, cfg, 1 << 16);
+    let reply = next
         .ask(&[sp_subscribe_line(
             8,
             json!([SP_MISS_SCAN, SP_MISS_SPEND, 0]),
         )])
         .await;
     sp_accepted(&reply[0]);
-    let note = sp_next_line(&mut s.client).await;
+    let note = sp_next_line(&mut next.client).await;
     assert_eq!(
         note["method"], "blockchain.silentpayments.subscribe",
         "{note}"
@@ -3636,8 +3639,44 @@ async fn pruned_scan_miss_is_not_an_empty_history() {
     let message = note["params"]["error"]["message"].as_str().unwrap_or("");
     assert!(message.contains("window miss"), "{note}");
     // The failed scan is not a live subscription.
-    s.tip_tx.send(sp_tip(1, None)).unwrap();
-    s.assert_quiet(9).await;
+    next.tip_tx.send(sp_tip(1, None)).unwrap();
+    next.assert_quiet(9).await;
+    s.hang_up().await;
+    next.hang_up().await;
+    drop(q);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A history that ends below the tip reads the heights above it before the
+/// address goes live. A keep-file miss there is the error note, and the
+/// address does not go live: live, it would count height 1 as scanned.
+#[tokio::test]
+async fn sp_catch_up_miss_does_not_go_live() {
+    let (dir, q) = sp_pruned_chain_missing_height_1();
+    let mut s = sp_session_with(&q, sp_cfg(), SP_STALL_BUF);
+    let features = json!({"jsonrpc":"2.0","id":2,"method":"server.features","params":[]});
+    let lines = format!(
+        "{}{features}\n",
+        sp_subscribe_line(1, json!([SP_MISS_SCAN, SP_MISS_SPEND, "0-1"]))
+    );
+    s.send.write_all(lines.as_bytes()).await.unwrap();
+    let reply = sp_next_line(&mut s.client).await;
+    sp_accepted(&reply);
+    // The session stays in the features reply. The chain forks at 0 and its
+    // tip drops to 0, so the scan starts again and ends at 0.
+    s.tip_tx.send(sp_tip(0, Some(0))).unwrap();
+    assert_eq!(sp_next_line(&mut s.client).await["id"], 2);
+    let (history, progress) = sp_read_history(&mut s.client, &reply["result"]).await;
+    assert!(history.is_empty(), "{history:?}");
+    assert_eq!(progress, [1.0]);
+    // The catch-up reads height 1, the store tip.
+    let note = sp_next_line(&mut s.client).await;
+    assert_eq!(note["params"]["subscription"], reply["result"], "{note}");
+    let message = note["params"]["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("window miss"), "{note}");
+    // A live subscription would read height 1 again after this reorg.
+    s.tip_tx.send(sp_tip(1, Some(0))).unwrap();
+    s.assert_quiet(3).await;
     s.hang_up().await;
     drop(q);
     let _ = std::fs::remove_dir_all(&dir);
