@@ -3788,6 +3788,35 @@ async fn silentpayments_unsubscribe_stops_only_the_matching_address() {
     handle.shutdown().await;
 }
 
+/// A silent-payment scan reads the tweak index, not the scripthash index.
+/// With `--sh-index` off a session still subscribes, finds the payment and
+/// unsubscribes.
+#[tokio::test]
+async fn sp_subscribe_and_unsubscribe_serve_with_the_sh_index_off() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-no-sh", 2, &[1]);
+    chain.q.set_sh_index_enabled(false);
+    let mut s = sp_session(&chain.q);
+    s.send
+        .write_all(sp_subscribe_line(1, chain.sub(json!(0))).as_bytes())
+        .await
+        .unwrap();
+    let reply = sp_next_line(&mut s.client).await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    let (history, _) = sp_read_history(&mut s.client, &reply["result"]).await;
+    assert_eq!(history.len(), 1, "{history:?}");
+    assert_eq!(history[0]["height"], 1, "{history:?}");
+
+    let unsub = format!(
+        "{}\n",
+        json!({"jsonrpc":"2.0","id":2,"method":"blockchain.silentpayments.unsubscribe","params":chain.sub(json!(0))})
+    );
+    s.send.write_all(unsub.as_bytes()).await.unwrap();
+    let gone = sp_next_line(&mut s.client).await;
+    assert_eq!(gone["result"], reply["result"]["address"], "{gone}");
+}
+
 /// Two pruned blocks with no sealed tweak rows: each height reads from its
 /// keep file. The file of height 1 is gone.
 fn sp_pruned_chain_missing_height_1() -> (rbitcoin_query::testutil::TempDir, Arc<Query>) {

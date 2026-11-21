@@ -2652,7 +2652,7 @@ pub fn sh_tick_blocked(query: &Query, rescan: &mut bool) -> bool {
 
 #[doc(hidden)]
 pub fn method_needs_sh_index(method: &str) -> bool {
-    method.starts_with("blockchain.scripthash.") || method.starts_with("blockchain.silentpayments.")
+    method.starts_with("blockchain.scripthash.")
 }
 
 /// Chain-tip stamp and a trailing `asof:` share this set. A method that
