@@ -106,6 +106,10 @@ impl ChainParams {
         btc.bip34_height = 1;
         btc.bip65_height = 1;
         btc.bip66_height = 1;
+        // rust-bitcoin gives regtest the mainnet two weeks. Core's one day
+        // makes the period 144 blocks, where the min-difficulty walk stops
+        // and the period-edge time floors apply.
+        btc.pow_target_timespan = 24 * 60 * 60;
         Self {
             network: Network::Regtest,
             genesis_hash: genesis.block_hash(),

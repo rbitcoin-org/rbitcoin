@@ -219,6 +219,28 @@ fn next_work_bits_walks_back_past_min_difficulty() {
     assert_eq!(kept, full);
 }
 
+/// Core regtest's min-difficulty walk stops at a multiple of 144, its period
+/// length, and takes the bits there. Harder bits below that height are not
+/// reached.
+#[test]
+fn regtest_min_difficulty_walk_stops_at_a_144_block_period_start() {
+    let params = ChainParams::regtest();
+    let limit = params.pow_limit.to_compact_lossy();
+    let harder = CompactTarget::from_consensus(0x200f_ffff);
+    let t = 1_000_000u32;
+    let walked = next_work_bits(&params, 146, limit, t, t + 1, None, |h| {
+        Some(if h < 144 { harder } else { limit })
+    })
+    .unwrap();
+    assert_eq!(walked, limit);
+    // Within one period the walk still reaches the harder bits.
+    let walked = next_work_bits(&params, 143, limit, t, t + 1, None, |h| {
+        Some(if h < 140 { harder } else { limit })
+    })
+    .unwrap();
+    assert_eq!(walked, harder);
+}
+
 #[test]
 fn check_header_rejects_without_a_store() {
     let params = ChainParams::mainnet();
@@ -521,7 +543,7 @@ fn h9_version_floors_at_bip34_66_65() {
 }
 
 /// Pure next-work arithmetic over a scripted ancestry; no session reaches the
-/// 2016 boundary without mining 2016 blocks.
+/// 144 boundary without mining 144 blocks.
 #[test]
 fn regtest_pow_overlay_follows_next_work() {
     let mut params = ChainParams::regtest();
@@ -545,15 +567,15 @@ fn regtest_pow_overlay_follows_next_work() {
     // Without the overlay the bits are unchanged.
     assert_eq!(at(&plain, 1, limit, 1, None), limit);
 
-    // 2016 boundary: regtest does not retarget, so the parent bits stand.
+    // 144 boundary: regtest does not retarget, so the parent bits stand.
     // A pow-limit parent stays the pow limit, gap or not.
     let first = Some(PeriodFirst {
         time: t - 5,
         bits: limit,
     });
-    assert_eq!(at(&params, 2016, overlay, 1, first), overlay);
-    assert_eq!(at(&params, 2016, limit, 1, first), limit);
-    assert_eq!(at(&params, 2016, limit, 10 * spacing, first), limit);
+    assert_eq!(at(&params, 144, overlay, 1, first), overlay);
+    assert_eq!(at(&params, 144, limit, 1, first), limit);
+    assert_eq!(at(&params, 144, limit, 10 * spacing, first), limit);
 
     // A hand-set field on mainnet does not replace the first period's bits.
     let mut main = ChainParams::mainnet();

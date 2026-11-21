@@ -200,6 +200,18 @@ fn for_network_and_helpers() {
     assert!(rt.bip66_active_at(1));
 }
 
+/// Core `CRegTestParams`: a one-day target timespan at ten-minute spacing, so
+/// a difficulty period is 144 blocks. It never retargets.
+#[test]
+fn regtest_difficulty_period_is_144_blocks_like_core() {
+    let p = ChainParams::regtest();
+    assert_eq!(p.btc.pow_target_timespan, 24 * 60 * 60);
+    assert_eq!(p.btc.pow_target_spacing, 10 * 60);
+    assert_eq!(p.difficulty_adjustment_interval(), 144);
+    assert!(p.no_pow_retargeting());
+    assert!(p.allow_min_difficulty_blocks());
+}
+
 /// Core `-testactivationheight=csv@102` (regtest) must move the buried height.
 #[test]
 fn testactivationheight_csv_overlay() {

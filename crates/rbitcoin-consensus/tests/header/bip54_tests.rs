@@ -53,11 +53,11 @@ fn period_first_height_names_the_header_each_rule_reads() {
     }
     let regtest = ChainParams::regtest();
     assert_eq!(
-        regtest.period_first_height(2016),
+        regtest.period_first_height(144),
         None,
         "no retargeting, no BIP 54"
     );
-    assert_eq!(regtest.period_first_height(2015), None);
+    assert_eq!(regtest.period_first_height(143), None);
 }
 
 /// Core `MAX_TIMEWARP_BIP54`: a period's first header is at most two hours
