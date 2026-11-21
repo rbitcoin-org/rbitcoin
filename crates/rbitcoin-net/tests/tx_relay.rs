@@ -3821,7 +3821,7 @@ fn relay_admit_erases_the_parked_copy() {
 fn test_package_member_leaves_its_parked_copy() {
     let (_store, q, cbs) = pad_cbs(12);
     let dir = tmp();
-    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    let hub = Arc::new(MempoolHub::open(&dir, Arc::clone(&q)).unwrap());
     hub.set_relay_enabled(true);
     let parent = spend_true(cbs[7], 10_000, ScriptBuf::from_bytes(vec![0x51]));
     let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9980_0000);
@@ -3832,8 +3832,7 @@ fn test_package_member_leaves_its_parked_copy() {
         BTreeSet::from([parent.compute_txid()]),
         Some(4),
     ));
-    hub.accept_test_package_member(&child)
-        .expect("its parent is pooled");
+    block_on(hub.accept_test_package_member_async(child.clone())).expect("its parent is pooled");
     assert_eq!(
         hub.lock_read()
             .orphanage

@@ -2739,22 +2739,6 @@ impl MempoolHub {
         self.accept_tx_from(tx, TxOrigin::Relay(None))
     }
 
-    /// Sync [`Self::accept_test_package_member_async`].
-    pub fn accept_test_package_member(
-        &self,
-        tx: &Transaction,
-    ) -> Result<AcceptResult, AcceptError> {
-        crate::reactor::assert_not_reactor("mempool accept");
-        let utxo = self.utxo_provider();
-        self.accept_with_utxo(
-            tx,
-            &utxo,
-            TxOrigin::Relay(None),
-            AcceptPath::TestPackageMember,
-            &[],
-        )
-    }
-
     /// Accept from `origin`. A relayed tx that parks records its peer as an
     /// orphan announcer.
     pub fn accept_tx_from(

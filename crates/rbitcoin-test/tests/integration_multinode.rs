@@ -11,6 +11,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_ibd::{rehydrate_block_queue_residue, IbdConfig};
+use rbitcoin_net::tip_accept::run_on_tip_accept;
 use rbitcoin_net::{
     run_feeler_timed, select_inbound_eviction, InboundEvictCandidate, NetAddr, NetError, P2PNode,
 };
@@ -2415,18 +2416,18 @@ async fn reorg_to_longer_branch() {
     }
     let eq_tip = eq[19].block_hash();
     assert_eq!(hub.tip_hash().unwrap(), fork_tip);
-    hub.precious_block(eq_tip).unwrap();
+    run_on_tip_accept(|| hub.precious_block_inner(eq_tip)).unwrap();
     assert_eq!(hub.tip_hash().unwrap(), eq_tip);
     assert!(hub.held_body(&fork_tip).is_none());
-    hub.precious_block(fork_tip).unwrap();
+    run_on_tip_accept(|| hub.precious_block_inner(fork_tip)).unwrap();
     assert_eq!(hub.tip_hash().unwrap(), fork_tip);
 
     // Invalidate falls to the next most-work branch; reconsider does not park
     // the old tip as a held body.
-    hub.invalidate_block(fork[1].block_hash()).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(fork[1].block_hash())).unwrap();
     assert_eq!(hub.tip_hash().unwrap(), eq_tip);
     assert!(hub.held_body(&fork_tip).is_none());
-    hub.reconsider_block(fork[1].block_hash()).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(fork[1].block_hash())).unwrap();
     assert!(
         hub.held_body(&fork_tip).is_none(),
         "reconsider must not park the old tip"
@@ -2664,28 +2665,28 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
 
     // `feature_chain_tiebreaks.py`: invalidating the tip picks the first-seen
     // equal-work held sibling, not the last of the 17 and not the stump.
-    hub.invalidate_block(ext.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(ext.block_hash())).unwrap();
     assert_eq!(
         hub.tip_hash().unwrap(),
         sibling.block_hash(),
         "first-seen equal-work held tip must win after invalidate"
     );
-    hub.precious_block(ext.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.precious_block_inner(ext.block_hash())).unwrap();
     assert_eq!(
         hub.tip_hash().unwrap(),
         sibling.block_hash(),
         "precious of an invalidated hash is a no-op"
     );
-    hub.reconsider_block(ext.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(ext.block_hash())).unwrap();
     assert_eq!(
         hub.tip_hash().unwrap(),
         sibling.block_hash(),
         "no-op precious must not leave a preference reconsider would honor"
     );
-    hub.precious_block(ext.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.precious_block_inner(ext.block_hash())).unwrap();
     assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
 
-    hub.precious_block(sibling.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.precious_block_inner(sibling.block_hash())).unwrap();
     assert_eq!(hub.tip_hash().unwrap(), sibling.block_hash());
     let h1 = BlockHash::from_byte_array(
         hub.query
@@ -2695,16 +2696,16 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
             .1
             .hash,
     );
-    hub.precious_block(h1).unwrap();
+    run_on_tip_accept(|| hub.precious_block_inner(h1)).unwrap();
     assert_eq!(
         hub.tip_hash().unwrap(),
         sibling.block_hash(),
         "precious of less work must not activate"
     );
     let miss = BlockHash::from_byte_array([0xab; 32]);
-    let err = hub.precious_block(miss).unwrap_err();
+    let err = run_on_tip_accept(|| hub.precious_block_inner(miss)).unwrap_err();
     assert!(err.to_string().contains("Block not found"), "{err}");
-    let err = hub.reconsider_block(miss).unwrap_err();
+    let err = run_on_tip_accept(|| hub.reconsider_block_inner(miss)).unwrap_err();
     assert!(err.to_string().contains("Block not found"), "{err}");
 
     // Tip has one more block, so the held siblings are weaker and precious
@@ -2730,7 +2731,7 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
         hub.accept_received_block(later.clone()).unwrap(),
         AcceptOutcome::IgnoredWeaker
     ));
-    hub.precious_block(later.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.precious_block_inner(later.block_hash())).unwrap();
     assert_eq!(
         hub.tip_hash().unwrap(),
         top.block_hash(),
@@ -2753,13 +2754,13 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
             .unwrap_or_else(|e| panic!("heavier {}: {e}", b.block_hash()));
     }
     assert_eq!(hub.tip_hash().unwrap(), top.block_hash());
-    hub.invalidate_block(top.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(top.block_hash())).unwrap();
     assert_eq!(
         hub.tip_hash().unwrap(),
         heavy_2.block_hash(),
         "more work must beat precious after invalidate"
     );
-    hub.invalidate_block(heavy_1.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(heavy_1.block_hash())).unwrap();
     assert_eq!(
         hub.tip_hash().unwrap(),
         later.block_hash(),

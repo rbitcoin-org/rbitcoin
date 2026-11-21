@@ -662,7 +662,7 @@ async fn catchup_reorg_and_drain(
         .collect();
     assert_eq!(stale_asks.len(), MAX_SERVE_BLOCKS);
     let stale_first = stale_asks[0];
-    src.invalidate_block(stale_first).unwrap();
+    run_on_tip_accept(|| src.invalidate_block_inner(stale_first)).unwrap();
     src.generate_to_script(MAX_SERVE_BLOCKS as u32 - 2, ScriptBuf::from_bytes(vec![0x52]), vec![])
         .unwrap();
     let weak_headers: Vec<Header> = ((FORK_PARENT + 1)..=(FORK_PARENT + MAX_SERVE_BLOCKS as u32 - 2))
@@ -901,7 +901,7 @@ async fn catchup_reorg_and_drain(
     let shallow_tip = hub.tip_height().unwrap();
     let shallow_parent = shallow_tip - 2;
     let shallow_stale = block_at(src, shallow_parent + 1).block_hash();
-    src.invalidate_block(shallow_stale).unwrap();
+    run_on_tip_accept(|| src.invalidate_block_inner(shallow_stale)).unwrap();
     src.generate_to_script(6, ScriptBuf::from_bytes(vec![0x53]), vec![]).unwrap();
     let shallow_stem = block_at(src, shallow_parent + 1);
     let shallow_want = src.tip_hash().unwrap();

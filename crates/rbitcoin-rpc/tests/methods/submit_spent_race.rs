@@ -5,12 +5,14 @@
 //! inputs only in `ConnectBlock`, against B's own parent: B is an equal-work
 //! side block, `inconclusive`, and never cached invalid.
 
-use super::{block_hex, ctx_from_mature_pad, dispatch};
+use super::{block_hex, ctx_from_mature_pad, dispatch, request_task_runtime};
 use bitcoin::absolute::LockTime;
 use bitcoin::transaction::Version as TxVersion;
 use bitcoin::{Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 use rbitcoin_primitives::Height;
-use rbitcoin_rpc::methods::mine::{during_next_submit_inputs, SubmitInputsPoint};
+use rbitcoin_rpc::methods::mine::{
+    during_next_submit_inputs, finish_submit, prepare_submit, SubmitInputsPoint, SubmitPrep,
+};
 use rbitcoin_rpc::methods::*;
 use rbitcoin_store::testutil::TempDir;
 use serde_json::{json, Value};
@@ -164,8 +166,19 @@ fn submit(ctx: &RpcContext, block: &Block) -> Value {
 /// `submit` for a block whose pre-check runs a [`during_next_submit_inputs`]
 /// hook. The hook is this thread's, and the request task runs the pre-check
 /// on the off-pool thread, so this submit runs the same pre-check here.
-fn submit_hooked(hub: &rbitcoin_net::ChainHub, block: &Block) -> Value {
-    match submit_received_block(hub, block.clone()) {
+fn submit_hooked(hub: &Arc<rbitcoin_net::ChainHub>, block: &Block) -> Value {
+    let outcome = match prepare_submit(hub, block.clone()) {
+        SubmitPrep::Done(outcome) => outcome,
+        SubmitPrep::Ready {
+            block,
+            already_held,
+        } => {
+            let result =
+                request_task_runtime().block_on(hub.accept_received_block_async(block.clone()));
+            finish_submit(hub, already_held, &block, result)
+        }
+    };
+    match outcome {
         SubmitBlockOutcome::Accepted => Value::Null,
         SubmitBlockOutcome::Duplicate => json!("duplicate"),
         SubmitBlockOutcome::IgnoredWeaker => json!("inconclusive"),
@@ -213,7 +226,9 @@ fn submit_spent_race_reorg_undone_mid_check() {
             assert_eq!(hub.tip_hash(), Some(x.block_hash()));
         }
         SubmitInputsPoint::BeforeRecheck => {
-            hub.invalidate_block(x.header.prev_blockhash).unwrap();
+            request_task_runtime()
+                .block_on(hub.invalidate_block_async(x.header.prev_blockhash))
+                .unwrap();
         }
     });
     assert_eq!(submit_hooked(&r.hub, &r.b), Value::Null);

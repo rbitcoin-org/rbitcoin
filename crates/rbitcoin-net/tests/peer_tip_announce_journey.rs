@@ -408,7 +408,7 @@ fn getblocks_continuation_waits_for_a_served_block() {
     let side = rbitcoin_consensus::mine_empty_regtest(gen, t0, 1);
     let side_hash = side.block_hash();
     hub.accept_block(side).unwrap();
-    hub.invalidate_block(side_hash).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(side_hash)).unwrap();
     let best_time = t0 + rbitcoin_net::chain::STALE_RELAY_AGE_LIMIT_SECS as u32;
     hub.clock.set_mock(i64::from(best_time));
     let tip = rbitcoin_consensus::mine_empty_regtest(gen, best_time, 1);
@@ -1743,7 +1743,7 @@ fn tip_announce_skips_a_stump_the_peer_already_has() {
         .unwrap()
         .block_hash();
     let mut tips = hub.subscribe_tips();
-    hub.invalidate_block(cut).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(cut)).unwrap();
     let mut ev = None;
     while let Ok(got) = tips.try_recv() {
         ev = Some(got);

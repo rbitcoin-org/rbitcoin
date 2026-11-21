@@ -17,8 +17,7 @@ pub use auth::{
     default_socket_path, default_token_path, read_cookie_file, RpcAuth, RpcCookiePerms,
 };
 pub use methods::{
-    difficulty_rpc_f64, gbt_template, submit_received_block, HubRegtest, RpcActive, RpcContext,
-    RpcRegtest, SubmitBlockOutcome,
+    difficulty_rpc_f64, gbt_template, HubRegtest, RpcActive, RpcContext, RpcRegtest,
 };
 pub use server::{
     run_rpc, RpcConfig, RpcHandle, DEFAULT_RPC_WORK_QUEUE, REST_MAX_HTTP_BODY, RPC_MAX_HTTP_BODY,

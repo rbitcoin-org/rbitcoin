@@ -2,9 +2,8 @@ use rbitcoin_log::progress::Snapshot;
 use rbitcoin_node::health::metrics::*;
 use std::time::{Duration, SystemTime};
 
-fn assert_rpc_headers(hub: &std::sync::Arc<rbitcoin_net::ChainHub>, blocks: u32, headers: u32) {
-    use rbitcoin_rpc::methods::{dispatch, RpcContext};
-    let ctx = RpcContext {
+fn rpc_ctx(hub: &std::sync::Arc<rbitcoin_net::ChainHub>) -> rbitcoin_rpc::methods::RpcContext {
+    rbitcoin_rpc::methods::RpcContext {
         query: std::sync::Arc::clone(&hub.query),
         chain: Some(std::sync::Arc::clone(hub)),
         mempool: None,
@@ -24,8 +23,17 @@ fn assert_rpc_headers(hub: &std::sync::Arc<rbitcoin_net::ChainHub>, blocks: u32,
         package_dialect: false,
         client_version: 190_000,
         active: Default::default(),
-    };
-    let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+    }
+}
+
+/// Drive a request-task future from a `spawn_blocking` thread.
+fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Handle::current().block_on(fut)
+}
+
+fn assert_rpc_headers(hub: &std::sync::Arc<rbitcoin_net::ChainHub>, blocks: u32, headers: u32) {
+    let ctx = rpc_ctx(hub);
+    let info = rbitcoin_rpc::methods::dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
     assert_eq!(info["blocks"], blocks);
     assert_eq!(info["headers"], headers);
     let progress = if headers == 0 {
@@ -45,16 +53,19 @@ async fn ibd_header_height_survives_resume() {
     use rbitcoin_node::health::{router, NodeStatus, Phase};
     use rbitcoin_primitives::Network;
     use rbitcoin_query::Query;
-    use rbitcoin_rpc::{HubRegtest, RpcRegtest};
     use std::sync::Arc;
 
     let (dir, hub, mut st) = tokio::task::spawn_blocking(|| {
         let _blocking = rbitcoin_net::reactor::BlockingRegion::enter();
         let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-metrics");
         let hub = Arc::new(hub);
-        HubRegtest(Arc::clone(&hub))
-            .generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![], true)
-            .unwrap();
+        block_on(hub.generate_to_script_for_rpc_async(
+            1,
+            bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            vec![],
+            true,
+        ))
+        .unwrap();
         hub.clock
             .set_mock(i64::from(hub.tip_header().unwrap().time) + 172_800);
         let st = IbdWorkState::new(vec![], hub.tip_hash(), hub.tip_height());
@@ -159,7 +170,7 @@ async fn ibd_header_height_survives_resume() {
         ));
         assert!(!hub.knows_header(&parent.block_hash()));
         assert_rpc_headers(&hub, 1, 6);
-        let mut rejected = HubRegtest(Arc::clone(&hub))
+        let mut rejected = hub
             .assemble_block_to_script(bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
             .unwrap();
         rejected.header.time = hub.tip_header().unwrap().time + 1;
@@ -168,20 +179,25 @@ async fn ibd_header_height_survives_resume() {
         rbitcoin_consensus::grind_regtest_pow(&mut rejected.header);
         let rejected_hash = rejected.block_hash();
         assert!(!hub.knows_header(&rejected_hash));
-        assert_eq!(
-            HubRegtest(Arc::clone(&hub)).submit_block(rejected),
-            rbitcoin_rpc::methods::SubmitBlockOutcome::Rejected("bad-cb-length".into())
-        );
+        let submitted = block_on(rbitcoin_rpc::methods::dispatch_tip_connect(
+            &Arc::new(rpc_ctx(&hub)),
+            "submitblock",
+            vec![serde_json::json!(
+                bitcoin::consensus::encode::serialize_hex(&rejected)
+            )]
+            .into(),
+        ));
+        assert_eq!(submitted, Ok(serde_json::json!("bad-cb-length")));
         assert!(hub.knows_header(&rejected_hash));
         assert_rpc_headers(&hub, 1, 6);
-        hub.reconsider_block(rejected_hash).unwrap();
+        block_on(hub.reconsider_block_async(rejected_hash)).unwrap();
         let mut sibling = hub.tip_header().unwrap();
         sibling.prev_blockhash = sibling.block_hash();
         sibling.time += 1;
         sibling.merkle_root = bitcoin::TxMerkleNode::from_byte_array([99; 32]);
         rbitcoin_consensus::grind_regtest_pow(&mut sibling);
         hub.ensure_header(&sibling).unwrap();
-        hub.invalidate_block(sibling.block_hash()).unwrap();
+        block_on(hub.invalidate_block_async(sibling.block_hash())).unwrap();
         header_walk::publish_work(&mut st, &hub);
         assert_rpc_headers(&hub, 1, 6);
         let mut next = parent;
@@ -203,8 +219,7 @@ async fn ibd_header_height_survives_resume() {
         assert_rpc_headers(&hub, 1, 4);
         hub.ensure_header(&unstored_interior).unwrap();
         assert_rpc_headers(&hub, 1, 4);
-        hub.reconsider_block(unstored_interior.block_hash())
-            .unwrap();
+        block_on(hub.reconsider_block_async(unstored_interior.block_hash())).unwrap();
         assert_rpc_headers(&hub, 1, 7);
         let checkpoint = hub.header_of(&st.header_walk.checkpoints[0].hash).unwrap();
         let interior = checkpoint.prev_blockhash;
@@ -213,16 +228,16 @@ async fn ibd_header_height_survives_resume() {
             .checkpoints
             .iter()
             .any(|c| c.hash == interior));
-        hub.invalidate_block(interior).unwrap();
+        block_on(hub.invalidate_block_async(interior)).unwrap();
         header_walk::publish_work(&mut st, &hub);
         assert_rpc_headers(&hub, 1, 2);
-        hub.reconsider_block(interior).unwrap();
+        block_on(hub.reconsider_block_async(interior)).unwrap();
         header_walk::publish_work(&mut st, &hub);
         assert_rpc_headers(&hub, 1, 7);
         let mut late_origin = IbdWorkState::new(vec![], hub.tip_hash(), hub.tip_height());
         let input = header_walk::origin_input(&late_origin, &hub);
         let loaded = header_walk::load_origin(&hub, &input);
-        hub.invalidate_block(connected).unwrap();
+        block_on(hub.invalidate_block_async(connected)).unwrap();
         assert_rpc_headers(&hub, 0, 0);
         header_walk::publish_work(&mut st, &hub);
         assert_rpc_headers(&hub, 0, 0);
@@ -241,7 +256,7 @@ async fn ibd_header_height_survives_resume() {
     assert!(m.contains("rbitcoin_headers 0\n"), "{m}");
     tokio::task::spawn_blocking(move || {
         let _blocking = rbitcoin_net::reactor::BlockingRegion::enter();
-        hub.reconsider_block(connected).unwrap();
+        block_on(hub.reconsider_block_async(connected)).unwrap();
         assert!(header_walk::restore_adopt(&mut st, &hub));
         // Short look-ahead after the proving batch is not rewritten into
         // `header.adopt`. Resume returns that saved checkpoint. The header

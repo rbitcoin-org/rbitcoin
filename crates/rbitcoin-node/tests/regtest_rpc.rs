@@ -2,13 +2,27 @@ use bitcoin::ScriptBuf;
 use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_net::ChainHub;
 use rbitcoin_query::Query;
-use rbitcoin_rpc::HubRegtest;
-use rbitcoin_rpc::RpcRegtest;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// One block through the HTTP `generate*` mine.
+fn generate_one(hub: &Arc<ChainHub>) -> Vec<bitcoin::BlockHash> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(hub.generate_to_script_for_rpc_async(
+            1,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![],
+            true,
+        ))
+        .unwrap()
+}
+
 #[test]
-fn hub_regtest_generate_one() {
+fn regtest_generate_one() {
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -20,17 +34,14 @@ fn hub_regtest_generate_one() {
         ChainParams::regtest(),
         Milestone::NONE,
     ));
-    let miner = HubRegtest(hub);
-    let hashes = miner
-        .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![], true)
-        .unwrap();
+    let hashes = generate_one(&hub);
     assert_eq!(hashes.len(), 1);
-    assert_eq!(miner.0.tip_height(), Some(1));
+    assert_eq!(hub.tip_height(), Some(1));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn hub_op_true_signet_generate_one() {
+fn op_true_signet_generate_one() {
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -44,13 +55,10 @@ fn hub_op_true_signet_generate_one() {
         params,
         Milestone::NONE,
     ));
-    let miner = HubRegtest(hub);
-    let hashes = miner
-        .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![], true)
-        .unwrap();
+    let hashes = generate_one(&hub);
     assert_eq!(hashes.len(), 1);
-    assert_eq!(miner.0.tip_height(), Some(1));
-    let bits = miner.0.tip_header().expect("tip").bits;
+    assert_eq!(hub.tip_height(), Some(1));
+    let bits = hub.tip_header().expect("tip").bits;
     assert_eq!(
         bits.to_consensus(),
         rbitcoin_consensus::REGTEST_POW_BITS,

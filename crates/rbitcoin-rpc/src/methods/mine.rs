@@ -1493,14 +1493,16 @@ pub fn fill_witness_reserved_value(hub: &rbitcoin_net::ChainHub, block: &mut Blo
     }
 }
 
-enum SubmitPrep {
+#[doc(hidden)]
+pub enum SubmitPrep {
     Done(SubmitBlockOutcome),
     Ready { block: Block, already_held: bool },
 }
 
 /// Cheap `submitblock` checks. The connect itself is separate so HTTP can await
 /// it off the blocking pool.
-fn prepare_submit(hub: &rbitcoin_net::ChainHub, mut block: Block) -> SubmitPrep {
+#[doc(hidden)]
+pub fn prepare_submit(hub: &rbitcoin_net::ChainHub, mut block: Block) -> SubmitPrep {
     use bitcoin::Target;
     let hash = block.block_hash();
     if hub.is_block_invalid(&hash) {
@@ -1565,7 +1567,8 @@ fn prepare_submit(hub: &rbitcoin_net::ChainHub, mut block: Block) -> SubmitPrep 
     }
 }
 
-fn finish_submit(
+#[doc(hidden)]
+pub fn finish_submit(
     hub: &rbitcoin_net::ChainHub,
     already_held: bool,
     block: &Block,
@@ -1590,21 +1593,6 @@ fn finish_submit(
                 let _ = hub.ensure_header(&block.header);
             }
             SubmitBlockOutcome::Rejected(reason)
-        }
-    }
-}
-
-/// Same receive path as P2P `block` (all networks), for [`HubRegtest`].
-/// The `submitblock` RPC is [`submitblock_async`].
-pub fn submit_received_block(hub: &rbitcoin_net::ChainHub, block: Block) -> SubmitBlockOutcome {
-    match prepare_submit(hub, block) {
-        SubmitPrep::Done(outcome) => outcome,
-        SubmitPrep::Ready {
-            block,
-            already_held,
-        } => {
-            let result = hub.accept_received_block(block.clone());
-            finish_submit(hub, already_held, &block, result)
         }
     }
 }

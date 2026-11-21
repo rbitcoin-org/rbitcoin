@@ -1,6 +1,6 @@
 //! Tier-1 Core-class JSON-RPC method handlers (pure dispatch over Query/mempool).
 
-use bitcoin::{Block, BlockHash, ScriptBuf, Transaction};
+use bitcoin::Transaction;
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Network;
 use rbitcoin_query::Query;
@@ -16,7 +16,7 @@ pub use chain::{tip_hash_height, wait_timeout_ms};
 
 /// Cap for `waitfor*` and `getblocktemplate` long-poll. Not a knob.
 pub const RPC_WAIT_TIMEOUT_MS: u64 = 120_000;
-pub use mine::{gbt_template, submit_received_block};
+pub use mine::gbt_template;
 pub use net::{parse_rpc_client_version, RPC_COMPAT_VERSION};
 
 /// HTTP methods whose connect runs on `tip-accept` and must be awaited on the
@@ -345,61 +345,20 @@ pub enum SubmitBlockOutcome {
     Error(String),
 }
 
-/// Regtest-only mine + accept. Implemented by the node (not a mining product).
-/// The RPC methods call only [`Self::set_mock_time`]. The mining RPCs run on
-/// the [`rbitcoin_net::ChainHub`] request-task path.
+/// Regtest-only clock control. Implemented by the node (not a mining
+/// product). `ctx.regtest` being set is also the gate for the regtest
+/// mining RPCs: `generate`, `generatetoaddress`, `generatetodescriptor`,
+/// and `generateblock` refuse when it is `None`. They mine on the
+/// [`rbitcoin_net::ChainHub`] request-task path, not through this trait.
 pub trait RpcRegtest: Send + Sync {
-    /// `record_assembly`: each block is a pool assembly for `getmininginfo`.
-    fn generate_to_script(
-        &self,
-        nblocks: u32,
-        script_pubkey: ScriptBuf,
-        extra_txs: Vec<Transaction>,
-        record_assembly: bool,
-    ) -> Result<Vec<BlockHash>, String>;
-
-    fn assemble_block_to_script(
-        &self,
-        script_pubkey: ScriptBuf,
-        extra_txs: Vec<Transaction>,
-    ) -> Result<Block, String>;
-
-    fn submit_block(&self, block: Block) -> SubmitBlockOutcome;
-
     /// `0` = wall clock. Regtest harness only.
     fn set_mock_time(&self, timestamp: i64) -> Result<(), String>;
 }
 
-/// [`RpcRegtest`] over the live [`rbitcoin_net::ChainHub`] confirm path.
+/// [`RpcRegtest`] that sets the live [`rbitcoin_net::ChainHub`] mock clock.
 pub struct HubRegtest(pub Arc<rbitcoin_net::ChainHub>);
 
 impl RpcRegtest for HubRegtest {
-    fn generate_to_script(
-        &self,
-        nblocks: u32,
-        script_pubkey: ScriptBuf,
-        extra_txs: Vec<Transaction>,
-        record_assembly: bool,
-    ) -> Result<Vec<BlockHash>, String> {
-        self.0
-            .generate_to_script_for_rpc(nblocks, script_pubkey, extra_txs, record_assembly)
-            .map_err(|e| mine::submit_reject_reason(&e))
-    }
-
-    fn assemble_block_to_script(
-        &self,
-        script_pubkey: ScriptBuf,
-        extra_txs: Vec<Transaction>,
-    ) -> Result<Block, String> {
-        self.0
-            .assemble_block_to_script(script_pubkey, extra_txs)
-            .map_err(|e| mine::submit_reject_reason(&e))
-    }
-
-    fn submit_block(&self, block: Block) -> SubmitBlockOutcome {
-        submit_received_block(&self.0, block)
-    }
-
     fn set_mock_time(&self, timestamp: i64) -> Result<(), String> {
         self.0.clock.set_mock(timestamp);
         Ok(())

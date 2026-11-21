@@ -2771,21 +2771,14 @@ impl ChainHub {
         script_pubkey: ScriptBuf,
         extra_txs: Vec<Transaction>,
     ) -> Result<Vec<BlockHash>, NetError> {
-        self.generate_paying(
-            nblocks,
-            script_pubkey,
-            extra_txs,
-            Self::GENERATE_MAX_BLOCKS,
-            false,
-            false,
-        )
+        self.generate_paying(nblocks, script_pubkey, extra_txs, Self::GENERATE_MAX_BLOCKS)
     }
 
     /// Confirm `nblocks` empty regtest blocks through [`rbitcoin_query::confirm_wire_run`].
     ///
     /// IBD packs at most 144 blocks into one confirm wave. A long fixture uses
     /// that wave. [`Self::generate_to_script`] still accepts one block at a time
-    /// on `tip-accept` when the test needs pool txs, assembly stats, or the lane.
+    /// on `tip-accept` when the test needs chosen txs or the lane.
     #[doc(hidden)]
     pub fn confirm_empty_regtest(&self, nblocks: u32) -> Result<Vec<BlockHash>, NetError> {
         if nblocks == 0 {
@@ -2824,31 +2817,6 @@ impl ChainHub {
         // A fixture that turned the filter index on needs that same watermark.
         self.drain_generate_indexes();
         Ok(hashes)
-    }
-
-    /// Sync mine for `HubRegtest::generate_to_script` in `rbitcoin-rpc`. The
-    /// RPC methods use [`Self::generate_to_script_for_rpc_async`]. Same mine as
-    /// [`Self::generate_to_script`], and the pool txids in an accepted block
-    /// are removed before the next block of this call is mined. A relay-off
-    /// connect does not remove them. `record_assembly` records each block for
-    /// `getmininginfo` before it is mined: `generate` builds from the pool,
-    /// `generateblock` does not.
-    #[doc(hidden)]
-    pub fn generate_to_script_for_rpc(
-        &self,
-        nblocks: u32,
-        script_pubkey: ScriptBuf,
-        extra_txs: Vec<Transaction>,
-        record_assembly: bool,
-    ) -> Result<Vec<BlockHash>, NetError> {
-        self.generate_paying(
-            nblocks,
-            script_pubkey,
-            extra_txs,
-            Self::GENERATE_MAX_BLOCKS,
-            true,
-            record_assembly,
-        )
     }
 
     /// HTTP `generate*`. Mines off the blocking pool and awaits each connect
@@ -2979,7 +2947,7 @@ impl ChainHub {
         hub.generate_commit_parked.store(false, Ordering::Release);
     }
 
-    /// Sync generate runs on stack hubs, `HubRegtest`, and some
+    /// Sync generate runs on stack hubs and some
     /// `#[tokio::test]` tasks. `blocking_lock` panics on a Tokio worker even
     /// when the lock is free, so a worker only uses `try_lock`.
     fn lock_generate_sync(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -3014,7 +2982,7 @@ impl ChainHub {
         extra_txs: Vec<Transaction>,
         limit: u32,
     ) -> Result<Vec<BlockHash>, NetError> {
-        self.generate_paying(nblocks, script_pubkey, extra_txs, limit, false, false)
+        self.generate_paying(nblocks, script_pubkey, extra_txs, limit)
     }
 
     /// Live pool transactions for the first block of `generate`.
@@ -3033,8 +3001,6 @@ impl ChainHub {
         script_pubkey: ScriptBuf,
         mut extras: Vec<Transaction>,
         limit: u32,
-        commit_on_accept: bool,
-        record_assembly: bool,
     ) -> Result<Vec<BlockHash>, NetError> {
         if nblocks == 0 {
             return Ok(Vec::new());
@@ -3057,23 +3023,7 @@ impl ChainHub {
             } else {
                 Vec::new()
             };
-            let ids = commit_on_accept.then(|| {
-                txs.iter()
-                    .map(|tx| tx.compute_txid())
-                    .collect::<Vec<Txid>>()
-            });
-            if record_assembly {
-                let weight = txs.iter().map(|tx| tx.weight().to_wu()).sum();
-                self.note_block_assembled(weight, txs.len());
-            }
             hashes.push(self.mine_and_accept_paying(&script_pubkey, txs)?);
-            if let Some(ids) = ids {
-                let Some(mp) = self.mempool() else {
-                    continue;
-                };
-                mp.commit_generated_txids(&ids)
-                    .map_err(|e| NetError::Consensus(e.to_string()))?;
-            }
         }
         self.drain_generate_indexes();
         Ok(hashes)
@@ -3161,15 +3111,11 @@ impl ChainHub {
         ))
     }
 
-    /// Disconnect `hash` and descendants from the tip. Remember hashes only;
-    /// [`Self::reconsider_block`] reconstructs from Class A. Then apply the
-    /// next most-work non-invalid fork (production: invalidate is not "stay
-    /// on the stump").
-    pub fn invalidate_block(&self, hash: BlockHash) -> Result<(), NetError> {
-        crate::tip_accept::run_on_tip_accept(|| self.invalidate_block_inner(hash))
-    }
-
-    /// HTTP `invalidateblock`. The connect waits on the request task.
+    /// HTTP `invalidateblock`: disconnect `hash` and descendants from the
+    /// tip. Remember hashes only; [`Self::reconsider_block_async`]
+    /// reconstructs from Class A. Then apply the next most-work non-invalid
+    /// fork (production: invalidate is not "stay on the stump"). The connect
+    /// waits on the request task.
     pub async fn invalidate_block_async(
         self: &std::sync::Arc<Self>,
         hash: BlockHash,
@@ -3280,14 +3226,10 @@ impl ChainHub {
         activated
     }
 
-    /// Clear the invalid mark on `hash`, its invalidated paths, and ancestors,
-    /// then activate the most-work chain. Header-only descendants stay header
-    /// tips.
-    pub fn reconsider_block(&self, hash: BlockHash) -> Result<(), NetError> {
-        crate::tip_accept::run_on_tip_accept(|| self.reconsider_block_inner(hash))
-    }
-
-    /// HTTP `reconsiderblock`. The connect waits on the request task.
+    /// HTTP `reconsiderblock`: clear the invalid mark on `hash`, its
+    /// invalidated paths, and ancestors, then activate the most-work chain.
+    /// Header-only descendants stay header tips. The connect waits on the
+    /// request task.
     pub async fn reconsider_block_async(
         self: &std::sync::Arc<Self>,
         hash: BlockHash,
@@ -3546,12 +3488,8 @@ impl ChainHub {
         taken
     }
 
-    /// Prefer this hash among equal-work competing tips.
-    pub fn precious_block(&self, hash: BlockHash) -> Result<(), NetError> {
-        crate::tip_accept::run_on_tip_accept(|| self.precious_block_inner(hash))
-    }
-
-    /// HTTP `preciousblock`. The connect waits on the request task.
+    /// HTTP `preciousblock`: prefer this hash among equal-work competing
+    /// tips. The connect waits on the request task.
     pub async fn precious_block_async(
         self: &std::sync::Arc<Self>,
         hash: BlockHash,
@@ -4292,8 +4230,7 @@ impl ChainHub {
     /// `submitblock`). Runs on the process-wide `tip-accept` thread (lookup →
     /// load → `rbtc-scripts-*` steal → write). Peer sessions and HTTP
     /// `submitblock` use [`Self::accept_received_block_async`]. This sync
-    /// wrapper is for stack hubs, `submit_received_block` in `rbitcoin-rpc`
-    /// (`HubRegtest`), and tests.
+    /// wrapper is for stack hubs and tests.
     ///
     /// Tip-extend via [`Self::accept_block`]; otherwise hold the body by hash
     /// and [`Self::accept_branch`] when a held (or archived) path has more

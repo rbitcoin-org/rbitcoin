@@ -9,6 +9,7 @@ use rbitcoin_ibd::ibd::peer_io::{solicit_track, PeerCmd, PeerEvent, PeerSlot};
 use rbitcoin_ibd::ibd::state::IbdWorkState;
 use rbitcoin_ibd::ibd::ORDERED_HEADERS_SOFT_CAP;
 use rbitcoin_net::chain::ChainHub;
+use rbitcoin_net::tip_accept::run_on_tip_accept;
 use std::time::{Duration, Instant};
 
 use rbitcoin_net::seeds::AddrMan;
@@ -1256,7 +1257,7 @@ fn same_height_rebuilds_the_tail(
     tip_h: u32,
     ahead: BlockHash,
 ) -> BlockHash {
-    hub.invalidate_block(tip).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(tip)).unwrap();
     assert_eq!(hub.tip_height(), Some(tip_h - 1));
     let alt_script = bitcoin::ScriptBuf::from_bytes(vec![0x52]);
     hub.generate_to_script(1, alt_script, vec![]).unwrap();
