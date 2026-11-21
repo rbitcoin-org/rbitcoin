@@ -346,14 +346,16 @@ pub enum SubmitBlockOutcome {
 }
 
 /// Regtest-only clock control. Implemented by the node (not a mining
-/// product). The mining RPCs run on the [`rbitcoin_net::ChainHub`]
-/// request-task path.
+/// product). `ctx.regtest` being set is also the gate for the regtest
+/// mining RPCs: `generate`, `generatetoaddress`, `generatetodescriptor`,
+/// and `generateblock` refuse when it is `None`. They mine on the
+/// [`rbitcoin_net::ChainHub`] request-task path, not through this trait.
 pub trait RpcRegtest: Send + Sync {
     /// `0` = wall clock. Regtest harness only.
     fn set_mock_time(&self, timestamp: i64) -> Result<(), String>;
 }
 
-/// [`RpcRegtest`] over the live [`rbitcoin_net::ChainHub`] confirm path.
+/// [`RpcRegtest`] that sets the live [`rbitcoin_net::ChainHub`] mock clock.
 pub struct HubRegtest(pub Arc<rbitcoin_net::ChainHub>);
 
 impl RpcRegtest for HubRegtest {

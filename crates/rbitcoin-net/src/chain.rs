@@ -2771,21 +2771,14 @@ impl ChainHub {
         script_pubkey: ScriptBuf,
         extra_txs: Vec<Transaction>,
     ) -> Result<Vec<BlockHash>, NetError> {
-        self.generate_paying(
-            nblocks,
-            script_pubkey,
-            extra_txs,
-            Self::GENERATE_MAX_BLOCKS,
-            false,
-            false,
-        )
+        self.generate_paying(nblocks, script_pubkey, extra_txs, Self::GENERATE_MAX_BLOCKS)
     }
 
     /// Confirm `nblocks` empty regtest blocks through [`rbitcoin_query::confirm_wire_run`].
     ///
     /// IBD packs at most 144 blocks into one confirm wave. A long fixture uses
     /// that wave. [`Self::generate_to_script`] still accepts one block at a time
-    /// on `tip-accept` when the test needs pool txs, assembly stats, or the lane.
+    /// on `tip-accept` when the test needs chosen txs or the lane.
     #[doc(hidden)]
     pub fn confirm_empty_regtest(&self, nblocks: u32) -> Result<Vec<BlockHash>, NetError> {
         if nblocks == 0 {
@@ -2989,7 +2982,7 @@ impl ChainHub {
         extra_txs: Vec<Transaction>,
         limit: u32,
     ) -> Result<Vec<BlockHash>, NetError> {
-        self.generate_paying(nblocks, script_pubkey, extra_txs, limit, false, false)
+        self.generate_paying(nblocks, script_pubkey, extra_txs, limit)
     }
 
     /// Live pool transactions for the first block of `generate`.
@@ -3008,8 +3001,6 @@ impl ChainHub {
         script_pubkey: ScriptBuf,
         mut extras: Vec<Transaction>,
         limit: u32,
-        commit_on_accept: bool,
-        record_assembly: bool,
     ) -> Result<Vec<BlockHash>, NetError> {
         if nblocks == 0 {
             return Ok(Vec::new());
@@ -3032,23 +3023,7 @@ impl ChainHub {
             } else {
                 Vec::new()
             };
-            let ids = commit_on_accept.then(|| {
-                txs.iter()
-                    .map(|tx| tx.compute_txid())
-                    .collect::<Vec<Txid>>()
-            });
-            if record_assembly {
-                let weight = txs.iter().map(|tx| tx.weight().to_wu()).sum();
-                self.note_block_assembled(weight, txs.len());
-            }
             hashes.push(self.mine_and_accept_paying(&script_pubkey, txs)?);
-            if let Some(ids) = ids {
-                let Some(mp) = self.mempool() else {
-                    continue;
-                };
-                mp.commit_generated_txids(&ids)
-                    .map_err(|e| NetError::Consensus(e.to_string()))?;
-            }
         }
         self.drain_generate_indexes();
         Ok(hashes)
