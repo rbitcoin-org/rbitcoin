@@ -828,6 +828,7 @@ pub fn forget_walk_peer(st: &mut IbdWorkState, peer: usize) {
     st.header_walk.header_timeout_peers.remove(&peer);
     st.header_walk.header_misses.remove(&peer);
     st.header_walk.asked_tips.remove(&peer);
+    st.header_walk.emptied.remove(&peer);
     if st.header_walk.reserved == Some(peer) {
         st.header_walk.reserved = None;
     }
@@ -1260,6 +1261,7 @@ pub fn rewind_above(st: &mut IbdWorkState, hub: &ChainHub, height: u32) {
 #[doc(hidden)]
 pub fn rewind_to(st: &mut IbdWorkState, hub: &ChainHub, height: u32, dead: Option<BlockHash>) {
     let dead_height = st.header_walk.tip_height();
+    let tip_before = st.header_walk.tip_hash();
     let marked = dead.filter(|hash| st.header_walk.base_hash != Some(*hash));
     if dead.is_some() {
         if let Some(hash) = marked {
@@ -1301,13 +1303,14 @@ pub fn rewind_to(st: &mut IbdWorkState, hub: &ChainHub, height: u32, dead: Optio
     // `clear_path_above` already dropped path slots above `keep`. An ordered
     // hash with no height stays unless it is the abandoned tip.
     drop_queue_above(st, keep, &keep_hashes);
-    if dead.is_some() {
+    // `emptied` names the tip those peers answered empty at. A rewind that
+    // moves the tip invalidates every entry, whether or not a dead hash was
+    // named.
+    if dead.is_some() || st.header_walk.tip_hash() != tip_before {
         st.header_walk.emptied.clear();
-        if let Some(dead) = marked {
-            rbitcoin_log::warn!(
-                "ibd: headers dead-end hash={dead} height={dead_height} rewind={keep}"
-            );
-        }
+    }
+    if let Some(dead) = marked {
+        rbitcoin_log::warn!("ibd: headers dead-end hash={dead} height={dead_height} rewind={keep}");
     }
     clear_off_path(st);
     recompute_witness(st);
@@ -2568,21 +2571,35 @@ pub fn note_empty(
     if asked.is_some() && asked == st.header_walk.tip_hash() {
         st.header_walk.emptied.insert(peer);
     }
+    // A quiet peer is retired from the walk, so it cannot answer another ask
+    // at this tip. Waiting on one would keep the rewind from ever firing.
     let tall: Vec<usize> = st
         .slots
         .iter()
-        .filter(|s| s.alive && s.peer_height > st.header_walk.tip_height())
+        .filter(|s| {
+            s.alive
+                && !st.header_walk.walk_quiet.contains(&s.id)
+                && s.peer_height > st.header_walk.tip_height()
+        })
         .map(|s| s.id)
         .collect();
     let alive: Vec<usize> = if tall.is_empty() {
-        st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect()
+        st.slots
+            .iter()
+            .filter(|s| s.alive && !st.header_walk.walk_quiet.contains(&s.id))
+            .map(|s| s.id)
+            .collect()
     } else {
         tall
     };
-    if alive.is_empty() || alive.iter().any(|id| !st.header_walk.emptied.contains(id)) {
+    let waiting = alive.iter().any(|id| !st.header_walk.emptied.contains(id));
+    if alive.is_empty() || waiting {
         let _ = send_getheaders(st, hub);
         return true;
     }
+    // The whole tip is abandoned. The rewind changes the tip, so the ask
+    // starts from the new one instead of keeping the last empty peer.
+    st.header_walk.reserved = None;
     rewind(st, hub);
     let _ = send_getheaders(st, hub);
     true
@@ -3353,25 +3370,43 @@ pub fn pick_any_header_peer(st: &IbdWorkState, skip: Option<usize>) -> Option<us
 }
 
 /// Lowest time-to-first-byte among peers still on the walk. A peer with no
-/// body yet sorts after one who has delivered. `skip` is the peer whose ask
+/// body yet sorts after one who has delivered. A peer that answered empty at
+/// this tip sorts after every peer that has not. `skip` is the peer whose ask
 /// just expired, unless they are the only one left.
 #[doc(hidden)]
 pub fn pick_header_peer(st: &IbdWorkState, above: u32, skip: Option<usize>) -> Option<usize> {
-    let mut best: Option<(bool, u8, u64, usize)> = None;
-    for slot in &st.slots {
-        if !peer_can_head(st, slot.id, above) || skip == Some(slot.id) {
-            continue;
+    fn rank(
+        st: &IbdWorkState,
+        above: u32,
+        skip: Option<usize>,
+        accept_emptied: bool,
+    ) -> Option<usize> {
+        let mut best: Option<(bool, u8, u64, usize)> = None;
+        for slot in &st.slots {
+            if !peer_can_head(st, slot.id, above) || skip == Some(slot.id) {
+                continue;
+            }
+            if !accept_emptied && st.header_walk.emptied.contains(&slot.id) {
+                continue;
+            }
+            let key = header_peer_rank_key(st, slot);
+            // The id is in the key, so two peers never tie.
+            if best.is_none_or(|cur| key.cmp(&cur).is_lt()) {
+                best = Some(key);
+            }
         }
-        let key = header_peer_rank_key(st, slot);
-        // The id is in the key, so two peers never tie.
-        if best.is_none_or(|cur| key.cmp(&cur).is_lt()) {
-            best = Some(key);
+        if let Some((_, _, _, id)) = best {
+            return Some(id);
         }
+        skip.filter(|&id| {
+            peer_can_head(st, id, above)
+                && (accept_emptied || !st.header_walk.emptied.contains(&id))
+        })
     }
-    if let Some((_, _, _, id)) = best {
-        return Some(id);
-    }
-    skip.filter(|&id| peer_can_head(st, id, above))
+    // A peer that answered empty at this tip cannot extend it. Another taller
+    // peer still can. Fall back to the empty peer only when nobody else can
+    // head, so a probe or a later tip can still use it.
+    rank(st, above, skip, false).or_else(|| rank(st, above, skip, true))
 }
 
 #[doc(hidden)]
@@ -3382,7 +3417,19 @@ pub fn ensure_reserved(st: &mut IbdWorkState, above: u32, skip: Option<usize>) {
         // did not come from them.
         let unjudged_external =
             st.header_walk.challenge_open == Some(id) && st.header_walk.challenge_external;
-        if unjudged_external || (peer_can_head(st, id, above) && skip != Some(id)) {
+        // A peer that answered empty at this tip cannot head it. Give the ask
+        // to another taller peer that has not answered empty here.
+        let tip = st.header_walk.tip_height();
+        let another_can_head = st.slots.iter().any(|s| {
+            s.id != id && !st.header_walk.emptied.contains(&s.id) && peer_can_head(st, s.id, tip)
+        });
+        let empty_at_tip = st.header_walk.emptied.contains(&id) && another_can_head;
+        if unjudged_external || (peer_can_head(st, id, above) && skip != Some(id) && !empty_at_tip)
+        {
+            return;
+        }
+        if empty_at_tip {
+            st.header_walk.reserved = pick_header_peer(st, tip, skip);
             return;
         }
     }
