@@ -2677,3 +2677,34 @@ MISSED   crates/rbitcoin-net/src/tx_relay.rs:5479:46: replace && with || in Memp
 MISSED   crates/rbitcoin-net/src/tx_relay.rs:5479:49: delete ! in MempoolHub::orphan_write in 8s build + 63s test
 MISSED   crates/rbitcoin-net/src/tx_relay.rs:5574:13: replace + with * in MempoolHub::schedule_parents_locked in 7s build + 63s test
 MISSED   crates/rbitcoin-net/src/tx_relay.rs:5580:25: delete ! in MempoolHub::schedule_parents_locked in 7s build + 63s test
+# 44881681315 2 0a6dbf632ed446c2411a84015116425e5e9a1624
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:6141:34: replace == with != in MempoolHub::try_cmpct_avail in 109s build + 63s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:6169:47: replace && with || in MempoolHub::try_cmpct_avail in 7s build + 64s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:6344:40: replace && with || in MempoolHub::package_would_exceed_cluster in 9s build + 63s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:7235:25: replace > with == in MempoolHub::push_confirm_memory in 110s build + 62s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:7235:25: replace > with >= in MempoolHub::push_confirm_memory in 7s build + 63s test
+MISSED   crates/rbitcoin-net/src/v2.rs:381:37: replace > with >= in V2SessionReader<R>::read_packet in 110s build + 64s test
+MISSED   crates/rbitcoin-net/src/v2.rs:565:44: replace == with != in command_from_12 in 8s build + 64s test
+MISSED   crates/rbitcoin-net/src/v2.rs:582:43: replace match guard gh.locator_hashes.len() > MAX_LOCATOR_SZ with false in encode_v2_contents in 7s build + 63s test
+MISSED   crates/rbitcoin-net/src/v2.rs:585:42: replace match guard gb.locator_hashes.len() > MAX_LOCATOR_SZ with false in encode_v2_contents in 7s build + 63s test
+MISSED   crates/rbitcoin-net/src/v2.rs:575:24: replace > with == in encode_v2_contents in 7s build + 64s test
+MISSED   crates/rbitcoin-net/src/v2.rs:575:24: replace > with >= in encode_v2_contents in 7s build + 63s test
+MISSED   crates/rbitcoin-net/src/v2.rs:582:67: replace > with == in encode_v2_contents in 7s build + 63s test
+MISSED   crates/rbitcoin-net/src/v2.rs:582:67: replace > with >= in encode_v2_contents in 7s build + 62s test
+MISSED   crates/rbitcoin-net/src/v2.rs:585:66: replace > with == in encode_v2_contents in 7s build + 63s test
+MISSED   crates/rbitcoin-net/src/v2.rs:585:66: replace > with >= in encode_v2_contents in 7s build + 64s test
+MISSED   crates/rbitcoin-net/src/v2.rs:592:9: delete match arm NetworkMessage::Unknown{command, ..} in encode_v2_contents in 13s build + 63s test
+MISSED   crates/rbitcoin-net/src/v2.rs:596:19: replace > with == in encode_v2_contents in 13s build + 63s test
+MISSED   crates/rbitcoin-net/src/v2.rs:596:19: replace > with >= in encode_v2_contents in 7s build + 63s test
+MISSED   crates/rbitcoin-net/src/v2.rs:672:22: replace > with == in framed_payload in 7s build + 63s test
+MISSED   crates/rbitcoin-net/src/v2.rs:672:22: replace > with >= in framed_payload in 7s build + 63s test
+MISSED   crates/rbitcoin-net/src/v2.rs:858:24: replace && with || in bip324_halves in 8s build + 64s test
+MISSED   crates/rbitcoin-net/src/versionbits_warn.rs:91:42: replace || with && in UnknownBitsScan::advance in 110s build + 64s test
+MISSED   crates/rbitcoin-net/src/parent_req.rs:249:73: replace && with || in ParentTracker::schedule in 4s build + 35s test
+MISSED   crates/rbitcoin-net/src/parent_req.rs:287:57: replace && with || in ParentTracker::rearm_existing in 4s build + 35s test
+MISSED   crates/rbitcoin-net/src/parent_req.rs:287:39: replace && with || in ParentTracker::rearm_existing in 4s build + 34s test
+MISSED   crates/rbitcoin-net/src/parent_req.rs:287:30: replace == with != in ParentTracker::rearm_existing in 4s build + 34s test
+MISSED   crates/rbitcoin-net/src/parent_req.rs:287:49: replace != with == in ParentTracker::rearm_existing in 4s build + 35s test
+MISSED   crates/rbitcoin-net/src/parent_req.rs:289:82: replace || with && in ParentTracker::rearm_existing in 4s build + 34s test
+MISSED   crates/rbitcoin-net/src/parent_req.rs:461:41: delete ! in ParentTracker::select in 4s build + 34s test
+MISSED   crates/rbitcoin-net/src/parent_req.rs:461:64: replace <= with > in ParentTracker::select in 4s build + 35s test
