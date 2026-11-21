@@ -438,38 +438,6 @@ pub(crate) fn take_fail_sync(handle: IoHandle) -> bool {
     true
 }
 
-/// Watched fds, and whether one submitted sync batch held all of them.
-#[cfg(debug_assertions)]
-static SYNC_BATCH_WATCH: std::sync::Mutex<Option<(Vec<IoHandle>, bool)>> =
-    std::sync::Mutex::new(None);
-
-/// Watch for one `sync_data` batch that submits every fd in `handles`
-/// together. [`take_sync_batch_seen`] reports it.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn watch_sync_batch(handles: Vec<IoHandle>) {
-    *SYNC_BATCH_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = Some((handles, false));
-}
-
-/// Stop watching. True when one batch held every watched fd.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn take_sync_batch_seen() -> bool {
-    SYNC_BATCH_WATCH
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .is_some_and(|(_, seen)| seen)
-}
-
-#[cfg(debug_assertions)]
-pub(crate) fn note_sync_batch(batch: &[IoHandle]) {
-    let mut watch = SYNC_BATCH_WATCH.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((handles, seen)) = watch.as_mut() {
-        *seen |= handles.iter().all(|h| batch.contains(h));
-    }
-}
-
 #[cfg(debug_assertions)]
 fn take_fail_pread(handle: IoHandle) -> bool {
     let mut slots = FAIL_PREAD.lock().unwrap_or_else(|e| e.into_inner());

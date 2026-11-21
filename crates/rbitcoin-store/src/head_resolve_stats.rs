@@ -139,24 +139,10 @@ pub static LAST_PROBE_DIAG: std::sync::Mutex<Option<LeftoverProbeDiag>> =
     std::sync::Mutex::new(None);
 #[doc(hidden)]
 pub static LAST_PROBE_DIAG_SET: AtomicU64 = AtomicU64::new(0);
-/// Recent leftover hop-dump txids (cap 16). Survives `take` / next resolve
-/// `clear_leftover_miss` so tests can pin **this** parent, not a process flag.
-#[doc(hidden)]
-pub static RECORDED_PROBE_TXIDS: std::sync::Mutex<Vec<[u8; 32]>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// True when leftover (not lookup) recorded a probe dump (`diag=1` on the reject line).
 pub fn leftover_probe_diag_ready() -> bool {
     LAST_PROBE_DIAG_SET.load(Ordering::Relaxed) != 0
-}
-
-/// True when a leftover hop-dump for `txid` was recorded this process.
-pub fn leftover_probe_diag_recorded(txid: &[u8; 32]) -> bool {
-    RECORDED_PROBE_TXIDS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .any(|t| t == txid)
 }
 
 pub fn take_leftover_probe_diag() -> Option<LeftoverProbeDiag> {
@@ -169,15 +155,6 @@ pub fn take_leftover_probe_diag() -> Option<LeftoverProbeDiag> {
 
 pub fn note_leftover_probe_diag(diag: LeftoverProbeDiag) {
     LAST_PROBE_DIAG_SET.store(1, Ordering::Relaxed);
-    {
-        let mut rec = RECORDED_PROBE_TXIDS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if rec.len() >= 16 {
-            rec.remove(0);
-        }
-        rec.push(diag.txid);
-    }
     *LAST_PROBE_DIAG.lock().unwrap_or_else(|e| e.into_inner()) = Some(diag);
 }
 

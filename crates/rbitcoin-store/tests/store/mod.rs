@@ -1462,19 +1462,33 @@ fn tiponly_same_page_foreigner_records_probe_diag() {
         }
     }
     assert!(found, "need a same-slot miss key (page+h1)");
+    rbitcoin_log::capture_logs(true);
     let hits = s.get_fk_by_txid_batch(&[b]).unwrap();
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
     assert!(hits[0].1.is_none(), "B is not in the head");
+    assert!(
+        !logs.iter().any(|(_, l)| l.contains("leftover probe diag")),
+        "resolve must not dump this key; leftover caller does: {logs:?}"
+    );
     // A sits on B's chain but carries another fingerprint, so the probe
     // drops it before identity: the miss is on the head, with no cands.
     let (on, n_cands) =
         rbitcoin_store::head_resolve_stats::take_leftover_miss().expect("classified");
     assert_eq!(on, LeftoverMissOn::Head);
     assert_eq!(n_cands, 0, "fingerprint must skip A, n_cands={n_cands}");
-    assert!(
-        !rbitcoin_store::head_resolve_stats::leftover_probe_diag_recorded(&b),
-        "resolve must not dump this key; leftover caller does"
-    );
+    rbitcoin_log::capture_logs(true);
     s.diagnose_leftover_probe(&b);
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let b_hex = rbitcoin_primitives::hex_encode(b);
+    assert!(
+        logs.iter()
+            .any(|(level, l)| *level == rbitcoin_log::Level::Warn
+                && l.contains("leftover probe diag")
+                && l.contains(&b_hex)),
+        "leftover caller must WARN the dump for B: {logs:?}"
+    );
     let diag = rbitcoin_store::head_resolve_stats::take_leftover_probe_diag()
         .expect("leftover miss path must record a probe dump");
     assert_eq!(diag.txid, b);
@@ -1521,17 +1535,21 @@ fn open_head_page_uses_mix_txid_not_raw() {
 }
 
 /// Lookup / BQ-ahead also use TipOnly `get_fk_by_txid_batch`. A miss there
-/// is routine (parent not published yet). Dump + WARN only on leftover.
+/// is routine (parent not published yet): it logs no leftover probe dump,
+/// which only the leftover miss path WARNs.
 #[test]
 fn tiponly_resolve_miss_does_not_dump_probe_diag() {
     let dir = tmp();
     let s = Store::create_tiny(&dir).unwrap();
     let miss = [0xCCu8; 32];
+    rbitcoin_log::capture_logs(true);
     let hits = s.get_fk_by_txid_batch(&[miss]).unwrap();
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
     assert!(hits[0].1.is_none(), "unknown txid must miss");
     assert!(
-        !rbitcoin_store::head_resolve_stats::leftover_probe_diag_recorded(&miss),
-        "resolve TipOnly miss must not hop-dump this key; leftover miss path only"
+        !logs.iter().any(|(_, l)| l.contains("leftover probe diag")),
+        "resolve TipOnly miss must not log a hop dump: {logs:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

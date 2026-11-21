@@ -553,17 +553,26 @@ fn inflight_binds_after_drain_before_fence() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Leftover miss (unknown parent) hop-dumps once. Lookup TipOnly does not.
+/// Leftover miss (unknown parent) names that parent in the confirm stats
+/// and WARNs its hop dump.
 #[test]
 fn leftover_miss_dumps_probe_diag() {
     let (dir, q) = temp_query("leftover-miss-diag");
     let empty = rbitcoin_query::InFlight::new();
     let ghost = [0xDDu8; 32];
     let need = vec![(Fk(1), vec![child_spend(ghost, 0xaa)])];
+    rbitcoin_log::capture_logs(true);
     let _ = plan_applies(&q, &need, 1, &empty, None);
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert_eq!(q.confirm_stats().last_union_miss().txid, Some(ghost));
+    let ghost_hex = rbitcoin_primitives::hex_encode(ghost);
     assert!(
-        rbitcoin_store::leftover_probe_diag_recorded(&ghost),
-        "leftover miss must hop-dump this parent"
+        logs.iter()
+            .any(|(level, l)| *level == rbitcoin_log::Level::Warn
+                && l.contains("leftover probe diag")
+                && l.contains(&ghost_hex)),
+        "leftover miss must WARN this parent's hop dump: {logs:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
