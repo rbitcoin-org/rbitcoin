@@ -1,14 +1,14 @@
 {
   "schemaVersion": 1,
   "label": "coverage",
-  "message": "92.61%",
+  "message": "92.58%",
   "color": "brightgreen",
-  "pct": 92.61,
-  "lh": 123732,
-  "lf": 133612,
+  "pct": 92.58,
+  "lh": 123774,
+  "lf": 133693,
   "gate": 91,
   "scope": "production",
-  "sha": "3d8e7d8a8d1b",
+  "sha": "0a6dbf632ed4",
   "date": "2026-11-21",
   "crates": [
     {
@@ -19,33 +19,33 @@
     },
     {
       "name": "rbitcoin-consensus",
-      "lh": 6811,
+      "lh": 6813,
       "lf": 7013,
-      "pct": 97.12
+      "pct": 97.15
     },
     {
       "name": "rbitcoin-electrum",
-      "lh": 3346,
+      "lh": 3344,
       "lf": 3601,
-      "pct": 92.92
+      "pct": 92.86
     },
     {
       "name": "rbitcoin-esplora",
-      "lh": 4271,
-      "lf": 4713,
-      "pct": 90.62
+      "lh": 4285,
+      "lf": 4727,
+      "pct": 90.65
     },
     {
       "name": "rbitcoin-ibd",
-      "lh": 14223,
-      "lf": 15101,
-      "pct": 94.19
+      "lh": 14264,
+      "lf": 15153,
+      "pct": 94.13
     },
     {
       "name": "rbitcoin-log",
-      "lh": 528,
+      "lh": 527,
       "lf": 542,
-      "pct": 97.42
+      "pct": 97.23
     },
     {
       "name": "rbitcoin-mempool",
@@ -55,15 +55,15 @@
     },
     {
       "name": "rbitcoin-net",
-      "lh": 26515,
-      "lf": 28399,
-      "pct": 93.37
+      "lh": 26555,
+      "lf": 28438,
+      "pct": 93.38
     },
     {
       "name": "rbitcoin-node",
-      "lh": 5294,
+      "lh": 5286,
       "lf": 6216,
-      "pct": 85.17
+      "pct": 85.04
     },
     {
       "name": "rbitcoin-primitives",
@@ -73,9 +73,9 @@
     },
     {
       "name": "rbitcoin-query",
-      "lh": 17368,
+      "lh": 17351,
       "lf": 18873,
-      "pct": 92.03
+      "pct": 91.94
     },
     {
       "name": "rbitcoin-rpc",
@@ -85,9 +85,9 @@
     },
     {
       "name": "rbitcoin-store",
-      "lh": 29732,
-      "lf": 32582,
-      "pct": 91.25
+      "lh": 29705,
+      "lf": 32558,
+      "pct": 91.24
     },
     {
       "name": "rbitcoin-sv2",
