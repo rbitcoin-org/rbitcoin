@@ -460,7 +460,11 @@ pub fn request_headers_from(
     let Some(s) = slots.iter().find(|s| s.id == peer && s.alive) else {
         return Ok(false);
     };
-    Ok(s.cmd_tx.send(PeerCmd::GetHeaders { locator }).is_ok())
+    let sent = s.cmd_tx.send(PeerCmd::GetHeaders { locator }).is_ok();
+    if sent {
+        s.headers_asks.note_ask(ibd_mono_ms());
+    }
+    Ok(sent)
 }
 
 /// Locator for IBD getheaders: `refill`, then every other hash by descending

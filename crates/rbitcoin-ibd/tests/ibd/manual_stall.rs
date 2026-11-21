@@ -276,6 +276,7 @@ fn reader_of(st: &IbdWorkState, id: usize) -> (IbdReadCtx, mpsc::UnboundedReceiv
             ctrl: ctrl_tx,
         },
         requested: std::sync::Arc::clone(&slot.requested),
+        headers_asks: std::sync::Arc::clone(&slot.headers_asks),
         solicited_bytes: std::sync::Arc::clone(&slot.solicited_bytes),
         solicited_ms: std::sync::Arc::clone(&slot.solicited_ms),
         light_decode: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),

@@ -3,7 +3,7 @@ use bitcoin::p2p::Magic;
 use bitcoin::BlockHash;
 use rbitcoin_ibd::ibd::dial::*;
 use rbitcoin_ibd::ibd::peer_io::solicit_track;
-use rbitcoin_ibd::ibd::peer_io::{ibd_mono_ms, PeerEventSinks, PeerSlot};
+use rbitcoin_ibd::ibd::peer_io::{ibd_mono_ms, PeerCmd, PeerEventSinks, PeerSlot};
 use rbitcoin_ibd::ibd::rate::RELSLOW_ACTIVE_MS;
 use rbitcoin_net::error::NetError;
 use rbitcoin_net::peers::{PeerConnType, PeerHub};
@@ -84,6 +84,7 @@ fn dummy_slot(id: usize, a: SocketAddr, alive: bool) -> PeerSlot {
         cmd_tx,
         in_flight: HashSet::new(),
         requested: solicit_track().0,
+        headers_asks: Default::default(),
         solicited_bytes: solicit_track().1,
         solicited_ms: solicit_track().2,
         open_block_bytes: Arc::new(AtomicU64::new(0)),
@@ -1794,6 +1795,26 @@ fn request_headers_no_alive_returns_false() {
     let loc = ibd_header_locator(&hub, &[], &[], &[]);
     assert!(!loc.is_empty());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A sent `getheaders` opens one exemption for the reply that answers it.
+#[test]
+fn request_headers_opens_one_reply_exemption() {
+    let mut seq = 0u32;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut slot = dummy_slot(1, addr(1), true);
+    slot.cmd_tx = tx;
+    assert!(request_headers_from(std::slice::from_ref(&slot), 1, &mut seq, vec![]).unwrap());
+    assert!(matches!(rx.try_recv(), Ok(PeerCmd::GetHeaders { .. })));
+    let now = ibd_mono_ms();
+    assert!(
+        slot.headers_asks.take_reply(now),
+        "the send opened one exemption"
+    );
+    assert!(
+        !slot.headers_asks.take_reply(now),
+        "one ask exempts one reply"
+    );
 }
 
 /// The protocol maximum drops the lowest heights. A hash named twice counts once.

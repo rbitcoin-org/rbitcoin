@@ -59,6 +59,7 @@ fn slot_at(id: usize, ip: Ipv4Addr, height: u32) -> (PeerSlot, mpsc::UnboundedRe
             cmd_tx,
             in_flight: Default::default(),
             requested,
+            headers_asks: Default::default(),
             solicited_bytes,
             solicited_ms,
             open_block_bytes: Arc::new(AtomicU64::new(0)),

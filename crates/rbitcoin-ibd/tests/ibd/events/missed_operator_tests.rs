@@ -65,6 +65,7 @@ fn peer(id: usize, peer_height: u32) -> (PeerSlot, mpsc::UnboundedReceiver<PeerC
             cmd_tx,
             in_flight: Default::default(),
             requested,
+            headers_asks: Default::default(),
             solicited_bytes,
             solicited_ms,
             open_block_bytes: Arc::new(AtomicU64::new(0)),

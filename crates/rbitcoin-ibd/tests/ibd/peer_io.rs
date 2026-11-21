@@ -34,6 +34,7 @@ fn dummy_slot(id: usize) -> PeerSlot {
         cmd_tx,
         in_flight: HashSet::new(),
         requested: Arc::new(Mutex::new(HashSet::new())),
+        headers_asks: Default::default(),
         solicited_bytes: Arc::new(AtomicU64::new(0)),
         solicited_ms: Arc::new(AtomicU64::new(0)),
         open_block_bytes: Arc::new(AtomicU64::new(0)),
@@ -440,6 +441,100 @@ fn framed(command: [u8; 12], payload: Vec<u8>) -> FramedMessage {
     }
 }
 
+fn headers_frame(headers: &[Header]) -> FramedMessage {
+    use bitcoin::consensus::Encodable;
+    let mut payload = Vec::new();
+    bitcoin::consensus::encode::VarInt(headers.len() as u64)
+        .consensus_encode(&mut payload)
+        .unwrap();
+    for header in headers {
+        header.consensus_encode(&mut payload).unwrap();
+    }
+    framed(*b"headers\0\0\0\0\0", payload)
+}
+
+fn notfound_frame(hashes: &[BlockHash]) -> FramedMessage {
+    use bitcoin::consensus::Encodable;
+    let mut payload = Vec::new();
+    bitcoin::consensus::encode::VarInt(hashes.len() as u64)
+        .consensus_encode(&mut payload)
+        .unwrap();
+    for hash in hashes {
+        Inventory::WitnessBlock(*hash)
+            .consensus_encode(&mut payload)
+            .unwrap();
+    }
+    framed(*b"notfound\0\0\0\0", payload)
+}
+
+/// `headers` and `notfound` are heavy decodes like any other session frame:
+/// they take the message and byte window before the decode is spawned.
+#[tokio::test]
+async fn headers_and_notfound_charge_the_session_window() {
+    use rbitcoin_net::peer_dos::DEFAULT_MAX_BYTES_PER_SEC;
+
+    let (mut ctx, _out, _body, _ctrl) = test_ctx(1);
+    ctx.rate = PeerRateLimiter::new(2, DEFAULT_MAX_BYTES_PER_SEC);
+    assert!(!ctx.handle(Ok(headers_frame(&[one_header()]))));
+    assert_eq!(ctx.rate.cur_msgs, 1, "a headers frame is one message");
+    let hash = BlockHash::from_byte_array([11u8; 32]);
+    assert!(!ctx.handle(Ok(notfound_frame(&[hash]))));
+    assert_eq!(ctx.rate.cur_msgs, 2, "a notfound frame is one message");
+    assert_eq!(
+        ctx.rate.cur_bytes,
+        (headers_frame(&[one_header()]).payload_len() + notfound_frame(&[hash]).payload_len())
+            as u64,
+        "the framed payload bytes are charged"
+    );
+
+    assert!(
+        !ctx.handle(Ok(headers_frame(&[one_header()]))),
+        "the first overflow stays connected"
+    );
+    assert_eq!(ctx.ban_score, RATE_LIMIT_BAN_SCORE);
+    assert!(ctx.handle(Ok(notfound_frame(&[hash]))));
+    assert_eq!(ctx.ban_score, RATE_LIMIT_BAN_SCORE * 2);
+}
+
+/// One `getheaders` exempts exactly one `headers` reply. A second reply is
+/// unsolicited spam and takes the window like any heavy frame.
+#[tokio::test]
+async fn one_solicited_headers_reply_stays_off_the_session_window() {
+    use rbitcoin_net::peer_dos::DEFAULT_MAX_BYTES_PER_SEC;
+
+    let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx(1);
+    ctx.rate = PeerRateLimiter::new(1, DEFAULT_MAX_BYTES_PER_SEC);
+    ctx.headers_asks.note_ask(ibd_mono_ms());
+    assert!(!ctx.handle(Ok(headers_frame(&[one_header()]))));
+    assert_eq!(ctx.rate.cur_msgs, 0, "the asked reply is exempt");
+
+    assert!(!ctx.handle(Ok(headers_frame(&[one_header()]))));
+    assert_eq!(ctx.rate.cur_msgs, 1, "a second reply is charged");
+    assert!(!ctx.handle(Ok(headers_frame(&[one_header()]))));
+    assert_eq!(ctx.ban_score, RATE_LIMIT_BAN_SCORE);
+    assert!(body_rx.try_recv().is_err(), "the overflow stays connected");
+}
+
+#[test]
+fn a_stale_or_stacked_headers_ask_does_not_bank_exemptions() {
+    let asks = HeaderAsks::new();
+    asks.note_ask(1_000);
+    assert!(
+        !asks.take_reply(1_000 + HEADERS_ASK_TTL_MS + 1),
+        "a reply after the ask window is charged"
+    );
+    assert!(!asks.take_reply(1_000), "the stale ask is forgotten");
+
+    let newest = 1_000 + HEADERS_ASKS_MAX as u64 + 3;
+    for now in 1_000..newest {
+        asks.note_ask(now);
+    }
+    for _ in 0..HEADERS_ASKS_MAX {
+        assert!(asks.take_reply(newest), "a stacked ask exempts one reply");
+    }
+    assert!(!asks.take_reply(newest), "the ask count stays at its cap");
+}
+
 fn test_ctx(
     permits: usize,
 ) -> (
@@ -460,6 +555,7 @@ fn test_ctx(
             ctrl: ctrl_tx,
         },
         requested: Arc::new(Mutex::new(HashSet::new())),
+        headers_asks: Default::default(),
         solicited_bytes: Arc::new(AtomicU64::new(0)),
         solicited_ms: Arc::new(AtomicU64::new(0)),
         light_decode: Arc::new(Semaphore::new(permits)),

@@ -46,6 +46,7 @@ fn slot(id: usize) -> (PeerSlot, mpsc::UnboundedReceiver<PeerCmd>) {
             cmd_tx,
             in_flight: Default::default(),
             requested: solicit_track().0,
+            headers_asks: Default::default(),
             solicited_bytes: solicit_track().1,
             solicited_ms: solicit_track().2,
             open_block_bytes: Arc::new(AtomicU64::new(0)),
