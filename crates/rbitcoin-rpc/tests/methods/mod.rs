@@ -5333,6 +5333,22 @@ fn pressure_admit_then_cluster(ctx: &RpcContext, spk: &ScriptBuf) {
         let err = row["package-error"].as_str().expect("package-error");
         assert!(err.contains("too-large-cluster"), "got {row}");
     }
+
+    // Each fails alone only on fee or missing inputs, so the pair goes to
+    // package evaluation, which hits the cluster cap (Core `package_msg`).
+    let low = child_of(&cluster_parent, 1);
+    let payer = child_of(&low, 80_000);
+    let pkg = dispatch(
+        ctx,
+        "submitpackage",
+        vec![json!([
+            rbitcoin_primitives::hex_encode(serialize(&low)),
+            rbitcoin_primitives::hex_encode(serialize(&payer))
+        ])],
+    )
+    .unwrap();
+    assert_eq!(pkg["package_msg"], "too-large-cluster", "{pkg}");
+    assert!(!mp.contains(&low.compute_txid()), "{pkg}");
 }
 
 #[test]

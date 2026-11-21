@@ -2125,12 +2125,12 @@ pub async fn submitpackage_admit_async(
     // `note_unbroadcast` is inside `submitpackage_apply`. That call shares
     // the admit task so a dropped request still records each published member.
     rbitcoin_net::spawn_with_store_budget(async move {
-        let rows = mp_a
+        let outcome = mp_a
             .submit_package_rpc_eval_async(plan.eval_txs.clone(), plan.package_eval)
             .await;
         park_before_unbroadcast_note(&mp_a).await;
         let mp_b = Arc::clone(&mp_a);
-        rbitcoin_net::off_pool(move || submitpackage_apply(&mp_b, plan, rows)).await
+        rbitcoin_net::off_pool(move || submitpackage_apply(&mp_b, plan, outcome)).await
     })
     .await
     .expect("submitpackage")
@@ -2206,7 +2206,7 @@ fn submitpackage_plan(
 fn submitpackage_apply(
     mp: &MempoolHub,
     plan: PackagePlan,
-    rows: Vec<rbitcoin_net::tx_relay::SubmitPackageRow>,
+    outcome: rbitcoin_net::tx_relay::SubmitPackage,
 ) -> Value {
     let PackagePlan {
         mut tx_results,
@@ -2217,7 +2217,10 @@ fn submitpackage_apply(
         over_max,
         package_eval: _,
     } = plan;
-    for (tx, row) in eval_txs.iter().zip(rows) {
+    // A `version` member is a Core pre-check failure, which skips package
+    // evaluation and its reason.
+    let mut reason = outcome.reason.filter(|_| !any_fail);
+    for (tx, row) in eval_txs.iter().zip(outcome.rows) {
         match row.result {
             Ok(ok) => {
                 mp.note_unbroadcast(ok.txid);
@@ -2264,6 +2267,7 @@ fn submitpackage_apply(
         let row = match mp.wtxid_of(&txid) {
             None => {
                 any_fail = true;
+                reason = None;
                 json!({ "txid": txid_s, "error": "mempool full" })
             }
             // Core `DIFFERENT_WITNESS`: the txid is live under another witness.
@@ -2295,7 +2299,7 @@ fn submitpackage_apply(
         );
     }
     let package_msg = if any_fail {
-        "transaction failed"
+        reason.unwrap_or("transaction failed")
     } else {
         "success"
     };

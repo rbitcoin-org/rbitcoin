@@ -607,6 +607,17 @@ pub fn package_full_slot(in_rest: bool, slot_err: bool) -> bool {
     in_rest && slot_err
 }
 
+/// Core `package_msg` for a failed package evaluation, for the reasons Core
+/// names bare. Its TRUC and package-RBF reasons carry detail this layer does
+/// not build, so they stay `transaction failed`.
+fn package_eval_reason(e: &AcceptError) -> Option<&'static str> {
+    match e {
+        AcceptError::Policy("missing-ephemeral-spends") => Some("unspent-dust"),
+        AcceptError::ClusterTooLarge { .. } => Some("too-large-cluster"),
+        _ => None,
+    }
+}
+
 /// Progress lines are at most once per ten seconds, including the instant the
 /// window elapses.
 #[doc(hidden)]
@@ -1256,6 +1267,16 @@ pub struct SubmitPackageRow {
     /// Remainder whose modified fees make up this tx's effective feerate.
     /// `None` when the tx was admitted on its own.
     pub fee_with: Option<Vec<Txid>>,
+}
+
+/// `submitpackage` rows, in package order, and the package-level reason.
+#[derive(Debug)]
+pub struct SubmitPackage {
+    pub rows: Vec<SubmitPackageRow>,
+    /// Core `package_msg` when the package evaluation itself failed for a
+    /// reason Core names there. `None` means `transaction failed` on any
+    /// failed row.
+    pub reason: Option<&'static str>,
 }
 
 /// Confirmed coins sampled before the write lock. `stamp` is `None` when a
@@ -6389,7 +6410,7 @@ impl MempoolHub {
     /// Trim runs once at the end. A tx admitted on its own reports `fee_with =
     /// None`. A tx that only cleared the fee floor inside the remainder reports
     /// that remainder, in package order.
-    pub fn submit_package_rpc(&self, txs: &[Transaction]) -> Vec<SubmitPackageRow> {
+    pub fn submit_package_rpc(&self, txs: &[Transaction]) -> SubmitPackage {
         self.submit_package_rpc_eval(txs, true)
     }
 
@@ -6400,7 +6421,7 @@ impl MempoolHub {
         &self,
         txs: &[Transaction],
         package_eval: bool,
-    ) -> Vec<SubmitPackageRow> {
+    ) -> SubmitPackage {
         let mut out: Vec<Result<AcceptResult, AcceptError>> =
             txs.iter().map(|tx| self.accept_tx_defer_trim(tx)).collect();
         let rest: Vec<Transaction> = txs
@@ -6412,12 +6433,13 @@ impl MempoolHub {
             })
             .map(|(tx, _)| tx.clone())
             .collect();
+        let mut reason = None;
         if package_eval && rest.len() >= 2 {
             // `accept_package` kicks. This path trims once more below, so use
             // the admit that does not kick and kick after that trim.
-            Self::note_package_full(txs, &rest, &mut out, self.admit_package(&rest));
+            reason = Self::note_package_eval(txs, &rest, &mut out, self.admit_package(&rest));
         }
-        self.package_rows_after_eval(txs, out, rest)
+        self.package_rows_after_eval(txs, out, rest, reason)
     }
 
     /// [`Self::submit_package_rpc_eval`] with scripts awaited on the caller.
@@ -6428,7 +6450,7 @@ impl MempoolHub {
         self: &Arc<Self>,
         txs: Vec<Transaction>,
         package_eval: bool,
-    ) -> Vec<SubmitPackageRow> {
+    ) -> SubmitPackage {
         self.submit_package_rpc_eval_work(txs, package_eval).await
     }
 
@@ -6436,7 +6458,7 @@ impl MempoolHub {
         self: &Arc<Self>,
         txs: Vec<Transaction>,
         package_eval: bool,
-    ) -> Vec<SubmitPackageRow> {
+    ) -> SubmitPackage {
         let mut out = Vec::with_capacity(txs.len());
         for tx in &txs {
             out.push(self.accept_tx_defer_trim_async(tx.clone()).await);
@@ -6457,31 +6479,47 @@ impl MempoolHub {
         })
         .await;
         let mut out = out;
+        let mut reason = None;
         if package_eval && rest.len() >= 2 {
             // `accept_package_async` kicks. This path trims once more below,
             // so use the admit that does not kick and kick after that trim.
             let admitted = self.admit_package_work(rest.clone()).await;
-            Self::note_package_full(&txs, &rest, &mut out, admitted);
+            reason = Self::note_package_eval(&txs, &rest, &mut out, admitted);
         }
         let hub = Arc::clone(self);
-        crate::reactor::off_pool(move || hub.package_rows_after_eval(&txs, out, rest)).await
+        crate::reactor::off_pool(move || hub.package_rows_after_eval(&txs, out, rest, reason)).await
     }
 
-    fn note_package_full(
+    /// Stamps a mempool-full package failure on the remainder and returns
+    /// the package-level reason, if Core would report one.
+    fn note_package_eval(
         txs: &[Transaction],
         rest: &[Transaction],
         out: &mut [Result<AcceptResult, AcceptError>],
         admitted: Result<Vec<AcceptResult>, AcceptError>,
-    ) {
-        if let Err(AcceptError::Policy("mempool full")) = admitted {
-            let rest_ids: std::collections::BTreeSet<Txid> =
-                rest.iter().map(|t| t.compute_txid()).collect();
+    ) -> Option<&'static str> {
+        let Err(e) = admitted else {
+            return None;
+        };
+        let rest_ids: std::collections::BTreeSet<Txid> =
+            rest.iter().map(|t| t.compute_txid()).collect();
+        // Core `AcceptPackage` quits early, with no package evaluation, when
+        // a member fails alone for a reason a package cannot fix.
+        let quit_early = txs
+            .iter()
+            .zip(out.iter())
+            .any(|(tx, slot)| slot.is_err() && !rest_ids.contains(&tx.compute_txid()));
+        if let AcceptError::Policy("mempool full") = e {
             for (tx, slot) in txs.iter().zip(out.iter_mut()) {
                 if package_full_slot(rest_ids.contains(&tx.compute_txid()), slot.is_err()) {
                     *slot = Err(AcceptError::Policy("mempool full"));
                 }
             }
         }
+        if quit_early {
+            return None;
+        }
+        package_eval_reason(&e)
     }
 
     fn package_rows_after_eval(
@@ -6489,7 +6527,8 @@ impl MempoolHub {
         txs: &[Transaction],
         out: Vec<Result<AcceptResult, AcceptError>>,
         rest: Vec<Transaction>,
-    ) -> Vec<SubmitPackageRow> {
+        mut reason: Option<&'static str>,
+    ) -> SubmitPackage {
         self.trim_over_budget();
         let live: Vec<Txid> = txs.iter().map(|tx| tx.compute_txid()).collect();
         self.kick_isolated_if_live(&live);
@@ -6514,6 +6553,8 @@ impl MempoolHub {
                     slot = Ok(ok);
                 }
             } else if slot.is_ok() {
+                // Core's post-trim recheck names the package `transaction failed`.
+                reason = None;
                 slot = Err(AcceptError::Policy("mempool full"));
             }
             rows.push(SubmitPackageRow {
@@ -6521,7 +6562,7 @@ impl MempoolHub {
                 fee_with: in_package.then(|| fee_with.clone().unwrap_or_default()),
             });
         }
-        rows
+        SubmitPackage { rows, reason }
     }
 
     /// Core `LimitMempoolSize` after a package: no member is protected.

@@ -2805,9 +2805,42 @@ fn chain_ops_ephemeral_anchor(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
         vec![json!([tx_hex(&parent), tx_hex(&skips)])],
     )
     .unwrap();
-    // Core answers `unspent-dust` here (mempool_ephemeral_dust.py
-    // test_unspent_ephemeral); the per-member strings differ too (COMPAT.md).
+    assert_eq!(r["package_msg"], "unspent-dust", "{r}");
+    assert_eq!(dispatch(ctx, "getrawmempool", vec![]).unwrap(), json!([]));
+    // Core answers -25 for this 3-generation chain; the dialect path
+    // evaluates it, and the `version` pre-check failure keeps the generic
+    // reason.
+    let v4 = Transaction {
+        version: TxVersion::non_standard(4),
+        ..v3_spend(&skips, &[0], cb - 20_000)
+    };
+    let r = dispatch(
+        ctx,
+        "submitpackage",
+        vec![json!([tx_hex(&parent), tx_hex(&skips), tx_hex(&v4)])],
+    )
+    .unwrap();
     assert_eq!(r["package_msg"], "transaction failed", "{r}");
+    assert_eq!(dispatch(ctx, "getrawmempool", vec![]).unwrap(), json!([]));
+    // Core answers -25 for an unrelated member; the dialect path evaluates
+    // it, and a member that fails alone for a reason no package fixes keeps
+    // the generic reason.
+    let h_stray = cbs.take();
+    let cb_stray = generated_coinbase_value(ctx, h_stray);
+    let mut stray = spend_generated_coinbase(ctx, h_stray, cb_stray - 10_000, true_spk()).1;
+    stray.output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: true_spk(),
+    });
+    let r = dispatch(
+        ctx,
+        "submitpackage",
+        vec![json!([tx_hex(&parent), tx_hex(&skips), tx_hex(&stray)])],
+    )
+    .unwrap();
+    assert_eq!(r["package_msg"], "transaction failed", "{r}");
+    let stray_row = &r["tx-results"][hash_hex_display(&stray.compute_wtxid().to_byte_array())];
+    assert_eq!(stray_row["error"], "dust", "{r}");
     assert_eq!(dispatch(ctx, "getrawmempool", vec![]).unwrap(), json!([]));
 
     let child = v3_spend(&parent, &[0, 1], cb - 10_000);
