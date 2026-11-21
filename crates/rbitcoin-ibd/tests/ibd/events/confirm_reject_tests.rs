@@ -3322,11 +3322,7 @@ fn merged_respend_of_a_same_block_spend_is_rejected_alone() {
     assert!(size(&b0) < size(&b2), "tip+1 and tip+3 sizes must differ");
     let both = [size(&b1) + size(&b2), size(&b0) + size(&b1) + size(&b2)];
     wait("scripts queue tip+2..=tip+3", &|| {
-        both.contains(
-            &queues
-                .write_wire_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        both.contains(&queues.content_snap().write_wire_bytes)
     });
     drop(commit);
     let rejects = rig.pump(
