@@ -230,9 +230,8 @@ impl P2PNode {
                 let ua = dial_ua.clone();
                 let live = dial_live.clone();
                 let d = dialer_task.clone();
-                let (ah_tx, ah_rx) = tokio::sync::oneshot::channel::<tokio::task::AbortHandle>();
                 let h = tokio::spawn(async move {
-                    let _ = run_outbound_session_with_abort(
+                    let _ = run_outbound_session(
                         req.target,
                         req.in_flight,
                         magic,
@@ -242,12 +241,10 @@ impl P2PNode {
                         ua,
                         live,
                         req.typ,
-                        ah_rx,
                         d,
                     )
                     .await;
                 });
-                let _ = ah_tx.send(h.abort_handle());
                 push_session_task(&sessions_dial, h);
             }
         });
@@ -580,8 +577,6 @@ pub fn spawn_inbound_accept(
                     let peers = peers.clone();
                     let ua = user_agent.clone();
                     let sessions = session_tasks.clone();
-                    let (ah_tx, ah_rx) =
-                        tokio::sync::oneshot::channel::<tokio::task::AbortHandle>();
                     let h = tokio::spawn(async move {
                         let _session_slot = permit;
                         let handshake = inbound_connect_and_handshake(
@@ -611,9 +606,6 @@ pub fn spawn_inbound_accept(
                             peers.unregister(sess.id);
                             return;
                         }
-                        if let Ok(ah) = ah_rx.await {
-                            sess.set_session_abort(ah);
-                        }
                         if let Some(mp) = hub.mempool() {
                             sess.set_inv_gen_floor(mp.next_accept_gen());
                         }
@@ -627,7 +619,6 @@ pub fn spawn_inbound_accept(
                         let _ = peer_session_with(reader, writer, magic, hub, tip_rx, meta).await;
                         peers.unregister(id);
                     });
-                    let _ = ah_tx.send(h.abort_handle());
                     push_session_task(&sessions, h);
                 }
                 Err(e) => {
@@ -826,7 +817,7 @@ pub async fn run_prepared_outbound(prepared: PreparedOutbound) -> Result<(), Net
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
-pub async fn run_outbound_session_with_abort(
+pub async fn run_outbound_session(
     peer: DialTarget,
     in_flight: Option<crate::peers::DialInFlight>,
     magic: Magic,
@@ -836,7 +827,6 @@ pub async fn run_outbound_session_with_abort(
     user_agent: String,
     follow_live: Arc<AtomicUsize>,
     typ: PeerConnType,
-    ah_rx: tokio::sync::oneshot::Receiver<tokio::task::AbortHandle>,
     dialer: crate::socks::Dialer,
 ) -> Result<(), NetError> {
     if typ == PeerConnType::Feeler {
@@ -876,9 +866,6 @@ pub async fn run_outbound_session_with_abort(
         dialer,
     )
     .await?;
-    if let Ok(ah) = ah_rx.await {
-        prepared.sess.set_session_abort(ah);
-    }
     run_prepared_outbound(prepared).await
 }
 

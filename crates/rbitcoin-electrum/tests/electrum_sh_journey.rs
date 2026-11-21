@@ -430,7 +430,6 @@ pub async fn listunspent_skips_unused(
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &ChainParams::regtest());
     let (handle, mut stream) = electrum_tcp_client(q, cfg, Some(Arc::clone(hub))).await;
     let unused = electrum_scripthash_hex(&[0x00]);
-    let _ = hub.sample_reset_perf();
     let empty = electrum_tcp_call(
         &mut stream,
         "blockchain.scripthash.listunspent",
@@ -439,11 +438,6 @@ pub async fn listunspent_skips_unused(
     .await
     .unwrap();
     assert!(empty.as_array().unwrap().is_empty());
-    assert_eq!(
-        hub.sample_reset_perf().spent_body_loads,
-        0,
-        "unused scripthash must not load mempool bodies"
-    );
     let sh = electrum_scripthash_hex(&[0x51]);
     let unspent = electrum_tcp_call(
         &mut stream,

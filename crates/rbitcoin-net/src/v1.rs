@@ -8,9 +8,9 @@ use crate::codec::{command_bytes_ok, FramedMessage, MAX_PROTOCOL_MESSAGE_LENGTH}
 use crate::error::NetError;
 use crate::net_permissions::NetPermissionFlags;
 use crate::v2::{
-    bip324_halves, counted_halves, encode_v2_contents, encode_v2_payload, read_v2_frame,
-    read_v2_frame_with_progress, v1_prefix, wait_v1_prefix_mismatch, write_v2_contents,
-    write_v2_msg, CountRead, CountWrite, PrefixedRead, V2Reader, V2Writer, WireBytes,
+    bip324_halves, counted_halves, encode_v2_contents, read_v2_frame, read_v2_frame_with_progress,
+    v1_prefix, wait_v1_prefix_mismatch, write_v2_contents, write_v2_msg, CountRead, CountWrite,
+    PrefixedRead, V2Reader, V2Writer, WireBytes,
 };
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::p2p::message::NetworkMessage;
@@ -279,12 +279,6 @@ impl PeerWriter {
             Self::V2(w) => write_v2_contents(w, contents).await,
             Self::V1(w) => w.write_contents(contents).await,
         }
-    }
-
-    /// A heavy payload encodes on `rbtc-scripts-*`.
-    pub async fn write_msg_offload(&mut self, msg: NetworkMessage) -> Result<(), NetError> {
-        let contents = encode_v2_payload(msg).await?;
-        self.write_contents(contents).await
     }
 }
 

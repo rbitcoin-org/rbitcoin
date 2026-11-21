@@ -571,8 +571,6 @@ pub struct LivePeer {
     pub age_inv_seen_gen: AtomicU64,
     /// Writer-task abort — FIN via dropping the write half.
     pub writer_abort: Mutex<Option<tokio::task::AbortHandle>>,
-    /// Whole session-task abort — drops reader+writer if the loop is stuck.
-    pub session_abort: Mutex<Option<tokio::task::AbortHandle>>,
     /// Cloned std TCP fd for `Shutdown::Both` on `disconnectnode` so the far
     /// side sees EOF even if our session task is mid-frame.
     pub tcp_shutdown: Mutex<Option<std::net::TcpStream>>,
@@ -700,14 +698,17 @@ impl LivePeer {
             .or_insert(0) += nbytes;
     }
 
+    /// The session writer calls this once per frame it wrote. A command
+    /// already in the map takes no allocation.
     pub fn note_sent(&self, cmd: &str, nbytes: u64) {
         let n = acct_bytes(cmd, nbytes);
-        *self
-            .sent
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(cmd.into())
-            .or_insert(0) += n;
+        let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
+        match sent.get_mut(cmd) {
+            Some(total) => *total += n,
+            None => {
+                sent.insert(cmd.to_owned(), n);
+            }
+        }
     }
 
     pub fn request_disconnect(&self) {
@@ -996,10 +997,6 @@ impl LivePeer {
         *self.writer_abort.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
-    pub fn set_session_abort(&self, handle: tokio::task::AbortHandle) {
-        *self.session_abort.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
-    }
-
     pub fn attach_tcp_shutdown(&self, stream: std::net::TcpStream) {
         *self.tcp_shutdown.lock().unwrap_or_else(|e| e.into_inner()) = Some(stream);
     }
@@ -1026,14 +1023,6 @@ impl LivePeer {
     #[doc(hidden)]
     pub fn take_writer_abort(&self) -> Option<tokio::task::AbortHandle> {
         self.writer_abort
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-    }
-
-    #[doc(hidden)]
-    pub fn take_session_abort(&self) -> Option<tokio::task::AbortHandle> {
-        self.session_abort
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
@@ -3704,7 +3693,6 @@ impl PeerHub {
             age_inv_seen_due: AtomicU64::new(0),
             age_inv_seen_gen: AtomicU64::new(0),
             writer_abort: Mutex::new(None),
-            session_abort: Mutex::new(None),
             tcp_shutdown: Mutex::new(None),
             handshake_complete: AtomicBool::new(false),
             v2_transport_ready: AtomicBool::new(false),

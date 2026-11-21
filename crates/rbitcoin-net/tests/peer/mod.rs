@@ -1859,7 +1859,6 @@ async fn open_decode_session_with(
         )
         .await;
     });
-    live.set_session_abort(session.abort_handle());
     DecodeSession {
         live,
         reader: c_reader,
@@ -9749,6 +9748,145 @@ fn wire_pongs(wire: &[NetworkMessage]) -> Vec<u64> {
             _ => None,
         })
         .collect()
+}
+
+/// `getpeerinfo.bytessent_per_msg` counts what the writer put on the wire,
+/// per command, as payload plus Core's 24-byte header (the same rule as
+/// `bytesrecv_per_msg`). A pre-encoded getdata block counts as `block`.
+#[tokio::test(flavor = "current_thread")]
+async fn writer_counts_bytes_sent_per_message() {
+    let peer = addrfetch_peer();
+    let block = bitcoin::constants::genesis_block(Network::Regtest);
+    let block_len = serialize(&block).len() as u64;
+    let encoded = rbitcoin_net::v2::encode_v2_contents(NetworkMessage::Block(block)).unwrap();
+    let wire = messages_from_writer(
+        &peer,
+        |tx| {
+            tx.send(PeerOut::Msg(NetworkMessage::Ping(7))).unwrap();
+            tx.send(PeerOut::Msg(NetworkMessage::GetData(Vec::new())))
+                .unwrap();
+            tx.send(PeerOut::Msg(NetworkMessage::GetData(Vec::new())))
+                .unwrap();
+            tx.send(PeerOut::Encoded(encoded)).unwrap();
+        },
+        4,
+    )
+    .await;
+    assert_eq!(wire.len(), 4, "every queued message is written: {wire:?}");
+    let sent = peer.snapshot(0).bytessent_per_msg;
+    let want: HashMap<String, u64> = [
+        ("ping", 8 + 24),
+        ("getdata", 2 * (1 + 24)),
+        ("block", block_len + 24),
+    ]
+    .into_iter()
+    .map(|(cmd, n)| (cmd.to_owned(), n))
+    .collect();
+    assert_eq!(sent, want, "bytessent_per_msg after the writer ran");
+}
+
+/// Only a write that succeeded is counted. The far side resets the
+/// connection after the ping, so the getdata queued next fails and stays
+/// out of `bytessent_per_msg`.
+#[tokio::test(flavor = "current_thread")]
+async fn writer_does_not_count_a_failed_write() {
+    use tokio::io::AsyncReadExt;
+    let peer = addrfetch_peer();
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let (mut read, write) = server.into_split();
+    let magic = Magic::from(Network::Regtest);
+    let wire = rbitcoin_net::WireBytes::new();
+    let writer = rbitcoin_net::v1::PeerWriter::V1(rbitcoin_net::v1::V1Writer::new(
+        wire.count_write(write),
+        magic,
+    ));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run_writer_task(writer, rx, Some(Arc::clone(&peer))));
+    tx.send(PeerOut::Msg(NetworkMessage::Ping(7))).unwrap();
+    let mut reader = rbitcoin_net::v1::V1Reader::new(&mut client);
+    let frame = tokio::time::timeout(Duration::from_secs(2), reader.read_frame(magic, |_| Ok(())))
+        .await
+        .expect("ping written")
+        .unwrap();
+    assert!(matches!(
+        frame.decode().into_payload(),
+        NetworkMessage::Ping(7)
+    ));
+    // A zero linger makes the drop send RST. Once the read half sees it,
+    // the next write fails.
+    client.set_zero_linger().unwrap();
+    drop(client);
+    let mut buf = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(2), read.read(&mut buf)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "reset must reach the server socket: {closed:?}"
+    );
+    tx.send(PeerOut::Msg(NetworkMessage::GetData(Vec::new())))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("a failed write ends the writer task")
+        .unwrap();
+    let sent = peer.snapshot(0).bytessent_per_msg;
+    assert_eq!(sent.get("ping"), Some(&(8 + 24)), "{sent:?}");
+    assert_eq!(
+        sent.get("getdata"),
+        None,
+        "a failed write is not counted: {sent:?}"
+    );
+}
+
+/// The session start writes `sendheaders`, `sendcmpct`, the first `ping`
+/// and, when relay is on or IBD runs, `feefilter` before the writer task
+/// runs. Those count in `bytessent_per_msg` too.
+#[tokio::test]
+async fn session_start_messages_count_in_bytes_sent() {
+    use rbitcoin_net::v2::read_v2_frame;
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("start-sent");
+    hub.ensure_genesis().unwrap();
+    let hub = hub.into_arc();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let mut sess = open_decode_session(Arc::clone(&hub), &peers, 18496, None).await;
+    let mut seen = HashSet::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !["sendheaders", "sendcmpct", "ping"]
+        .iter()
+        .all(|c| seen.contains(*c))
+    {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let frame = tokio::time::timeout(left, read_v2_frame(&mut sess.reader, sess.magic))
+            .await
+            .expect("session start frames")
+            .unwrap();
+        seen.insert(frame.decode().payload().cmd().to_owned());
+    }
+    // Counted after the write returns, which can trail the read here.
+    let mut sent = HashMap::new();
+    while std::time::Instant::now() < deadline {
+        sent = sess.live.snapshot(0).bytessent_per_msg;
+        if ["sendheaders", "sendcmpct", "ping"]
+            .iter()
+            .all(|c| sent.contains_key(*c))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(sent.get("sendheaders"), Some(&24), "{sent:?}");
+    assert_eq!(sent.get("sendcmpct"), Some(&(9 + 24)), "{sent:?}");
+    assert_eq!(sent.get("ping"), Some(&(8 + 24)), "{sent:?}");
+    if seen.contains("feefilter") {
+        assert_eq!(sent.get("feefilter"), Some(&(8 + 24)), "{sent:?}");
+    }
+    sess.session.abort();
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The writer puts the nonce from the queued pong on the wire. A newer

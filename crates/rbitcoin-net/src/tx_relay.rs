@@ -807,17 +807,12 @@ pub struct MempoolPerfSample {
     /// Confirmed-chain prevouts resolved by Electrum unconfirmed-balance.
     /// Unused scripthash (sh_index miss) must stay 0.
     pub delta_prevouts: u64,
-    /// Live mempool bodies loaded while building the spent-outpoint set.
-    /// Unused-scripthash `listunspent` must stay 0 (use `graph.conflicts`).
-    pub spent_body_loads: u64,
     /// Calls to [`MempoolHub::list_live`] (clones every live body).
     pub list_live: u64,
     /// Calls to [`MempoolHub::list_live_meta`] (full live-set scan).
     pub list_live_meta: u64,
     /// Calls to [`MempoolHub::list_live_wtxids`] / `try_list_live_wtxids`.
     pub list_live_wtxids: u64,
-    /// Full `accept_at` walks for INV age (`any_tx_inv_due` before the due-log).
-    pub age_scan: u64,
     /// `expire_stale` walks of live accept times.
     pub expire_full_scans: u64,
     /// Tip MTP computed for accept ctx (cache miss).
@@ -1129,14 +1124,11 @@ pub struct MempoolHub {
     pub meter_announce: AtomicU64,
     /// Chain prevouts resolved by [`Self::scripthash_unconfirmed_delta`].
     pub meter_delta_prevouts: AtomicU64,
-    /// Bodies loaded by [`Self::spent_outpoints`] (must stay 0 after conflict-map).
-    pub meter_spent_body_loads: AtomicU64,
     /// Full live-set clones ([`Self::list_live`]).
     pub meter_list_live: AtomicU64,
     /// Full live-set meta scans ([`Self::list_live_meta`]).
     pub meter_list_live_meta: AtomicU64,
     pub meter_list_live_wtxids: AtomicU64,
-    pub meter_age_scan: AtomicU64,
     pub meter_expire_full_scans: AtomicU64,
     pub meter_tip_mtp: AtomicU64,
     pub meter_get_coin: AtomicU64,
@@ -1495,11 +1487,9 @@ impl MempoolHub {
             meter_getdata_tx: AtomicU64::new(0),
             meter_announce: AtomicU64::new(0),
             meter_delta_prevouts: AtomicU64::new(0),
-            meter_spent_body_loads: AtomicU64::new(0),
             meter_list_live: AtomicU64::new(0),
             meter_list_live_meta: AtomicU64::new(0),
             meter_list_live_wtxids: AtomicU64::new(0),
-            meter_age_scan: AtomicU64::new(0),
             meter_expire_full_scans: AtomicU64::new(0),
             meter_tip_mtp: AtomicU64::new(0),
             meter_get_coin: AtomicU64::new(0),
@@ -1853,11 +1843,9 @@ impl MempoolHub {
             getdata_tx: self.meter_getdata_tx.swap(0, Ordering::Relaxed),
             announce: self.meter_announce.swap(0, Ordering::Relaxed),
             delta_prevouts: self.meter_delta_prevouts.swap(0, Ordering::Relaxed),
-            spent_body_loads: self.meter_spent_body_loads.swap(0, Ordering::Relaxed),
             list_live: self.meter_list_live.swap(0, Ordering::Relaxed),
             list_live_meta: self.meter_list_live_meta.swap(0, Ordering::Relaxed),
             list_live_wtxids: self.meter_list_live_wtxids.swap(0, Ordering::Relaxed),
-            age_scan: self.meter_age_scan.swap(0, Ordering::Relaxed),
             expire_full_scans: self.meter_expire_full_scans.swap(0, Ordering::Relaxed),
             tip_mtp: self.meter_tip_mtp.swap(0, Ordering::Relaxed),
             get_coin: self.meter_get_coin.swap(0, Ordering::Relaxed),

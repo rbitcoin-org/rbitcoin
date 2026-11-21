@@ -3642,6 +3642,13 @@ pub fn framed_cmd(frame: &FramedMessage) -> String {
     String::from_utf8_lossy(&frame.command[..end]).into_owned()
 }
 
+/// A command [`crate::v2::v2_command`] already checked, without the NUL
+/// padding. Borrowed, so the writer does not allocate per frame.
+fn command_str(cmd: &[u8; 12]) -> &str {
+    let end = cmd.iter().position(|&b| b == 0).unwrap_or(12);
+    std::str::from_utf8(&cmd[..end]).unwrap_or("*other*")
+}
+
 #[doc(hidden)]
 pub fn rand_nonce() -> u64 {
     let mut buf = [0u8; 8];
@@ -3710,6 +3717,33 @@ pub fn requeue_later_pong(session: &crate::peers::LivePeer, written: u64) {
     }
 }
 
+/// Write v2 `contents` and, once the write succeeded, count them in
+/// `bytessent_per_msg`. Every frame the session sends goes through here.
+async fn write_counted(
+    writer: &mut PeerWriter,
+    session: Option<&crate::peers::LivePeer>,
+    contents: Vec<u8>,
+) -> Result<(), NetError> {
+    let sent = crate::v2::v2_command(&contents)
+        .ok()
+        .map(|(cmd, prefix)| (cmd, contents.len().saturating_sub(prefix)));
+    writer.write_contents(contents).await?;
+    if let (Some(s), Some((cmd, payload))) = (session, sent) {
+        s.note_sent(command_str(&cmd), payload as u64);
+    }
+    Ok(())
+}
+
+/// [`write_counted`] for a message the caller has not encoded.
+async fn write_msg_counted(
+    writer: &mut PeerWriter,
+    session: Option<&crate::peers::LivePeer>,
+    msg: NetworkMessage,
+) -> Result<(), NetError> {
+    let contents = crate::v2::encode_v2_contents(msg)?;
+    write_counted(writer, session, contents).await
+}
+
 pub async fn run_writer_task(
     mut writer: PeerWriter,
     mut out_rx: mpsc::UnboundedReceiver<PeerOut>,
@@ -3725,11 +3759,16 @@ pub async fn run_writer_task(
                 PeerOut::Msg(NetworkMessage::Pong(queued)) => Some(*queued),
                 _ => None,
             };
-            let err = match out {
-                PeerOut::Msg(msg) | PeerOut::Served(msg) => {
-                    writer.write_msg_offload(msg).await.is_err()
-                }
-                PeerOut::Encoded(bytes) => writer.write_contents(bytes).await.is_err(),
+            // A heavy payload encodes on `rbtc-scripts-*`.
+            let contents = match out {
+                PeerOut::Msg(msg) | PeerOut::Served(msg) => crate::v2::encode_v2_payload(msg).await,
+                PeerOut::Encoded(bytes) => Ok(bytes),
+            };
+            let err = match contents {
+                Ok(contents) => write_counted(&mut writer, writer_session.as_deref(), contents)
+                    .await
+                    .is_err(),
+                Err(_) => true,
             };
             if let Some(s) = &writer_session {
                 s.note_out_written(serve_slot, n);
@@ -4200,14 +4239,18 @@ async fn open_peer_writer(
         .map(|p| p.to_string())
         .unwrap_or_else(|| "peer".into());
 
-    let _ = writer.write_msg(NetworkMessage::SendHeaders).await;
+    let session = meta.session.as_deref();
+    let _ = write_msg_counted(&mut writer, session, NetworkMessage::SendHeaders).await;
     // BIP152: compact v2 low-bandwidth. HB is selected later (max 3, prefer outbound).
-    let _ = writer
-        .write_msg(NetworkMessage::SendCmpct(SendCmpct {
+    let _ = write_msg_counted(
+        &mut writer,
+        session,
+        NetworkMessage::SendCmpct(SendCmpct {
             send_compact: false,
             version: 2,
-        }))
-        .await;
+        }),
+    )
+    .await;
     // Handshake-writer ping, same nonce as LivePeer: connect_nodes needs pong
     // bytes before the writer task; a second ping makes the first pong mismatch.
     let keepalive = if let Some(s) = meta.session.as_ref() {
@@ -4216,15 +4259,14 @@ async fn open_peer_writer(
         Some(rand_nonce())
     };
     if let Some(n) = keepalive {
-        let _ = writer.write_msg(NetworkMessage::Ping(n)).await;
+        let _ = write_msg_counted(&mut writer, session, NetworkMessage::Ping(n)).await;
     }
-    if let Some(fee_sat) = outbound_feefilter_sats(hub, meta.session.as_deref()) {
-        if writer
-            .write_msg(NetworkMessage::FeeFilter(fee_sat))
+    if let Some(fee_sat) = outbound_feefilter_sats(hub, session) {
+        if write_msg_counted(&mut writer, session, NetworkMessage::FeeFilter(fee_sat))
             .await
             .is_ok()
         {
-            if let Some(s) = meta.session.as_ref() {
+            if let Some(s) = session {
                 s.note_sent_feefilter(fee_sat);
             }
         }
@@ -5561,8 +5603,8 @@ pub struct PeerFollowState {
     pub continuation_block: Option<BlockHash>,
 }
 
-/// A live session's follow state. Dropping it, including when
-/// `PeerHub::disconnect_id` aborts the session task, releases the body asks
+/// A live session's follow state. Dropping it, including when the session
+/// task is aborted at shutdown, releases the body asks
 /// the peer never answered: `asked_blocks` is hub-wide, so a held ask would
 /// keep every other peer from fetching that body.
 #[doc(hidden)]

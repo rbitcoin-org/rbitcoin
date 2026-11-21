@@ -774,7 +774,6 @@ fn relay_on_inbound_age_gate(
     let young = mp.sample_reset_perf();
     assert_eq!(young.list_live, 0, "idle INV tick must not clone bodies");
     assert_eq!(young.list_live_wtxids, 0, "young idle must not list wtxids");
-    assert_eq!(young.age_scan, 0, "young idle must not scan accept_at");
     assert!(
         out_rx.try_recv().is_err(),
         "relay-on inbound waits 30s even for unbroadcast"
@@ -811,10 +810,6 @@ fn relay_on_inbound_age_gate(
     assert_eq!(
         idle.list_live_wtxids, 0,
         "age-only tick after cursor catch-up must not list_live_wtxids"
-    );
-    assert_eq!(
-        idle.age_scan, 0,
-        "age-only tick after cursor catch-up must not scan accept_at"
     );
     assert!(out_rx.try_recv().is_err(), "second age tick must not re-INV");
 

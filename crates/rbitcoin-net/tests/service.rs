@@ -77,10 +77,9 @@ async fn feeler_does_not_dial_a_discouraged_address() {
     let addr = std::net::SocketAddr::from(([1, 2, 3, 4], 8333));
     peers.note_misbehavior_addr(addr.ip());
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("feeler-discouraged");
-    let (_tx, rx) = tokio::sync::oneshot::channel();
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(200),
-        run_outbound_session_with_abort(
+        run_outbound_session(
             rbitcoin_net::peers::DialTarget::Socket(addr),
             None,
             Magic::REGTEST,
@@ -90,7 +89,6 @@ async fn feeler_does_not_dial_a_discouraged_address() {
             "/rbitcoin:test/".into(),
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             rbitcoin_net::peers::PeerConnType::Feeler,
-            rx,
             rbitcoin_net::socks::Dialer::Direct,
         ),
     )
@@ -145,10 +143,9 @@ async fn proxied_dns_seed_dials_by_name_through_socks() {
     });
     let peers = rbitcoin_net::peers::PeerHub::new();
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("proxied-dns-seed");
-    let (_tx, rx) = tokio::sync::oneshot::channel();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        run_outbound_session_with_abort(
+        run_outbound_session(
             rbitcoin_net::peers::DialTarget::Domain {
                 host: "seed.example".into(),
                 port: 8333,
@@ -161,7 +158,6 @@ async fn proxied_dns_seed_dials_by_name_through_socks() {
             "/rbitcoin:test/".into(),
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             rbitcoin_net::peers::PeerConnType::AddrFetch,
-            rx,
             rbitcoin_net::socks::Dialer::socks(proxy, false),
         ),
     )
