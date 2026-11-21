@@ -1137,3 +1137,50 @@ fn park_returns_before_sleep_when_work_or_epoch_moved() {
     handle.join().expect("second check work");
     assert!(!parked, "work queued during the recheck must not park");
 }
+
+/// A steal from a wave with nothing left to claim leaves the wave alone: no
+/// `next` bump, and no failed-claim drop that marks it done and wakes the
+/// publisher. Not published, so no worker claims it.
+#[test]
+fn claim_on_a_fully_claimed_wave_touches_nothing() {
+    unsafe fn nop(_: *const (), _: usize) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+    let wave = Arc::new(Wave {
+        n: 1,
+        chunk: 1,
+        next: rbitcoin_consensus::sync::atomic::AtomicUsize::new(0),
+        in_wave: rbitcoin_consensus::sync::atomic::AtomicUsize::new(0),
+        failed: AtomicBool::new(false),
+        first_err: Mutex::new(None),
+        keep_faults: AtomicBool::new(false),
+        faults: Mutex::new(Vec::new()),
+        apply: Apply {
+            f: nop,
+            ctx: std::ptr::null(),
+        },
+        done: Mutex::new(false),
+        done_cv: Condvar::new(),
+        pair: Mutex::new(None),
+        pair_capped: AtomicBool::new(false),
+        published: AtomicBool::new(false),
+    });
+    let (range, hold) = Wave::claim_chunk(&wave).expect("the only chunk");
+    assert_eq!(range, 0..1);
+    drop(hold);
+    assert!(wave.is_complete());
+    *wave.done.lock().unwrap_or_else(|p| p.into_inner()) = false;
+
+    assert!(Wave::claim_chunk(&wave).is_none());
+    assert_eq!(
+        wave.next.load(Ordering::Relaxed),
+        1,
+        "a claim on a fully claimed wave advanced next"
+    );
+    assert!(
+        !*wave.done.lock().unwrap_or_else(|p| p.into_inner()),
+        "a claim on a fully claimed wave ran the completion notify"
+    );
+    assert_eq!(wave.in_wave.load(Ordering::Relaxed), 0);
+    assert_eq!(Arc::strong_count(&wave), 1);
+}

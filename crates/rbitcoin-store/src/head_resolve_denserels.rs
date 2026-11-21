@@ -299,6 +299,7 @@ pub fn resolve_identity_core(
     let mut had_id = vec![false; txids.len()];
     let mut body_lookups = 0u64;
     let mut miss_peeks = 0u64;
+    let mut hit_ranks = crate::head_resolve_stats::HitRanks::default();
     let mut id_ns = 0u64;
     let mut probe_ns = 0u64;
     let mut cands_total = 0u64;
@@ -320,6 +321,7 @@ pub fn resolve_identity_core(
         heights,
         &mut body_lookups,
         &mut miss_peeks,
+        &mut hit_ranks,
         &mut id_ns,
         &first_fks,
         &mut local_age,
@@ -356,6 +358,7 @@ pub fn resolve_identity_core(
                 heights,
                 &mut body_lookups,
                 &mut miss_peeks,
+                &mut hit_ranks,
                 &mut id_ns,
                 &first_fks,
                 &mut local_age,
@@ -383,6 +386,7 @@ pub fn resolve_identity_core(
     crate::head_resolve_stats::add_body(id_ns);
     crate::head_resolve_stats::add_body_lookups(body_lookups);
     crate::head_resolve_stats::add_miss_peeks(miss_peeks);
+    crate::head_resolve_stats::add_hit_ranks(&hit_ranks);
     crate::head_resolve_stats::add_hit_ages(&local_age);
 
     Ok(IdentityHits { picked })
@@ -494,6 +498,7 @@ pub fn id_idx_wave(
     heights: Option<&HeightFence>,
     body_lookups: &mut u64,
     miss_peeks: &mut u64,
+    hit_ranks: &mut crate::head_resolve_stats::HitRanks,
     id_ns: &mut u64,
     first_fks: &[u64],
     local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
@@ -565,7 +570,7 @@ pub fn id_idx_wave(
             }
             key_miss[ki] = walked.miss;
             if let Some((fk, rank)) = walked.winner {
-                crate::head_resolve_stats::add_hit_rank(rank);
+                hit_ranks.note(rank);
                 note_identity_pick(ki, fk, picked, connected, heights, first_fks, local_age);
                 skip[ki] = true;
             }

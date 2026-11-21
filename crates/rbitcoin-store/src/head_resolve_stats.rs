@@ -17,6 +17,7 @@
 //! wave1 hits; age ≥ 4 are wave2. Hist is over **resolved** keys only (`hit_n`).
 
 use crate::head_resolve_pick::LeftoverMissOn;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Histogram buckets for winner sealed-age (last bucket is ages ≥ CAP−1).
@@ -53,8 +54,8 @@ pub static PENDING_HITS: AtomicU64 = AtomicU64::new(0);
 // Per-thread leftover class so parallel resolve tests cannot steal another
 // batch's Head/Fence/Body. Stamp reads this on the same thread that resolved.
 thread_local! {
-    static LAST_MISS_ON: AtomicU64 = const { AtomicU64::new(0) };
-    static LAST_MISS_CANDS: AtomicU64 = const { AtomicU64::new(0) };
+    static LAST_MISS_ON: Cell<u64> = const { Cell::new(0) };
+    static LAST_MISS_CANDS: Cell<u64> = const { Cell::new(0) };
 }
 
 #[doc(hidden)]
@@ -83,26 +84,24 @@ pub fn miss_on_from_code(code: u64) -> Option<LeftoverMissOn> {
 /// (`leftover_miss_dumps_probe_diag`) and could clear `diag=1` on the
 /// operator reject line before it was read.
 pub fn clear_leftover_miss() {
-    LAST_MISS_ON.with(|a| a.store(0, Ordering::Relaxed));
-    LAST_MISS_CANDS.with(|a| a.store(0, Ordering::Relaxed));
+    LAST_MISS_ON.with(|a| a.set(0));
+    LAST_MISS_CANDS.with(|a| a.set(0));
 }
 
 /// Record the first leftover miss in this batch (later calls ignored).
 pub fn note_leftover_miss(on: LeftoverMissOn, n_cands: u64) {
     LAST_MISS_ON.with(|slot| {
-        if slot
-            .compare_exchange(0, miss_on_code(on), Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            LAST_MISS_CANDS.with(|c| c.store(n_cands, Ordering::Relaxed));
+        if slot.get() == 0 {
+            slot.set(miss_on_code(on));
+            LAST_MISS_CANDS.with(|c| c.set(n_cands));
         }
     });
 }
 
 /// Last leftover miss table + probe cand count on this thread (`None` if the batch hit every key).
 pub fn take_leftover_miss() -> Option<(LeftoverMissOn, u64)> {
-    let code = LAST_MISS_ON.with(|a| a.swap(0, Ordering::Relaxed));
-    let cands = LAST_MISS_CANDS.with(|a| a.swap(0, Ordering::Relaxed));
+    let code = LAST_MISS_ON.with(|a| a.replace(0));
+    let cands = LAST_MISS_CANDS.with(|a| a.replace(0));
     miss_on_from_code(code).map(|on| (on, cands))
 }
 
@@ -344,12 +343,30 @@ pub fn add_body_lookups(n: u64) {
     }
 }
 
-/// Record a resolved key: `rank` is 1-based index in probe/body order of the match.
+/// Batch-local hit-rank totals (no atomics until [`add_hit_ranks`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HitRanks {
+    pub sum: u64,
+    pub n: u64,
+}
+
+impl HitRanks {
+    /// Note a resolved key: `rank` is the 1-based index in probe/body order of the match.
+    #[inline]
+    pub fn note(&mut self, rank: u64) {
+        if rank > 0 {
+            self.sum = self.sum.saturating_add(rank);
+            self.n = self.n.saturating_add(1);
+        }
+    }
+}
+
+/// Flush batch-local hit ranks into process counters.
 #[inline]
-pub fn add_hit_rank(rank: u64) {
-    if rank > 0 {
-        HIT_RANK_SUM.fetch_add(rank, Ordering::Relaxed);
-        HIT_RANK_N.fetch_add(1, Ordering::Relaxed);
+pub fn add_hit_ranks(local: &HitRanks) {
+    if local.n > 0 {
+        HIT_RANK_SUM.fetch_add(local.sum, Ordering::Relaxed);
+        HIT_RANK_N.fetch_add(local.n, Ordering::Relaxed);
     }
 }
 

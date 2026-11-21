@@ -2308,7 +2308,9 @@ impl TxTable {
         crate::head_resolve_stats::add_cands(cands.len() as u64);
         for (i, fk) in cands.into_iter().enumerate() {
             if self.body_txid(fk)? == *txid {
-                crate::head_resolve_stats::add_hit_rank((i as u64).saturating_add(1));
+                let mut hit = crate::head_resolve_stats::HitRanks::default();
+                hit.note((i as u64).saturating_add(1));
+                crate::head_resolve_stats::add_hit_ranks(&hit);
                 return Ok(Some(fk));
             }
             crate::head_resolve_stats::add_miss_peeks(1);

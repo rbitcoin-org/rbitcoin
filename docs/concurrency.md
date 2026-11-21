@@ -136,7 +136,10 @@ including when the value is unchanged (`send_replace`).
 capped by how many workers are parked. A worker is on that idle list only
 while it is not holding a job. The epoch check still runs after the debug
 park delay, so a wave published after the steal check is not missed.
-`steal_publish_wakes_idle_workers` is the pin. A claim increments
+`steal_publish_wakes_idle_workers` is the pin. A claim first skips a
+wave with nothing left to claim (`!has_unclaimed()`): one that has
+`failed`, or whose relaxed `next` already reached `n` (`next` only grows,
+so the skip is final; a stale low value falls through). It then increments
 `in_wave`, then release-increments `next`. `is_complete` acquire-loads
 `next` before it reads `in_wave`, so it does not drop the wave under a
 claim that still applies.

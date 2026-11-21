@@ -294,6 +294,7 @@ frontier reassignment after EOF without waiting for header timeout intervals.
 | Engine | Subject | What a bad schedule shows |
 |--------|---------|---------------------------|
 | loom | script-pool `claim_chunk` | `next` advances before `in_wave`, so `is_complete` frees the wave under a claim that still applies |
+| loom | script-pool `claim_chunk` fully claimed skip | the loser of a one-job race skips on the `next` hint and no drop marks the wave done |
 | shuttle | script-pool idle turn (`park_if_still_idle`) | the worker parks after the epoch bump and the unpark have both missed it. The check does not start the OS pool |
 | loom | `Store::hold_utxo_view` / `utxo_view_stamp` | a stamp is visible while the hold is live |
 | loom | Class C sequence counter (`get_sample`, `get_range`) | a new length arrives with the slot from before that store, or a header first/count pair mixes two generations |

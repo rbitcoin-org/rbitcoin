@@ -65,6 +65,22 @@ fn note_local_hit_age_buckets() {
     let _ = sample_and_reset();
 }
 
+/// Batch-local hit ranks sum 1-based ranks and skip rank 0. Pins the local
+/// value only: the process counters race parallel tests
+/// (`tests/tx_table/mod.rs`, `streaming_resolve_early_exit_fewer_body_lookups`).
+#[test]
+fn hit_ranks_note_sums_ranks_and_skips_zero() {
+    let mut local = HitRanks::default();
+    local.note(1);
+    local.note(3);
+    local.note(0);
+    local.note(2);
+    assert_eq!((local.sum, local.n), (6, 3));
+    // Flush path is best-effort under parallel tests; still exercise the API.
+    add_hit_ranks(&local);
+    add_hit_ranks(&HitRanks::default());
+}
+
 fn dummy_probe_diag(txid: [u8; 32]) -> LeftoverProbeDiag {
     LeftoverProbeDiag {
         txid,

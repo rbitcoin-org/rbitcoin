@@ -169,7 +169,12 @@ impl Wave {
 
     #[doc(hidden)]
     pub fn claim_chunk(wave: &Arc<Wave>) -> Option<(Range<usize>, InWave)> {
-        if wave.failed.load(Ordering::Acquire) {
+        // A hint, not the claim: `next` only grows, so a relaxed load at or
+        // past `n` means every later claim fails too. A fully claimed wave
+        // stays published until it completes, and a steal tries it first;
+        // this skips the `in_wave`/`next` RMWs and the failed-claim drop. A
+        // stale low load falls through to the claim below, which decides.
+        if !wave.has_unclaimed() {
             return None;
         }
         // `in_wave` before `next`. `next` is the release, and `is_complete`
