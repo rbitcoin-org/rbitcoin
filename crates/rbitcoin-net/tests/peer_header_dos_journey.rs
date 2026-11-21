@@ -1091,7 +1091,7 @@ fn empty_locator_needs_a_body(hub: &rbitcoin_net::chain::ChainHub) {
 
     hub.generate_to_script(1, op_true(), vec![]).unwrap();
     let stale = hub.tip_hash().unwrap();
-    hub.invalidate_block(stale).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(stale)).unwrap();
     assert!(!hub.is_connected(&stale));
     assert!(
         hub.query.is_block_archived(&stale.to_byte_array()).unwrap(),
@@ -1293,7 +1293,7 @@ async fn invalid_parent_child_is_fetched_after_reconsider(
     let parent = hub.tip_hash().unwrap();
     let time = hub.tip_header().unwrap().time.saturating_add(1);
     let height = hub.tip_height().unwrap().saturating_add(1);
-    hub.invalidate_block(parent).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(parent)).unwrap();
     let child = rbitcoin_consensus::mine_regtest_paying(parent, time, height, op_true(), vec![]);
     let hash = child.block_hash();
     let (out_tx, _rx) = mpsc::unbounded_channel();
@@ -1327,7 +1327,7 @@ async fn invalid_parent_child_is_fetched_after_reconsider(
         "a bad-prevblk child is not left claimed"
     );
 
-    hub.reconsider_block(parent).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(parent)).unwrap();
     assert_eq!(hub.tip_hash(), Some(parent));
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(hash);
@@ -3753,7 +3753,7 @@ fn three_day_side_block_is_served() {
     let old = rbitcoin_consensus::mine_regtest_paying(gen, t0, 1, op_true(), vec![]);
     hub.accept_block(old.clone()).unwrap();
     let old_hash = old.block_hash();
-    hub.invalidate_block(old_hash).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(old_hash)).unwrap();
     let t1 = t0 + 3 * 24 * 60 * 60;
     hub.clock.set_mock(i64::from(t1));
     let tip = rbitcoin_consensus::mine_regtest_paying(gen, t1, 1, op_true(), vec![]);

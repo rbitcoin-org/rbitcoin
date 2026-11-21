@@ -7,6 +7,7 @@ use rbitcoin_consensus::{genesis_block, mine_regtest_paying, ChainParams, Milest
 use rbitcoin_net::chain::*;
 use rbitcoin_net::error::NetError;
 use rbitcoin_net::most_work::work_better;
+use rbitcoin_net::tip_accept::run_on_tip_accept;
 use rbitcoin_primitives::{Fk, Height};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -432,13 +433,13 @@ fn precious_archive_block_returns_after_the_tip_is_invalidated() {
     let a2_hash = a2.block_hash();
     hub.accept_block(a1).unwrap();
     hub.accept_block(a2).unwrap();
-    hub.precious_block(a2_hash).unwrap();
+    run_on_tip_accept(|| hub.precious_block_inner(a2_hash)).unwrap();
     hub.rewind_to_height(0).unwrap();
     let weak = mine_distinct(gen, t0.saturating_add(3), 1, &[a2_hash]);
     let weak_hash = weak.block_hash();
     hub.accept_block(weak).unwrap();
     assert_eq!(hub.tip_hash(), Some(weak_hash));
-    hub.invalidate_block(weak_hash).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(weak_hash)).unwrap();
     assert_eq!(
         hub.tip_hash(),
         Some(a2_hash),
@@ -449,13 +450,13 @@ fn precious_archive_block_returns_after_the_tip_is_invalidated() {
     hub.rewind_to_height(0).unwrap();
     let sibling = mine_distinct(gen, t0.saturating_add(4), 1, &[a2_hash, weak_hash]);
     let sibling_hash = sibling.block_hash();
-    hub.precious_block(a1_hash).unwrap();
+    run_on_tip_accept(|| hub.precious_block_inner(a1_hash)).unwrap();
     // a1 is one archive block and the tip is genesis, so precious connects it.
     // Park it as precious while a taller chain is the tip, then rewind again.
     let tall = mine(sibling_hash, t0.saturating_add(5), 2);
     hub.accept_branch(&arcs(&[sibling, tall])).unwrap();
     assert_eq!(hub.tip_height(), Some(2));
-    hub.precious_block(a1_hash).unwrap();
+    run_on_tip_accept(|| hub.precious_block_inner(a1_hash)).unwrap();
     assert_ne!(hub.tip_hash(), Some(a1_hash));
     hub.rewind_to_height(0).unwrap();
     let other = mine_distinct(
@@ -491,7 +492,7 @@ fn invalid_child_missing_parent_and_linked_reconsider() {
     assert_eq!(hub.held_missing_parents(), vec![on_tip.block_hash()]);
 
     hub.accept_block(on_tip.clone()).unwrap();
-    hub.invalidate_block(on_tip.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(on_tip.block_hash())).unwrap();
     let child = mine_distinct(
         on_tip.block_hash(),
         t0.saturating_add(3),
@@ -522,9 +523,9 @@ fn invalid_child_missing_parent_and_linked_reconsider() {
     let d_hash = d.block_hash();
     hub.ensure_header(&d.header).unwrap();
     hub.hold_body(Arc::new(d), false);
-    hub.invalidate_block(d_hash).unwrap();
-    hub.invalidate_block(b.block_hash()).unwrap();
-    hub.reconsider_block(b.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(d_hash)).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(b.block_hash())).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(b.block_hash())).unwrap();
     assert!(
         !hub.is_block_invalid(&d_hash),
         "reconsider clears a path whose parent was on the path just restored"
@@ -822,7 +823,7 @@ async fn confirmed_private_broadcast_is_not_sent_again_before_the_pool_is_mainta
     );
     assert!(mp.skip_standing_inv(&txid));
 
-    hub.invalidate_block(hub.tip_hash().unwrap()).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(hub.tip_hash().unwrap())).unwrap();
     mp.note_mock_now(mp.relay_now_secs() + 181);
     assert_eq!(mp.requeue_unreturned(), 1, "a reorg can retry the tx");
     assert_eq!(mp.next_isolated().await.0, txid);
@@ -1655,7 +1656,7 @@ fn stale_relay_allowed_withholds_month_old_side_block() {
     let a = mine(gen, t0, 1);
     hub.accept_block(a.clone()).unwrap();
     let a_hash = a.block_hash();
-    hub.invalidate_block(a_hash).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(a_hash)).unwrap();
     let best_time = t0 + STALE_RELAY_AGE_LIMIT_SECS as u32;
     hub.clock.set_mock(i64::from(best_time));
     let c1 = mine(gen, best_time, 1);
@@ -1766,12 +1767,12 @@ fn chain_edges_pin_work_headers_and_reopen() {
         "a held body is a known parent: {parked_err}"
     );
     let missing = BlockHash::from_byte_array([0x44; 32]);
-    let err = hub.reconsider_block(missing).unwrap_err();
+    let err = run_on_tip_accept(|| hub.reconsider_block_inner(missing)).unwrap_err();
     assert!(
         err.to_string().contains("Block not found"),
         "reconsider of an unknown hash fails: {err}"
     );
-    hub.reconsider_block(parked.block_hash())
+    run_on_tip_accept(|| hub.reconsider_block_inner(parked.block_hash()))
         .expect("a parked body is a known block");
     assert_eq!(
         hub.tip_hash(),
@@ -1808,13 +1809,13 @@ fn chain_edges_pin_work_headers_and_reopen() {
         Some("valid-headers"),
         "a held side block outranks a header-only label"
     );
-    hub.reconsider_block(side.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(side.block_hash())).unwrap();
     assert_eq!(
         side_status(&hub).as_deref(),
         Some("valid-headers"),
         "a block that never connected is not a valid fork after reconsider"
     );
-    hub.invalidate_block(side.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(side.block_hash())).unwrap();
     assert_eq!(
         side_status(&hub).as_deref(),
         Some("invalid"),
@@ -1846,7 +1847,7 @@ fn chain_edges_pin_work_headers_and_reopen() {
         Some("valid-fork"),
         "a reorg loser that is also held stays a valid fork"
     );
-    hub.invalidate_block(parked.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(parked.block_hash())).unwrap();
     let fork_status = hub
         .chaintips()
         .into_iter()
@@ -1857,13 +1858,13 @@ fn chain_edges_pin_work_headers_and_reopen() {
         Some("invalid"),
         "invalidate outranks the valid-fork label"
     );
-    hub.reconsider_block(parked.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(parked.block_hash())).unwrap();
     assert!(!hub.is_block_invalid(&parked.block_hash()));
     let tip = hub.tip_hash().unwrap();
     let tip_h = hub.tip_height().unwrap();
-    hub.invalidate_block(tip).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(tip)).unwrap();
     assert_eq!(hub.tip_height(), Some(tip_h - 1));
-    hub.reconsider_block(tip).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(tip)).unwrap();
     assert_eq!(hub.tip_height(), Some(tip_h));
 
     let mut prev = hub.tip_hash().unwrap();
@@ -3324,7 +3325,7 @@ fn submit_header_child_is_headers_only_tip() {
         2,
         "a shorter valid header cannot lower the best header height"
     );
-    hub.invalidate_block(child.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(child.block_hash())).unwrap();
     assert_eq!(
         hub.best_header_height(),
         1,
@@ -3349,30 +3350,30 @@ fn submit_header_child_is_headers_only_tip() {
     hub.ensure_headers_batch(&headers).unwrap();
     assert_eq!(hub.best_header_height(), 10_003);
     let interior = headers[4_998].block_hash();
-    hub.invalidate_block(interior).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(interior)).unwrap();
     assert_eq!(
         hub.best_header_height(),
         4_999,
         "keep the valid prefix below height 5,000"
     );
     let higher = headers[6_998].block_hash();
-    hub.invalidate_block(higher).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(higher)).unwrap();
     assert_eq!(
         hub.best_header_height(),
         4_999,
         "a second invalid descendant must not hide the lower failure"
     );
-    hub.reconsider_block(interior).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(interior)).unwrap();
     assert_eq!(hub.best_header_height(), 6_999);
-    hub.reconsider_block(higher).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(higher)).unwrap();
     assert_eq!(hub.best_header_height(), 10_003);
-    hub.invalidate_block(b1.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(b1.block_hash())).unwrap();
     assert_eq!(
         hub.best_header_height(),
         1,
         "only the shorter valid sibling remains"
     );
-    hub.reconsider_block(b1.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(b1.block_hash())).unwrap();
     assert_eq!(hub.best_header_height(), 10_003);
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -3416,7 +3417,7 @@ fn prev_of_reads_parent_without_archive_rebuild() {
         "unknown hash"
     );
     assert_eq!(hub.query.sample_reset_reconstruct_archived(), 0);
-    hub.invalidate_block(b2.block_hash()).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(b2.block_hash())).unwrap();
     hub.query.sample_reset_reconstruct_archived();
     assert_eq!(
         hub.prev_of(&b2.block_hash()),
@@ -3733,7 +3734,7 @@ fn exclusive_sh_handoff_mempool_to_pending() {
     );
 
     let h101 = hub.tip_hash().expect("spend block");
-    hub.invalidate_block(h101).expect("reorg spend block");
+    run_on_tip_accept(|| hub.invalidate_block_inner(h101)).expect("reorg spend block");
     assert_eq!(hub.tip_height(), Some(100));
     assert!(
         in_mp(&mp),
@@ -3812,7 +3813,7 @@ fn invalidate_evicts_immature_coinbase_spend() {
     assert_eq!(coin.create_height, 1);
 
     let h10 = hub.block_at_height(10).unwrap().expect("height 10");
-    hub.invalidate_block(h10.block_hash())
+    run_on_tip_accept(|| hub.invalidate_block_inner(h10.block_hash()))
         .expect("invalidate height 10");
     assert_eq!(hub.tip_height(), Some(9));
     assert_eq!(
@@ -5177,7 +5178,7 @@ fn coinbase_spend_rejects_cached_height_after_disconnect() {
     let fk = hub.query.block_tx_fks(Height(1)).unwrap()[0];
     let created_h = hub.query.store().tx_height_get(fk).unwrap().unwrap();
     assert_eq!(created_h, 1);
-    hub.invalidate_block(hub.tip_hash().unwrap()).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(hub.tip_hash().unwrap())).unwrap();
     assert_eq!(
         hub.query.store().tx_height_get(fk).unwrap(),
         None,
@@ -5368,7 +5369,7 @@ fn check_block_proposal_prices_fees_and_rejects_on_one_chain() {
     assert_eq!(store.txs.sample_reset_body_decodes(), 1);
 
     let stale = hub.tip_hash().unwrap();
-    hub.invalidate_block(stale).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(stale)).unwrap();
     assert_eq!(hub.tip_height(), Some(102));
     let grandchild = spend_out(child(0).compute_txid(), payout - 1_000);
     let block = hub
@@ -5729,19 +5730,19 @@ fn reconsider_skips_a_branch_that_fails() {
         let _ = hub.accept_received_block(b);
     }
     assert_eq!(hub.tip_hash(), Some(a[3]));
-    hub.invalidate_block(a[1]).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(a[1])).unwrap();
     assert_eq!(hub.tip_hash(), Some(a[0]));
-    hub.reconsider_block(a[1]).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(a[1])).unwrap();
     assert_eq!(hub.tip_hash(), Some(a[3]));
     assert!(hub.is_block_invalid(&bad_hash));
 
     // A held child of a4 whose time is below the median fails its header
     // check. That is not a mark, and a4 under it still connects.
-    hub.invalidate_block(a[3]).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(a[3])).unwrap();
     assert_eq!(hub.tip_hash(), Some(a[2]));
     let late = mine(a[3], t0, 5);
     let _ = hub.accept_received_block(late);
-    hub.reconsider_block(a[3]).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(a[3])).unwrap();
     assert_eq!(hub.tip_hash(), Some(a[3]));
 
     // A tip child that failed connect keeps its archived body. It was
@@ -5765,15 +5766,15 @@ fn reconsider_skips_a_branch_that_fails() {
     let a6 = mine(a5.block_hash(), t0 + 32, 6);
     hub.accept_block(a5).unwrap();
     hub.accept_block(a6).unwrap();
-    hub.invalidate_block(bad5_hash).unwrap();
-    hub.reconsider_block(bad5_hash).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(bad5_hash)).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(bad5_hash)).unwrap();
     assert!(!kept(&marks), "reconsiderblock forgets the kept failure");
     let tip_block = hub
         .block_at_height(hub.tip_height().unwrap())
         .unwrap()
         .unwrap();
     let tip_hash = tip_block.block_hash();
-    hub.invalidate_block(tip_hash).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(tip_hash)).unwrap();
     assert!(hub.accept_received_block(tip_block).is_err());
     assert!(
         !std::fs::read(&marks)
@@ -5782,7 +5783,7 @@ fn reconsider_skips_a_branch_that_fails() {
             .any(|w| w == tip_hash.as_byte_array()),
         "a block refused as already invalidated is not a connect failure"
     );
-    hub.reconsider_block(tip_hash).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(tip_hash)).unwrap();
     assert!(
         !hub.fork_tips.read().unwrap().iter().any(|h| h == bad5_hash),
         "a block that never connected is not kept as a fork tip"
@@ -5796,7 +5797,7 @@ fn reconsider_skips_a_branch_that_fails() {
         .block_at_height(hub.tip_height().unwrap())
         .unwrap()
         .unwrap();
-    hub.invalidate_block(tip).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(tip)).unwrap();
     hub.hold_body(Arc::new(tip_body), false);
     hub.chain_work_prefix.write().unwrap().clear();
     let header_body = dir.path().join("header.body");
@@ -5806,7 +5807,7 @@ fn reconsider_skips_a_branch_that_fails() {
         .unwrap()
         .set_len(16)
         .unwrap();
-    let err = hub.reconsider_block(tip).unwrap_err();
+    let err = run_on_tip_accept(|| hub.reconsider_block_inner(tip)).unwrap_err();
     assert!(err.is_local_fault(), "{err}");
     assert!(hub.fork_tips.read().unwrap().iter().any(|h| h == tip));
     let _ = std::fs::remove_dir_all(dir);
@@ -5852,7 +5853,7 @@ fn invalidate_skips_a_fork_that_fails() {
             .map(|t| t.status)
     };
 
-    hub.invalidate_block(a[2]).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(a[2])).unwrap();
     assert_eq!(hub.tip_hash(), Some(v2_hash));
     assert!(hub.is_block_invalid(&bad2_hash));
     assert_eq!(status(c3_hash), Some("invalid"));
@@ -5878,7 +5879,7 @@ fn invalidate_skips_a_fork_that_fails() {
     }
     assert_eq!(hub.tip_hash(), Some(w[3]));
 
-    hub.invalidate_block(w[2]).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(w[2])).unwrap();
     assert_eq!(hub.tip_hash(), Some(p4_hash));
     assert!(hub.is_block_invalid(&bad5_hash));
     assert_eq!(status(bad5_hash), Some("invalid"));
@@ -5903,7 +5904,7 @@ fn invalidate_skips_a_fork_that_fails() {
     }
     assert_eq!(hub.tip_hash(), Some(r[3]));
     assert_eq!(status(q6_hash), Some("valid-fork"));
-    hub.invalidate_block(q5_hash).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(q5_hash)).unwrap();
     assert_eq!(hub.tip_hash(), Some(r[3]));
     assert_eq!(status(q6_hash), Some("invalid"));
     assert_eq!(status(q5_hash), None, "q6 builds on it");
@@ -7519,7 +7520,7 @@ fn prune_failed_stays_pending_when_the_file_cannot_write() {
     let marks = dir.path().join("block.invalid");
     std::fs::remove_file(&marks).unwrap();
     std::fs::create_dir(&marks).unwrap();
-    hub.reconsider_block(h1).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(h1)).unwrap();
     assert!(!hub.is_block_invalid(&h1));
     assert!(hub.is_block_invalid(&h2));
     assert!(
@@ -7610,7 +7611,7 @@ fn precious_later_equal_work_held_tip_wins() {
         c1_hash,
         "equal work prefers the precious held tip"
     );
-    hub.invalidate_block(a1_hash).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(a1_hash)).unwrap();
     assert_eq!(hub.tip_hash(), Some(c1_hash));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -7788,9 +7789,9 @@ fn reconsider_losing_fork_parks_only_the_leaf() {
         b.push(block.block_hash());
         let _ = hub.accept_received_block(block);
     }
-    hub.invalidate_block(c2_hash).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(c2_hash)).unwrap();
     assert_eq!(hub.tip_hash(), Some(b[3]));
-    hub.reconsider_block(c2_hash).unwrap();
+    run_on_tip_accept(|| hub.reconsider_block_inner(c2_hash)).unwrap();
     assert_eq!(hub.tip_hash(), Some(b[3]));
     let status = |h: BlockHash| {
         hub.chaintips()
@@ -7843,7 +7844,7 @@ fn invalidate_skips_a_time_reject_heavier_fork() {
     let v2 = mine_distinct(a1_hash, t0 + 20, 2, &late);
     let v2_hash = v2.block_hash();
     let _ = hub.accept_received_block(v2);
-    hub.invalidate_block(a2_hash).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(a2_hash)).unwrap();
     assert_eq!(hub.tip_hash(), Some(v2_hash));
     assert!(!hub.is_block_invalid(&late[2]));
     let _ = std::fs::remove_dir_all(dir);
@@ -7892,7 +7893,7 @@ fn zero_target_held_child_does_not_fail_invalidate() {
     child.header.bits = CompactTarget::from_consensus(0);
     hub.hold_body(Arc::new(parent), false);
     hub.hold_body(Arc::new(child), false);
-    hub.invalidate_block(a1_hash).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(a1_hash)).unwrap();
     assert_eq!(hub.tip_hash(), Some(p));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -7912,8 +7913,7 @@ fn activate_best_side_branch_store_fault_is_not_a_failed_block() {
     let dummy_hash = dummy.block_hash();
     hub.hold_body(Arc::new(dummy), false);
     hub.query.fail_next_header_read_cancelled();
-    let err = hub
-        .invalidate_block(dummy_hash)
+    let err = run_on_tip_accept(|| hub.invalidate_block_inner(dummy_hash))
         .expect_err("a cancelled header read while activating the other held tip is a store fault");
     assert!(err.is_local_fault(), "{err}");
     assert!(

@@ -862,7 +862,7 @@ async fn getdata_until_announced_or_reorg(
     let stale = hub
         .generate_to_script(1, op_true(), vec![disconnected.clone()])
         .unwrap()[0];
-    hub.invalidate_block(stale).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(stale)).unwrap();
     assert!(
         mp.try_contains(&disconnected.compute_txid()),
         "disconnect puts the block's tx back"

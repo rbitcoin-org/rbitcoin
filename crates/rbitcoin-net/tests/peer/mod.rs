@@ -17,6 +17,7 @@ use rbitcoin_net::error::NetError;
 use rbitcoin_net::peer::*;
 use rbitcoin_net::peers::{CappedSet, PeerOut};
 use rbitcoin_net::seeds::AddrMan;
+use rbitcoin_net::tip_accept::run_on_tip_accept;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use std::collections::{HashMap, HashSet};
@@ -575,7 +576,7 @@ async fn inv_then_non_descendant_waits_out_the_batch() {
         Some(offered),
         "an inv is the tip we offered"
     );
-    hub.invalidate_block(offered).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(offered)).unwrap();
     let early = collect_block_invs(&mut sess.reader, sess.magic, Duration::from_millis(120)).await;
     assert!(
         early.is_empty(),
@@ -675,7 +676,7 @@ async fn getheaders_of_a_reorg_tip_does_not_hold_its_child() {
         "the child is announced, got {offered_hdrs:?}"
     );
     assert_eq!(sess.live.last_tip_offered(), Some(offered));
-    hub.invalidate_block(offered).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(offered)).unwrap();
     assert_eq!(hub.tip_hash(), Some(parent));
     write_v2_msg(
         &mut sess.writer,
@@ -848,7 +849,7 @@ async fn getheaders_keeps_a_newer_offer() {
         Some(child),
         "a headers reply does not replace a newer offer"
     );
-    hub.invalidate_block(child).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(child)).unwrap();
     let parent_time = hub.tip_header().unwrap().time;
     let sibling_block = rbitcoin_consensus::mine_empty_regtest(
         parent,
@@ -8218,7 +8219,7 @@ fn hb_announce_stays_servable_when_a_sibling_wins() {
         panic!("a weaker accept must not forget the announced body");
     };
     assert_eq!(bt.transactions[0].compute_txid(), coinbase);
-    hub.invalidate_block(hash)
+    run_on_tip_accept(|| hub.invalidate_block_inner(hash))
         .expect("the lost block can be invalidated");
     let reply = getblocktxn_reply(
         &hub.cache,
@@ -8461,8 +8462,7 @@ fn hb_announce_stays_servable_when_the_parent_is_invalid() {
         ),
         "the high-bandwidth peer is announced the compact block"
     );
-    hub.invalidate_block(tip)
-        .expect("parent can be invalidated");
+    run_on_tip_accept(|| hub.invalidate_block_inner(tip)).expect("parent can be invalidated");
     let still = getblocktxn_reply(
         &hub.cache,
         &hub.query,
@@ -9252,7 +9252,7 @@ fn month_old_side_block_is_not_rebuilt_for_getdata() {
     let side = rbitcoin_consensus::mine_empty_regtest(gen, t0, 1);
     let side_hash = side.block_hash();
     hub.accept_block(side).unwrap();
-    hub.invalidate_block(side_hash).unwrap();
+    run_on_tip_accept(|| hub.invalidate_block_inner(side_hash)).unwrap();
     let best_time = t0 + rbitcoin_net::chain::STALE_RELAY_AGE_LIMIT_SECS as u32;
     hub.clock.set_mock(i64::from(best_time));
     let tip = rbitcoin_consensus::mine_empty_regtest(gen, best_time, 1);

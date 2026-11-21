@@ -2840,7 +2840,9 @@ fn invalidate_wakes_a_tip_wait_without_a_mempool() {
     let tip = hub.tip_hash().expect("hash");
     let bare = ctx_without_mempool(&ctx);
     let got = http_wait_woken_by(bare, "waitfornewblock", json!([60_000]), move || {
-        hub.invalidate_block(tip).expect("invalidate tip");
+        request_task_runtime()
+            .block_on(hub.invalidate_block_async(tip))
+            .expect("invalidate tip");
     });
     assert!(got["error"].is_null(), "{got}");
     assert!(
@@ -2872,7 +2874,9 @@ fn invalidate_publishes_the_replacement_fork_not_the_stump() {
     let bare = ctx_without_mempool(&ctx);
     let invalidator = Arc::clone(&hub);
     let got = http_wait_woken_by(bare, "waitfornewblock", json!([60_000]), move || {
-        invalidator.invalidate_block(start).expect("invalidate tip");
+        request_task_runtime()
+            .block_on(invalidator.invalidate_block_async(start))
+            .expect("invalidate tip");
     });
     let fork_hex = rbitcoin_rpc::methods::hash_hex_display(&fork_tip.to_byte_array());
     assert_eq!(got["result"]["hash"], fork_hex, "{got}");
@@ -2925,7 +2929,9 @@ fn invalidate_with_a_mempool_returns_the_replacement_fork() {
         });
         let invalidator = Arc::clone(&hub);
         let got = http_wait_woken_by(ctx, "waitfornewblock", json!([60_000]), move || {
-            invalidator.invalidate_block(start).expect("invalidate tip");
+            request_task_runtime()
+                .block_on(invalidator.invalidate_block_async(start))
+                .expect("invalidate tip");
         });
         stop.store(true, Ordering::Relaxed);
         let fork_hex = rbitcoin_rpc::methods::hash_hex_display(&fork_tip.to_byte_array());
@@ -2966,8 +2972,8 @@ fn invalidate_evicting_a_mempool_tx_returns_the_replacement_fork() {
     let cut = hub.block_at_height(100).unwrap().unwrap().block_hash();
     let invalidator = Arc::clone(&hub);
     let got = http_wait_woken_by(ctx, "waitfornewblock", json!([60_000]), move || {
-        invalidator
-            .invalidate_block(cut)
+        request_task_runtime()
+            .block_on(invalidator.invalidate_block_async(cut))
             .expect("invalidate below maturity");
     });
     let fork_hex = rbitcoin_rpc::methods::hash_hex_display(&fork_tip.to_byte_array());
@@ -3000,7 +3006,9 @@ fn invalidate_on_a_catch_up_pool_builds_on_the_fork() {
     hub.hold_body(Arc::new(b1), false);
     hub.hold_body(Arc::new(b2), false);
     let cut = hub.block_at_height(100).unwrap().unwrap().block_hash();
-    hub.invalidate_block(cut).expect("invalidate");
+    request_task_runtime()
+        .block_on(hub.invalidate_block_async(cut))
+        .expect("invalidate");
     assert_eq!(hub.tip_hash(), Some(fork_tip));
     assert!(!mp.pool_maintained(), "maintenance hid the fork point");
     let gbt = dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
@@ -3038,7 +3046,7 @@ fn http_wait_woken_by(
             .await
         });
         crate::server::wait_for_active_call(&ctx.active, method, true).await;
-        // `invalidate_block` panics on a tokio thread.
+        // `act` blocks on a runtime, which panics on a tokio thread.
         let act = std::thread::spawn(act);
         tokio::task::spawn_blocking(move || act.join())
             .await
@@ -7545,7 +7553,8 @@ fn generateblock_mine_leaves_the_last_assembly() {
     let (_, spend) = mature_coinbase_spend_hex(&ctx, generated_coinbase_value(&ctx, 1) - 1_000);
     dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
     assert_eq!(hub.last_block_assembled(), Some((8_000, 0)));
-    hub.generate_to_script_for_rpc(1, true_spk(), vec![spend], false)
+    request_task_runtime()
+        .block_on(hub.generate_to_script_for_rpc_async(1, true_spk(), vec![spend], false))
         .unwrap();
     assert_eq!(hub.last_block_assembled(), Some((8_000, 0)));
     let _ = std::fs::remove_dir_all(&dir);
