@@ -1492,9 +1492,9 @@ fn plant_deep_heavy_header(q: &Query) -> [u8; 32] {
     hash
 }
 
-type StartupLogs = Vec<(rbitcoin_log::Level, String)>;
+pub(crate) type StartupLogs = Vec<(rbitcoin_log::Level, String)>;
 
-fn spawn_run_p2p_logs(
+pub(crate) fn spawn_run_p2p_logs(
     cfg: NodeConfig,
 ) -> tokio::task::JoinHandle<(Result<(), rbitcoin_node::NodeError>, StartupLogs)> {
     match std::fs::remove_dir_all(cfg.datadir.path().join("run")) {

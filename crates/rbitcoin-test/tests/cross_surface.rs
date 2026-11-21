@@ -3346,10 +3346,12 @@ async fn node_listen_and_exit() {
         .await
         .expect("no reachable peer is not fatal");
 
-    // Once pruned, the datadir refuses a start without --prune-seqsigwit.
+    // Both flags start on a short unpruned chain. Once pruned, the datadir
+    // refuses a start without --prune-seqsigwit.
     let mut cfg = listen_and_exit_cfg(&dir);
     cfg.prune_seqsigwit = true;
-    start_and_exit(cfg).await.expect("pruned start");
+    cfg.sptweaks = true;
+    start_and_exit(cfg).await.expect("pruned start with tweaks");
     let err = start_and_exit(listen_and_exit_cfg(&dir))
         .await
         .expect_err("unpruned start on a pruned datadir")
@@ -4161,6 +4163,69 @@ async fn history_closed(electrum_addr: SocketAddr, scripthash: &str) {
     }
 }
 
+/// The `sp_tweaks:` lines of one run, for assert messages.
+fn sp_tweaks_lines(logs: &crate::end_of_ibd::StartupLogs) -> Vec<&str> {
+    logs.iter()
+        .map(|(_, line)| line.as_str())
+        .filter(|line| line.starts_with("sp_tweaks:"))
+        .collect()
+}
+
+async fn stop_run_p2p_logs(
+    rpc_addr: SocketAddr,
+    node: tokio::task::JoinHandle<(
+        Result<(), rbitcoin_node::NodeError>,
+        crate::end_of_ibd::StartupLogs,
+    )>,
+) -> crate::end_of_ibd::StartupLogs {
+    let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
+    match tokio::time::timeout(Duration::from_secs(15), node).await {
+        Ok(Ok((Ok(()), logs))) => logs,
+        Ok(Ok((Err(e), _))) => panic!("run_p2p error after stop: {e}"),
+        Ok(Err(e)) => panic!("run_p2p join: {e}"),
+        Err(_) => panic!("run_p2p did not exit after stop"),
+    }
+}
+
+/// Heights `blockchain.tweaks.subscribe [0, count, false]` streams before
+/// `done`. An error reply panics with it.
+async fn tweak_heights(electrum_addr: SocketAddr, count: u32) -> Vec<u32> {
+    let stream = TcpStream::connect(electrum_addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "blockchain.tweaks.subscribe",
+        "params": [0, count, false],
+    });
+    reader
+        .get_mut()
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut heights = Vec::new();
+    loop {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .expect("tweaks stream stalled")
+            .unwrap();
+        let msg: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        let body = if msg["id"] == 1 {
+            &msg["result"]
+        } else {
+            &msg["params"][0]
+        };
+        if body["message"] == "done" {
+            return heights;
+        }
+        let map = body
+            .as_object()
+            .unwrap_or_else(|| panic!("tweaks.subscribe: {msg}"));
+        heights.extend(map.keys().map(|k| k.parse::<u32>().unwrap()));
+    }
+}
+
 async fn history_len(electrum_addr: SocketAddr, scripthash: &str) -> usize {
     let mut el = TcpStream::connect(electrum_addr).await.unwrap();
     let hist = electrum_rpc(
@@ -4181,7 +4246,10 @@ async fn history_len(electrum_addr: SocketAddr, scripthash: &str) -> usize {
 /// on the first start with it on; turning it off closes Electrum and keeps
 /// the index; turning it back on after a crash that left a collect run and
 /// a lagging high-water mark resumes the write-behind, discards the run,
-/// and follows the next block.
+/// and follows the next block. The same datadir then walks the
+/// `--sp-tweaks` × `--prune-seqsigwit` restarts an operator sees: the
+/// index serves through the tip, prune joins it, the omit warning counts
+/// down, and once a height it needs is dropped `--sp-tweaks` is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn enter_tip_mode_indexes() {
     let td = TestDatadir::new().unwrap();
@@ -4198,7 +4266,7 @@ async fn enter_tip_mode_indexes() {
         .unwrap();
     }
     let (electrum_addr, rpc_addr) = (ephemeral_addr(), ephemeral_addr());
-    let start = |shindex: bool| {
+    let config = |shindex: bool| {
         let mut cfg = NodeConfig::default()
             .with_datadir(&dir)
             .with_network(Network::Regtest)
@@ -4215,8 +4283,9 @@ async fn enter_tip_mode_indexes() {
         } else {
             60
         });
-        spawn_run_p2p(cfg)
+        cfg
     };
+    let start = |shindex: bool| spawn_run_p2p(config(shindex));
     let op_true = electrum_scripthash_hex(&[0x51]);
 
     // No scripthash index: tip follow, RPC, and Electrum listen.
@@ -4271,6 +4340,118 @@ async fn enter_tip_mode_indexes() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    stop_run_p2p(rpc_addr, node).await;
+
+    // The same datadir turns on silent payment tweaks. `--sp-tweaks` alone
+    // builds the index, and Electrum streams every height through the tip.
+    let tweaks = |sptweaks: bool, prune: bool| {
+        let mut cfg = config(false);
+        cfg.sptweaks = sptweaks;
+        cfg.prune_seqsigwit = prune;
+        cfg
+    };
+    let node = spawn_run_p2p(tweaks(true, false));
+    wait_listeners(&[electrum_addr, rpc_addr]).await;
+    let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
+    let mut tip = count["result"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{count}")) as u32;
+    let through_tip: Vec<u32> = (0..=tip).collect();
+    assert_eq!(tweak_heights(electrum_addr, tip + 1).await, through_tip);
+    stop_run_p2p(rpc_addr, node).await;
+
+    // A damaged tweak table does not stop an unpruned node. The failed
+    // enable is logged and the node serves.
+    let meta = store.join("sp_tweaks.idx").join("meta");
+    let good_meta = std::fs::read(&meta).unwrap();
+    std::fs::write(&meta, [0u8; 4]).unwrap();
+    let node = crate::end_of_ibd::spawn_run_p2p_logs(tweaks(true, false));
+    wait_listeners(&[electrum_addr, rpc_addr]).await;
+    let logs = stop_run_p2p_logs(rpc_addr, node).await;
+    let said = sp_tweaks_lines(&logs);
+    assert!(
+        said.iter().any(|line| line.contains("enable failed")),
+        "{said:?}"
+    );
+    std::fs::write(&meta, good_meta).unwrap();
+
+    // Prune is added beside that index, and a restart keeps both. Each
+    // start mines a block past the sealed table. Under prune only an enabled
+    // index serves that height; with it off the stream ends short of it.
+    for _ in 0..2 {
+        let node = spawn_run_p2p(tweaks(true, true));
+        wait_listeners(&[electrum_addr, rpc_addr]).await;
+        let mined = jsonrpc(rpc_addr, "generateblock", json!(["raw(51)", []])).await;
+        assert!(mined["result"]["hash"].is_string(), "{mined}");
+        tip += 1;
+        let through_tip: Vec<u32> = (0..=tip).collect();
+        assert_eq!(tweak_heights(electrum_addr, tip + 1).await, through_tip);
+        stop_run_p2p(rpc_addr, node).await;
+    }
+
+    // Prune without `--sp-tweaks` warns how many blocks may still confirm
+    // before the index cannot come back. A caught-up index has the whole
+    // keep window.
+    let keep = Query::SEQSIGWIT_KEEP_HEIGHTS;
+    let node = crate::end_of_ibd::spawn_run_p2p_logs(tweaks(false, true));
+    wait_listeners(&[electrum_addr, rpc_addr]).await;
+    let logs = stop_run_p2p_logs(rpc_addr, node).await;
+    let left = format!(" {keep} more blocks ");
+    let said = sp_tweaks_lines(&logs);
+    assert!(said.iter().any(|line| line.contains(&left)), "{said:?}");
+
+    // One block past that window drops a height the index never sealed.
+    // The blocks connect offline through the shipped confirm path in one
+    // `confirm_wire_run`: a tip connect over RPC is ~40 ms a block.
+    {
+        let q = Query::open_or_create_tiny(&store).unwrap();
+        q.enter_direct_index_mode_sh(false).unwrap();
+        let (_, rec) = q.header_at_height(Height(tip)).unwrap().unwrap();
+        let (mut prev, mut time) = (bitcoin::BlockHash::from_byte_array(rec.hash), rec.timestamp);
+        let run: Vec<_> = (tip + 1..=tip + keep + 1)
+            .map(|h| {
+                time += 1;
+                let op_true = ScriptBuf::from_bytes(vec![0x51]);
+                let b = rbitcoin_consensus::mine_regtest_paying(prev, time, h, op_true, Vec::new());
+                prev = b.block_hash();
+                (Height(h), b)
+            })
+            .collect();
+        rbitcoin_query::confirm_wire_run(&q, &ChainParams::regtest(), Milestone::NONE, &run)
+            .unwrap();
+    }
+
+    // Those blocks dropped that height. The next prune start says the
+    // index cannot come back.
+    let node = crate::end_of_ibd::spawn_run_p2p_logs(tweaks(false, true));
+    wait_listeners(&[electrum_addr, rpc_addr]).await;
+    let logs = stop_run_p2p_logs(rpc_addr, node).await;
+    let said = sp_tweaks_lines(&logs);
+    assert!(
+        said.iter()
+            .any(|line| line.contains("cannot be turned back on") && !line.contains("more block")),
+        "{said:?}"
+    );
+
+    // Now `--sp-tweaks` is refused, and the error names the files to delete.
+    let err = start_and_exit(tweaks(true, true))
+        .await
+        .expect_err("tweaks over a dropped height")
+        .to_string();
+    assert!(err.contains("does not cover"), "{err}");
+    assert!(err.contains("sp_tweaks.idx"), "{err}");
+
+    // With those files deleted, the index has to start before taproot and
+    // is refused again. Prune alone still starts.
+    std::fs::remove_dir_all(store.join("sp_tweaks.idx")).unwrap();
+    std::fs::remove_dir_all(store.join("sp_tweaks.body")).unwrap();
+    let err = start_and_exit(tweaks(true, true))
+        .await
+        .expect_err("tweaks with no index after a drop")
+        .to_string();
+    assert!(err.contains("before taproot"), "{err}");
+    let node = spawn_run_p2p(tweaks(false, true));
+    wait_listeners(&[electrum_addr, rpc_addr]).await;
     stop_run_p2p(rpc_addr, node).await;
 }
 
