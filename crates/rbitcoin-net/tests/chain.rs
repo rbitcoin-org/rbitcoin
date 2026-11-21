@@ -3747,9 +3747,12 @@ fn exclusive_sh_handoff_mempool_to_pending() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// `mempool_reorg.py`: invalidate below coinbase maturity must empty the spend.
+/// `mempool_reorg.py`. Invalidating the block that confirmed a parent puts
+/// the parent back in the pool, and its seq=1 child, now BIP68 non-final
+/// behind an unconfirmed parent, leaves with a `reorg` row. Invalidating
+/// below coinbase maturity then empties the pool.
 #[test]
-fn invalidate_evicts_immature_coinbase_spend() {
+fn invalidate_evicts_bip68_and_immature_spends() {
     use bitcoin::absolute::LockTime;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness};
@@ -3761,48 +3764,87 @@ fn invalidate_evicts_immature_coinbase_spend() {
         .expect("pad to mature coinbase");
     assert_eq!(hashes.len(), 103);
     assert_eq!(hub.tip_height(), Some(103));
-    let b1 = hub.block_at_height(1).unwrap().expect("height 1");
-    let cb = b1.txdata[0].compute_txid();
+    let cb_at = |h: u32| hub.block_at_height(h).unwrap().expect("padded").txdata[0].compute_txid();
+    let cb = cb_at(1);
 
     let mp =
         rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
     mp.set_relay_enabled(true);
     assert!(hub.attach_mempool(mp.clone()).is_ok());
 
-    let spend = Transaction {
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let spend_tx = |prev: OutPoint, sequence: Sequence, value: u64| Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: cb, vout: 0 },
+            previous_output: prev,
             script_sig: ScriptBuf::new(),
-            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            sequence,
             witness: Witness::new(),
         }],
         output: vec![TxOut {
-            value: Amount::from_sat(49_9999_0000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            value: Amount::from_sat(value),
+            script_pubkey: spk.clone(),
         }],
     };
+
+    let parent = spend_tx(
+        OutPoint {
+            txid: cb_at(2),
+            vout: 0,
+        },
+        Sequence::ENABLE_RBF_NO_LOCKTIME,
+        49_9999_0000,
+    );
+    let parent_id = parent.compute_txid();
+    let block = hub
+        .assemble_block_to_script(spk.clone(), vec![parent])
+        .expect("assemble");
+    let confirmed = block.block_hash();
+    match hub.accept_block(block).expect("connect parent block") {
+        AcceptOutcome::Accepted { height } => assert_eq!(height, 104),
+        other => panic!("expected Accepted, got {other:?}"),
+    }
+    let seq1 = spend_tx(
+        OutPoint {
+            txid: parent_id,
+            vout: 0,
+        },
+        Sequence::from_consensus(1),
+        49_9998_0000,
+    );
+    let seq1_id = seq1.compute_txid();
+    mp.accept_tx(&seq1).expect("parent one block deep");
+    hub.invalidate_block(confirmed)
+        .expect("invalidate parent block");
+    assert_eq!(hub.tip_height(), Some(103));
+    assert!(mp.contains(&parent_id), "the parent is back in the pool");
+    assert!(!mp.contains(&seq1_id), "the seq=1 child stayed");
+    let reasons: Vec<_> = mp
+        .removed_rows()
+        .rows
+        .iter()
+        .filter(|r| r.txid == seq1_id)
+        .map(|r| r.reason)
+        .collect();
+    assert_eq!(reasons, [rbitcoin_mempool::RemovalReason::Reorg]);
+
+    let spend = spend_tx(
+        OutPoint { txid: cb, vout: 0 },
+        Sequence::ENABLE_RBF_NO_LOCKTIME,
+        49_9999_0000,
+    );
     mp.accept_tx(&spend).expect("mature coinbase spend");
-    let child = Transaction {
-        version: TxVersion::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: spend.compute_txid(),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(49_9998_0000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
+    let child = spend_tx(
+        OutPoint {
+            txid: spend.compute_txid(),
+            vout: 0,
+        },
+        Sequence::ENABLE_RBF_NO_LOCKTIME,
+        49_9998_0000,
+    );
     mp.accept_tx(&child).expect("child of coinbase spend");
-    assert_eq!(mp.live_count(), 2);
+    assert_eq!(mp.live_count(), 3);
 
     // QueryUtxoProvider must see a coinbase at height 1 (same path evict uses).
     let coin = rbitcoin_net::tx_relay::QueryUtxoProvider::new(hub.query.as_ref())
@@ -3818,7 +3860,7 @@ fn invalidate_evicts_immature_coinbase_spend() {
     assert_eq!(
         mp.live_count(),
         0,
-        "invalidate below maturity must evict the coinbase spend and its child"
+        "invalidate below maturity must evict the coinbase spends and the child"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -313,7 +313,8 @@ fn is_trust_tx_fault(err: &AcceptError) -> bool {
     ) && rbitcoin_consensus::reason_is_warn_and_apply(&err.mempool_reject_reason())
 }
 
-/// Reorg eviction uses the same keep as [`ActiveMempool::evict_nonfinal`].
+/// True when reorg eviction keeps a trust-marked tx whose fault is `err`:
+/// non-final, immature, or BIP68, and only in the warn class.
 pub fn trust_keeps_structural(trust: bool, err: &AcceptError) -> bool {
     trust && is_trust_tx_fault(err)
 }
@@ -2755,70 +2756,6 @@ impl ActiveMempool {
         )
     }
 
-    /// Re-accept non-coinbase txs after a reorg disconnect (best-effort).
-    ///
-    /// Failures on individual txs are collected; successful accepts remain.
-    pub fn reorg_disconnect_reaccept(
-        &mut self,
-        txs: &[Transaction],
-        utxos: &impl UtxoProvider,
-        tip: ChainTipCtx,
-    ) -> Vec<Result<AcceptResult, AcceptError>> {
-        let out: Vec<Result<AcceptResult, AcceptError>> = txs
-            .iter()
-            .filter(|t| !t.is_coinbase())
-            .map(|t| self.accept_tx(t, utxos, tip))
-            .collect();
-        self.evict_nonfinal(utxos, tip);
-        out
-    }
-
-    /// Drop live txs whose BIP68 / finality no longer holds (reorg: parent
-    /// went from confirmed to mempool).
-    pub fn evict_nonfinal(&mut self, utxos: &impl UtxoProvider, tip: ChainTipCtx) {
-        loop {
-            let ids: Vec<Txid> = self.graph.iter().map(|(t, _)| *t).collect();
-            let mut removed = false;
-            for id in ids {
-                let Some(tx) = self.get_tx(&id).cloned() else {
-                    continue;
-                };
-                let mut chain_coins = Vec::with_capacity(tx.input.len());
-                let mut missing_chain = false;
-                for inp in &tx.input {
-                    if self.graph.creator(&inp.previous_output).is_some() {
-                        chain_coins.push(None);
-                    } else if let Some(c) = utxos.get_coin(&inp.previous_output) {
-                        chain_coins.push(Some(c));
-                    } else {
-                        // Parent is neither live nor a confirmed coin — reorg
-                        // made the input disappear (or we just evicted it).
-                        missing_chain = true;
-                        break;
-                    }
-                }
-                let structural = check_mempool_structural(&tx, &chain_coins, tip);
-                let keep_fault = structural
-                    .as_ref()
-                    .err()
-                    .is_some_and(|e| trust_keeps_structural(self.trust_kept.contains(&id), e));
-                if keep_fault && !missing_chain {
-                    if let Err(e) = &structural {
-                        warn_trust_tx(true, id, &e.mempool_reject_reason());
-                    }
-                }
-                if missing_chain || (structural.is_err() && !keep_fault) {
-                    let _ = self.unlink_txid(&id, Removal::Committed(RemovalReason::Reorg));
-                    removed = true;
-                }
-            }
-            let _ = self.store.sync_deaths();
-            if !removed {
-                break;
-            }
-        }
-    }
-
     /// Fill sigop cost for entries migrated from schema ≤ 2 (open-time pass).
     ///
     /// Prevouts resolve from live parents or `utxos`. Entries whose prevouts
@@ -3097,11 +3034,14 @@ mod accept_mutant_pins {
         ));
     }
 
-    /// Reorg eviction keeps an immature coinbase and drops a policy string
-    /// that only shares the warn class.
+    /// Reorg eviction keeps a marked non-final, immature, or BIP68 tx and
+    /// drops a policy string that only shares the warn class.
     #[test]
     fn a_warn_string_on_a_policy_error_is_not_a_structural_keep() {
+        assert!(trust_keeps_structural(true, &AcceptError::NotFinal));
         assert!(trust_keeps_structural(true, &AcceptError::ImmatureCoinbase));
+        assert!(trust_keeps_structural(true, &AcceptError::NonBip68Final));
+        assert!(!trust_keeps_structural(false, &AcceptError::NotFinal));
         assert!(!trust_keeps_structural(
             true,
             &AcceptError::Policy("not final")

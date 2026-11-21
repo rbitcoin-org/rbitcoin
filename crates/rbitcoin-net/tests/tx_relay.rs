@@ -1828,6 +1828,7 @@ fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
 
 /// Disconnecting the parent's coin must not leave the child selectable.
 /// The check runs after the parent is gone and before the function returns.
+/// Both leave with a `reorg` removal row.
 #[test]
 fn reorg_evict_does_not_template_a_parentless_child() {
     let (store, q, cbs) = copy_maturity_pad(3);
@@ -1879,6 +1880,19 @@ fn reorg_evict_does_not_template_a_parentless_child() {
     assert!(!hub.contains(&child_id));
     assert!(!hub.sh_index.lock().unwrap().by_tx.contains_key(&parent_id));
     assert!(!hub.sh_index.lock().unwrap().by_tx.contains_key(&child_id));
+    let left: BTreeSet<(Txid, rbitcoin_mempool::RemovalReason)> = hub
+        .removed_rows()
+        .rows
+        .iter()
+        .map(|r| (r.txid, r.reason))
+        .collect();
+    assert_eq!(
+        left,
+        BTreeSet::from([
+            (parent_id, rbitcoin_mempool::RemovalReason::Reorg),
+            (child_id, rbitcoin_mempool::RemovalReason::Reorg),
+        ])
+    );
     let _ = std::fs::remove_dir_all(&mp);
     let _ = std::fs::remove_dir_all(&store);
 }
@@ -6757,6 +6771,9 @@ fn mempool_tx_snapshot_refresh_reuses_tx_arc() {
 /// A non-final tx from the trusted session stays through hub reorg eviction.
 /// A local submit of the same shape is rejected and stays out of the pool.
 /// The coin is on the chain, so this is `evict_after_reorg`, not a private utxo map.
+/// An unmarked tx that a one-block reorg makes non-final leaves with a
+/// `reorg` row, or a template would carry it into a `bad-txns-nonfinal` block.
+/// Once a reorg takes that coin away, the marked tx leaves.
 #[test]
 fn trust_peer_reorg_evict_keeps_nonfinal() {
     let (store, q, cbs) = copy_maturity_pad(3);
@@ -6802,6 +6819,42 @@ fn trust_peer_reorg_evict_keeps_nonfinal() {
         "a local non-final tx is not in the pool after the sweep"
     );
     assert!(hub.try_contains(&txid));
+
+    let mut unmarked = spend_true(cbs[2], 1_000, ScriptBuf::from_bytes(vec![0x53]));
+    unmarked.lock_time = LockTime::from_height(tip).unwrap();
+    unmarked.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+    hub.accept_tx(&unmarked).expect("final at tip + 1");
+    let unmarked_id = unmarked.compute_txid();
+    assert!(!hub.lock_read().trust_kept.contains(&unmarked_id));
+    q.disconnect_tip().unwrap();
+    hub.evict_after_reorg();
+    assert!(
+        !hub.try_contains(&unmarked_id),
+        "an unmarked tx the lower tip makes non-final must leave"
+    );
+    let left: BTreeSet<(Txid, rbitcoin_mempool::RemovalReason)> = hub
+        .removed_rows()
+        .rows
+        .iter()
+        .map(|r| (r.txid, r.reason))
+        .collect();
+    assert_eq!(
+        left,
+        BTreeSet::from([(unmarked_id, rbitcoin_mempool::RemovalReason::Reorg)])
+    );
+    assert!(
+        hub.try_contains(&txid),
+        "the mark keeps the non-final tx through the same sweep"
+    );
+
+    while q.tip_height().map(|h| h.0).unwrap_or(0) > 0 {
+        q.disconnect_tip().unwrap();
+    }
+    hub.evict_after_reorg();
+    assert!(
+        !hub.try_contains(&txid),
+        "the mark does not keep a tx whose input the reorg took away"
+    );
     let _ = std::fs::remove_dir_all(&mp);
     let _ = std::fs::remove_dir_all(&store);
 }

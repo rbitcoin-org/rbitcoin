@@ -133,7 +133,7 @@ fn two_rows(
 #[test]
 fn each_pool_removal_keeps_its_reason_and_sequence() {
     let dir = tmp_dir();
-    let (ops, utxos) = chain_coins(6);
+    let (ops, utxos) = chain_coins(5);
     let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
 
     let parent = spend(ops[0], 99_000);
@@ -184,21 +184,7 @@ fn each_pool_removal_keeps_its_reason_and_sequence() {
         Some(&row(at, &stale, RemovalReason::Expiry))
     );
 
-    let orphaned = spend(ops[4], 99_000);
-    mp.accept_tx(&orphaned, &utxos, TIP_OK).expect("orphaned");
-    let mut reorged = MapUtxoProvider {
-        map: utxos.map.clone(),
-    };
-    reorged.map.remove(&ops[4]);
-    let at = mp.mempool_sequence();
-    mp.evict_nonfinal(&reorged, TIP_OK);
-    assert_eq!(
-        mp.removed_rows().rows.last(),
-        Some(&row(at, &orphaned, RemovalReason::Reorg)),
-        "an input the reorg took away"
-    );
-
-    let cheap = spend(ops[5], 99_900);
+    let cheap = spend(ops[4], 99_900);
     mp.accept_tx(&cheap, &utxos, TIP_OK).expect("cheap");
     mp.max_weight = mp.graph.total_weight() - 1;
     let at = mp.mempool_sequence();
