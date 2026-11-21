@@ -800,3 +800,95 @@ async fn shutdown_finishes_without_the_dial_grace() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A `[::]` listener is dual-stack on Linux, so an IPv4 client is accepted
+/// as `::ffff:a.b.c.d`. Its row carries the IPv4 address (Core
+/// `CNetAddr` maps v4-in-v6 to IPv4), and a local `127.0.0.1` client that
+/// misbehaves is disconnected but not discouraged: it can connect again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dual_stack_inbound_ipv4_is_seen_as_ipv4() {
+    use rbitcoin_net::peer::{connect_and_handshake_timed, punish_disconnect, HandshakePolicy};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::net::TcpStream;
+
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-dual-stack-inbound-{n}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let node = match P2PNode::start_with_dialer(
+        "[::]:0".parse().unwrap(),
+        Query::open_or_create_tiny(&dir).unwrap(),
+        ChainParams::regtest(),
+        Milestone::NONE,
+        "/rbitcoin:0.1.0(dual)/".into(),
+        rbitcoin_net::DEFAULT_MAX_INBOUND,
+        rbitcoin_net::socks::Dialer::Direct,
+        rbitcoin_net::REDIAL_INTERVAL_TEST,
+    )
+    .await
+    {
+        Ok(node) => node,
+        Err(e) => {
+            eprintln!("SKIP dual_stack_inbound_ipv4_is_seen_as_ipv4: no IPv6 listen on [::]: {e}");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+    };
+    let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, node.local_addr.port()));
+    let stream = match TcpStream::connect(v4).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "SKIP dual_stack_inbound_ipv4_is_seen_as_ipv4: [::] listener is not \
+                 dual-stack (net.ipv6.bindv6only=1?): {e}"
+            );
+            node.shutdown().await;
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+    };
+    let client = stream.local_addr().unwrap();
+    let watch = first_handshaken(node.peers.clone(), true);
+    let _hs = connect_and_handshake_timed(
+        Duration::from_secs(5),
+        stream,
+        Magic::REGTEST,
+        v4,
+        v4,
+        0,
+        false,
+        "/rbitcoin:test/",
+        HandshakePolicy::plain(),
+    )
+    .await
+    .unwrap();
+    let row = watch.await.unwrap().expect("handshaken inbound row");
+    let shown = (row.addr, row.net.to_string());
+    let live = node.peers.live.read().unwrap().get(&row.id).cloned();
+    let mut score = 0u32;
+    punish_disconnect(&mut score, live.as_deref());
+    let mut reconnected = false;
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    let mut again = Vec::new();
+    while !reconnected && std::time::Instant::now() < end {
+        if let Ok(s) = TcpStream::connect(v4).await {
+            again.push(s);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        reconnected = node
+            .peers
+            .snapshot()
+            .iter()
+            .any(|p| p.inbound && p.id != row.id);
+    }
+    drop(again);
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        (shown, reconnected),
+        ((client, client.to_string()), true),
+        "(getpeerinfo addr, reconnect after a loopback misbehavior) of a dual-stack IPv4 inbound"
+    );
+}
