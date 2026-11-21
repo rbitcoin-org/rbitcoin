@@ -13,18 +13,21 @@ use bitcoin::{
 use rbitcoin_ibd::ibd::confirm::{ConfirmRejectClass, RejectParent};
 use rbitcoin_ibd::ibd::events::{
     apply_block_framed, apply_cascade_reject, apply_confirm_reject, complete_stored_headers,
-    disconnect_all_peers, on_empty_headers, on_known_headers_batch, ordered_live_has_header_room,
-    FramedBody,
+    disconnect_all_peers, drain_ready_peer_and_body_events, on_empty_headers,
+    on_known_headers_batch, ordered_live_has_header_room, FramedBody,
 };
 use rbitcoin_ibd::ibd::header_walk::InFlight;
-use rbitcoin_ibd::ibd::peer_io::{PeerCmd, PeerSlot};
-use rbitcoin_ibd::ibd::state::{IbdWorkState, InflightReq};
-use rbitcoin_ibd::ibd::{MAX_ORDERED_HEADERS, ORDERED_HEADERS_SOFT_CAP};
+use rbitcoin_ibd::ibd::peer_io::{PeerCmd, PeerEvent, PeerSlot};
+use rbitcoin_ibd::ibd::state::{HeaderCmd, IbdWorkState, InflightReq};
+use rbitcoin_ibd::ibd::{
+    spawn_header_thread, LoopStats, MAX_ORDERED_HEADERS, ORDERED_HEADERS_SOFT_CAP,
+};
 use rbitcoin_net::codec::MAX_HEADERS_RESULTS;
+use rbitcoin_net::seeds::AddrMan;
 use rbitcoin_primitives::Fk;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 fn hash_n(n: u32) -> BlockHash {
@@ -258,6 +261,71 @@ fn known_batch_asks_only_for_a_full_window() {
     assert!(!asked(&mut rx));
     on_known_headers_batch(&mut st, &hub, 1, MAX_HEADERS_RESULTS);
     assert!(asked(&mut rx));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A headers message that arrives while the header thread's queue is full
+/// waits on the ctrl channel. It is written once the thread has room, not
+/// dropped with a failed send.
+#[test]
+fn ctrl_headers_wait_for_a_full_header_queue_and_are_written() {
+    let (dir, hub) = open("drain-full-queue");
+    let hub = Arc::new(hub);
+    let (s0, _peer_rx) = peer(0, 10);
+    let mut st = IbdWorkState::new(vec![s0], hub.tip_hash(), hub.tip_height());
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.try_send(HeaderCmd::Ask).unwrap();
+    st.header_cmd = Some(tx.clone());
+    let shared = Arc::new(Mutex::new(st));
+    let hdr = mine(hub.tip_hash().unwrap(), 1_600_000_100, 1).header;
+    let hash = hdr.block_hash();
+    let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+    ctrl_tx
+        .send(PeerEvent::Headers {
+            peer: 0,
+            headers: vec![hdr],
+        })
+        .unwrap();
+    let (body_tx, mut body_rx) = mpsc::unbounded_channel();
+    let mut book = AddrMan::new();
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let mut drain = |shared: &Mutex<IbdWorkState>| {
+        let mut st = shared.lock().unwrap();
+        drain_ready_peer_and_body_events(
+            &mut st,
+            hub.as_ref(),
+            &mut body_rx,
+            &mut ctrl_rx,
+            &AtomicU32::new(0),
+            &LoopStats::default(),
+            &mut book,
+            local,
+            None,
+        )
+        .unwrap();
+    };
+    drain(&shared);
+    assert!(
+        hub.header_of(&hash).is_none(),
+        "the headers are not written while the queue is full"
+    );
+    assert!(matches!(rx.try_recv(), Ok(HeaderCmd::Ask)));
+    let join = spawn_header_thread(
+        Arc::clone(&shared),
+        Arc::clone(&hub),
+        rx,
+        rbitcoin_store::HeaderThreadProbe::new(),
+    );
+    drain(&shared);
+    shared.lock().unwrap().header_cmd = None;
+    drop(tx);
+    drop(ctrl_tx);
+    drop(body_tx);
+    join.join().unwrap();
+    assert!(
+        hub.header_of(&hash).is_some(),
+        "the held headers are written once the header thread has room"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
