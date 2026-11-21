@@ -4353,7 +4353,7 @@ async fn enter_tip_mode_indexes() {
     let node = spawn_run_p2p(tweaks(true, false));
     wait_listeners(&[electrum_addr, rpc_addr]).await;
     let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
-    let tip = count["result"]
+    let mut tip = count["result"]
         .as_u64()
         .unwrap_or_else(|| panic!("{count}")) as u32;
     let through_tip: Vec<u32> = (0..=tip).collect();
@@ -4375,11 +4375,16 @@ async fn enter_tip_mode_indexes() {
     );
     std::fs::write(&meta, good_meta).unwrap();
 
-    // Prune is added beside that index, and a restart keeps both. With
-    // prune on, Electrum reads the sealed index through the tip.
+    // Prune is added beside that index, and a restart keeps both. Each
+    // start mines a block past the sealed table. Under prune only an enabled
+    // index serves that height; with it off the stream ends short of it.
     for _ in 0..2 {
         let node = spawn_run_p2p(tweaks(true, true));
         wait_listeners(&[electrum_addr, rpc_addr]).await;
+        let mined = jsonrpc(rpc_addr, "generateblock", json!(["raw(51)", []])).await;
+        assert!(mined["result"]["hash"].is_string(), "{mined}");
+        tip += 1;
+        let through_tip: Vec<u32> = (0..=tip).collect();
         assert_eq!(tweak_heights(electrum_addr, tip + 1).await, through_tip);
         stop_run_p2p(rpc_addr, node).await;
     }
@@ -4396,7 +4401,8 @@ async fn enter_tip_mode_indexes() {
     assert!(said.iter().any(|line| line.contains(&left)), "{said:?}");
 
     // One block past that window drops a height the index never sealed.
-    // The blocks arrive as one IBD batch: a tip connect is ~40 ms a block.
+    // The blocks connect offline through the shipped confirm path in one
+    // `confirm_wire_run`: a tip connect over RPC is ~40 ms a block.
     {
         let q = Query::open_or_create_tiny(&store).unwrap();
         q.enter_direct_index_mode_sh(false).unwrap();
@@ -4415,8 +4421,8 @@ async fn enter_tip_mode_indexes() {
             .unwrap();
     }
 
-    // The next prune start cuts that height, and the warning says the index
-    // cannot come back.
+    // Those blocks dropped that height. The next prune start says the
+    // index cannot come back.
     let node = crate::end_of_ibd::spawn_run_p2p_logs(tweaks(false, true));
     wait_listeners(&[electrum_addr, rpc_addr]).await;
     let logs = stop_run_p2p_logs(rpc_addr, node).await;
