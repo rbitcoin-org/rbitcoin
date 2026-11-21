@@ -96,7 +96,18 @@ pub fn check_tx_shape(tx: &Transaction, base_size: usize) -> Result<(), Consensu
     tx_value_out(tx).map(|_| ())
 }
 
-fn reject_duplicate_outpoints(
+/// Core `CheckTransaction` for a coinbase: a scriptSig of 2 to 100 bytes.
+pub fn check_coinbase_script_sig(coinbase: &Transaction) -> Result<(), ConsensusError> {
+    let len = coinbase.input.first().map_or(0, |i| i.script_sig.len());
+    if !(2..=100).contains(&len) {
+        return Err(ConsensusError::BadBlock("bad-cb-length"));
+    }
+    Ok(())
+}
+
+/// Core `CheckTransaction`'s duplicate-input walk. `seen` is scratch space
+/// a block reuses across its transactions.
+pub fn reject_duplicate_outpoints(
     tx: &Transaction,
     seen: &mut crate::OutPointSet,
 ) -> Result<(), ConsensusError> {
@@ -243,10 +254,7 @@ pub fn validate_block_structure_with_pres(
     // a merkle mismatch, after the coinbase's shape and outputs, and before
     // ContextualCheckBlock's BIP34 height.
     check_tx_shape(&block.txdata[0], pres[0].base_size)?;
-    let cb_ss = block.txdata[0].input[0].script_sig.len();
-    if !(2..=100).contains(&cb_ss) {
-        return Err(ConsensusError::BadBlock("bad-cb-length"));
-    }
+    check_coinbase_script_sig(&block.txdata[0])?;
 
     let mut seen: crate::TxidSet = crate::TxidSet::with_capacity_and_hasher(n, Default::default());
     for p in pres.iter() {

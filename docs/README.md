@@ -47,7 +47,7 @@ into `AGENTS.md`.
 | [`operator/mainnet.md`](./operator/mainnet.md) | Mainnet runbook: catch-up, milestone, wallets after tip. |
 | [`experimental-mainnet.md`](./experimental-mainnet.md) | Pointer. The runbook moved to `operator/mainnet.md`. |
 | [`rpc.md`](./rpc.md) | Core-class JSON-RPC subset. |
-| [`consensus-tests.md`](./consensus-tests.md) | Rules we own vs Core corpora. |
+| [`consensus-tests.md`](./consensus-tests.md) | Rules we own vs Core corpora, and the bitcoin-consensus-spec release gate. |
 | [`blvm-consensus-crosswalk.md`](./blvm-consensus-crosswalk.md) | BLVM register ids mapped to our code and tests. Gaps both ways stay there. |
 | [`core-functional.md`](./core-functional.md) | Core functional harness. |
 | [`overlay-functional.md`](./overlay-functional.md) | Private Tor / i2pd / cjdns mesh harness (labeled / nightly). |

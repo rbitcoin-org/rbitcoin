@@ -1,0 +1,443 @@
+# Checks rbitcoin is known to fail in bitcoin-consensus-spec's suites
+# (bcs-conformance --known-failures). One "<suite> <check>" per line: the
+# location FAIL prints, up to its first ":" or "(". A line names one failure,
+# whole. A failure not named here fails the run. So does a line here that no
+# longer fails: delete it in the change that fixes it.
+
+# BIP340 over messages that are not 32 bytes. Consensus verifies only 32-byte
+# sighashes, and rbitcoin has no BIP340 path for another length.
+bip340 row 15
+bip340 row 16
+bip340 row 17
+bip340 row 18
+
+# Compact targets decoded as rust-bitcoin's Target::from_compact does, not as
+# Core's SetCompact: a negative mantissa decodes to zero where Core keeps its
+# value, a size below 4 keeps the sign bit, a size past 32 bytes wraps the
+# shift where Core overflows, and the work of a zero target is the maximum
+# where Core's GetBlockProof is 0. check_header and validate_header_on_parent
+# reject nBits other than next_work_bits' before the proof of work, and
+# next_work_bits gives only canonical positive targets, so no header with
+# these nBits gets that far (#1774).
+pow proof-of-work.jsonl line 1
+pow proof-of-work.jsonl line 2
+pow proof-of-work.jsonl line 3
+pow proof-of-work.jsonl line 5
+pow proof-of-work.jsonl line 6
+pow proof-of-work.jsonl line 12
+pow proof-of-work.jsonl line 14
+pow proof-of-work.jsonl line 15
+pow proof-of-work.jsonl line 19
+pow proof-of-work.jsonl line 29
+pow proof-of-work.jsonl line 32
+pow proof-of-work.jsonl line 34
+pow proof-of-work.jsonl line 35
+pow proof-of-work.jsonl line 36
+pow proof-of-work.jsonl line 37
+pow proof-of-work.jsonl line 38
+pow proof-of-work.jsonl line 39
+pow proof-of-work.jsonl line 40
+pow proof-of-work.jsonl line 41
+pow proof-of-work.jsonl line 44
+pow proof-of-work.jsonl line 45
+pow proof-of-work.jsonl line 46
+pow proof-of-work.jsonl line 48
+pow proof-of-work.jsonl line 55
+pow proof-of-work.jsonl line 56
+pow proof-of-work.jsonl line 57
+pow proof-of-work.jsonl line 58
+pow proof-of-work.jsonl line 60
+pow proof-of-work.jsonl line 61
+pow proof-of-work.jsonl line 65
+pow proof-of-work.jsonl line 69
+pow proof-of-work.jsonl line 71
+pow proof-of-work.jsonl line 72
+pow proof-of-work.jsonl line 77
+pow proof-of-work.jsonl line 78
+pow proof-of-work.jsonl line 80
+pow proof-of-work.jsonl line 85
+pow proof-of-work.jsonl line 86
+pow proof-of-work.jsonl line 88
+pow proof-of-work.jsonl line 89
+pow proof-of-work.jsonl line 91
+pow proof-of-work.jsonl line 92
+pow proof-of-work.jsonl line 93
+pow proof-of-work.jsonl line 95
+pow proof-of-work.jsonl line 96
+pow proof-of-work.jsonl line 97
+pow proof-of-work.jsonl line 98
+pow proof-of-work.jsonl line 101
+pow proof-of-work.jsonl line 102
+pow proof-of-work.jsonl line 103
+pow proof-of-work.jsonl line 104
+pow proof-of-work.jsonl line 105
+pow proof-of-work.jsonl line 107
+pow proof-of-work.jsonl line 112
+pow proof-of-work.jsonl line 113
+pow proof-of-work.jsonl line 115
+pow proof-of-work.jsonl line 117
+pow proof-of-work.jsonl line 119
+pow proof-of-work.jsonl line 120
+pow proof-of-work.jsonl line 121
+pow proof-of-work.jsonl line 122
+pow proof-of-work.jsonl line 127
+pow proof-of-work.jsonl line 128
+pow proof-of-work.jsonl line 129
+pow proof-of-work.jsonl line 131
+pow proof-of-work.jsonl line 133
+pow proof-of-work.jsonl line 134
+pow proof-of-work.jsonl line 135
+pow proof-of-work.jsonl line 136
+pow proof-of-work.jsonl line 139
+pow proof-of-work.jsonl line 142
+pow proof-of-work.jsonl line 143
+pow proof-of-work.jsonl line 144
+pow proof-of-work.jsonl line 145
+pow proof-of-work.jsonl line 148
+pow proof-of-work.jsonl line 153
+pow proof-of-work.jsonl line 154
+pow proof-of-work.jsonl line 158
+pow proof-of-work.jsonl line 159
+
+# pow_hash_meets_target from the same decode: a negative or zero target, and
+# on regtest an overflowing one, accept a hash at or below the decoded value
+# where Core rejects the nBits. Unreachable for the same reason (#1774).
+pow proof-of-work.jsonl line 171
+pow proof-of-work.jsonl line 172
+pow proof-of-work.jsonl line 184
+pow proof-of-work.jsonl line 185
+pow proof-of-work.jsonl line 197
+pow proof-of-work.jsonl line 198
+pow proof-of-work.jsonl line 210
+pow proof-of-work.jsonl line 211
+pow proof-of-work.jsonl line 223
+pow proof-of-work.jsonl line 224
+pow proof-of-work.jsonl line 225
+
+# rbitcoin's regtest pow_target_timespan is rust-bitcoin's 14 days, not Core's
+# one day, so its difficulty period is 2016 blocks, not 144. Regtest never
+# retargets; only the minimum-difficulty walk reads the period, and it walks
+# past the start of Core's period when every header there is at the limit
+# (#1775).
+pow proof-of-work.jsonl line 1230
+pow proof-of-work.jsonl line 1231
+pow proof-of-work.jsonl line 1232
+pow proof-of-work.jsonl line 1233
+pow proof-of-work.jsonl line 1234
+
+# validate_signet_block_solution skips every block whose previous hash is
+# zero; Core skips only the genesis hash. Block processing never gets such a
+# block that far: it is the genesis block or has no parent (#1776).
+signet signet-block-solution.jsonl line 24
+signet signet-block-solution.jsonl line 46
+
+# pow_limit is rust-bitcoin's MAX_ATTAINABLE target, Core's limit cut to
+# what compact nBits can express. No nBits decodes between the two (#1777).
+params network-params.jsonl line 11
+params network-params.jsonl line 29
+params network-params.jsonl line 47
+params network-params.jsonl line 83
+
+# The regtest timespan above.
+params network-params.jsonl line 86
+
+# The mainnet BIP16 and taproot exception hashes apply on every network;
+# Core lists them for mainnet only. No block of another network has either
+# hash, since each commits to a mainnet parent (#1778).
+params network-params.jsonl line 33
+params network-params.jsonl line 51
+params network-params.jsonl line 69
+params network-params.jsonl line 87
+
+# Equal-work tie-break after invalidateblock. Core activates the candidate
+# whose data arrived first (nSequenceId); rbitcoin keeps the earlier held tip
+# (COMPAT.md, Equal-work fork choice). Both chains are valid.
+corpus feature_block.node0 check 88
+corpus feature_block.node0 check 89
+corpus feature_block.node0 check 90
+corpus feature_block_reorg.node0 check 88
+corpus feature_block_reorg.node0 check 89
+corpus feature_block_reorg.node0 check 90
+corpus feature_chain_tiebreaks.node0 check 21
+
+# A 1,088-block reorg onto a branch delivered before it became best: open
+# finding 088 F3 (docs/external_findings/088-tip-chain-selection.md), not a
+# harness effect. Tip-follow cannot assemble a branch that forks more than
+# HeldBodies::STALE_BELOW (288) blocks below the tip and does not hand off to
+# the IBD rewind, which refuses more than REWIND_MAX_DEPTH (1024). A peer
+# would not help. Interop and peer-sync sync this chain over P2P but never do
+# this reorg.
+corpus feature_block_reorg.node0 check 131
+corpus feature_block_reorg.node0 check 132
+
+# No regtest -test=bip94 (COMPAT.md, BIP94). BIP94 is enforced on testnet4
+# only, so these scenarios cannot be configured (#1779). Each file's errors
+# are named from the refused chain_reset, so an error before it is not
+# covered. The replay stops after too many errors, and every check after the
+# stop fails as not replayed.
+corpus feature_spec_pitfalls.node2 check 1
+corpus feature_spec_pitfalls.node2 check 2
+corpus feature_spec_pitfalls.node2 check 3
+corpus feature_spec_pitfalls.node2 check 4
+corpus feature_spec_pitfalls.node2 check 5
+corpus feature_spec_pitfalls.node2 check 6
+corpus feature_spec_pitfalls.node2 check 7
+corpus feature_spec_pitfalls.node2 check 8
+corpus feature_spec_pitfalls.node2 check 9
+corpus feature_spec_pitfalls.node2 check 10
+corpus feature_spec_pitfalls.node2 check 11
+corpus feature_spec_pitfalls.node2 check 12
+corpus feature_spec_pitfalls.node2 check 13
+corpus feature_spec_pitfalls.node2 check 14
+corpus feature_spec_pitfalls.node2 check 15
+corpus feature_spec_pitfalls.node2 check 16
+corpus feature_spec_pitfalls.node2 check 17
+corpus feature_spec_pitfalls.node2 check 18
+corpus feature_spec_pitfalls.node2 check 19
+corpus feature_spec_pitfalls.node2 check 20
+corpus feature_spec_pitfalls.node2 check 21
+corpus feature_spec_pitfalls.node2 check 22
+corpus feature_spec_pitfalls.node2 check 23
+corpus feature_spec_pitfalls.node2 check 24
+corpus feature_spec_pitfalls.node2 check 25
+corpus feature_spec_pitfalls.node2 check 26
+corpus feature_spec_pitfalls.node2 check 27
+corpus feature_spec_pitfalls.node2 check 28
+corpus feature_spec_pitfalls.node2 check 29
+corpus feature_spec_pitfalls.node2 check 30
+corpus feature_spec_pitfalls.node2 check 31
+corpus feature_spec_pitfalls.node2 check 32
+corpus feature_spec_pitfalls.node2 check 33
+corpus feature_spec_pitfalls.node2 check 34
+corpus feature_spec_pitfalls.node2 check 35
+corpus feature_spec_pitfalls.node2 check 36
+corpus feature_spec_pitfalls.node2 check 37
+corpus feature_spec_pitfalls.node2 check 38
+corpus feature_spec_pitfalls.node2 check 39
+corpus feature_spec_pitfalls.node2 check 40
+corpus feature_spec_pitfalls.node2 check 41
+corpus feature_spec_pitfalls.node2 check 42
+corpus feature_spec_pitfalls.node2 check 43
+corpus feature_spec_pitfalls.node2 check 44
+corpus feature_spec_pitfalls.node2 check 45
+corpus feature_spec_pitfalls.node2 check 46
+corpus feature_spec_pitfalls.node2 check 47
+corpus feature_spec_pitfalls.node2 check 48
+corpus feature_spec_pitfalls.node2 check 49
+corpus feature_spec_pitfalls.node2 check 50
+corpus feature_spec_pitfalls.node2 check 51
+corpus feature_spec_pitfalls.node2 check 52
+corpus feature_spec_pitfalls.node2 check 53
+corpus feature_spec_pitfalls.node2 check 54
+corpus feature_spec_pitfalls.node2 check 55
+corpus feature_spec_pitfalls.node2 check 56
+corpus feature_spec_pitfalls.node2 check 57
+corpus feature_spec_pitfalls.node2 check 58
+corpus feature_spec_pitfalls.node2 check 59
+corpus feature_spec_pitfalls.node2 check 60
+corpus feature_spec_pitfalls.node2 check 61
+corpus feature_spec_pitfalls.node2 check 62
+corpus feature_spec_pitfalls.node2 check 63
+corpus feature_spec_pitfalls.node2 check 64
+corpus feature_spec_pitfalls.node2 check 65
+corpus feature_spec_pitfalls.node2 check 66
+corpus feature_spec_pitfalls.node2 check 67
+corpus feature_spec_pitfalls.node2 check 68
+corpus feature_spec_pitfalls.node2 check 69
+corpus feature_spec_pitfalls.node2 check 70
+corpus feature_spec_pitfalls.node2 check 71
+corpus feature_spec_pitfalls.node2 check 72
+corpus feature_spec_pitfalls.node2 check 73
+corpus feature_spec_pitfalls.node2 check 74
+corpus feature_spec_pitfalls.node2 check 75
+corpus feature_spec_pitfalls.node2 check 76
+corpus feature_spec_pitfalls.node2 check 77
+corpus feature_spec_pitfalls.node2 check 78
+corpus feature_spec_pitfalls.node2 check 79
+corpus feature_spec_pitfalls.node2 check 80
+corpus feature_spec_pitfalls.node2 check 81
+corpus feature_spec_pitfalls.node2 check 82
+corpus feature_spec_pitfalls.node2 check 83
+corpus feature_spec_pitfalls.node2 check 84
+corpus feature_spec_pitfalls.node2 check 85
+corpus feature_spec_pitfalls.node2 check 86
+corpus feature_spec_pitfalls.node2 check 87
+corpus feature_spec_pitfalls.node2 check 88
+corpus feature_spec_pitfalls.node2 check 89
+corpus feature_spec_pitfalls.node2 check 90
+corpus feature_spec_pitfalls.node2 check 91
+corpus feature_spec_pitfalls.node2 check 92
+corpus feature_spec_pitfalls.node2 check 93
+corpus feature_spec_pitfalls.node2 check 94
+corpus feature_spec_pitfalls.node2 check 95
+corpus feature_spec_pitfalls.node2 check 96
+corpus feature_spec_pitfalls.node2 check 97
+corpus feature_spec_pitfalls.node2 check 98
+corpus feature_spec_pitfalls.node2 check 99
+corpus feature_spec_pitfalls.node2 check 100
+corpus feature_spec_pitfalls.node2 check 101
+corpus feature_spec_pitfalls.node2 check 102
+corpus feature_spec_pitfalls.node2 check 103
+corpus feature_spec_pitfalls.node2 check 104
+corpus feature_spec_pitfalls.node2 check 105
+corpus feature_spec_pitfalls.node2 check 106
+corpus feature_spec_pitfalls.node2 check 107
+corpus feature_spec_pitfalls.node2 check 108
+corpus feature_spec_pitfalls.node2 check 109
+corpus feature_spec_pitfalls.node2 check 110
+corpus feature_spec_pitfalls.node2 check 111
+corpus feature_spec_pitfalls.node2 check 112
+corpus feature_spec_pitfalls.node2 check 113
+corpus feature_spec_pitfalls.node2 check 114
+corpus feature_spec_pitfalls.node2 check 115
+corpus feature_spec_pitfalls.node2 check 116
+corpus feature_spec_pitfalls.node2 check 117
+corpus feature_spec_pitfalls.node2 check 118
+corpus feature_spec_pitfalls.node2 check 119
+corpus feature_spec_pitfalls.node2 check 120
+corpus feature_spec_pitfalls.node2 check 121
+corpus feature_spec_pitfalls.node2 check 122
+corpus feature_spec_pitfalls.node2 check 123
+corpus feature_spec_pitfalls.node2 check 124
+corpus feature_spec_pitfalls.node2 check 125
+corpus feature_spec_pitfalls.node2 check 126
+corpus feature_spec_pitfalls.node2 check 127
+corpus feature_spec_pitfalls.node2 check 128
+corpus feature_spec_pitfalls.node2 check 129
+corpus feature_spec_pitfalls.node2 check 130
+corpus feature_spec_pitfalls.node2 check 131
+corpus feature_spec_pitfalls.node2 check 132
+corpus feature_spec_pitfalls.node2 check 133
+corpus feature_spec_pitfalls.node2 check 134
+corpus feature_spec_pitfalls.node2 check 135
+corpus feature_spec_pitfalls.node2 check 136
+corpus feature_spec_pitfalls.node2 check 137
+corpus feature_spec_pitfalls.node2 check 138
+corpus feature_spec_pitfalls.node2 check 139
+corpus feature_spec_pitfalls.node2 check 140
+corpus feature_spec_pitfalls.node2 check 141
+corpus feature_spec_pitfalls.node2 check 142
+corpus feature_spec_pitfalls.node2 check 143
+corpus feature_spec_pitfalls.node2 check 144
+corpus feature_spec_pitfalls.node2 check 145
+corpus feature_spec_pitfalls.node2 check 146
+corpus feature_spec_pitfalls.node2 check 147
+corpus feature_spec_pitfalls.node2 errors from event 0
+corpus mining_basic.node0 check 265
+corpus mining_basic.node0 check 266
+corpus mining_basic.node0 check 267
+corpus mining_basic.node0 check 268
+corpus mining_basic.node0 check 269
+corpus mining_basic.node0 check 270
+corpus mining_basic.node0 check 271
+corpus mining_basic.node0 check 272
+corpus mining_basic.node0 check 273
+corpus mining_basic.node0 check 274
+corpus mining_basic.node0 check 275
+corpus mining_basic.node0 check 276
+corpus mining_basic.node0 check 277
+corpus mining_basic.node0 check 278
+corpus mining_basic.node0 check 279
+corpus mining_basic.node0 check 280
+corpus mining_basic.node0 check 281
+corpus mining_basic.node0 check 282
+corpus mining_basic.node0 check 283
+corpus mining_basic.node0 check 284
+corpus mining_basic.node0 check 285
+corpus mining_basic.node0 check 286
+corpus mining_basic.node0 check 287
+corpus mining_basic.node0 check 288
+corpus mining_basic.node0 check 289
+corpus mining_basic.node0 check 290
+corpus mining_basic.node0 check 291
+corpus mining_basic.node0 check 292
+corpus mining_basic.node0 check 293
+corpus mining_basic.node0 check 294
+corpus mining_basic.node0 check 295
+corpus mining_basic.node0 check 296
+corpus mining_basic.node0 check 297
+corpus mining_basic.node0 check 298
+corpus mining_basic.node0 check 299
+corpus mining_basic.node0 check 300
+corpus mining_basic.node0 check 301
+corpus mining_basic.node0 check 302
+corpus mining_basic.node0 check 303
+corpus mining_basic.node0 check 304
+corpus mining_basic.node0 check 305
+corpus mining_basic.node0 check 306
+corpus mining_basic.node0 check 307
+corpus mining_basic.node0 check 308
+corpus mining_basic.node0 check 309
+corpus mining_basic.node0 check 310
+corpus mining_basic.node0 check 311
+corpus mining_basic.node0 check 312
+corpus mining_basic.node0 check 313
+corpus mining_basic.node0 check 314
+corpus mining_basic.node0 check 315
+corpus mining_basic.node0 check 316
+corpus mining_basic.node0 check 317
+corpus mining_basic.node0 check 318
+corpus mining_basic.node0 check 319
+corpus mining_basic.node0 check 320
+corpus mining_basic.node0 check 321
+corpus mining_basic.node0 check 322
+corpus mining_basic.node0 check 323
+corpus mining_basic.node0 check 324
+corpus mining_basic.node0 check 325
+corpus mining_basic.node0 check 326
+corpus mining_basic.node0 check 327
+corpus mining_basic.node0 check 328
+corpus mining_basic.node0 check 329
+corpus mining_basic.node0 check 330
+corpus mining_basic.node0 check 331
+corpus mining_basic.node0 check 332
+corpus mining_basic.node0 check 333
+corpus mining_basic.node0 check 334
+corpus mining_basic.node0 check 335
+corpus mining_basic.node0 check 336
+corpus mining_basic.node0 check 337
+corpus mining_basic.node0 check 338
+corpus mining_basic.node0 check 339
+corpus mining_basic.node0 check 340
+corpus mining_basic.node0 check 341
+corpus mining_basic.node0 check 342
+corpus mining_basic.node0 check 343
+corpus mining_basic.node0 check 344
+corpus mining_basic.node0 check 345
+corpus mining_basic.node0 check 346
+corpus mining_basic.node0 check 347
+corpus mining_basic.node0 check 348
+corpus mining_basic.node0 check 349
+corpus mining_basic.node0 check 350
+corpus mining_basic.node0 check 351
+corpus mining_basic.node0 check 352
+corpus mining_basic.node0 check 353
+corpus mining_basic.node0 check 354
+corpus mining_basic.node0 check 355
+corpus mining_basic.node0 check 356
+corpus mining_basic.node0 check 357
+corpus mining_basic.node0 check 358
+corpus mining_basic.node0 check 359
+corpus mining_basic.node0 check 360
+corpus mining_basic.node0 check 361
+corpus mining_basic.node0 check 362
+corpus mining_basic.node0 check 363
+corpus mining_basic.node0 check 364
+corpus mining_basic.node0 check 365
+corpus mining_basic.node0 check 366
+corpus mining_basic.node0 check 367
+corpus mining_basic.node0 check 368
+corpus mining_basic.node0 check 369
+corpus mining_basic.node0 check 370
+corpus mining_basic.node0 check 371
+corpus mining_basic.node0 check 372
+corpus mining_basic.node0 check 373
+corpus mining_basic.node0 check 374
+corpus mining_basic.node0 check 375
+corpus mining_basic.node0 errors from event 642
+interop chain feature_spec_pitfalls.node2
+peer-sync feature_spec_pitfalls.node2 follow 2ceeaacd9e8420fa3d3f411344676842942119b5406f9fb6217f44bb50f1c565
+peer-sync feature_spec_pitfalls.node2 follow 0112034c8a6ffa97a9a141491ded0b7c5322fbff1b716e29d8c631cea4e8cf6e
+peer-sync feature_spec_pitfalls.node2 follow final tip
+peer-sync feature_spec_pitfalls.node2 ibd 2ceeaacd9e8420fa3d3f411344676842942119b5406f9fb6217f44bb50f1c565
+peer-sync feature_spec_pitfalls.node2 ibd 0112034c8a6ffa97a9a141491ded0b7c5322fbff1b716e29d8c631cea4e8cf6e
