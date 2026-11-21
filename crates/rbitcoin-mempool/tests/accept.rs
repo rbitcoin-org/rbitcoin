@@ -1037,7 +1037,7 @@ fn live_sigops(mp: &ActiveMempool, tx: &Transaction) -> u64 {
 }
 
 #[test]
-fn package_and_reorg_readmit_record_sigop_cost() {
+fn package_and_single_admits_record_sigop_cost() {
     let dir = tmp_dir();
     let (utxos, parent, _) = p2sh_p2wsh_multisig_spends();
     let pid = parent.compute_txid();
@@ -1054,12 +1054,9 @@ fn package_and_reorg_readmit_record_sigop_cost() {
 
     mp.remove_for_block(&[pid, child.compute_txid()]).unwrap();
     assert_eq!(mp.live_count(), 0);
-    let readmitted: Vec<Txid> = mp
-        .reorg_disconnect_reaccept(&pkg, &utxos, TIP_OK)
-        .into_iter()
-        .map(|r| r.expect("reorg re-admit").txid)
-        .collect();
-    assert_eq!(readmitted, [pid, child.compute_txid()]);
+    for tx in &pkg {
+        mp.accept_tx(tx, &utxos, TIP_OK).expect("single admit");
+    }
     assert_eq!(live_sigops(&mp, &parent), 8);
     assert_eq!(live_sigops(&mp, &child), 80);
 }
@@ -2633,8 +2630,8 @@ fn admit_waived(
     mp.commit_after_script(tx, prep)
 }
 
-/// A failed replacement puts a warned tx back. Reopening with the mode off
-/// drops the mark, so the next non-final eviction removes the tx.
+/// A failed replacement puts a warned tx back with its mark. A discard drops
+/// the mark, and the next reopen does not load it.
 #[test]
 fn trust_kept_survives_failed_replacement_and_restart() {
     let dir = tmp_dir();
@@ -2674,8 +2671,6 @@ fn trust_kept_survives_failed_replacement_and_restart() {
         "failed replacement dropped the warned tx"
     );
     assert!(mp.trust_kept.contains(&id), "trust mark was not restored");
-    mp.evict_nonfinal(&utxos, tip);
-    assert!(mp.graph.contains(&id), "evict dropped the restored tx");
 
     mp.flush().unwrap();
     drop(mp);
@@ -2686,15 +2681,10 @@ fn trust_kept_survives_failed_replacement_and_restart() {
     );
     again.discard_trust_marks().unwrap();
     drop(again);
-    let mut off = ActiveMempool::open_or_create(&dir).unwrap();
+    let off = ActiveMempool::open_or_create(&dir).unwrap();
     assert!(
         !off.trust_kept.contains(&id),
         "flag-off reopen reloaded the mark"
-    );
-    off.evict_nonfinal(&utxos, tip);
-    assert!(
-        !off.graph.contains(&id),
-        "eviction after a flag-off reopen kept the tx"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2929,8 +2919,8 @@ fn duplicate_live_trust_slot(mp: &mut ActiveMempool) {
     mp.store.set_live_count(mp.store.live_count + 1);
 }
 
-/// A waived admit that does not warn is not marked. A later low tip evicts it,
-/// and a restart does not bring the mark back.
+/// A waived admit that does not warn is not marked, and a restart does not
+/// bring the mark back.
 #[test]
 fn review_trust_clean_admit_is_not_marked() {
     let dir = tmp_dir();
@@ -2938,23 +2928,16 @@ fn review_trust_clean_admit_is_not_marked() {
     let mut tx = spend_tx(op, 99_000);
     tx.lock_time = LockTime::from_height(500).unwrap();
     tx.input[0].sequence = Sequence::from_consensus(0xfffffffe);
-    let low = ChainTipCtx {
-        height: 100,
-        mtp: u32::MAX,
-    };
     let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
     let id = admit_waived(&mut mp, &tx, &utxos, TIP_OK)
         .expect("final at TIP_OK")
         .txid;
     assert!(!mp.trust_kept.contains(&id), "a clean admit was marked");
-    mp.evict_nonfinal(&utxos, low);
-    assert!(!mp.graph.contains(&id));
     mp.flush().unwrap();
     drop(mp);
-    let mut again = ActiveMempool::open_or_create(&dir).unwrap();
+    let again = ActiveMempool::open_or_create(&dir).unwrap();
+    assert!(again.graph.contains(&id));
     assert!(!again.trust_kept.contains(&id));
-    again.evict_nonfinal(&utxos, low);
-    assert!(!again.graph.contains(&id));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2984,13 +2967,9 @@ fn review_trust_restored_mark_survives_restart() {
     assert!(mp.trust_kept.contains(&id));
     mp.flush().unwrap();
     drop(mp);
-    let mut again = ActiveMempool::open_or_create(&dir).unwrap();
+    let again = ActiveMempool::open_or_create(&dir).unwrap();
+    assert!(again.graph.contains(&id), "restart dropped the warned tx");
     assert!(again.trust_kept.contains(&id), "restart dropped the mark");
-    again.evict_nonfinal(&utxos, low);
-    assert!(
-        again.graph.contains(&id),
-        "eviction after restart dropped the warned tx"
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3117,10 +3096,10 @@ fn review_trust_template_skips_marked_chunk() {
 }
 
 /// Script, non-final, immature, and BIP68 faults admit when the session
-/// waive bit is set, and stay through non-final eviction. `accept_tx` stays
-/// strict even when the process flag is on. Policy and a missing parent drop.
+/// waive bit is set, and are marked. `accept_tx` stays strict even when the
+/// process flag is on. Policy drops.
 #[test]
-fn trust_peer_admit_keeps_fee_and_skips_evict() {
+fn trust_peer_admit_keeps_fee_and_marks() {
     use bitcoin::WPubkeyHash;
 
     let dir = tmp_dir();
@@ -3196,27 +3175,14 @@ fn trust_peer_admit_keeps_fee_and_skips_evict() {
     let policy_log = trust_logs();
     assert!(!policy_log.contains("trust-peer:"), "{policy_log}");
 
-    let (nf_id, op_n, nutxos) = waived_lock_faults_stay(&mut mp);
+    let (op_n, nutxos) = waived_lock_faults_are_marked(&mut mp);
     rbitcoin_log::capture_logs(false);
-    rbitcoin_log::capture_logs(true);
-    mp.evict_nonfinal(
-        &MapUtxoProvider {
-            map: HashMap::new(),
-        },
-        ChainTipCtx {
-            height: 100,
-            mtp: u32::MAX,
-        },
-    );
-    assert!(!mp.graph.contains(&nf_id), "a missing parent still leaves");
-    let gone = trust_logs();
-    assert!(!gone.contains("trust-peer:"), "{gone}");
     assert_duplicate_inputs_not_applied(&mut mp, &nutxos, op_n);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Non-final, immature, and BIP68 admits stay through eviction.
-fn waived_lock_faults_stay(mp: &mut ActiveMempool) -> (Txid, OutPoint, MapUtxoProvider) {
+/// Non-final, immature, and BIP68 admits are marked for reorg eviction to keep.
+fn waived_lock_faults_are_marked(mp: &mut ActiveMempool) -> (OutPoint, MapUtxoProvider) {
     let op_n = OutPoint {
         txid: Txid::from_byte_array([0x22; 32]),
         vout: 0,
@@ -3247,8 +3213,8 @@ fn waived_lock_faults_stay(mp: &mut ActiveMempool) -> (Txid, OutPoint, MapUtxoPr
         "{nf_log}"
     );
     assert!(nf_log.contains("not final"), "{nf_log}");
-    mp.evict_nonfinal(&nutxos, tip);
-    assert!(mp.graph.contains(&nf_id), "evict keeps the warned fault");
+    assert!(mp.graph.contains(&nf_id));
+    assert!(mp.trust_kept.contains(&nf_id), "the warned fault is marked");
 
     let op_i = OutPoint {
         txid: Txid::from_byte_array([0x33; 32]),
@@ -3272,8 +3238,8 @@ fn waived_lock_faults_stay(mp: &mut ActiveMempool) -> (Txid, OutPoint, MapUtxoPr
     let immature = spend_tx(op_i, 49_0000_0000);
     admit_waived(mp, &immature, &iutxos, tip).expect("immature");
     let im_id = immature.compute_txid();
-    mp.evict_nonfinal(&iutxos, tip);
     assert!(mp.graph.contains(&im_id));
+    assert!(mp.trust_kept.contains(&im_id));
 
     let op_b = OutPoint {
         txid: Txid::from_byte_array([0x44; 32]),
@@ -3303,9 +3269,9 @@ fn waived_lock_faults_stay(mp: &mut ActiveMempool) -> (Txid, OutPoint, MapUtxoPr
     };
     admit_waived(mp, &bip68, &butxos, btip).expect("bip68");
     let b_id = bip68.compute_txid();
-    mp.evict_nonfinal(&butxos, btip);
     assert!(mp.graph.contains(&b_id));
-    (nf_id, op_n, nutxos)
+    assert!(mp.trust_kept.contains(&b_id));
+    (op_n, nutxos)
 }
 
 fn assert_duplicate_inputs_not_applied(

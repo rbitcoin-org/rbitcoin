@@ -1828,6 +1828,7 @@ fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
 
 /// Disconnecting the parent's coin must not leave the child selectable.
 /// The check runs after the parent is gone and before the function returns.
+/// Both leave with a `reorg` removal row.
 #[test]
 fn reorg_evict_does_not_template_a_parentless_child() {
     let (store, q, cbs) = copy_maturity_pad(3);
@@ -1879,6 +1880,19 @@ fn reorg_evict_does_not_template_a_parentless_child() {
     assert!(!hub.contains(&child_id));
     assert!(!hub.sh_index.lock().unwrap().by_tx.contains_key(&parent_id));
     assert!(!hub.sh_index.lock().unwrap().by_tx.contains_key(&child_id));
+    let left: BTreeSet<(Txid, rbitcoin_mempool::RemovalReason)> = hub
+        .removed_rows()
+        .rows
+        .iter()
+        .map(|r| (r.txid, r.reason))
+        .collect();
+    assert_eq!(
+        left,
+        BTreeSet::from([
+            (parent_id, rbitcoin_mempool::RemovalReason::Reorg),
+            (child_id, rbitcoin_mempool::RemovalReason::Reorg),
+        ])
+    );
     let _ = std::fs::remove_dir_all(&mp);
     let _ = std::fs::remove_dir_all(&store);
 }
@@ -6757,6 +6771,7 @@ fn mempool_tx_snapshot_refresh_reuses_tx_arc() {
 /// A non-final tx from the trusted session stays through hub reorg eviction.
 /// A local submit of the same shape is rejected and stays out of the pool.
 /// The coin is on the chain, so this is `evict_after_reorg`, not a private utxo map.
+/// Once a reorg takes that coin away, the marked tx leaves.
 #[test]
 fn trust_peer_reorg_evict_keeps_nonfinal() {
     let (store, q, cbs) = copy_maturity_pad(3);
@@ -6802,6 +6817,15 @@ fn trust_peer_reorg_evict_keeps_nonfinal() {
         "a local non-final tx is not in the pool after the sweep"
     );
     assert!(hub.try_contains(&txid));
+
+    while q.tip_height().map(|h| h.0).unwrap_or(0) > 0 {
+        q.disconnect_tip().unwrap();
+    }
+    hub.evict_after_reorg();
+    assert!(
+        !hub.try_contains(&txid),
+        "the mark does not keep a tx whose input the reorg took away"
+    );
     let _ = std::fs::remove_dir_all(&mp);
     let _ = std::fs::remove_dir_all(&store);
 }

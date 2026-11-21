@@ -9,15 +9,7 @@ struct LifeChain {
 
 impl LifeChain {
     fn fund(&mut self, value: u64) -> OutPoint {
-        self.fund_at(value, 1, false)
-    }
-
-    fn fund_at(&mut self, value: u64, height: u32, is_coinbase: bool) -> OutPoint {
-        let op = self.fund_paying(value, ScriptBuf::from_bytes(vec![0x51]));
-        let funded = self.unspent.get_mut(&op).expect("just funded");
-        funded.create_height = height;
-        funded.is_coinbase = is_coinbase;
-        op
+        self.fund_paying(value, ScriptBuf::from_bytes(vec![0x51]))
     }
 
     fn fund_paying(&mut self, value: u64, script_pubkey: ScriptBuf) -> OutPoint {
@@ -36,34 +28,6 @@ impl LifeChain {
     fn spend(&mut self, op: OutPoint) {
         if let Some(c) = self.unspent.remove(&op) {
             self.spent.insert(op, c);
-        }
-    }
-
-    fn confirm(&mut self, tx: &Transaction, height: u32) {
-        for inp in &tx.input {
-            self.spend(inp.previous_output);
-        }
-        let txid = tx.compute_txid();
-        for (vout, txout) in tx.output.iter().enumerate() {
-            self.unspent.insert(
-                out(txid, vout as u32),
-                Coin {
-                    create_height: height,
-                    ..coin(txout.clone())
-                },
-            );
-        }
-    }
-
-    fn disconnect(&mut self, tx: &Transaction) {
-        let txid = tx.compute_txid();
-        for vout in 0..tx.output.len() {
-            self.unspent.remove(&out(txid, vout as u32));
-        }
-        for inp in &tx.input {
-            if let Some(c) = self.spent.remove(&inp.previous_output) {
-                self.unspent.insert(inp.previous_output, c);
-            }
         }
     }
 }
@@ -381,35 +345,6 @@ fn block_evicts_conflicts_and_confirms_the_rest(
     let rest: Vec<Txid> = life.live_set().into_iter().collect();
     assert_eq!(life.mp.remove_live_txids(&rest, BLOCK).unwrap(), rest.len());
     assert_eq!(life.mp.live_count(), 0);
-}
-
-/// Block 200 confirmed `zp`. A seq=1 spend of its output and a coinbase
-/// spend that matures at 201 enter. Disconnecting 200 puts `zp` back in the
-/// pool: the seq=1 child is BIP68 non-final behind an unconfirmed parent,
-/// and the coinbase spend is immature again. The next block 200 confirms
-/// `zp` once more.
-fn reorg_readmits_and_evicts_nonfinal(life: &mut Life) {
-    let zp = spend_tx(life.chain.fund_at(100_000, 150, false), 99_000);
-    life.chain.confirm(&zp, 200);
-    let mut seq1 = spend_tx(out(zp.compute_txid(), 0), 98_000);
-    seq1.input[0].sequence = Sequence::from_consensus(1);
-    let cb_spend = spend_tx(life.chain.fund_at(50_0000_0000, 101, true), 49_0000_0000);
-    life.accept(&seq1).expect("parent one block deep");
-    life.accept(&cb_spend).expect("mature at 201");
-
-    life.chain.disconnect(&zp);
-    life.tip.height = 199;
-    let back = life
-        .mp
-        .reorg_disconnect_reaccept(std::slice::from_ref(&zp), &life.chain, life.tip);
-    assert!(back[0].is_ok(), "{:?}", back[0].as_ref().err());
-    assert!(!life.live(&seq1));
-    assert!(!life.live(&cb_spend));
-    assert_eq!(life.live_set(), BTreeSet::from([zp.compute_txid()]));
-
-    life.chain.confirm(&zp, 200);
-    life.tip.height = 200;
-    assert_eq!(life.mp.remove_live_txids(&[zp.compute_txid()], BLOCK).unwrap(), 1);
 }
 
 /// With -minrelaytxfee at 50 sat/vB a parent below it goes to the extra
@@ -958,8 +893,8 @@ fn replacement_unconfirmed_inputs_follow_libre_rule() {
 }
 
 /// One mempool from the first orphan to a full pool: relay order, RBF,
-/// cluster caps, packages, a block, a reorg, a raised `-minrelaytxfee`, and
-/// eviction, against one chain view.
+/// cluster caps, packages, a block, a raised `-minrelaytxfee`, and eviction,
+/// against one chain view.
 #[test]
 fn mempool_accept_life() {
     let dir = tmp_dir();
@@ -982,7 +917,6 @@ fn mempool_accept_life() {
         [rbf_coin, cpfp_coin],
         BTreeSet::from([rbf_winner, cp, cc]),
     );
-    reorg_readmits_and_evicts_nonfinal(&mut life);
     raised_min_relay_one_parent_one_child(&mut life);
     full_pool_evicts_worst_chunks(&mut life);
     let _ = std::fs::remove_dir_all(&dir);
