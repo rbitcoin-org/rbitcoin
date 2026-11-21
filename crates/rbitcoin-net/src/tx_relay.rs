@@ -841,6 +841,10 @@ pub const GETDATA_TX_INTERVAL_SECS: u64 = 60;
 /// Core `MAX_PEER_TX_REQUEST_IN_FLIGHT`.
 #[doc(hidden)]
 pub const MAX_PARENTS_PER_PARK: usize = 100;
+/// Most age-INV log rows one [`MempoolHub::try_age_inv_since`] call walks.
+/// It holds `relay_index`, which every session point lookup takes, so a new
+/// session's first walk from `(0, 0)` resumes on later ticks.
+pub const AGE_INV_SCAN_MAX: usize = 1024;
 
 /// INV AlreadyHave for recently confirmed txid/wtxid (Core rolling bloom is ~100k).
 #[doc(hidden)]
@@ -1074,6 +1078,29 @@ fn isolated_resend_delay_secs() -> u64 {
     120 + crate::peer::rand_nonce() % 61
 }
 
+/// Relay bookkeeping for each live tx in [`MempoolHub`]. Every insert,
+/// remove and restamp changes these maps together, so one mutex guards them
+/// all.
+#[derive(Default)]
+pub struct RelayIndex {
+    /// Reverse of `relay_seq` / `accept_at` so `unindex_txid` can drop them
+    /// after the graph entry is already gone.
+    pub wtxid_by_txid: HashMap<Txid, Wtxid>,
+    /// Core mempool entry_sequence. Regular accept starts at 1; reorg is 0.
+    pub relay_seq: HashMap<Wtxid, u64>,
+    /// Mock/wall seconds when each live wtxid was accepted.
+    pub accept_at: HashMap<Wtxid, u64>,
+    /// Accept generation for `p2p_tx_privacy` (skip pre-handshake txs).
+    pub accept_gen: HashMap<Wtxid, u64>,
+    /// Age-INV log: `(due_secs, accept_gen) → (txid, wtxid)`. Not `inner`.
+    pub age_inv: BTreeMap<(u64, u64), (Txid, Wtxid)>,
+    /// Accept-time order for expiry: `(accept_at, wtxid) → txid`, one row per
+    /// live tx. Extra RAM beside `accept_at` (key + txid, plus tree nodes;
+    /// about 8 MiB at 100k txs) so a 256-entry scan reads the oldest accepts
+    /// and does not walk `wtxid_by_txid`.
+    pub expiry_order: BTreeMap<(u64, Wtxid), Txid>,
+}
+
 /// Shared mempool + relay gate used by peer sessions and tip confirm.
 pub struct MempoolHub {
     pub inner: RwLock<ActiveMempool>,
@@ -1172,11 +1199,9 @@ pub struct MempoolHub {
     /// Wtxids re-admitted from a disconnected block. Core serves these
     /// even if this peer has not been INV'd yet (`mempool_reorg`).
     pub reorg_servable: Mutex<HashSet<Wtxid>>,
-    /// Core mempool entry_sequence. Regular accept starts at 1; reorg is 0.
-    pub relay_seq: Mutex<HashMap<Wtxid, u64>>,
-    /// Reverse of `relay_seq` / `accept_at` so `unindex_txid` can drop them
-    /// after the graph entry is already gone.
-    pub wtxid_by_txid: Mutex<HashMap<Txid, Wtxid>>,
+    /// Per-tx relay bookkeeping. One lock: insert, remove and restamp
+    /// change every map together. Leaf lock, taken under `inner`.
+    pub relay_index: Mutex<RelayIndex>,
     pub next_relay_seq: AtomicU64,
     /// `prioritisetransaction` fee deltas (sat), keyed by txid even if not live.
     pub fee_deltas: Mutex<HashMap<Txid, i64>>,
@@ -1201,27 +1226,18 @@ pub struct MempoolHub {
     /// Last `setmocktime` (0 = wall). Used to age mempool txs for delayed INV.
     /// Shared with the mempool, which stamps it on each durable record.
     pub mock_now: Arc<AtomicU64>,
-    /// Mock/wall seconds when each live wtxid was accepted.
-    pub accept_at: Mutex<HashMap<Wtxid, u64>>,
     /// Monotonic accept generation for `p2p_tx_privacy` (skip pre-handshake txs).
     pub next_accept_gen: AtomicU64,
-    pub accept_gen: Mutex<HashMap<Wtxid, u64>>,
     /// Mempool expiry in seconds (default 336h).
     pub expiry_secs: AtomicU64,
-    /// Accept-time order for expiry: `(accept_at, wtxid) → txid`, one row per
-    /// live tx. Extra RAM beside `accept_at` (key + txid, plus tree nodes;
-    /// about 8 MiB at 100k txs) so a 256-entry scan reads the oldest accepts
-    /// and does not walk `wtxid_by_txid`.
-    pub expiry_order: Mutex<BTreeMap<(u64, Wtxid), Txid>>,
     /// Min-relay overlay (sat/kvB). Readers avoid `inner`.
     pub min_relay_sat_kvb: AtomicU64,
     /// Enforced admission floor (sat/kvB): configured min, the near-full
     /// bump, and the decaying eviction floor. Handshake FeeFilter and
     /// Electrum read this without taking `inner`.
     pub fee_floor_sat_kvb: AtomicU64,
-    /// Age-INV log: `(due_secs, accept_gen) → (txid, wtxid)`. Not `inner`.
-    pub age_inv: Mutex<BTreeMap<(u64, u64), (Txid, Wtxid)>>,
-    /// Min live `accept_at` (`u64::MAX` if empty).
+    /// Min live `accept_at` (`u64::MAX` if empty). Stored under
+    /// `relay_index`; read without it.
     pub min_live_accept_at: AtomicU64,
     /// Cached tip MTP for accept (`{header_fk, ctx}`).
     pub tip_ctx: Mutex<Option<(Fk, ChainTipCtx)>>,
@@ -1520,16 +1536,12 @@ impl MempoolHub {
             isolated_no_targets: AtomicU64::new(0),
             isolated_lap: tokio::sync::Notify::new(),
             reorg_servable: Mutex::new(HashSet::new()),
-            relay_seq: Mutex::new(HashMap::new()),
-            wtxid_by_txid: Mutex::new(HashMap::new()),
+            relay_index: Mutex::new(RelayIndex::default()),
             next_relay_seq: AtomicU64::new(1),
             immediate_relay: AtomicBool::new(false),
             mock_now: Arc::new(AtomicU64::new(0)),
-            accept_at: Mutex::new(HashMap::new()),
             next_accept_gen: AtomicU64::new(1),
-            accept_gen: Mutex::new(HashMap::new()),
             expiry_secs: AtomicU64::new(DEFAULT_MEMPOOL_EXPIRY_SECS),
-            expiry_order: Mutex::new(BTreeMap::new()),
             min_relay_sat_kvb: AtomicU64::new(
                 rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
             ),
@@ -1544,7 +1556,6 @@ impl MempoolHub {
             template_prev_waiters: AtomicUsize::new(0),
             template_commit: Mutex::new(None),
             pool_settle: AtomicU64::new(0),
-            age_inv: Mutex::new(BTreeMap::new()),
             min_live_accept_at: AtomicU64::new(u64::MAX),
             tip_ctx: Mutex::new(None),
             parent_req: Mutex::new(parent_req::ParentTracker::new()),
@@ -1733,47 +1744,41 @@ impl MempoolHub {
     pub fn insert_relay_maps(&self, txid: Txid, wtxid: Wtxid, seq: u64, at: u64, age_inv: bool) {
         let gen = self.next_accept_gen.fetch_add(1, Ordering::Relaxed);
         let due = at.saturating_add(30);
-        let mut by_tx = self.wtxid_by_txid.lock().unwrap();
-        let mut seqs = self.relay_seq.lock().unwrap();
-        let mut ats = self.accept_at.lock().unwrap();
-        let mut gens = self.accept_gen.lock().unwrap();
-        let mut age = self.age_inv.lock().unwrap();
-        let mut order = self.expiry_order.lock().unwrap();
-        if let Some(prev_w) = by_tx.insert(txid, wtxid) {
-            if let Some(prev_at) = ats.get(&prev_w).copied() {
-                order.remove(&(prev_at, prev_w));
+        let mut ix = self.relay_index.lock().unwrap();
+        let ix = &mut *ix;
+        if let Some(prev_w) = ix.wtxid_by_txid.insert(txid, wtxid) {
+            if let Some(prev_at) = ix.accept_at.get(&prev_w).copied() {
+                ix.expiry_order.remove(&(prev_at, prev_w));
             }
         }
-        seqs.insert(wtxid, seq);
-        ats.insert(wtxid, at);
-        gens.insert(wtxid, gen);
+        ix.relay_seq.insert(wtxid, seq);
+        ix.accept_at.insert(wtxid, at);
+        ix.accept_gen.insert(wtxid, gen);
         if age_inv {
-            age.insert((due, gen), (txid, wtxid));
+            ix.age_inv.insert((due, gen), (txid, wtxid));
         }
-        order.insert((at, wtxid), txid);
+        ix.expiry_order.insert((at, wtxid), txid);
         self.min_live_accept_at.fetch_min(at, Ordering::Relaxed);
     }
 
     #[doc(hidden)]
     pub fn remove_relay_maps(&self, txid: &Txid) {
-        let mut by_tx = self.wtxid_by_txid.lock().unwrap();
-        let mut seqs = self.relay_seq.lock().unwrap();
-        let mut ats = self.accept_at.lock().unwrap();
-        let mut gens = self.accept_gen.lock().unwrap();
-        let mut age = self.age_inv.lock().unwrap();
-        let mut order = self.expiry_order.lock().unwrap();
-        if let Some(w) = by_tx.remove(txid) {
-            seqs.remove(&w);
-            let at = ats.remove(&w);
-            let gen = gens.remove(&w);
+        let mut ix = self.relay_index.lock().unwrap();
+        let ix = &mut *ix;
+        if let Some(w) = ix.wtxid_by_txid.remove(txid) {
+            ix.relay_seq.remove(&w);
+            let at = ix.accept_at.remove(&w);
+            let gen = ix.accept_gen.remove(&w);
             if let (Some(at), Some(gen)) = (at, gen) {
-                age.remove(&(at.saturating_add(30), gen));
+                ix.age_inv.remove(&(at.saturating_add(30), gen));
             }
             if let Some(at) = at {
-                order.remove(&(at, w));
+                ix.expiry_order.remove(&(at, w));
             }
             self.min_live_accept_at.store(
-                order.first_key_value().map_or(u64::MAX, |(&(at, _), _)| at),
+                ix.expiry_order
+                    .first_key_value()
+                    .map_or(u64::MAX, |(&(at, _), _)| at),
                 Ordering::Relaxed,
             );
         }
@@ -1785,7 +1790,12 @@ impl MempoolHub {
     }
 
     pub fn accept_gen(&self, wtxid: &Wtxid) -> Option<u64> {
-        self.accept_gen.lock().unwrap().get(wtxid).copied()
+        self.relay_index
+            .lock()
+            .unwrap()
+            .accept_gen
+            .get(wtxid)
+            .copied()
     }
 
     /// A local tx left the unbroadcast set because it confirmed before a peer
@@ -2027,8 +2037,9 @@ impl MempoolHub {
 
     /// Entry time for `getmempoolentry.time` (mock/wall seconds at accept).
     pub fn accept_time_txid(&self, txid: &Txid) -> Option<u64> {
-        let w = self.wtxid_by_txid.lock().unwrap().get(txid).copied()?;
-        self.accept_at.lock().unwrap().get(&w).copied()
+        let ix = self.relay_index.lock().unwrap();
+        let w = ix.wtxid_by_txid.get(txid)?;
+        ix.accept_at.get(w).copied()
     }
 
     /// Drop live txs (and in-mempool descendants) older than `-mempoolexpiry`.
@@ -2055,16 +2066,16 @@ impl MempoolHub {
             return 0;
         }
         let expired_roots = {
-            let order = if block {
-                self.expiry_order.lock().unwrap()
+            let ix = if block {
+                self.relay_index.lock().unwrap()
             } else {
-                let Ok(order) = self.expiry_order.try_lock() else {
+                let Ok(ix) = self.relay_index.try_lock() else {
                     return 0;
                 };
-                order
+                ix
             };
             self.meter_expire_full_scans.fetch_add(1, Ordering::Relaxed);
-            expired_roots_in(&order, now, lim)
+            expired_roots_in(&ix.expiry_order, now, lim)
         };
         self.remove_expired_roots(&expired_roots)
     }
@@ -2139,14 +2150,20 @@ impl MempoolHub {
     }
 
     pub fn accept_time(&self, wtxid: &Wtxid) -> Option<u64> {
-        self.accept_at.lock().unwrap().get(wtxid).copied()
+        self.relay_index
+            .lock()
+            .unwrap()
+            .accept_at
+            .get(wtxid)
+            .copied()
     }
 
     pub fn tx_inv_due(&self, wtxid: &Wtxid) -> bool {
         let now = self.relay_now_secs();
-        self.accept_at
+        self.relay_index
             .lock()
             .unwrap()
+            .accept_at
             .get(wtxid)
             .is_some_and(|at| now.saturating_sub(*at) >= 30)
     }
@@ -2177,18 +2194,21 @@ impl MempoolHub {
     }
 
     #[allow(clippy::type_complexity)] // age-inv cursor `(due, gen)` plus the due txid/wtxid list
-    /// Newly age-due INVs after `seen` (`(due_secs, accept_gen)` cursor).
+    /// Newly age-due INVs after `seen` (`(due_secs, accept_gen)` cursor), at
+    /// most [`AGE_INV_SCAN_MAX`] per call; the next tick resumes after `last`.
     /// Session tick: `try_lock` — busy skip.
     pub fn try_age_inv_since(
         &self,
         seen: (u64, u64),
         now: u64,
     ) -> Option<((u64, u64), Vec<(Txid, Wtxid)>)> {
-        let log = self.age_inv.try_lock().ok()?;
+        let ix = self.relay_index.try_lock().ok()?;
         let mut last = seen;
         let mut out = Vec::new();
-        for (&(due, gen), &(txid, wtxid)) in
-            log.range((Bound::Excluded(seen), Bound::Included((now, u64::MAX))))
+        for (&(due, gen), &(txid, wtxid)) in ix
+            .age_inv
+            .range((Bound::Excluded(seen), Bound::Included((now, u64::MAX))))
+            .take(AGE_INV_SCAN_MAX)
         {
             out.push((txid, wtxid));
             last = (due, gen);
@@ -2198,8 +2218,11 @@ impl MempoolHub {
 
     /// Last due-log key with `due <= now` (advance cursor after a rare full walk).
     pub fn try_age_inv_watermark(&self, now: u64) -> Option<(u64, u64)> {
-        let log = self.age_inv.try_lock().ok()?;
-        log.range(..=(now, u64::MAX)).next_back().map(|(k, _)| *k)
+        let ix = self.relay_index.try_lock().ok()?;
+        ix.age_inv
+            .range(..=(now, u64::MAX))
+            .next_back()
+            .map(|(k, _)| *k)
     }
 
     /// Drop live mempool entries that are confirmed-strong on tip, then live
@@ -3759,7 +3782,11 @@ impl MempoolHub {
 
     #[doc(hidden)]
     pub fn relay_indexed(&self, txid: &Txid) -> bool {
-        self.wtxid_by_txid.lock().unwrap().contains_key(txid)
+        self.relay_index
+            .lock()
+            .unwrap()
+            .wtxid_by_txid
+            .contains_key(txid)
     }
 
     /// A failed re-admit keeps the trust mark when the tx is still in the pool.
@@ -5717,16 +5744,22 @@ impl MempoolHub {
 
     /// True when entry_sequence < peer's last INV sequence.
     pub fn is_relay_servable(&self, wtxid: &Wtxid, last_inv_seq: u64) -> bool {
-        self.relay_seq
+        self.relay_index
             .lock()
             .unwrap()
+            .relay_seq
             .get(wtxid)
             .is_some_and(|s| *s < last_inv_seq)
     }
 
     /// Entry sequence for a live wtxid, if we assigned one.
     pub fn relay_seq_of(&self, wtxid: &Wtxid) -> Option<u64> {
-        self.relay_seq.lock().unwrap().get(wtxid).copied()
+        self.relay_index
+            .lock()
+            .unwrap()
+            .relay_seq
+            .get(wtxid)
+            .copied()
     }
 
     /// Drop live txs that are non-final / immature at the new tip (invalidate
@@ -6837,33 +6870,30 @@ impl MempoolHub {
     /// from submit, and the expiry order follows that same stamp.
     fn restamp_relay_age(&self, txid: &Txid) {
         let now = self.relay_now_secs();
-        let by_tx = self.wtxid_by_txid.lock().unwrap();
-        let Some(wtxid) = by_tx.get(txid).copied() else {
+        let mut ix = self.relay_index.lock().unwrap();
+        let ix = &mut *ix;
+        let Some(wtxid) = ix.wtxid_by_txid.get(txid).copied() else {
             return;
         };
-        // Same order as `insert_relay_maps`: wtxid, seq, accept, gen, age, expiry.
-        let _seqs = self.relay_seq.lock().unwrap();
-        let mut ats = self.accept_at.lock().unwrap();
-        let gens = self.accept_gen.lock().unwrap();
-        let mut age = self.age_inv.lock().unwrap();
-        let mut order = self.expiry_order.lock().unwrap();
-        let Some(old) = ats.get(&wtxid).copied() else {
+        let Some(old) = ix.accept_at.get(&wtxid).copied() else {
             return;
         };
         if old == now {
             return;
         }
-        ats.insert(wtxid, now);
-        if let Some(gen) = gens.get(&wtxid).copied() {
+        ix.accept_at.insert(wtxid, now);
+        if let Some(gen) = ix.accept_gen.get(&wtxid).copied() {
             let pair = (*txid, wtxid);
-            age.remove(&(old.saturating_add(30), gen));
-            age.insert((now.saturating_add(30), gen), pair);
+            ix.age_inv.remove(&(old.saturating_add(30), gen));
+            ix.age_inv.insert((now.saturating_add(30), gen), pair);
         }
-        order.remove(&(old, wtxid));
-        order.insert((now, wtxid), *txid);
+        ix.expiry_order.remove(&(old, wtxid));
+        ix.expiry_order.insert((now, wtxid), *txid);
         if old == self.min_live_accept_at.load(Ordering::Relaxed) {
             self.min_live_accept_at.store(
-                order.first_key_value().map_or(u64::MAX, |(&(at, _), _)| at),
+                ix.expiry_order
+                    .first_key_value()
+                    .map_or(u64::MAX, |(&(at, _), _)| at),
                 Ordering::Relaxed,
             );
         }

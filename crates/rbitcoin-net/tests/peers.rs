@@ -616,7 +616,7 @@ fn parked_noban_headers_timeout_leaves_a_restarted_sync_alone() {
 
 /// Wait until the thread at `/proc/<task>` is asleep (`S`), with a deadline.
 #[cfg(target_os = "linux")]
-fn wait_until_asleep(task: &std::path::Path) {
+pub(crate) fn wait_until_asleep(task: &std::path::Path) {
     let stat = std::path::Path::new("/proc").join(task).join("stat");
     let t0 = std::time::Instant::now();
     loop {

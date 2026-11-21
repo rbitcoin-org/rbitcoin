@@ -103,11 +103,9 @@ pub fn wait_idle() {
 /// have not called [`begin_job`]. Does not publish [`note_wait_seen`].
 #[doc(hidden)]
 pub fn quiet_drain_for_tests() {
-    if on_tip_accept_thread() {
-        return;
-    }
+    // Release builds count no queued jobs, so there is nothing to wait for.
     #[cfg(debug_assertions)]
-    {
+    if !on_tip_accept_thread() {
         let q = lane_queued();
         let mut g = q.mu.lock().unwrap_or_else(|e| e.into_inner());
         while q.n.load(Ordering::SeqCst) > 0 {
@@ -234,56 +232,55 @@ pub fn arm_lane_oneshot() {
     LANE_ONESHOT.with(|c| c.set(true));
 }
 
+/// Release builds have no test lane gate, so every entry is exempt.
+#[cfg(not(debug_assertions))]
+fn take_lane_exemption() -> bool {
+    true
+}
+
 /// True for this whole entry. The oneshot is consumed once so a retry loop
 /// does not lose it, and a tokio worker is not left exempt after the poll.
+#[cfg(debug_assertions)]
 fn take_lane_exemption() -> bool {
-    #[cfg(not(debug_assertions))]
-    {
+    if on_tip_accept_thread() {
         return true;
     }
-    #[cfg(debug_assertions)]
-    {
-        if on_tip_accept_thread() {
-            return true;
-        }
-        let oneshot = LANE_ONESHOT.with(|c| c.replace(false));
-        if oneshot {
-            return true;
-        }
-        if lane_held_after_revoke() == 0 {
-            return false;
-        }
-        // `LANE_HELD` is the worker thread. Another task polled there is not
-        // the holder. A plain-thread take has no task id to compare.
-        match LANE_OWNER.with(|c| c.get()) {
-            LaneOwner::Empty => false,
-            // A task polled on this thread is not the plain-thread holder.
-            LaneOwner::PlainThread => tokio::task::try_id().is_none(),
-            LaneOwner::Task(id) => tokio::task::try_id() == Some(id),
-        }
+    let oneshot = LANE_ONESHOT.with(|c| c.replace(false));
+    if oneshot {
+        return true;
+    }
+    if lane_held_after_revoke() == 0 {
+        return false;
+    }
+    // `LANE_HELD` is the worker thread. Another task polled there is not
+    // the holder. A plain-thread take has no task id to compare.
+    match LANE_OWNER.with(|c| c.get()) {
+        LaneOwner::Empty => false,
+        // A task polled on this thread is not the plain-thread holder.
+        LaneOwner::PlainThread => tokio::task::try_id().is_none(),
+        LaneOwner::Task(id) => tokio::task::try_id() == Some(id),
     }
 }
 
 /// Held across `send` / `try_send` so [`LanePermit::take`] cannot miss a
 /// caller that already decided the lane was free. `None` when this entry is
 /// exempt (the permit holder, or release builds).
+#[cfg(debug_assertions)]
 fn lane_send_guard(exempt: bool) -> Option<std::sync::MutexGuard<'static, ()>> {
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = exempt;
+    if exempt || !LANE_GATE_ON.load(Ordering::Acquire) {
         return None;
     }
-    #[cfg(debug_assertions)]
-    {
-        if exempt || !LANE_GATE_ON.load(Ordering::Acquire) {
-            return None;
-        }
-        let mut g = LANE_EXCLUSIVE_MU.lock().unwrap_or_else(|p| p.into_inner());
-        while LANE_EXCLUSIVE.load(Ordering::Acquire) {
-            g = LANE_EXCLUSIVE_CV.wait(g).unwrap_or_else(|p| p.into_inner());
-        }
-        Some(g)
+    let mut g = LANE_EXCLUSIVE_MU.lock().unwrap_or_else(|p| p.into_inner());
+    while LANE_EXCLUSIVE.load(Ordering::Acquire) {
+        g = LANE_EXCLUSIVE_CV.wait(g).unwrap_or_else(|p| p.into_inner());
     }
+    Some(g)
+}
+
+/// Release builds have no test lane gate, so no send takes the mutex.
+#[cfg(not(debug_assertions))]
+fn lane_send_guard(_exempt: bool) -> Option<std::sync::MutexGuard<'static, ()>> {
+    None
 }
 
 #[cfg(debug_assertions)]

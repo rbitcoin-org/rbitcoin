@@ -381,9 +381,7 @@ fn expire_stale_reaches_a_live_tx_behind_evicted_ghosts() {
     let live_id = live.compute_txid();
     hub.accept_tx(&live).expect("admit live");
     {
-        let mut by_tx = hub.wtxid_by_txid.lock().unwrap();
-        let mut ats = hub.accept_at.lock().unwrap();
-        let mut order = hub.expiry_order.lock().unwrap();
+        let mut ix = hub.relay_index.lock().unwrap();
         for i in 0..GHOSTS {
             let mut raw = [0u8; 32];
             raw[0..4].copy_from_slice(&(i as u32 + 1).to_le_bytes());
@@ -391,9 +389,9 @@ fn expire_stale_reaches_a_live_tx_behind_evicted_ghosts() {
             raw[31] = 1;
             let wtxid = Wtxid::from_byte_array(raw);
             let at = (i as u64) + 1;
-            by_tx.insert(txid, wtxid);
-            ats.insert(wtxid, at);
-            order.insert((at, wtxid), txid);
+            ix.wtxid_by_txid.insert(txid, wtxid);
+            ix.accept_at.insert(wtxid, at);
+            ix.expiry_order.insert((at, wtxid), txid);
         }
     }
     hub.min_live_accept_at.store(1, Ordering::Relaxed);
@@ -408,18 +406,61 @@ fn expire_stale_reaches_a_live_tx_behind_evicted_ghosts() {
     );
     assert_eq!(hub.expire_stale(), 1);
     assert!(!hub.contains(&live_id));
-    assert!(hub.wtxid_by_txid.lock().unwrap().get(&live_id).is_none());
-    assert!(hub
-        .expiry_order
-        .lock()
-        .unwrap()
-        .values()
-        .all(|id| *id != live_id));
+    let ix = hub.relay_index.lock().unwrap();
+    assert!(!ix.wtxid_by_txid.contains_key(&live_id));
+    assert!(ix.expiry_order.values().all(|id| *id != live_id));
+    drop(ix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One age-INV walk holds the relay index that every session point lookup
+/// takes. A session starting at `(0, 0)` reads a long log a bounded slice
+/// at a time, and the cursor resumes until the whole log is covered.
+#[test]
+fn age_inv_walk_is_bounded_and_resumes_from_the_cursor() {
+    let (_store, q, _cbs) = pad_cbs(1);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, q).unwrap();
+    let rows = AGE_INV_SCAN_MAX * 2 + 5;
+    let mut want = BTreeSet::new();
+    for i in 0..rows {
+        let mut raw = [0u8; 32];
+        raw[0..4].copy_from_slice(&(i as u32 + 1).to_le_bytes());
+        let txid = Txid::from_byte_array(raw);
+        raw[31] = 1;
+        let wtxid = Wtxid::from_byte_array(raw);
+        hub.insert_relay_maps(txid, wtxid, i as u64 + 1, 1, true);
+        want.insert(wtxid);
+    }
+    let now = 1_000;
+    let mut seen = (0, 0);
+    let mut got = BTreeSet::new();
+    let mut calls = 0;
+    loop {
+        let (last, due) = hub.try_age_inv_since(seen, now).expect("index free");
+        assert!(
+            due.len() <= AGE_INV_SCAN_MAX,
+            "one walk returned {} rows",
+            due.len()
+        );
+        if due.is_empty() {
+            assert_eq!(last, seen, "an empty walk keeps the cursor");
+            break;
+        }
+        for (_, w) in due {
+            assert!(got.insert(w), "a resumed walk repeated a row");
+        }
+        seen = last;
+        calls += 1;
+        assert!(calls <= rows, "the cursor never reached the end");
+    }
+    assert_eq!(got, want, "the resumed walks cover the whole log");
+    assert_eq!(calls, 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn try_expire_stale_skips_when_the_order_lock_is_held() {
+fn try_expire_stale_skips_when_the_relay_index_is_held() {
     let (_store, owned_q, owned_cbs) = pad_cbs(3);
     let q = &owned_q;
     let cbs = owned_cbs.as_slice();
@@ -432,7 +473,7 @@ fn try_expire_stale_skips_when_the_order_lock_is_held() {
     hub.accept_tx(&tx).expect("admit");
     hub.set_expiry_hours(0);
     hub.note_mock_now(hub.relay_now_secs() + 5);
-    let held = hub.expiry_order.lock().unwrap();
+    let held = hub.relay_index.lock().unwrap();
     assert_eq!(hub.try_expire_stale(), 0);
     assert!(hub.contains(&tid));
     drop(held);
@@ -849,30 +890,28 @@ async fn inv_floor_follows_the_oldest_live_accept() {
 }
 
 /// The row is still local origin at the moment the age stamp takes the
-/// wtxid map. Dropping it first lets an inbound inv tick read the submit time.
+/// relay index. Dropping it first lets an inbound inv tick read the submit
+/// time. The test holds the index and waits for the worker to park on it.
+///
+/// Linux only: the park is read from `/proc/<task>/stat`.
+#[cfg(target_os = "linux")]
 fn row_stays_until_age_stamp(
     hub: &Arc<MempoolHub>,
     txid: Txid,
     now: u64,
     end: impl FnOnce(&MempoolHub, Txid) + Send + 'static,
 ) {
-    let accept = hub.accept_at.lock().unwrap();
+    let index = hub.relay_index.lock().unwrap();
     let hub_b = Arc::clone(hub);
-    let worker = std::thread::spawn(move || end(&hub_b, txid));
-    let mut spins = 0u32;
-    loop {
-        if hub.wtxid_by_txid.try_lock().is_err() {
-            break;
-        }
-        std::thread::yield_now();
-        spins += 1;
-        assert!(
-            spins < 5_000_000,
-            "ending the broadcast never reached the age stamp"
-        );
-    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tx.send(std::fs::read_link("/proc/thread-self").unwrap())
+            .unwrap();
+        end(&hub_b, txid)
+    });
+    crate::peers::wait_until_asleep(&rx.recv().unwrap());
     let still = hub.is_local_origin(&txid);
-    drop(accept);
+    drop(index);
     worker.join().expect("end");
     assert!(
         still,
@@ -882,6 +921,7 @@ fn row_stays_until_age_stamp(
     assert_eq!(hub.accept_time_txid(&txid), Some(now));
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn ending_the_broadcast_keeps_the_row_until_the_age_moves() {
     let (_store, q, cbs) = pad_cbs(12);
@@ -1997,13 +2037,10 @@ fn package_rollback_unindexes_slot_eviction_and_keeps_delta() {
         !hub.sh_index.lock().unwrap().by_tx.contains_key(&victim_id),
         "rolled-back member's eviction must leave sh_index"
     );
-    assert!(!hub.wtxid_by_txid.lock().unwrap().contains_key(&victim_id));
-    assert!(hub
-        .expiry_order
-        .lock()
-        .unwrap()
-        .values()
-        .all(|id| *id != victim_id));
+    let ix = hub.relay_index.lock().unwrap();
+    assert!(!ix.wtxid_by_txid.contains_key(&victim_id));
+    assert!(ix.expiry_order.values().all(|id| *id != victim_id));
+    drop(ix);
     assert_eq!(hub.fee_delta(&victim_id), 11);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2177,13 +2214,10 @@ fn slot_evict_unindexes_evicted_relay_maps() {
         !hub.sh_index.lock().unwrap().by_tx.contains_key(&first_id),
         "slot eviction must drop sh_index"
     );
-    assert!(!hub.wtxid_by_txid.lock().unwrap().contains_key(&first_id));
-    assert!(hub
-        .expiry_order
-        .lock()
-        .unwrap()
-        .values()
-        .all(|id| *id != first_id));
+    let ix = hub.relay_index.lock().unwrap();
+    assert!(!ix.wtxid_by_txid.contains_key(&first_id));
+    assert!(ix.expiry_order.values().all(|id| *id != first_id));
+    drop(ix);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2214,13 +2248,10 @@ fn admission_trim_unindexes_evicted_relay_maps() {
         !hub.sh_index.lock().unwrap().by_tx.contains_key(&low_id),
         "fee eviction must leave sh_index"
     );
-    assert!(!hub.wtxid_by_txid.lock().unwrap().contains_key(&low_id));
-    assert!(hub
-        .expiry_order
-        .lock()
-        .unwrap()
-        .values()
-        .all(|id| *id != low_id));
+    let ix = hub.relay_index.lock().unwrap();
+    assert!(!ix.wtxid_by_txid.contains_key(&low_id));
+    assert!(ix.expiry_order.values().all(|id| *id != low_id));
+    drop(ix);
     assert!(hub.sh_index.lock().unwrap().by_tx.contains_key(&high_id));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2330,13 +2361,13 @@ fn tx_inv_due_uses_wall_clock_when_mocktime_unset() {
         "fresh accept must not be due before 30s"
     );
     {
-        let mut ats = hub.accept_at.lock().unwrap();
-        let mut order = hub.expiry_order.lock().unwrap();
-        let at = ats.get_mut(&w).expect("accept_at");
+        let mut ix = hub.relay_index.lock().unwrap();
+        let ix = &mut *ix;
+        let at = ix.accept_at.get_mut(&w).expect("accept_at");
         let old = *at;
         *at = at.saturating_sub(30);
-        let tid = order.remove(&(old, w)).expect("expiry order");
-        order.insert((*at, w), tid);
+        let tid = ix.expiry_order.remove(&(old, w)).expect("expiry order");
+        ix.expiry_order.insert((*at, w), tid);
         hub.min_live_accept_at.store(*at, Ordering::Relaxed);
     }
     assert!(
@@ -5141,7 +5172,7 @@ fn failed_replacement_keeps_below_floor_victim() {
     );
     assert_eq!(hub.orphan_count(), 0);
     assert!(
-        hub.wtxid_by_txid.lock().unwrap().contains_key(&victim_id),
+        hub.relay_indexed(&victim_id),
         "relay map must still name the conflict"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -5192,10 +5223,8 @@ fn failed_replacement_keeps_cpfp_conflict_set() {
     );
     assert!(!hub.try_recent_reject(&parent.compute_wtxid()));
     assert!(!hub.try_recent_reject(&paying.compute_wtxid()));
-    let maps = hub.wtxid_by_txid.lock().unwrap();
-    assert!(maps.contains_key(&parent_id));
-    assert!(maps.contains_key(&paying_id));
-    drop(maps);
+    assert!(hub.relay_indexed(&parent_id));
+    assert!(hub.relay_indexed(&paying_id));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
