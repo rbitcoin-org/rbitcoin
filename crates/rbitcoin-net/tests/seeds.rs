@@ -589,10 +589,9 @@ fn many_sources_in_one_group_share_one_bound() {
     assert_eq!(honest_rows(&am), BOOK - MAX_ROWS_PER_SOURCE_GROUP);
 }
 
-/// An inbound peer accepted on a dual-stack `[::]` listener arrives as
-/// `::ffff:a.b.c.d`. It is charged to the /16 of `a.b`: two such peers in
-/// different /16s do not share one group, and a mapped peer shares its
-/// group with the same /16 seen natively.
+/// A source given as `::ffff:a.b.c.d` (IPv4-mapped IPv6) is charged to the
+/// /16 of `a.b`: two such sources in different /16s do not share one group,
+/// and a mapped source shares its group with the same /16 seen natively.
 #[test]
 fn a_mapped_ipv4_source_is_charged_to_its_slash16() {
     let mapped = |a: u8, b: u8| {

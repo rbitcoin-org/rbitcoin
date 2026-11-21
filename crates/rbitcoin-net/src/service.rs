@@ -525,6 +525,10 @@ pub fn spawn_inbound_accept(
             };
             match accept {
                 Ok((stream, peer_addr)) => {
+                    // A `[::]` listener is dual-stack: an IPv4 client arrives
+                    // as `::ffff:a.b.c.d`. Every check and row keys it as IPv4.
+                    let peer_addr =
+                        SocketAddr::new(peer_addr.ip().to_canonical(), peer_addr.port());
                     if peers.inbound_discouraged(peer_addr) {
                         rbitcoin_log::info!("p2p: reject discouraged inbound {peer_addr}");
                         drop(stream);
