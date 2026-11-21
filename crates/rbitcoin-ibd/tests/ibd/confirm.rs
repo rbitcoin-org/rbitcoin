@@ -739,21 +739,23 @@ fn queue_hwm_tracks_max_depth() {
 /// A snapshot taken while another thread counts batches in and out shows
 /// each queue's batches, blocks, bytes and parents from one event. Every
 /// batch here is 1 block of `WIRE` bytes with `PARENTS` parents, so each
-/// field is a fixed multiple of that queue's batch count.
+/// field is a fixed multiple of that queue's batch count. The writer runs
+/// until the reader has taken `RACED` snapshots during which the writer
+/// finished a round, so a run where the two never overlap fails.
 #[test]
 fn queue_depth_snapshot_is_one_event_per_queue() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
     const WIRE: usize = 1_000;
     const PARENTS: usize = 7;
-    const ROUNDS: usize = 200_000;
+    const RACED: usize = 20_000;
     let q = ConfirmQueueDepths::new();
     let done = AtomicBool::new(false);
-    let torn = std::thread::scope(|s| {
+    let rounds = AtomicUsize::new(0);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (torn, raced) = std::thread::scope(|s| {
         s.spawn(|| {
-            for _ in 0..ROUNDS {
-                if done.load(Ordering::Relaxed) {
-                    break;
-                }
+            while !done.load(Ordering::Relaxed) {
                 q.send_load(1, WIRE, || Ok::<(), ()>(())).unwrap();
                 q.send_script(1, WIRE, PARENTS, || Ok::<(), ()>(()))
                     .unwrap();
@@ -761,8 +763,8 @@ fn queue_depth_snapshot_is_one_event_per_queue() {
                 q.note_load_recv(1, WIRE);
                 q.note_script_recv(1, WIRE, PARENTS);
                 q.note_write_recv(1, WIRE, PARENTS);
+                rounds.fetch_add(1, Ordering::Relaxed);
             }
-            done.store(true, Ordering::Relaxed);
         });
         let consistent = |c: &ConfirmPipelineSizes| {
             c.load_blocks == c.load_batches
@@ -774,16 +776,24 @@ fn queue_depth_snapshot_is_one_event_per_queue() {
                 && c.write_wire_bytes == c.write_batches * WIRE
                 && c.write_parents == c.write_batches * PARENTS
         };
-        while !done.load(Ordering::Relaxed) {
+        let mut raced = 0usize;
+        let mut torn = None;
+        while raced < RACED && Instant::now() < deadline {
+            let before = rounds.load(Ordering::Relaxed);
             let c = q.content_snap();
             if !consistent(&c) {
-                done.store(true, Ordering::Relaxed);
-                return Some(c);
+                torn = Some(c);
+                break;
+            }
+            if rounds.load(Ordering::Relaxed) != before {
+                raced += 1;
             }
         }
-        None
+        done.store(true, Ordering::Relaxed);
+        (torn, raced)
     });
     assert!(torn.is_none(), "snapshot mixed two events: {torn:?}");
+    assert_eq!(raced, RACED, "the writer and the reader did not overlap");
 }
 
 #[test]
