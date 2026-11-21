@@ -9,7 +9,7 @@ use bitcoin::{
     Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn,
     TxMerkleNode, TxOut, Witness,
 };
-use rbitcoin_ibd::ibd::confirm::{ConfirmFeed, ConfirmRejectClass, RejectParent};
+use rbitcoin_ibd::ibd::confirm::{ConfirmRejectClass, RejectParent};
 use rbitcoin_ibd::ibd::events::{
     apply_block_framed, apply_cascade_reject, apply_confirm_reject, apply_consensus_invalid_reject,
     apply_soft_wire_reject, batch_header_height, body_drain_budget_spent, complete_stored_headers,
@@ -643,47 +643,6 @@ fn unproved_probe_witnesses_another_peers_checkpoint() {
     assert!(matches!(plan, HeaderPlan::Done));
     assert_eq!(st.header_walk.witness_height, Some(1));
     assert!(!st.header_walk.lead_class_a.contains_key(&1));
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[test]
-fn cascade_batch_retries_one_block() {
-    let (dir, hub) = open("cascade-batch");
-    let hash = hash_n(50);
-    let mut single = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
-    let one = ConfirmFeed::new();
-    apply_confirm_reject(
-        &mut single,
-        10,
-        hash,
-        ConfirmRejectClass::Cascade,
-        "fk mismatch",
-        None,
-        Some(&hub),
-        1,
-        Some(&one),
-        None,
-        RejectParent::default(),
-    );
-    assert!(!one.single_block());
-
-    let mut wide = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
-    let feed = ConfirmFeed::new();
-    apply_confirm_reject(
-        &mut wide,
-        10,
-        hash,
-        ConfirmRejectClass::Cascade,
-        "fk mismatch",
-        None,
-        Some(&hub),
-        2,
-        Some(&feed),
-        None,
-        RejectParent::default(),
-    );
-    assert!(feed.single_block());
-    assert_eq!(feed.isolate_until(), 11);
     let _ = std::fs::remove_dir_all(dir);
 }
 

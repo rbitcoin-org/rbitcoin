@@ -1408,12 +1408,6 @@ pub(crate) fn apply_confirm_reject_pending(
     {
         return apply_soft_wire_reject(st, height, hash, err, query, hub, sender);
     }
-    if class == ConfirmRejectClass::Cascade && batch_len > 1 {
-        if let Some(f) = feed {
-            let until = height.saturating_add(batch_len as u32).saturating_sub(1);
-            f.request_single_block(until);
-        }
-    }
     if class.is_soft() {
         return apply_soft_wire_reject(st, height, hash, err, query, hub, sender);
     }
