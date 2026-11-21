@@ -1,6 +1,6 @@
 //! Bounds and caps of the header walk: the clock window, the ordered and
 //! refused-tip caps, the length cap, fork suppression under the floor, the
-//! retire of an invalid block, and the getheaders locator.
+//! retire of an invalid block, the confirm lead, and the getheaders locator.
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -411,6 +411,38 @@ fn retiring_a_block_drops_the_queue_above_its_parent_and_keeps_the_base() {
     assert_eq!(st.header_walk.checkpoints.len(), 2);
     assert_eq!(st.header_walk.checkpoints.last().unwrap().hash, parent);
     assert_eq!(st.header_walk.checkpoints.last().unwrap().height, 1);
+}
+
+/// The confirm lead starts at a match kept on this chain above the base.
+#[test]
+fn a_match_above_the_base_is_the_confirm_lead() {
+    let (_dir, hub, mut st, gen) = opened("witness-lead");
+    let supplier = Some(st.slots[0].net);
+    st.header_walk.proven = false;
+    st.header_walk.base_height = 4;
+    st.header_walk.base_hash = Some(gen.block_hash());
+    st.header_walk.witness_height = Some(9);
+    st.header_walk.checkpoints = vec![checkpoint(
+        9,
+        BlockHash::from_byte_array([0x91; 32]),
+        supplier,
+    )];
+    rewind_to(&mut st, &hub, 100, None);
+    let bounds = unproven_offer_bounds(&st);
+    assert_eq!(bounds.lead_from, 9);
+    assert_eq!(st.header_walk.witness_height, Some(9));
+
+    st.header_walk.proven = false;
+    st.header_walk.base_height = 4;
+    st.header_walk.witness_height = Some(4);
+    st.header_walk.checkpoints = vec![checkpoint(
+        4,
+        BlockHash::from_byte_array([0x44; 32]),
+        supplier,
+    )];
+    rewind_to(&mut st, &hub, 100, None);
+    assert!(st.header_walk.witness_height.is_none());
+    assert_eq!(unproven_offer_bounds(&st).lead_from, 4);
 }
 
 /// One-past bounds of the confirmed tip in the getheaders locator.
