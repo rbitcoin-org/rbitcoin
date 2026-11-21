@@ -75,26 +75,11 @@ pub fn decode_block_header_prefix(payload: &[u8]) -> Option<bitcoin::block::Head
 }
 
 /// Header/control events per turn (anti-livelock under multi-peer header spam).
-#[doc(hidden)]
-pub const CTRL_DRAIN_EVENT_BUDGET: u64 = 512;
-#[doc(hidden)]
-pub const CTRL_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(5);
+const CTRL_DRAIN_EVENT_BUDGET: u64 = 512;
+const CTRL_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(5);
 /// Body path (framed/decoded blocks): process as much as possible so delivered
 /// bytes are not stranded behind headers. Soft wall so cancel/assign still run.
-#[doc(hidden)]
-pub const BODY_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(40);
-
-/// Body drain stops once `elapsed` reaches [`BODY_DRAIN_TIME_BUDGET`].
-#[doc(hidden)]
-pub fn body_drain_budget_spent(elapsed: Duration) -> bool {
-    elapsed >= BODY_DRAIN_TIME_BUDGET
-}
-
-/// Control drain keeps going while both the event cap and the time cap remain.
-#[doc(hidden)]
-pub fn ctrl_drain_continues(ctrl_n: u64, elapsed: Duration) -> bool {
-    ctrl_n < CTRL_DRAIN_EVENT_BUDGET && elapsed < CTRL_DRAIN_TIME_BUDGET
-}
+const BODY_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(40);
 
 /// Another header still fits on the ordered path, including past the soft cap
 /// when the body window needs headroom.
@@ -133,7 +118,7 @@ pub fn drain_ready_peer_and_body_events(
 
     let body_t0 = Instant::now();
     loop {
-        if body_drain_budget_spent(body_t0.elapsed()) {
+        if body_t0.elapsed() >= BODY_DRAIN_TIME_BUDGET {
             break;
         }
         match body_rx.try_recv() {
@@ -155,7 +140,7 @@ pub fn drain_ready_peer_and_body_events(
 
     let ctrl_t0 = Instant::now();
     let mut ctrl_n = 0u64;
-    while ctrl_drain_continues(ctrl_n, ctrl_t0.elapsed()) {
+    while ctrl_n < CTRL_DRAIN_EVENT_BUDGET && ctrl_t0.elapsed() < CTRL_DRAIN_TIME_BUDGET {
         if st.header_cmd.as_ref().is_some_and(|tx| tx.capacity() == 0) {
             break;
         }
@@ -185,17 +170,6 @@ pub fn drain_ready_peer_and_body_events(
 }
 
 #[doc(hidden)]
-pub fn batch_header_height(
-    st: &IbdWorkState,
-    hub: &ChainHub,
-    prev: BlockHash,
-    batch_prev: Option<(BlockHash, u32)>,
-) -> Option<u32> {
-    parent_height(&st.hash_height, hub, prev)
-        .or_else(|| batch_prev.and_then(|(ph, pht)| (ph == prev).then_some(pht.saturating_add(1))))
-}
-
-#[doc(hidden)]
 pub fn note_header_path(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -216,8 +190,7 @@ pub fn note_header_path(
     }
 }
 
-#[doc(hidden)]
-pub fn try_enqueue_ordered_header(
+fn try_enqueue_ordered_header(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     hash: BlockHash,
@@ -305,8 +278,7 @@ pub fn accepted_prefix_after_failure<T>(
 /// The success path is one batch. A failing batch probes the first header
 /// and stops when that header is rejected. Otherwise the rest of the prefix
 /// is binary-searched.
-#[doc(hidden)]
-pub fn ensure_accepted_prefix(
+fn ensure_accepted_prefix(
     hub: &ChainHub,
     headers: &[bitcoin::block::Header],
 ) -> Vec<(bitcoin::block::Header, rbitcoin_primitives::Fk)> {
@@ -355,7 +327,10 @@ pub fn on_headers_batch(
         let hash = hdr.block_hash();
         let prev = hdr.prev_blockhash;
         st.header_fks.insert(hash, fk);
-        if let Some(h) = batch_header_height(st, hub, prev, batch_prev) {
+        let height = parent_height(&st.hash_height, hub, prev).or_else(|| {
+            batch_prev.and_then(|(ph, pht)| (ph == prev).then_some(pht.saturating_add(1)))
+        });
+        if let Some(h) = height {
             note_header_path(st, hub, hash, h, prev);
             if !st.is_on_path(&hash, h) && super::header_walk::note_off_path(st, hub, peer, hash) {
                 disconnect_peer(st, peer);
@@ -1542,8 +1517,7 @@ pub(crate) fn finish_deferred_archived_clear(
     }
 }
 
-#[doc(hidden)]
-pub fn apply_soft_wire_reject(
+fn apply_soft_wire_reject(
     st: &mut IbdWorkState,
     height: u32,
     hash: BlockHash,

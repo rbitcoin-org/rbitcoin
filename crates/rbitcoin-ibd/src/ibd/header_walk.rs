@@ -331,7 +331,7 @@ impl HeaderWalk {
     /// Walk tip when every height up to it is on the candidate.
     ///
     /// Per-second hygiene keeps that band and does not visit it.
-    pub fn indexed_band_end(&self) -> Option<u32> {
+    pub(crate) fn indexed_band_end(&self) -> Option<u32> {
         if self.tip.hash.is_none() || !self.origin {
             None
         } else {
@@ -930,7 +930,10 @@ pub fn split_heights_off_path(st: &IbdWorkState) -> Vec<u32> {
 
 /// Apply confirms already read for off-path splits. A height missing from
 /// `confirmed` appeared while the coordinator lock was down and waits.
-pub fn apply_split_confirms(st: &mut IbdWorkState, confirmed: &HashMap<u32, Option<BlockHash>>) {
+pub(crate) fn apply_split_confirms(
+    st: &mut IbdWorkState,
+    confirmed: &HashMap<u32, Option<BlockHash>>,
+) {
     let path = &st.height_to_hash;
     for slot in &mut st.slots {
         let Some(at) = slot.chain.off_path_split_height(path) else {
@@ -1429,8 +1432,7 @@ fn mark_unproved_if_below_floor(st: &mut IbdWorkState, hub: &ChainHub) {
     }
 }
 
-#[doc(hidden)]
-pub fn chain_work_after(parent: Work, headers: &[Header]) -> Work {
+fn chain_work_after(parent: Work, headers: &[Header]) -> Work {
     let mut work = parent;
     let mut link = headers[0].prev_blockhash;
     for hdr in headers {
@@ -1500,8 +1502,7 @@ pub fn push_header(tip: &mut WalkTip, hub: &ChainHub, hdr: &Header) -> bool {
     true
 }
 
-#[doc(hidden)]
-pub fn advance_tip(tip: &mut WalkTip, hub: &ChainHub, headers: &[Header]) {
+fn advance_tip(tip: &mut WalkTip, hub: &ChainHub, headers: &[Header]) {
     for hdr in headers {
         if tip.hash.is_none() {
             break;
@@ -1660,8 +1661,7 @@ pub fn extend_challenger(
     true
 }
 
-#[doc(hidden)]
-pub fn promote_challenger(st: &mut IbdWorkState, hub: &ChainHub) {
+fn promote_challenger(st: &mut IbdWorkState, hub: &ChainHub) {
     let Some(mut ch) = st.header_walk.challenger.take() else {
         return;
     };
@@ -1699,8 +1699,7 @@ pub fn promote_challenger(st: &mut IbdWorkState, hub: &ChainHub) {
 /// Drop queued hashes above `height`, and any path slot above it that is not
 /// in `keep`. A queued hash with no height is not known to be at or below the
 /// cut, so it leaves unless `keep` names it.
-#[doc(hidden)]
-pub fn drop_queue_above(st: &mut IbdWorkState, height: u32, keep: &HashSet<BlockHash>) {
+fn drop_queue_above(st: &mut IbdWorkState, height: u32, keep: &HashSet<BlockHash>) {
     let mut drop: HashSet<BlockHash> = st
         .ordered
         .iter()
@@ -1765,8 +1764,7 @@ pub fn consider_checkpoint(found: &mut Known, c: &Checkpoint) {
 }
 
 /// Tip, then checkpoints, then the challenger, then the base.
-#[doc(hidden)]
-pub fn known(st: &IbdWorkState, hash: BlockHash) -> Known {
+fn known(st: &IbdWorkState, hash: BlockHash) -> Known {
     let mut found = Known {
         height: None,
         work: None,
@@ -2727,8 +2725,7 @@ fn extend_connected(
 /// when the tip is a full headers window past the last saved checkpoint, or
 /// this batch is itself a full window. A saved height above the tip writes.
 /// In-memory checkpoints stay per reply.
-#[doc(hidden)]
-pub fn adopt_checkpoint_due(
+fn adopt_checkpoint_due(
     proven: bool,
     was_proven: bool,
     last_height: Option<u32>,

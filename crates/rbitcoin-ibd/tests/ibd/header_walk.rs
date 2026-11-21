@@ -6944,15 +6944,6 @@ fn proved_short_batches_do_not_rewrite_header_adopt() {
 fn a_missed_adopt_save_is_retried_by_the_next_short_batch() {
     use std::sync::atomic::Ordering;
 
-    assert!(
-        adopt_checkpoint_due(true, true, Some(50), 10, 1),
-        "a saved height above the tip is due"
-    );
-    assert!(
-        !adopt_checkpoint_due(true, true, Some(10), 10, 1),
-        "a short batch on the saved height is not due"
-    );
-
     let (dir, hub, mut st, gen) = opened("adopt-retry", false);
     assert!(send_getheaders(&mut st, &hub).unwrap());
     let first = headers_after(gen, 1, 1);

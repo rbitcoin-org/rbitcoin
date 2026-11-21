@@ -9,7 +9,7 @@ mod dial;
 mod events;
 mod exit;
 mod header_walk;
-mod header_walk_misses;
+mod header_walk_bounds;
 mod manual_stall;
 mod path;
 mod peer_book_and_config_tests;
