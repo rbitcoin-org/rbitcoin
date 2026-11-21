@@ -916,7 +916,7 @@ impl LivePeer {
         };
         match hub.onion_bind() {
             Some(bind) => bind == self.addrbind && link != SelfAnnounceLink::Tor,
-            None => source.ip().to_canonical().is_loopback() && hub.external_onion().is_some(),
+            None => source.ip().is_loopback() && hub.external_onion().is_some(),
         }
     }
 
@@ -962,7 +962,7 @@ impl LivePeer {
                 SelfAnnounceLink::Clearnet
             };
         }
-        if !sock.ip().to_canonical().is_loopback() {
+        if !sock.ip().is_loopback() {
             return SelfAnnounceLink::Clearnet;
         }
         let tor_on_shared_bind = onion_bind.is_none() && hub.p2p_onion().is_some();
@@ -2466,7 +2466,7 @@ impl PeerHub {
         let table = self.net_perms.lock().unwrap_or_else(|e| e.into_inner());
         let apply_whitelist = !(inbound
             && (table.onion_bind == Some(bind)
-                || (addr.ip().to_canonical().is_loopback()
+                || (addr.ip().is_loopback()
                     && (self.overlay_loopback_forward.load(Ordering::Relaxed)
                         || (table.onion_bind.is_none() && self.external_onion().is_some())))));
         table.flags_for_matched(addr.ip(), inbound, bind, apply_whitelist)

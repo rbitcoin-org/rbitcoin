@@ -229,7 +229,14 @@ pub fn parse_subnet(net: &str) -> Result<Subnet, String> {
         None => (net, None),
     };
     let host = host_raw.trim_matches(|c| c == '[' || c == ']');
-    if let Ok(addr) = host.parse::<Ipv4Addr>() {
+    // Core's `CNetAddr` reads `::ffff:a.b.c.d` as IPv4, and the prefix
+    // then counts IPv4 bits (`LookupSubNet`, `CSubNet`).
+    let v4 = host.parse::<Ipv4Addr>().ok().or_else(|| {
+        host.parse::<Ipv6Addr>()
+            .ok()
+            .and_then(|v6| v6.to_ipv4_mapped())
+    });
+    if let Some(addr) = v4 {
         let prefix = match prefix_s {
             None => 32,
             Some(p) => {

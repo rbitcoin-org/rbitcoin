@@ -20,7 +20,6 @@ fn loopback_forward_does_not_inherit_loopback_net_permission() {
         .push(parse_whitebind("noban@127.0.0.1:8335").unwrap());
     peers.set_net_perms(t);
     let loopback: SocketAddr = "127.0.0.1:40000".parse().unwrap();
-    let mapped: SocketAddr = "[::ffff:127.0.0.1]:40000".parse().unwrap();
     let p2p: SocketAddr = "0.0.0.0:8333".parse().unwrap();
     let wallet: SocketAddr = "127.0.0.1:8335".parse().unwrap();
     let remote: SocketAddr = "203.0.113.9:8333".parse().unwrap();
@@ -30,15 +29,13 @@ fn loopback_forward_does_not_inherit_loopback_net_permission() {
         .has(NetPermissionFlags::NOBAN));
 
     peers.set_overlay_loopback_forward(true);
-    for src in [loopback, mapped] {
-        let flags = peers.permission_flags(src, true, p2p);
-        assert!(
-            !flags.has(NetPermissionFlags::NOBAN),
-            "{src} took noban from the loopback subnet"
-        );
-        assert!(!flags.has(NetPermissionFlags::RELAY));
-        assert!(!flags.has(NetPermissionFlags::FORCE_RELAY));
-    }
+    let flags = peers.permission_flags(loopback, true, p2p);
+    assert!(
+        !flags.has(NetPermissionFlags::NOBAN),
+        "loopback took noban from the loopback subnet"
+    );
+    assert!(!flags.has(NetPermissionFlags::RELAY));
+    assert!(!flags.has(NetPermissionFlags::FORCE_RELAY));
     assert!(peers
         .permission_flags(loopback, true, wallet)
         .has(NetPermissionFlags::NOBAN));
@@ -106,12 +103,10 @@ fn loopback_forward_does_not_inherit_loopback_net_permission() {
     let onion = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
     for endpoint in [onion, &format!("{onion}:28333")] {
         peers.set_external_endpoints(vec![endpoint.parse().unwrap()]);
-        for src in [loopback, mapped] {
-            assert_eq!(
-                peers.permission_flags(src, true, p2p),
-                NetPermissionFlags::NONE
-            );
-        }
+        assert_eq!(
+            peers.permission_flags(loopback, true, p2p),
+            NetPermissionFlags::NONE
+        );
         assert_eq!(
             peers.permission_flags(remote, true, p2p),
             NetPermissionFlags::RELAY
@@ -324,6 +319,30 @@ fn whitelist_prefix_and_ipv6() {
     let err = parse_whitelist("noban@127.0.0.1/33").unwrap_err();
     assert!(err.contains("Invalid netmask specified in"), "{err}");
     let err = parse_whitelist("noban@127.0.0.1/nope").unwrap_err();
+    assert!(err.contains("Invalid netmask specified in"), "{err}");
+}
+
+/// Core's `LookupSubNet` reads `::ffff:a.b.c.d` as IPv4 `a.b.c.d`, then
+/// takes the prefix as an IPv4 prefix: `/8` names `a.0.0.0/8`, and `/96`
+/// is over 32 and is rejected.
+#[test]
+fn mapped_whitelist_is_the_ipv4_grant() {
+    let host = parse_whitelist("noban@::ffff:127.0.0.1").unwrap();
+    let net = parse_whitelist("noban@[::ffff:10.0.0.0]/8").unwrap();
+    assert_eq!(
+        (host.subnet, net.subnet),
+        (
+            Subnet::V4 {
+                addr: Ipv4Addr::LOCALHOST,
+                prefix: 32
+            },
+            Subnet::V4 {
+                addr: Ipv4Addr::new(10, 0, 0, 0),
+                prefix: 8
+            },
+        )
+    );
+    let err = parse_whitelist("noban@::ffff:0:0/96").unwrap_err();
     assert!(err.contains("Invalid netmask specified in"), "{err}");
 }
 

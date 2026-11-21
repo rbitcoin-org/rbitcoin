@@ -801,28 +801,42 @@ async fn shutdown_finishes_without_the_dial_grace() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A `[::]` listener is dual-stack on Linux, so an IPv4 client is accepted
-/// as `::ffff:a.b.c.d`. Its row carries the IPv4 address (Core
-/// `CNetAddr` maps v4-in-v6 to IPv4), and a local `127.0.0.1` client that
-/// misbehaves is disconnected but not discouraged: it can connect again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dual_stack_inbound_ipv4_is_seen_as_ipv4() {
-    use rbitcoin_net::peer::{connect_and_handshake_timed, punish_disconnect, HandshakePolicy};
-    use std::net::{Ipv4Addr, SocketAddr};
-    use tokio::net::TcpStream;
+/// No IPv6 socket on this host: `socket(AF_INET6)` fails, or `[::]` is not
+/// an address the kernel will bind.
+fn ipv6_unavailable(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::EAFNOSUPPORT) {
+        return true;
+    }
+    e.kind() == std::io::ErrorKind::AddrNotAvailable
+}
 
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("rbitcoin-dual-stack-inbound-{n}"));
-    std::fs::create_dir_all(&dir).unwrap();
+/// A dual-stack inbound session: the node on `[::]:0`, the client's local
+/// address and its open half of the session, and the node's handshaken row.
+struct DualStack {
+    _dir: rbitcoin_query::testutil::TempDir,
+    node: P2PNode,
+    client: std::net::SocketAddr,
+    _session: Box<dyn std::any::Any + Send>,
+    row: rbitcoin_net::peers::PeerInfo,
+}
+
+/// Start a node on `[::]:0` under `perms` and handshake with it from
+/// `127.0.0.1`. `None` (with a SKIP line) only when the host has no IPv6 or
+/// its `[::]` listener is IPv6-only; any other failure panics.
+async fn dual_stack_session(
+    label: &str,
+    perms: rbitcoin_net::net_permissions::NetPermTable,
+) -> Option<DualStack> {
+    use rbitcoin_net::peer::{connect_and_handshake_timed, HandshakePolicy};
+    let ua = format!("/rbitcoin:0.1.0({label})/");
+    let (dir, query) = rbitcoin_query::testutil::tiny_query_labeled(label);
     let node = match P2PNode::start_with_dialer(
         "[::]:0".parse().unwrap(),
-        Query::open_or_create_tiny(&dir).unwrap(),
+        query,
         ChainParams::regtest(),
         Milestone::NONE,
-        "/rbitcoin:0.1.0(dual)/".into(),
+        ua.clone(),
         rbitcoin_net::DEFAULT_MAX_INBOUND,
         rbitcoin_net::socks::Dialer::Direct,
         rbitcoin_net::REDIAL_INTERVAL_TEST,
@@ -830,28 +844,29 @@ async fn dual_stack_inbound_ipv4_is_seen_as_ipv4() {
     .await
     {
         Ok(node) => node,
-        Err(e) => {
-            eprintln!("SKIP dual_stack_inbound_ipv4_is_seen_as_ipv4: no IPv6 listen on [::]: {e}");
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
+        Err(NetError::Io(e) | NetError::Bind { source: e, .. }) if ipv6_unavailable(&e) => {
+            eprintln!("SKIP {label}: this host cannot listen on [::]: {e}");
+            return None;
         }
+        Err(e) => panic!("start a node on [::]:0: {e}"),
     };
-    let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, node.local_addr.port()));
-    let stream = match TcpStream::connect(v4).await {
-        Ok(s) => s,
-        Err(e) => {
+    node.peers.set_net_perms(perms);
+    let v4 = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, node.local_addr.port()));
+    let stream = match tokio::net::TcpStream::connect(v4).await {
+        Ok(stream) => stream,
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
             eprintln!(
-                "SKIP dual_stack_inbound_ipv4_is_seen_as_ipv4: [::] listener is not \
-                 dual-stack (net.ipv6.bindv6only=1?): {e}"
+                "SKIP {label}: the [::] listener is not dual-stack \
+                 (net.ipv6.bindv6only=1?): {e}"
             );
             node.shutdown().await;
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
+            return None;
         }
+        Err(e) => panic!("connect to the [::] listener on {v4}: {e}"),
     };
     let client = stream.local_addr().unwrap();
     let watch = first_handshaken(node.peers.clone(), true);
-    let _hs = connect_and_handshake_timed(
+    let session = connect_and_handshake_timed(
         Duration::from_secs(5),
         stream,
         Magic::REGTEST,
@@ -864,7 +879,34 @@ async fn dual_stack_inbound_ipv4_is_seen_as_ipv4() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        session.0.user_agent, ua,
+        "{label}: {v4} was answered by another node"
+    );
     let row = watch.await.unwrap().expect("handshaken inbound row");
+    Some(DualStack {
+        _dir: dir,
+        node,
+        client,
+        _session: Box::new(session),
+        row,
+    })
+}
+
+/// A `[::]` listener is dual-stack on Linux, so an IPv4 client is accepted
+/// as `::ffff:a.b.c.d`. Its row carries the IPv4 address (Core
+/// `CNetAddr` maps v4-in-v6 to IPv4), and a local `127.0.0.1` client that
+/// misbehaves is disconnected but not discouraged: it can connect again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dual_stack_inbound_ipv4_is_seen_as_ipv4() {
+    use rbitcoin_net::peer::punish_disconnect;
+    use tokio::net::TcpStream;
+
+    let Some(ds) = dual_stack_session("dual-stack-inbound", Default::default()).await else {
+        return;
+    };
+    let (node, row, client) = (&ds.node, &ds.row, ds.client);
+    let v4 = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, node.local_addr.port()));
     let shown = (row.addr, row.net.to_string());
     let live = node.peers.live.read().unwrap().get(&row.id).cloned();
     let mut score = 0u32;
@@ -884,11 +926,34 @@ async fn dual_stack_inbound_ipv4_is_seen_as_ipv4() {
             .any(|p| p.inbound && p.id != row.id);
     }
     drop(again);
-    node.shutdown().await;
-    let _ = std::fs::remove_dir_all(&dir);
+    ds.node.shutdown().await;
     assert_eq!(
         (shown, reconnected),
         ((client, client.to_string()), true),
         "(getpeerinfo addr, reconnect after a loopback misbehavior) of a dual-stack IPv4 inbound"
+    );
+}
+
+/// `getpeerinfo` showed a dual-stack IPv4 inbound as `::ffff:127.0.0.1`, so
+/// an operator may have whitelisted that form. Core maps it to `127.0.0.1`
+/// when it parses the grant, so the inbound keeps noban.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dual_stack_inbound_ipv4_keeps_a_mapped_whitelist_grant() {
+    use rbitcoin_net::net_permissions::{parse_whitelist, NetPermTable};
+
+    let mut perms = NetPermTable::default();
+    perms
+        .whitelist
+        .push(parse_whitelist("noban@::ffff:127.0.0.1").unwrap());
+    let Some(ds) = dual_stack_session("dual-stack-mapped-grant", perms).await else {
+        return;
+    };
+    let live = ds.node.peers.live.read().unwrap().get(&ds.row.id).cloned();
+    let noban = live.map(|l| l.session_noban());
+    ds.node.shutdown().await;
+    assert_eq!(
+        noban,
+        Some(true),
+        "noban@::ffff:127.0.0.1 on a dual-stack 127.0.0.1 inbound"
     );
 }
