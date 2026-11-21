@@ -248,7 +248,8 @@ merely touch net or RPC (too slow). Default `cargo test` is the PR pin
 ([`TESTING.md`](../TESTING.md)). Label harness PRs and every version-bump
 ship PR (see [`releases.md`](./releases.md)). The `release-extra` job in
 `release-gate.yml` fails when a ship PR did not get a green
-`core-functional`, `overlay-functional`, and `warnet-example`.
+`core-functional`, `overlay-functional`, `warnet-example`, and
+`consensus-spec`.
 The `core-functional` job is **30 minutes** (79 `test_runner` jobs: 73
 inventory `run`; Core expands transport twins and `wallet_txn_*` flags).
 
