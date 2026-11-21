@@ -14,9 +14,14 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::accept_and_connect_block;
 use rbitcoin_query::confirm_run::bq_resolve::*;
 use rbitcoin_query::Query;
-use rbitcoin_query::{TxPrecompute, TxidHasher};
-use std::collections::HashSet;
-use std::hash::BuildHasherDefault;
+use rbitcoin_query::TxPrecompute;
+fn numbered_txid(i: u32) -> [u8; 32] {
+    let mut t = [0u8; 32];
+    t[..4].copy_from_slice(&i.to_le_bytes());
+    t[31] = 1;
+    t
+}
+
 fn tmp_query() -> (rbitcoin_query::testutil::TempDir, Query) {
     rbitcoin_query::testutil::tiny_query_labeled("bq-resolve")
 }
@@ -31,6 +36,23 @@ fn resolve_wave(
     milestone: Milestone,
     heights: &[u32],
 ) -> BqResolveWave {
+    resolve_wave_with(
+        q,
+        params,
+        milestone,
+        heights,
+        &mut UndrainedCreates::default(),
+    )
+}
+
+/// One wave on the lookup thread's own set, as the thread runs wave after wave.
+fn resolve_wave_with(
+    q: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    heights: &[u32],
+    undrained: &mut UndrainedCreates,
+) -> BqResolveWave {
     confirm_bq_resolve_wave_capped(
         q,
         params,
@@ -38,8 +60,31 @@ fn resolve_wave(
         heights,
         BQ_RESOLVE_WAVE_MAX_BLOCKS,
         BQ_RESOLVE_WAVE_MAX_INPUTS,
+        undrained,
     )
     .unwrap()
+}
+
+/// Genesis connected, then block 1 and a block 2 that spends block 1's
+/// coinbase. Both are on the body queue. Returns block 1 and the txid
+/// block 2 spends. A wave reads identity only, so the spend need not be
+/// mature.
+fn queue_parent_and_child(q: &Query, params: &ChainParams) -> (Block, [u8; 32]) {
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(q, params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    let parent = b1.txdata[0].compute_txid();
+    let b2 = mine_with_txs(
+        b1.block_hash(),
+        b1.header.time + 600,
+        2,
+        vec![spend_op_true(parent, 0, Amount::from_sat(48_0000_0000))],
+    );
+    q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
+        .unwrap();
+    q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
+        .unwrap();
+    (b1, parent.to_byte_array())
 }
 
 fn resolve_and_take(q: &Query, params: &ChainParams, heights: &[u32]) -> BqResolveWaveStats {
@@ -190,23 +235,43 @@ fn push_resolve_keys_dedups_same_prev_txid() {
         txdata: vec![coinbase_tx(height), spend],
     };
     let pres: Vec<TxPrecompute> = block.txdata.iter().map(TxPrecompute::from_tx).collect();
-    let mut keys: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
-        HashSet::with_hasher(BuildHasherDefault::default());
-    let skip = HashSet::with_hasher(BuildHasherDefault::default());
+    let mut keys = WaveKeys::default();
+    let skip = UndrainedCreates::default();
     let spends = push_resolve_keys(&params, height, &block, &pres, &skip, &mut keys, 1);
-    assert_eq!(keys.len(), 1);
-    assert!(keys.contains(&prev.to_byte_array()));
+    assert_eq!(keys.need.len(), 1);
+    assert!(keys.need.contains(&prev.to_byte_array()));
+    assert!(keys.skipped.is_empty());
     assert_eq!(
         spends,
         vec![prev.to_byte_array()],
         "one key per parent txid"
     );
-    let mut skip_same = HashSet::with_hasher(BuildHasherDefault::default());
-    skip_same.insert(prev.to_byte_array());
-    let mut keys2: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
-        HashSet::with_hasher(BuildHasherDefault::default());
+    let mut skip_same = UndrainedCreates::default();
+    skip_same.note_block(height, std::iter::once(prev.to_byte_array()));
+    let mut keys2 = WaveKeys::default();
     let skipped = push_resolve_keys(&params, height, &block, &pres, &skip_same, &mut keys2, 1);
-    assert!(keys2.is_empty(), "same-wave creates are not TipOnly need");
+    assert!(
+        keys2.need.is_empty(),
+        "a prev the set holds is not TipOnly need"
+    );
+    assert_eq!(
+        keys2.skipped,
+        vec![prev.to_byte_array(), prev.to_byte_array()],
+        "each skipped input is kept, to go back into the need if its create drains"
+    );
+    let empty = UndrainedCreates::default();
+    assert_eq!(
+        keys2.readmit(&skip_same),
+        2,
+        "still skipped: two inputs left out"
+    );
+    assert!(keys2.need.is_empty() && keys2.skipped.is_empty());
+    keys2.skipped.push(prev.to_byte_array());
+    assert_eq!(keys2.readmit(&empty), 0);
+    assert!(
+        keys2.need.contains(&prev.to_byte_array()),
+        "a prev the set no longer holds is TipOnly need again"
+    );
     assert_eq!(
         skipped,
         vec![prev.to_byte_array()],
@@ -220,20 +285,18 @@ fn push_resolve_keys_dedups_same_prev_txid() {
     };
     let pre_pres: Vec<TxPrecompute> = pre.txdata.iter().map(TxPrecompute::from_tx).collect();
     let cb = pre_pres[0].txid;
-    let mut pre_keys: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
-        HashSet::with_hasher(BuildHasherDefault::default());
+    let mut pre_keys = WaveKeys::default();
     push_resolve_keys(&params, 0, &pre, &pre_pres, &skip, &mut pre_keys, 1);
     assert!(
-        pre_keys.contains(&cb),
+        pre_keys.need.contains(&cb),
         "before BIP34 the create txid is a resolve key"
     );
-    let mut skip_cb = HashSet::with_hasher(BuildHasherDefault::default());
-    skip_cb.insert(cb);
-    let mut hidden: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
-        HashSet::with_hasher(BuildHasherDefault::default());
+    let mut skip_cb = UndrainedCreates::default();
+    skip_cb.note_block(0, std::iter::once(cb));
+    let mut hidden = WaveKeys::default();
     push_resolve_keys(&params, 0, &pre, &pre_pres, &skip_cb, &mut hidden, 1);
     assert!(
-        !hidden.contains(&cb),
+        !hidden.need.contains(&cb),
         "a skipped create txid is not a TipOnly key"
     );
 }
@@ -282,6 +345,498 @@ fn same_wave_create_is_not_tiponly_need() {
         "h=2 spend_keys must name the same-wave parent so load stamp can in-flight bind"
     );
     let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Block 1 went to load in an earlier wave and is not connected. Load holds
+/// its creates in-flight, so the wave for block 2 does not read them from
+/// `tx.head`.
+#[test]
+fn earlier_wave_create_above_the_snapshot_is_not_tiponly_need() {
+    let (path, q) = tmp_query();
+    let params = ChainParams::regtest();
+    let (_b1, parent) = queue_parent_and_child(&q, &params);
+    let mut undrained = UndrainedCreates::default();
+
+    let first = resolve_wave_with(&q, &params, Milestone::NONE, &[1], &mut undrained);
+    take_emitted(&q, &first);
+
+    let second = resolve_wave_with(&q, &params, Milestone::NONE, &[2], &mut undrained);
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(
+        second.stats.keys, 0,
+        "block 1 is above the drain+fence snapshot: its create is load's in-flight bind"
+    );
+    assert_eq!(second.stats.undrained_skip, 1);
+    assert!(second.parent_ids.get(&parent).is_none());
+    assert!(
+        second.items[0].2.spend_keys.contains(&parent),
+        "spend_keys still name the parent so load can bind it in-flight"
+    );
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Once the drain and the fence have passed block 1, load may have dropped
+/// its pack: the wave reads the parent from `tx.head` again.
+#[test]
+fn create_the_snapshot_has_passed_is_tiponly_need_again() {
+    let (path, q) = tmp_query();
+    let params = ChainParams::regtest();
+    let (b1, parent) = queue_parent_and_child(&q, &params);
+    let mut undrained = UndrainedCreates::default();
+
+    let first = resolve_wave_with(&q, &params, Milestone::NONE, &[1], &mut undrained);
+    take_emitted(&q, &first);
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    assert_eq!(q.drain_and_fence_hi(), Some(1));
+
+    let second = resolve_wave_with(&q, &params, Milestone::NONE, &[2], &mut undrained);
+    assert_eq!(second.stats.keys, 1);
+    assert_eq!(second.stats.hits, 1);
+    assert_eq!(second.stats.undrained_skip, 0);
+    assert!(second.parent_ids.get(&parent).is_some());
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// A re-arm makes load drop every in-flight pack, so the next wave reads
+/// every parent again.
+#[test]
+fn rearm_makes_the_next_wave_read_every_parent() {
+    let (path, q) = tmp_query();
+    let params = ChainParams::regtest();
+    let (_b1, parent) = queue_parent_and_child(&q, &params);
+    let mut undrained = UndrainedCreates::default();
+
+    let first = resolve_wave_with(&q, &params, Milestone::NONE, &[1], &mut undrained);
+    take_emitted(&q, &first);
+    q.set_lookup_taken_hi(Some(1));
+
+    let second = resolve_wave_with(&q, &params, Milestone::NONE, &[2], &mut undrained);
+    assert_eq!(
+        second.stats.keys, 1,
+        "the parent is TipOnly need after a re-arm"
+    );
+    assert_eq!(second.stats.hits, 0, "block 1 is not connected");
+    assert!(second.parent_ids.get(&parent).is_none());
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Rows a wave decoded but did not send are selected again, and their
+/// creates are still this wave's own.
+#[test]
+fn unsent_heights_walked_again_are_still_the_waves_own_creates() {
+    let (path, q) = tmp_query();
+    let params = ChainParams::regtest();
+    let (_b1, _parent) = queue_parent_and_child(&q, &params);
+    let mut undrained = UndrainedCreates::default();
+
+    let first = resolve_wave_with(&q, &params, Milestone::NONE, &[1, 2], &mut undrained);
+    assert_eq!(first.items.len(), 2);
+    let again = resolve_wave_with(&q, &params, Milestone::NONE, &[1, 2], &mut undrained);
+    assert_eq!(again.items.len(), 2);
+    assert_eq!(again.stats.keys, 0, "the parent is this wave's own create");
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// The table never grows. A create that finds its bucket full overwrites
+/// the lowest height there, so the newest creates are always held and the
+/// oldest give way, and their spends are read from `tx.head` as before.
+/// Twice the table's slots go in here with nothing drained.
+#[test]
+fn a_full_table_overwrites_the_oldest_create() {
+    let per_block = 1_000u32;
+    let blocks = 2 * UNDRAINED_SLOTS as u32 / per_block;
+    let mut undrained = UndrainedCreates::default();
+    for height in 0..blocks {
+        let lo = height * per_block;
+        undrained.note_block(height, (lo..lo + per_block).map(numbered_txid));
+    }
+    let newest = (blocks - 20) * per_block..blocks * per_block;
+    let held_newest = newest
+        .clone()
+        .filter(|&i| undrained.holds(&numbered_txid(i)))
+        .count();
+    assert_eq!(held_newest, newest.len(), "the newest 20 blocks are held");
+    let held_oldest = (0..per_block)
+        .filter(|&i| undrained.holds(&numbered_txid(i)))
+        .count();
+    assert!(
+        held_oldest < per_block as usize / 10,
+        "the oldest block gave way, {held_oldest} of its creates held"
+    );
+}
+
+/// A height the snapshot has reached is dead at once, while the map that
+/// holds it lives on for its higher heights.
+#[test]
+fn a_height_the_snapshot_has_reached_is_not_held() {
+    let mut undrained = UndrainedCreates::default();
+    undrained.note_block(10, std::iter::once(numbered_txid(10)));
+    undrained.note_block(11, std::iter::once(numbered_txid(11)));
+
+    undrained.drop_through(Some(10));
+    assert!(!undrained.holds(&numbered_txid(10)));
+    assert!(undrained.holds(&numbered_txid(11)));
+
+    undrained.drop_through(Some(9));
+    assert!(
+        !undrained.holds(&numbered_txid(10)),
+        "a lower snapshot brings nothing back"
+    );
+}
+
+/// The skip and the load bind together. Wave 1 decodes block 1 and load
+/// plans it, which puts its create in in-flight. Wave 2 decodes block 2,
+/// which spends that create, and leaves the parent out of its read. Load
+/// binds it to the fk it planned for block 1. Without in-flight the same
+/// need reads `tx.head`, which block 1 has not reached, so it is an
+/// unresolved parent.
+#[test]
+fn a_skipped_parent_binds_from_in_flight_or_not_at_all() {
+    use rbitcoin_query::{
+        confirm_wire_lookup_stamp, stamp_external_parents, InFlight, WireLoadPipeline,
+    };
+    use std::sync::Arc;
+
+    let (path, q) = tmp_query();
+    let params = ChainParams::regtest();
+    let (b1, parent) = queue_parent_and_child(&q, &params);
+    let mut undrained = UndrainedCreates::default();
+
+    let first = resolve_wave_with(&q, &params, Milestone::NONE, &[1], &mut undrained);
+    let mut in_flight = InFlight::new();
+    let plan = {
+        let pipe = WireLoadPipeline {
+            path_lo: 1,
+            parent_hash: None,
+            next_tx_start: q.tx_body_count().saturating_add(1),
+            in_flight: &in_flight,
+            skeleton: Some(first.parent_ids.clone()),
+            carried_need: Vec::new(),
+            carried_header_fks: Vec::new(),
+            carried_header_hashes: Vec::new(),
+        };
+        let items = [(Height(1), Arc::new(b1.clone()), None)];
+        confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
+            .unwrap()
+            .plan
+            .expect("block 1 is a new body")
+    };
+    let planned_fk = plan.planned_fks[0];
+    in_flight.note_pins(
+        plan.planned_fks
+            .iter()
+            .zip(plan.batch_pin.iter())
+            .map(|(fk, pin)| (*fk, pin)),
+        Some(1),
+    );
+    take_emitted(&q, &first);
+
+    let second = resolve_wave_with(&q, &params, Milestone::NONE, &[2], &mut undrained);
+    assert_eq!(second.stats.undrained_skip, 1);
+    assert!(second.parent_ids.get(&parent).is_none());
+
+    let bound = stamp_external_parents(
+        q.store(),
+        &[parent],
+        &in_flight,
+        Some(&second.parent_ids),
+        q.confirm_stats(),
+    )
+    .unwrap();
+    assert_eq!(
+        bound.resolved.get(&parent).copied(),
+        Some(planned_fk),
+        "the skipped parent is the create load planned for block 1"
+    );
+    assert!(
+        bound.from_head.is_empty(),
+        "in-flight bound it, so no warning"
+    );
+
+    match stamp_external_parents(
+        q.store(),
+        &[parent],
+        &InFlight::new(),
+        Some(&second.parent_ids),
+        q.confirm_stats(),
+    ) {
+        Err(e) => assert!(e.to_string().contains("parent create_fk unresolved"), "{e}"),
+        Ok(stamp) => panic!(
+            "a skipped parent with no in-flight create bound to {:?}",
+            stamp.resolved.get(&parent)
+        ),
+    }
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Hashes every txid to one value, so all of them share one bucket and one
+/// tag in the [`UndrainedCreates`] table.
+#[derive(Clone, Copy, Default)]
+struct OneSlot;
+
+impl std::hash::BuildHasher for OneSlot {
+    type Hasher = OneSlot;
+    fn build_hasher(&self) -> OneSlot {
+        OneSlot
+    }
+}
+
+impl std::hash::Hasher for OneSlot {
+    fn finish(&self) -> u64 {
+        0
+    }
+    fn write(&mut self, _bytes: &[u8]) {}
+}
+
+/// A tag shared with a recorded create leaves a parent out of the read
+/// although nothing in the pipeline creates it. Here every txid shares one
+/// slot, so block 2's own creates hide block 1's coinbase, which is
+/// connected and in `tx.head`. Load finds the parent in neither in-flight
+/// nor the skeleton, reads that one key from `tx.head`, binds it with the
+/// ranges `tx.head` gives, and warns with the block, its height, and the
+/// prev. It does so for a new body (the plan) and again once that body is
+/// archived (the archived stamp).
+#[test]
+fn a_forced_tag_collision_reads_the_parent_from_tx_head_and_warns() {
+    use rbitcoin_query::{confirm_wire_lookup_stamp, InFlight, WireLoadPipeline};
+    use std::sync::Arc;
+
+    let (path, q) = tmp_query();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let parent = b1.txdata[0].compute_txid();
+    let b2 = mine_with_txs(
+        b1.block_hash(),
+        b1.header.time + 600,
+        2,
+        vec![spend_op_true(parent, 0, Amount::from_sat(48_0000_0000))],
+    );
+    q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
+        .unwrap();
+    let (on_disk, pair) = q
+        .store()
+        .get_fk_by_txid_batch(&[parent.to_byte_array()])
+        .unwrap()[0]
+        .1
+        .expect("block 1's coinbase is in tx.head");
+    let on_disk_id = on_disk.get().expect("a real fk");
+
+    let mut undrained = UndrainedCreates::with_hasher(OneSlot);
+    let wave = confirm_bq_resolve_wave_capped(
+        &q,
+        &params,
+        Milestone::NONE,
+        &[2],
+        BQ_RESOLVE_WAVE_MAX_BLOCKS,
+        BQ_RESOLVE_WAVE_MAX_INPUTS,
+        &mut undrained,
+    )
+    .unwrap();
+    assert_eq!(
+        wave.stats.undrained_skip, 1,
+        "the shared slot hid the parent"
+    );
+    assert!(wave.parent_ids.get(&parent.to_byte_array()).is_none());
+
+    let in_flight = InFlight::new();
+    let pipe = WireLoadPipeline {
+        path_lo: 2,
+        parent_hash: None,
+        next_tx_start: q.tx_body_count().saturating_add(1),
+        in_flight: &in_flight,
+        skeleton: Some(wave.parent_ids.clone()),
+        // IBD load carries every wave item's spend keys.
+        carried_need: wave
+            .items
+            .iter()
+            .flat_map(|(_, _, wire)| wire.spend_keys.iter().copied())
+            .collect(),
+        carried_header_fks: Vec::new(),
+        carried_header_hashes: Vec::new(),
+    };
+    let items = [(Height(2), Arc::new(b2.clone()), None)];
+    let stamp = || {
+        rbitcoin_log::capture_logs(true);
+        let stamped = confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe));
+        let logs = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        let stamped = stamped.expect("the parent binds from tx.head");
+        assert_eq!(stamped.parent_pin.from_head, vec![parent.to_byte_array()]);
+        let ident = stamped
+            .parent_pin
+            .idents
+            .get(&on_disk_id)
+            .expect("the parent's identity");
+        assert_eq!(
+            (ident.body, ident.spent, ident.n_out),
+            (Some(pair.txout), Some(pair.spent), Some(pair.n_out)),
+            "the ranges tx.head gives"
+        );
+        let warns: Vec<&String> = logs
+            .iter()
+            .filter(|(level, _)| *level == rbitcoin_log::Level::Warn)
+            .map(|(_, line)| line)
+            .collect();
+        assert_eq!(warns.len(), 1, "{logs:?}");
+        for part in [
+            b2.block_hash().to_string(),
+            "height 2".to_string(),
+            parent.to_string(),
+        ] {
+            assert!(warns[0].contains(&part), "{part} not in {}", warns[0]);
+        }
+        stamped
+    };
+
+    let mut plan = stamp().plan.expect("block 2 is a new body");
+    let spend = plan
+        .edges
+        .values()
+        .flatten()
+        .find(|e| e.vout != u32::MAX)
+        .expect("block 2 spends block 1's coinbase");
+    assert_eq!(spend.create_fk, on_disk);
+
+    rbitcoin_query::archive::stamp_wire_plan_txstat(&q, &mut plan).unwrap();
+    q.archive_commit_plan(plan).unwrap();
+    assert!(stamp().plan.is_none(), "block 2's body is archived");
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// A height decoded again replaces that height and every height above it.
+/// Lookup walks upward from the first unsent height, so the rows above a
+/// re-walked height were queued again and may differ.
+#[test]
+fn a_height_decoded_again_replaces_it_and_every_height_above() {
+    let mut undrained = UndrainedCreates::default();
+    undrained.note_block(10, std::iter::once(numbered_txid(10)));
+    undrained.note_block(11, std::iter::once(numbered_txid(11)));
+    undrained.note_block(12, std::iter::once(numbered_txid(12)));
+
+    undrained.note_block(11, std::iter::once(numbered_txid(99)));
+    assert!(undrained.holds(&numbered_txid(10)), "height 10 stays");
+    assert!(undrained.holds(&numbered_txid(99)));
+    assert!(
+        !undrained.holds(&numbered_txid(11)),
+        "the old height 11 left"
+    );
+    assert!(
+        !undrained.holds(&numbered_txid(12)),
+        "height 12 was above the height walked again"
+    );
+
+    undrained.drop_through(Some(11));
+    assert!(!undrained.holds(&numbered_txid(99)));
+}
+
+/// The set's heap is its table: none until lookup records a block, then
+/// the same 8 MiB however many creates it holds or has dropped.
+#[test]
+fn the_sets_heap_is_its_fixed_table() {
+    assert_eq!(UNDRAINED_TABLE_BYTES, 8 << 20);
+    let mut undrained = UndrainedCreates::default();
+    assert_eq!(undrained.heap_bytes(), 0);
+
+    undrained.note_block(10, (0..1_000).map(numbered_txid));
+    assert_eq!(undrained.heap_bytes(), UNDRAINED_TABLE_BYTES);
+    undrained.drop_through(Some(10));
+    undrained.rearm(7);
+    undrained.note_block(11, (0..1_000).map(numbered_txid));
+    assert_eq!(undrained.heap_bytes(), UNDRAINED_TABLE_BYTES);
+}
+
+/// A slot keeps a height in 24 bits. A block above that is not recorded, so
+/// spends of its creates are read from `tx.head` as before, and a snapshot
+/// that high passes every height the table holds.
+#[test]
+fn a_height_past_the_slot_width_is_not_recorded() {
+    let widest = (1u32 << 24) - 2;
+    let mut undrained = UndrainedCreates::default();
+    undrained.note_block(widest, std::iter::once(numbered_txid(1)));
+    assert!(undrained.holds(&numbered_txid(1)));
+
+    undrained.note_block(widest + 1, std::iter::once(numbered_txid(2)));
+    assert!(!undrained.holds(&numbered_txid(2)));
+    assert!(undrained.holds(&numbered_txid(1)), "the lower height stays");
+
+    undrained.drop_through(Some(u32::MAX));
+    assert!(!undrained.holds(&numbered_txid(1)));
+}
+
+/// Wall-clock cost of the set per block at three pipeline depths. Each
+/// block records 3,600 creates, probes 7,200 prevs (43% of them creates of
+/// the live blocks, the rest txids the set never held), then moves the
+/// snapshot up. `UNDRAINED_BENCH_EVICT=1` rewrites a 64 MiB buffer before
+/// each block so the set starts cold, as it does between waves on a node.
+#[test]
+#[ignore = "wall-clock bench: cargo test --release -p rbitcoin-query --test suite undrained_set_cost_per_block -- --ignored --nocapture"]
+fn undrained_set_cost_per_block() {
+    const CREATES: u64 = 3_600;
+    const PROBES: u64 = 7_200;
+    const LIVE_PCT: u64 = 43;
+    fn mix(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+    fn txid(i: u64) -> [u8; 32] {
+        let mut t = [0u8; 32];
+        for (k, chunk) in t.chunks_exact_mut(8).enumerate() {
+            chunk.copy_from_slice(&mix(i.wrapping_mul(4).wrapping_add(k as u64)).to_le_bytes());
+        }
+        t
+    }
+    let evict = std::env::var_os("UNDRAINED_BENCH_EVICT").is_some();
+    let mut buf = vec![0u8; if evict { 64 << 20 } else { 0 }];
+    for live in [50_000u64, 200_000, 450_000] {
+        let depth = (live / CREATES) as u32;
+        let (warm, timed) = (depth + 200, 1_000u32);
+        let mut set = UndrainedCreates::default();
+        let mut busy = std::time::Duration::ZERO;
+        let (mut live_n, mut live_miss, mut old_hit) = (0u64, 0u64, 0u64);
+        let mut rng = u64::from(depth);
+        for h in 0..warm + timed {
+            for b in buf.iter_mut().step_by(64) {
+                *b = b.wrapping_add(1);
+            }
+            let first = u64::from(h) * CREATES;
+            let creates: Vec<[u8; 32]> = (first..first + CREATES).map(txid).collect();
+            let lo = u64::from(h.saturating_sub(depth)) * CREATES;
+            let probes: Vec<(bool, [u8; 32])> = (0..PROBES)
+                .map(|_| {
+                    rng = mix(rng);
+                    if h > 0 && rng % 100 < LIVE_PCT {
+                        (true, txid(lo + (rng >> 8) % (first - lo)))
+                    } else {
+                        (false, txid(u64::MAX - (rng >> 1)))
+                    }
+                })
+                .collect();
+            let txids: Vec<[u8; 32]> = probes.iter().map(|(_, p)| *p).collect();
+            let t = std::time::Instant::now();
+            set.note_block(h, creates);
+            let held = set.holds_each(&txids);
+            set.drop_through(h.checked_sub(depth + 1));
+            if h < warm {
+                continue;
+            }
+            busy += t.elapsed();
+            for ((is_live, _), held) in probes.iter().zip(held) {
+                live_n += u64::from(*is_live);
+                live_miss += u64::from(*is_live && !held);
+                old_hit += u64::from(!*is_live && held);
+            }
+        }
+        println!(
+            "live {live}: {:.3} ms a block, live misses {:.3}%, false hits {old_hit}",
+            busy.as_secs_f64() * 1e3 / f64::from(timed),
+            live_miss as f64 * 100.0 / live_n as f64,
+        );
+    }
 }
 
 #[test]
@@ -970,6 +1525,7 @@ fn wave_under_confirm_cancel_returns_cancelled_and_keeps_the_decode() {
         &[1],
         BQ_RESOLVE_WAVE_MAX_BLOCKS,
         BQ_RESOLVE_WAVE_MAX_INPUTS,
+        &mut UndrainedCreates::default(),
     ) {
         Ok(_) => panic!("a wave under the confirm cancel must not resolve"),
         Err(e) => e,

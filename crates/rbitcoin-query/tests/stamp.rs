@@ -276,15 +276,62 @@ fn inflight_hit_adopts_skeleton_loc() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// IBD: a key in neither in-flight nor the skeleton is read from `tx.head`.
+/// One it holds binds with the ranges `tx.head` gives and is named in
+/// `from_head`. A key it does not hold is still `parent create_fk
+/// unresolved`, even beside one that binds.
 #[test]
-fn skeleton_miss_is_unresolved_without_head_probe() {
+fn skeleton_miss_binds_only_what_tx_head_holds() {
+    use bitcoin::hashes::Hash;
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_primitives::Height;
     let (dir, q) = tmp_store();
-    let mut txid = [0u8; 32];
-    txid[0] = 0x22;
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        Height::GENESIS,
+        &genesis,
+        Milestone::NONE,
+    )
+    .unwrap();
+    let b1 =
+        rbitcoin_consensus::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    rbitcoin_query::accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let on_disk = b1.txdata[0].compute_txid().to_byte_array();
+    let (fk, pair) = q.store().get_fk_by_txid_batch(&[on_disk]).unwrap()[0]
+        .1
+        .expect("block 1's coinbase is in tx.head");
     let skel = BatchParentIds::default();
     let empty = InFlight::new();
-    let err = stamp_external_parents(q.store(), &[txid], &empty, Some(&skel), q.confirm_stats())
-        .unwrap_err();
+
+    let st = stamp_external_parents(
+        q.store(),
+        &[on_disk],
+        &empty,
+        Some(&skel),
+        q.confirm_stats(),
+    )
+    .unwrap();
+    assert_eq!(st.resolved.get(&on_disk), Some(&fk));
+    assert_eq!(st.from_head, vec![on_disk]);
+    let ident = st.idents.get(&fk.get().unwrap()).expect("ident");
+    assert_eq!(
+        (ident.body, ident.spent, ident.n_out),
+        (Some(pair.txout), Some(pair.spent), Some(pair.n_out))
+    );
+
+    let mut missing = [0u8; 32];
+    missing[0] = 0x22;
+    let err = stamp_external_parents(
+        q.store(),
+        &[on_disk, missing],
+        &empty,
+        Some(&skel),
+        q.confirm_stats(),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("parent create_fk unresolved"), "got: {msg}");
     let _ = std::fs::remove_dir_all(&dir);

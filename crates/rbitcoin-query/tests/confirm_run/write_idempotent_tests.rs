@@ -2021,6 +2021,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         batch_creates: vec![],
         external_parents: Default::default(),
         external_parent_vouts: Default::default(),
+        external_from_head: Vec::new(),
         batch_pin: vec![],
         index_tx: false,
         body_est: 0,
@@ -2078,6 +2079,7 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
         batch_creates: vec![],
         external_parents: idents,
         external_parent_vouts: Default::default(),
+        external_from_head: Vec::new(),
         batch_pin: vec![],
         index_tx: false,
         body_est: 0,
@@ -2461,6 +2463,7 @@ fn pin_sparse_need_high_vout_only() {
             m
         },
         external_parent_vouts: Default::default(),
+        external_from_head: Vec::new(),
         batch_pin: vec![Arc::clone(&spend_pin)],
         index_tx: false,
         body_est: 0,

@@ -15,6 +15,9 @@ pub struct ParentPinStamp {
     pub idents: crate::U64Map<crate::ParentIdent>,
     /// create_fk_id → spent need-vouts (packed at lookup; load pin reuses).
     pub parent_vouts: U64Map<Vec<u32>>,
+    /// External parents read from `tx.head` because neither in-flight nor
+    /// the skeleton held them ([`crate::ExternalParentStamp::from_head`]).
+    pub from_head: Vec<[u8; 32]>,
 }
 
 impl ParentPinStamp {
@@ -26,6 +29,7 @@ impl ParentPinStamp {
             resolved: crate::TxidMap::with_hasher(Default::default()),
             idents: std::mem::take(&mut plan.external_parents),
             parent_vouts: std::mem::take(&mut plan.external_parent_vouts),
+            from_head: std::mem::take(&mut plan.external_from_head),
         }
     }
 
@@ -122,6 +126,9 @@ pub fn archived_create_pairs(
 
 /// IBD **load** stage: structure + stamp create_fk + parent body ranges.
 ///
+/// Parent create_fk: same-batch → in-flight → skeleton → one `tx.head` read
+/// for the keys in neither ([`crate::stamp_external_parents`]).
+///
 /// May read `tx.head`, `tx.idx`, `txid.body`. **Never** denserels-decode `tx.body`.
 /// Parent create_fk: in-flight → skeleton (carried BQ keys) → leftover TipOnly
 /// (plan=None). Wire blocks are `Arc` so IBD resolve can decode once and hand
@@ -202,6 +209,9 @@ fn lookup_stamp_work(
             (pin, pairs)
         }
     };
+    if !parent_pin.from_head.is_empty() {
+        warn_parents_from_head(&metas, &wire_blocks, &parent_pin.from_head);
+    }
     crate::note_confirm(&query.confirm_stats().lookup_blocks, blocks.len() as u64);
     crate::note_confirm(&query.confirm_stats().lookup_head_ns, plan_ns);
     let work_ns = t0.elapsed().as_nanos() as u64;
@@ -215,6 +225,31 @@ fn lookup_stamp_work(
         archived_pairs,
         trust_warns: Vec::new(),
     })
+}
+
+/// Warn once for each input that spends a parent load read from `tx.head`.
+///
+/// Neither in-flight nor lookup's read held that parent. A txid tag the
+/// undrained-creates table shares with another create does that, and so
+/// would a race between in-flight's prune and the `tx.head` drain. The read
+/// is TipOnly, so the bind is right either way; the warning keeps the case
+/// visible without rejecting the block.
+fn warn_parents_from_head(metas: &[BodyMeta], wire_blocks: &[Arc<Block>], from_head: &[[u8; 32]]) {
+    for (meta, block) in metas.iter().zip(wire_blocks) {
+        for tx in &block.txdata {
+            for inp in &tx.input {
+                if !from_head.contains(&inp.previous_output.txid.to_byte_array()) {
+                    continue;
+                }
+                rbitcoin_log::warn!(
+                    "ibd: load read a parent from tx.head that in-flight and lookup did not hold: block {} height {} prev {}",
+                    bitcoin::BlockHash::from_byte_array(meta.hash),
+                    meta.height.0,
+                    inp.previous_output.txid,
+                );
+            }
+        }
+    }
 }
 
 /// One fk per txid (`latest`), plus every fk when a txid is created again.
@@ -403,6 +438,7 @@ pub fn stamp_parent_pin_archived(
         resolved: crate::TxidMap::with_capacity_and_hasher(ext.resolved.len(), Default::default()),
         idents: ext.idents,
         parent_vouts: U64Map::default(),
+        from_head: ext.from_head,
     };
     for (tid, fk) in ext.resolved {
         let Some(id) = fk.get() else {

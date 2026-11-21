@@ -6,12 +6,15 @@
 //! is asked before each sealed segment and each identity shot. Hits ride the
 //! wave as
 //! [`crate::BatchParentIds`] (fk + body_range + spent_range). Does not
-//! claim, structure, or stamp. Same-wave creates are omitted from TipOnly need.
+//! claim, structure, or stamp. Creates above the wave's drain+fence snapshot
+//! ([`UndrainedCreates`]: this wave's, and earlier waves' of the same re-arm
+//! generation) are omitted from TipOnly need.
 
 use super::*;
 use crate::{BatchParentIds, IdMap, ResolvedWire, TxPrecompute, TxidHasher, U32Map, U64Map};
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
+use std::hash::{BuildHasher, BuildHasherDefault};
 use std::sync::Arc;
 
 /// Hard cap on BQ heights in one TipOnly wave (~1 week of 10-minute blocks).
@@ -32,6 +35,265 @@ pub const BQ_RESOLVE_WAVE_MAX_INPUTS: u32 = 64_000;
 pub const BQ_RESOLVE_WAVE_MIN_INPUTS: u32 = 8000;
 /// Safety cap so one megablock run cannot stall the wave.
 pub const BQ_RESOLVE_WAVE_MAX_KEYS: usize = 256_000;
+
+/// Slots in the [`UndrainedCreates`] table: 2^17 buckets of 8.
+#[doc(hidden)]
+pub const UNDRAINED_SLOTS: usize = 1 << 20;
+/// Heap of the [`UndrainedCreates`] table once lookup has recorded a block:
+/// 8 B a slot, 8 MiB.
+#[doc(hidden)]
+pub const UNDRAINED_TABLE_BYTES: usize = UNDRAINED_SLOTS * std::mem::size_of::<u64>();
+
+const BUCKET_SLOTS: usize = 8;
+const BUCKETS: usize = UNDRAINED_SLOTS / BUCKET_SLOTS;
+/// A slot is a 40-bit txid tag above a 24-bit level.
+const LEVEL_BITS: u32 = 24;
+const LEVEL_MASK: u64 = (1 << LEVEL_BITS) - 1;
+
+/// What a slot stores for the height that created a txid: the height plus
+/// one, so a zero slot is empty. `None` past the 24 bits a slot keeps.
+fn level(height: u32) -> Option<u32> {
+    height
+        .checked_add(1)
+        .filter(|&level| u64::from(level) <= LEVEL_MASK)
+}
+
+fn slot_level(slot: u64) -> u32 {
+    (slot & LEVEL_MASK) as u32
+}
+
+/// One cache line of slots.
+#[derive(Clone, Copy, Default)]
+#[repr(align(64))]
+struct Bucket([u64; BUCKET_SLOTS]);
+
+/// Creates of blocks this lookup thread has decoded that the `tx.head`
+/// drain and the fence have not passed.
+///
+/// A prev txid the set holds is not TipOnly need. Load binds it from
+/// in-flight, which keeps every pack at or above a wave's drain+fence
+/// snapshot until that wave's last batch has read it. The set holds only
+/// heights above the same snapshot. Load clears in-flight when the re-arm
+/// generation changes, and the set empties on the same change. Holding a
+/// txid only removes a key from the store read. It binds nothing, and a
+/// txid the set does not hold is read as before.
+///
+/// The set is one fixed table of [`UNDRAINED_SLOTS`] slots in 64 B buckets
+/// of 8, [`UNDRAINED_TABLE_BYTES`] in all. A slot is a 40-bit tag of the
+/// txid and the 24-bit `level` of the height that created it. The bucket
+/// and the tag come from the whole txid hashed with SipHash-1-3 under a
+/// random key of this set's own, so a txid that shares a slot with another
+/// cannot be built offline. Nothing is removed by itself: a slot whose
+/// height the snapshot has reached is dead, and an insert takes a dead or
+/// empty slot, or else overwrites the lowest height in the bucket. Heights
+/// die in the order they were inserted, so that is the oldest create, and
+/// spends of it are read from `tx.head` as before.
+///
+/// Two txids with one tag in one bucket answer as one. A prev held that way
+/// is in neither in-flight nor the wave's skeleton, and load reads it from
+/// `tx.head` ([`crate::stamp_external_parents`]).
+///
+/// `S` is the keyed hash. A test can give one that collides on purpose.
+pub struct UndrainedCreates<S = RandomState> {
+    gen: Option<u32>,
+    hasher: S,
+    /// Empty until the first block is recorded.
+    table: Box<[Bucket]>,
+    /// A level at or below it is dead.
+    dead_through: u32,
+    /// No live slot is above this level.
+    top: u32,
+}
+
+impl Default for UndrainedCreates {
+    fn default() -> Self {
+        Self::with_hasher(RandomState::new())
+    }
+}
+
+impl<S> std::fmt::Debug for UndrainedCreates<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UndrainedCreates")
+            .field("gen", &self.gen)
+            .field("heap_bytes", &self.heap_bytes())
+            .field("dead_through", &self.dead_through)
+            .field("top", &self.top)
+            .finish()
+    }
+}
+
+impl<S> UndrainedCreates<S> {
+    /// An empty set that places txids with `hasher`.
+    #[doc(hidden)]
+    pub fn with_hasher(hasher: S) -> Self {
+        Self {
+            gen: None,
+            hasher,
+            table: Box::default(),
+            dead_through: 0,
+            top: 0,
+        }
+    }
+
+    /// Heap the set holds: the table, once a block has been recorded.
+    #[doc(hidden)]
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.table)
+    }
+}
+
+impl<S: BuildHasher> UndrainedCreates<S> {
+    /// The bucket and the tag of `txid`.
+    fn place(&self, txid: &[u8; 32]) -> (usize, u64) {
+        use std::hash::Hasher;
+        let mut hasher = self.hasher.build_hasher();
+        hasher.write(txid);
+        let hash = hasher.finish();
+        ((hash as usize) & (BUCKETS - 1), hash >> LEVEL_BITS)
+    }
+
+    /// A live slot in `bucket` carries `tag`.
+    fn bucket_holds(&self, bucket: usize, tag: u64) -> bool {
+        self.table[bucket]
+            .0
+            .iter()
+            .any(|&slot| slot >> LEVEL_BITS == tag && slot_level(slot) > self.dead_through)
+    }
+
+    /// A create of `txid` is recorded at a height above the last snapshot.
+    #[doc(hidden)]
+    pub fn holds(&self, txid: &[u8; 32]) -> bool {
+        if self.table.is_empty() {
+            return false;
+        }
+        let (bucket, tag) = self.place(txid);
+        self.bucket_holds(bucket, tag)
+    }
+
+    /// [`Self::holds`] for each of `txids`, in order. Every txid is hashed
+    /// before any bucket is read, so the bucket reads do not wait on one
+    /// another's hash.
+    #[doc(hidden)]
+    pub fn holds_each(&self, txids: &[[u8; 32]]) -> Vec<bool> {
+        if self.table.is_empty() {
+            return vec![false; txids.len()];
+        }
+        let places: Vec<(usize, u64)> = txids.iter().map(|txid| self.place(txid)).collect();
+        places
+            .into_iter()
+            .map(|(bucket, tag)| self.bucket_holds(bucket, tag))
+            .collect()
+    }
+
+    /// Empty the set unless it was filled under re-arm generation `gen`.
+    #[doc(hidden)]
+    pub fn rearm(&mut self, gen: u32) {
+        if self.gen == Some(gen) {
+            return;
+        }
+        self.gen = Some(gen);
+        self.table.fill(Bucket::default());
+        self.dead_through = 0;
+        self.top = 0;
+    }
+
+    /// Mark the heights a drain+fence snapshot has reached dead. `None`
+    /// keeps all.
+    #[doc(hidden)]
+    pub fn drop_through(&mut self, hi: Option<u32>) {
+        let Some(hi) = hi else {
+            return;
+        };
+        let through = level(hi).unwrap_or(LEVEL_MASK as u32);
+        self.dead_through = self.dead_through.max(through);
+    }
+
+    /// Record the block decoded at `height`. It replaces that height and
+    /// every height above it: lookup decodes in ascending order, so a
+    /// height seen again means the rows from there up were queued again.
+    #[doc(hidden)]
+    pub fn note_block(&mut self, height: u32, txids: impl IntoIterator<Item = [u8; 32]>) {
+        self.forget_from(height);
+        let Some(level) = level(height) else {
+            return;
+        };
+        if self.table.is_empty() {
+            self.table = vec![Bucket::default(); BUCKETS].into_boxed_slice();
+        }
+        let places: Vec<(usize, u64)> = txids.into_iter().map(|txid| self.place(&txid)).collect();
+        for (bucket, tag) in places {
+            self.insert(bucket, tag, level);
+        }
+        self.top = self.top.max(level);
+    }
+
+    /// Put `tag` at `level` in `bucket`: over a live slot with that tag,
+    /// else in the first dead or empty slot, else over the lowest level.
+    fn insert(&mut self, bucket: usize, tag: u64, level: u32) {
+        let dead_through = self.dead_through;
+        let slots = &mut self.table[bucket].0;
+        let mut free = None;
+        let mut oldest = (u32::MAX, 0);
+        for (i, &slot) in slots.iter().enumerate() {
+            let at = slot_level(slot);
+            if at <= dead_through {
+                free.get_or_insert(i);
+            } else if slot >> LEVEL_BITS == tag {
+                free = Some(i);
+                break;
+            } else if at < oldest.0 {
+                oldest = (at, i);
+            }
+        }
+        slots[free.unwrap_or(oldest.1)] = (tag << LEVEL_BITS) | u64::from(level);
+    }
+
+    /// Forget `height` and every height above it, in one pass over the
+    /// table when any of them is recorded.
+    fn forget_from(&mut self, height: u32) {
+        let Some(from) = level(height) else {
+            return;
+        };
+        if self.top < from {
+            return;
+        }
+        for bucket in self.table.iter_mut() {
+            for slot in bucket.0.iter_mut() {
+                if slot_level(*slot) >= from {
+                    *slot = 0;
+                }
+            }
+        }
+        self.top = from - 1;
+    }
+}
+
+/// One wave's TipOnly need and the prevs left out of it.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct WaveKeys {
+    pub need: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>,
+    /// One entry per input whose prev was in the skip set at collect.
+    pub skipped: Vec<[u8; 32]>,
+}
+
+impl WaveKeys {
+    /// Move every skipped prev that `skip` no longer holds back into the
+    /// need. Returns the inputs still left out.
+    #[doc(hidden)]
+    pub fn readmit<S: BuildHasher>(&mut self, skip: &UndrainedCreates<S>) -> u32 {
+        let mut left_out = 0u32;
+        let held = skip.holds_each(&self.skipped);
+        for (prev, held) in self.skipped.drain(..).zip(held) {
+            if held {
+                left_out = left_out.saturating_add(1);
+            } else {
+                self.need.insert(prev);
+            }
+        }
+        left_out
+    }
+}
 
 /// Stop before another height once the key cap is hit and this wave already
 /// has a height. An empty `done` still emits the height that filled the cap.
@@ -143,24 +405,29 @@ pub struct BqResolveWaveStats {
     /// TipOnly `create.loc` fill is inside [`Self::head_ns`] (`idx_ns`): one
     /// batch after the sealed walk, not on the held probe ring.
     pub spent_ns: u64,
+    /// Inputs whose prev stayed out of the TipOnly need: its create is
+    /// above this wave's drain+fence snapshot.
+    pub undrained_skip: u32,
 }
 
 /// Push external prev_txids (+ pre-BIP34 create txids) into the wave TipOnly set.
 ///
-/// Spend keys record every non-coinbase prev (including same-wave creates) so
-/// a later load chunk can bind in-flight. TipOnly `keys` still omit `skip`.
+/// Spend keys record every non-coinbase prev (including the ones `skip`
+/// holds) so a later load chunk can bind in-flight. A prev `skip` holds goes
+/// to [`WaveKeys::skipped`], not the need.
 #[doc(hidden)]
-pub fn push_resolve_keys(
+pub fn push_resolve_keys<S: BuildHasher>(
     params: &ChainParams,
     height: u32,
     block: &Block,
     pres: &[TxPrecompute],
-    skip: &HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>,
-    keys: &mut HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>,
+    skip: &UndrainedCreates<S>,
+    keys: &mut WaveKeys,
     n_inputs: u32,
 ) -> Vec<[u8; 32]> {
     let bip34 = params.bip34_active_at(height);
     let mut spends = Vec::with_capacity(n_inputs as usize);
+    let mut bip30 = Vec::new();
     for (tx, p) in block.txdata.iter().zip(pres.iter()) {
         for inp in &tx.input {
             if inp.previous_output.is_null() {
@@ -171,12 +438,21 @@ pub fn push_resolve_keys(
                 continue;
             }
             spends.push(prev);
-            if !skip.contains(&prev) {
-                keys.insert(prev);
-            }
         }
-        if !bip34 && !skip.contains(&p.txid) {
-            keys.insert(p.txid);
+        if !bip34 {
+            bip30.push(p.txid);
+        }
+    }
+    for (prev, held) in spends.iter().zip(skip.holds_each(&spends)) {
+        if held {
+            keys.skipped.push(*prev);
+        } else {
+            keys.need.insert(*prev);
+        }
+    }
+    for (txid, held) in bip30.iter().zip(skip.holds_each(&bip30)) {
+        if !held {
+            keys.need.insert(*txid);
         }
     }
     // One key per parent txid: inputs spending the same parent share it.
@@ -192,22 +468,28 @@ pub fn push_resolve_keys(
 /// [`BqResolveWave::undecodable`]. Marks each
 /// processed height resolve-complete even when some keys miss (same-batch /
 /// in-flight remainder is load's job). Connected-only (fence) resolve.
-/// `max_blocks` / `max_inputs` cap emit (remaining loadq).
-pub fn confirm_bq_resolve_wave_capped(
+/// `max_blocks` / `max_inputs` cap emit (remaining loadq). `undrained` is
+/// the calling lookup thread's set, carried from wave to wave.
+pub fn confirm_bq_resolve_wave_capped<S: BuildHasher>(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     heights: &[u32],
     max_blocks: usize,
     max_inputs: u32,
+    undrained: &mut UndrainedCreates<S>,
 ) -> Result<BqResolveWave, ConfirmError> {
     let t0 = Instant::now();
+    // The caller read the generation before it selected heights and takes
+    // this wave's rows under that value. A re-arm between its read and this
+    // one fills the set under the new generation from the old selection,
+    // and the take then fails. The next wave starts at or below those
+    // heights, and a height walked again replaces itself and every height
+    // above it.
+    undrained.rearm(query.lookup_taken_gen());
     let mut stats = BqResolveWaveStats::default();
     let mut done: Vec<u32> = Vec::new();
-    let mut all_keys: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
-        HashSet::with_hasher(BuildHasherDefault::default());
-    let mut wave_creates: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
-        HashSet::with_hasher(BuildHasherDefault::default());
+    let mut keys = WaveKeys::default();
     let mut wires: Vec<(u32, [u8; 32], ResolvedWire)> = Vec::new();
 
     let intake = query.block_queue_wave_intake(heights);
@@ -285,7 +567,7 @@ pub fn confirm_bq_resolve_wave_capped(
 
     let mut undecodable = None;
     for &h in &selected {
-        if stop_for_key_cap(all_keys.len(), done.len()) {
+        if stop_for_key_cap(keys.need.len(), done.len()) {
             break;
         }
         let hash = query.block_queue_hash_at_height(h).unwrap_or([0u8; 32]);
@@ -330,16 +612,14 @@ pub fn confirm_bq_resolve_wave_capped(
             continue;
         };
         let t_col = Instant::now();
-        for p in pres.iter() {
-            wave_creates.insert(p.txid);
-        }
+        undrained.note_block(h, pres.iter().map(|p| p.txid));
         let spends = push_resolve_keys(
             params,
             h,
             block.as_ref(),
             pres.as_ref(),
-            &wave_creates,
-            &mut all_keys,
+            undrained,
+            &mut keys,
             n_inputs_at.get(&h).copied().unwrap_or(0),
         );
         stats.collect_ns = stats
@@ -357,14 +637,20 @@ pub fn confirm_bq_resolve_wave_capped(
         done.push(h);
     }
 
-    stats.keys = all_keys.len() as u32;
+    let t_settle = Instant::now();
+    let drain_fence_hi = query.drain_and_fence_hi();
+    undrained.drop_through(drain_fence_hi);
+    stats.undrained_skip = keys.readmit(undrained);
+    stats.collect_ns = stats
+        .collect_ns
+        .saturating_add(t_settle.elapsed().as_nanos() as u64);
+    stats.keys = keys.need.len() as u32;
     let mut layer = IdMap::default();
     let mut spent = U64Map::default();
     let mut n_out = U64Map::default();
-    let need: Vec<[u8; 32]> = all_keys.into_iter().collect();
+    let need: Vec<[u8; 32]> = keys.need.into_iter().collect();
     let t_head = Instant::now();
 
-    let drain_fence_hi = query.drain_and_fence_hi();
     if let Some(&hi) = selected.last() {
         query.note_lookup_tiponly_start(hi);
     }
@@ -402,6 +688,9 @@ pub fn confirm_bq_resolve_wave_capped(
         stats.head_ns,
         stats.spent_ns,
     );
+    query
+        .confirm_stats()
+        .note_wave_undrained_skip(u64::from(stats.undrained_skip));
     Ok(BqResolveWave {
         stats,
         items: wires,

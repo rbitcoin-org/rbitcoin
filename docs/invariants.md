@@ -43,7 +43,9 @@ wire / body-queue
   → lookup (stamp create_fk + parent txout/spent ranges + parent txid;
             IO: tx.head, create.loc, txid.body — NEVER outs/seqsigwit decode)
   → load / pin (BatchParents outs by known txout range only;
-            IO: txout.body — NEVER head / loc / txid.body / seqsigwit)
+            IO: txout.body — stamp reads tx.head only for a parent in
+            neither in-flight nor the skeleton — NEVER loc / txid.body /
+            seqsigwit, and pin NEVER head)
   → scripts (pure CPU — NEVER any store IO)
   → Class A commit (if ArchiveWritePlan present; wire seqsigwit encoded at write)
   → ensure abs (holes only: same-batch after Class A / missing stamp; post-condition: every spend has abs)
@@ -60,7 +62,9 @@ IBD thread split (same IO table): lookup **thread** is decode + TipOnly +
 `take_raw` onto loadq. Structure + plan_batch (`confirm_wire_lookup_stamp`)
 run on the **load** thread and consume `LoadBatch.pres` — they do not read
 `block_queue_resolved`. Leftover TipOnly on that stamp is still **lookup-stage
-IO** (head / create.loc), not load pin, and only on **plan=None / S0**. After lookup
+IO** (head / create.loc), not load pin. It runs on **plan=None / S0**, and on
+IBD only for a parent in neither in-flight nor the skeleton (one `tx.head`
+read, warned). After lookup
 puts parent P on the load-batch skeleton, load stamp of a child spending P has
 **zero** leftover TipOnly for P (`head_need_n=0`). Pack stays on load; do not
 move `plan_batch` onto lookup.
@@ -73,18 +77,18 @@ at commit only. SpendEdges + CreatePin survive freeze. Write encodes Class A
 outs from `Arc<Block>` + those edges (no plan-time `scriptPubKey` copy). The wire
 pin shares that block until Class A commit publishes one packed output blob and
 clears the shared slot. A `PinOuts` taken while the slot was full keeps its own
-`Arc<Block>` until that snapshot is dropped. Load still does not head/idx.
+`Arc<Block>` until that snapshot is dropped. Load pin still does not read head or idx.
 
 | Stage | Allowed IO | Forbidden |
 |-------|------------|-----------|
 | **lookup** | `tx.head`, `create.loc` (fk + body+spent ranges + `n_out`), `txid.body`, headers | **`txout.body`** (outs or spent-range peeks) / **`seqsigwit` decode** |
-| **load** | **`txout.body` outs by range** (from lookup stamp). A lone block's stamp miss reads `tx.head` once at the tip, and on a miss `txid.body` over every unsealed `tx.head` segment ([089](./external_findings/089-missing-parent-verdict.md)) | head, loc, `txid.body`, `seqsigwit` on the stamp and pin path |
+| **load** | **`txout.body` outs by range** (from lookup stamp). A parent in neither in-flight nor the skeleton is read from `tx.head` once, with a warning when it is there. A lone block's stamp miss reads `tx.head` once at the tip, and on a miss `txid.body` over every unsealed `tx.head` segment ([089](./external_findings/089-missing-parent-verdict.md)) | loc, `txid.body`, `seqsigwit` on the stamp and pin path; head on the pin path |
 | **scripts** | none | any store IO |
 
 | Stage | Invariant | Soft path allowed? |
 |-------|-----------|--------------------|
 | Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid. Archived parents also have computed `spent.body` range on the stamp (same-wave in-flight outs skip loc, miss OK; later-wave InFlight takes loc from the same `CreatePin` Arc write set at Class A, or skeleton TipOnly loc). IBD (`skeleton = Some`) never loc-by-fk: pin loc unset leaves spent unset for write TLS. The one exception is an all-archived retry (plan=None): a parent with no body is an archived create (this batch's own, or an earlier chunk's of the same wave), and only the store can range it. plan=None leftover still `fill_missing_parent_ranges` | Missing → hard Err at stamp / pin contract. **No** `finish_archive_plan` `fill_missing` after stamp loc. **No** IBD load `create.loc` |
-| Parent create_fk | **same-batch** planned fks (offline at pin) → **in-flight** (lookup snapshots `drain_and_fence_hi` **before** the wave's TipOnly read and passes it on the last load batch; load drops tagged map rows with pack height **below** that snapshot after that batch's in-flight read; equality keeps; not Class C tip, not `class_a_hi`, not write freeze; one load-thread HashMap, insert after stamp) → **skeleton** (`BatchParentIds` on the `LoadBatch`: lookup TipOnly fk + body_range + spent_range, shared by every chunk of the wave) → **Corrupt** on IBD miss. plan=None / S0 (`skeleton = None`) is in-flight → leftover TipOnly. One helper: [`stamp_external_parents`](../crates/rbitcoin-query/src/stamp.rs). No leftover pending map, no process pin FIFO, no BQ-side hits map, no parent-store create_fk on stamp, no published live_union. Same-wave creates are omitted from TipOnly need. Header-cache GC polls store tip each load pack. In-flight and skeleton maps stay one fk per txid (last write). That limit is only those RAM maps ([`errata.md`](./errata.md)), not a consensus rule for this write. | Miss of in-flight and skeleton → `Corrupt("parent create_fk unresolved")`. A batched miss isolates; a lone block's miss is an **engine fault** (requeue once, then halt IBD; never blacklist), unless the block extends the tip, `tx.head` holds every connected create (`Query::head_covers_fence`; open starts the drain at the head's last create, after its rebuild or tail backfill), and a fresh TipOnly read of its parents on the load thread (reject path only) still misses: that is `ConsensusInvalid`, unless `txid.body` holds the txid at a connected fk in an unsealed `tx.head` segment (the open tail or the in-flight seal), whose slot pages may hold a power-loss hole (`Corrupt("invariant: tx.head misses a connected create")`, engine fault) ([089](./external_findings/089-missing-parent-verdict.md)). A lone block whose parent is not the tip within 10 s is a `Cascade` retry. Identity without loc range → `Corrupt("invariant: loc range missing after identity")`, not a miss |
+| Parent create_fk | **same-batch** planned fks (offline at pin) → **in-flight** (lookup snapshots `drain_and_fence_hi` **before** the wave's TipOnly read and passes it on the last load batch; load drops tagged map rows with pack height **below** that snapshot after that batch's in-flight read; equality keeps; not Class C tip, not `class_a_hi`, not write freeze; one load-thread HashMap, insert after stamp) → **skeleton** (`BatchParentIds` on the `LoadBatch`: lookup TipOnly fk + body_range + spent_range, shared by every chunk of the wave) → **`tx.head`** for the keys in neither (IBD: one read, and a warning naming the block, its height, and the prev for each one it holds) → **Corrupt** on IBD miss. plan=None / S0 (`skeleton = None`) is in-flight → leftover TipOnly. One helper: [`stamp_external_parents`](../crates/rbitcoin-query/src/stamp.rs). No leftover pending map, no process pin FIFO, no BQ-side hits map, no parent-store create_fk on stamp, no published live_union. Creates above the wave's snapshot are omitted from TipOnly need: the wave's own, and those of earlier waves in the same re-arm generation (`UndrainedCreates`, a lookup-thread txid set that binds nothing). Header-cache GC polls store tip each load pack. In-flight and skeleton maps stay one fk per txid (last write). That limit is only those RAM maps ([`errata.md`](./errata.md)), not a consensus rule for this write. | Miss of in-flight, skeleton, and that `tx.head` read → `Corrupt("parent create_fk unresolved")`. A batched miss isolates; a lone block's miss is an **engine fault** (requeue once, then halt IBD; never blacklist), unless the block extends the tip, `tx.head` holds every connected create (`Query::head_covers_fence`; open starts the drain at the head's last create, after its rebuild or tail backfill), and a fresh TipOnly read of its parents on the load thread (the reject path's own read) still misses: that is `ConsensusInvalid`, unless `txid.body` holds the txid at a connected fk in an unsealed `tx.head` segment (the open tail or the in-flight seal), whose slot pages may hold a power-loss hole (`Corrupt("invariant: tx.head misses a connected create")`, engine fault) ([089](./external_findings/089-missing-parent-verdict.md)). A lone block whose parent is not the tip within 10 s is a `Cascade` retry. Identity without loc range → `Corrupt("invariant: loc range missing after identity")`, not a miss |
 | io_uring harvest | TLS session fail-closed ([`io-modality.md`](./io-modality.md)) | **No** silent success. `Corrupt("invariant: io_uring …")` (not `bdz g page bad slot`). Ring-unavailable still pread-fallback |
 | Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err. Pin **copies** lookup `spent_range` (no loc IO). Later-wave InFlight loc comes from the CreatePin Arc (Class A `set_loc`) | **No** loc cold outs on load; **no** `seqsigwit` on pin; **no** IBD loc-by-fk |
 | Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns. Lookup stamped archived parents; same-batch from append RAM loc; just-written from write-thread loc packs kept until write of the last height whose TipOnly had started at note (`lookup_started_hi`; `keep_until` never bumped; fill of that write already ran). Later-wave InFlight takes CreatePin loc set at Class A. Missing abs → `invariant:` | **No** write `create.loc` read |
@@ -153,6 +157,31 @@ bind: [`errata.md`](./errata.md).
 
 Equality (`pack height == snapshot`) keeps the row. Disconnect drops
 packs at/above the leaving **pack** height **before** the next bind.
+
+Lookup keeps the txids of the blocks it has decoded above its last
+drain+fence snapshot (`UndrainedCreates`, one set on the lookup thread). A
+prev txid in that set is left out of the wave's TipOnly need. The set is
+not a `txid → create_fk` cache and it binds nothing. Load binds the parent
+from in-flight, which holds every pack at or above the same snapshot. The
+wave marks the heights its own snapshot has reached dead before it reads,
+so a create load may have dropped is always read. Every re-arm changes the
+generation. Load clears in-flight on that change and the set empties on
+it. A height decoded again replaces itself and every height above it. The
+set is a fixed table of 40-bit txid tags, hashed under a random key of its
+own, so two txids can share a slot: a prev that does is left out though
+lookup recorded no create of it.
+
+A key lookup left out binds from in-flight, to the create load itself
+planned for that txid. If in-flight does not hold it, load reads that key
+from `tx.head` and binds it there, and warns with the block, its height,
+and the prev. A parent on disk that neither in-flight nor lookup's read
+held means a tag the set shares with another create hid it, or the
+pipeline raced (in-flight's prune against the drain). With the set's
+random key a shared tag is an accident or a block built to collide. The
+read is TipOnly, so the bind is right either way, and neither is a reason
+to reject the block. A key `tx.head` does not hold either is
+`parent create_fk unresolved`, and the retake after that re-arm starts
+with the set empty and reads every parent.
 
 ## Related code
 
