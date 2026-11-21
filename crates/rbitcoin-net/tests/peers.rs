@@ -500,6 +500,43 @@ fn pin_noban_headers_timeout_keep(via_cidr: bool) {
 ///
 /// Linux only: the test waits until `/proc` shows each heartbeat asleep in
 /// the kernel, which before the table lock it never is.
+/// The session, `flush_tx_invs`, and `force_announce_txid` update one
+/// peer's INV count and sequence from different threads. No count is lost
+/// and the sequence ends at the highest value any of them noted. Parking
+/// cannot force these windows, so this pin races the calls instead.
+#[test]
+fn concurrent_tx_inv_updates_keep_every_count_and_the_max_sequence() {
+    const THREADS: u64 = 8;
+    const ITERS: u64 = 20_000;
+    let hub = PeerHub::new();
+    let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let peer = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+    let start = std::sync::Barrier::new(THREADS as usize);
+    std::thread::scope(|s| {
+        for t in 0..THREADS {
+            let (peer, start) = (&peer, &start);
+            s.spawn(move || {
+                start.wait();
+                for i in 0..ITERS {
+                    peer.count_tx_inv_to_send();
+                    peer.note_tx_inv_seq_at_least(2 + i * THREADS + t);
+                }
+            });
+        }
+    });
+    let info = peer.snapshot(0);
+    assert_eq!(
+        u64::from(info.inv_to_send),
+        THREADS * ITERS,
+        "every count survives"
+    );
+    assert_eq!(
+        info.last_inv_sequence,
+        2 + (ITERS - 1) * THREADS + (THREADS - 1),
+        "the sequence ends at the highest value noted"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn concurrent_noban_headers_timeouts_release_the_slot_once() {

@@ -10,9 +10,7 @@ use bitcoin::{BlockHash, Wtxid};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use tokio::sync::{mpsc, watch, Notify};
 
@@ -104,6 +102,37 @@ impl PeerOut {
         match self {
             PeerOut::Msg(m) | PeerOut::Served(m) => m,
             PeerOut::Encoded(_) => panic!("expected application message, got encoded block"),
+        }
+    }
+}
+
+/// One peer's tx-INV state (`LivePeer::tx_inv`). The lock is a leaf: no
+/// mempool, hub, `live`, or writer call runs while it is held.
+struct TxInvState {
+    /// Wtxids we INV'd to this peer. GetData for a live mempool tx is
+    /// answered only if announced here or the tx is reorg-servable.
+    announced: CappedSet<Wtxid>,
+    /// Mempool sequence at last tx INV (starts at 1).
+    last_inv_sequence: u64,
+    /// Queued tx INV hashes not yet sent.
+    inv_to_send: u32,
+    /// Last clock we considered for delayed tx INV (`0` = not initialized).
+    last_tx_inv_now: u64,
+    /// Set when mocktime jumps; next ping/tick announces mempool txs.
+    tx_inv_requested: bool,
+    /// Age-INV due-log cursor (`due_secs`, `accept_gen`).
+    age_inv_seen: (u64, u64),
+}
+
+impl TxInvState {
+    fn new() -> Self {
+        Self {
+            announced: CappedSet::new(),
+            last_inv_sequence: 1,
+            inv_to_send: 0,
+            last_tx_inv_now: 0,
+            tx_inv_requested: false,
+            age_inv_seen: (0, 0),
         }
     }
 }
@@ -508,19 +537,13 @@ pub struct LivePeer {
     /// Hub-clock seconds our last marked getheaders went out (`0` = none
     /// in flight). Core `m_last_getheaders_timestamp`.
     pub getheaders_sent_at: AtomicU64,
-    /// Wtxids we INV'd to this peer. GetData for a live mempool tx is
-    /// answered only if announced here or the tx is reorg-servable.
-    pub announced_wtx: Mutex<CappedSet<Wtxid>>,
+    /// Tx-INV bookkeeping. The session, `flush_tx_invs` (RPC, admit, and
+    /// other sessions), and `force_announce_txid` (RPC or a forcerelay
+    /// peer's session) all update it, so each transition runs under this
+    /// one lock.
+    tx_inv: Mutex<TxInvState>,
     /// Compact fill slots taken by this session (hub-global `cmpct_fills`).
     pub taken_cmpct: Mutex<Vec<BlockHash>>,
-    /// Mempool sequence at last tx INV (starts at 1).
-    pub last_inv_sequence: AtomicU64,
-    /// Queued tx INV hashes not yet sent.
-    pub inv_to_send: AtomicU32,
-    /// Last clock we considered for delayed tx INV (`0` = not initialized).
-    pub last_tx_inv_now: AtomicU64,
-    /// Set when mocktime jumps; next ping/tick announces mempool txs.
-    pub tx_inv_requested: AtomicBool,
     /// Outstanding ping nonce (`0` = none).
     pub ping_nonce_sent: AtomicU64,
     /// When the last ping was sent, or `0` if never.
@@ -566,9 +589,6 @@ pub struct LivePeer {
     pub netgroup: u64,
     /// Skip INV for mempool txs with `accept_gen < floor` (post-verack privacy).
     pub inv_gen_floor: AtomicU64,
-    /// Age-INV due-log cursor (`due_secs`, `accept_gen`).
-    pub age_inv_seen_due: AtomicU64,
-    pub age_inv_seen_gen: AtomicU64,
     /// Writer-task abort — FIN via dropping the write half.
     pub writer_abort: Mutex<Option<tokio::task::AbortHandle>>,
     /// Whole session-task abort — drops reader+writer if the loop is stuck.
@@ -1206,19 +1226,20 @@ impl LivePeer {
     /// both pass a separate `has_announced_wtx` check; only the claim that
     /// wins may queue the INV.
     pub fn claim_announced_wtx(&self, wtxid: Wtxid) -> bool {
-        let mut announced = self.announced_wtx.lock().unwrap_or_else(|e| e.into_inner());
-        if announced.contains(&wtxid) {
+        let mut g = self.tx_inv();
+        if g.announced.contains(&wtxid) {
             return false;
         }
-        announced.insert(wtxid, 50_000);
+        g.announced.insert(wtxid, 50_000);
         true
     }
 
     pub fn has_announced_wtx(&self, wtxid: &Wtxid) -> bool {
-        self.announced_wtx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(wtxid)
+        self.tx_inv().announced.contains(wtxid)
+    }
+
+    fn tx_inv(&self) -> std::sync::MutexGuard<'_, TxInvState> {
+        self.tx_inv.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn try_cmpct_fill(&self, hash: BlockHash) -> bool {
@@ -1260,38 +1281,47 @@ impl LivePeer {
     }
 
     pub fn last_inv_sequence(&self) -> u64 {
-        self.last_inv_sequence.load(Ordering::Relaxed)
+        self.tx_inv().last_inv_sequence
     }
 
-    pub fn inv_to_send(&self) -> u32 {
-        self.inv_to_send.load(Ordering::Relaxed)
+    /// One more tx waits for this peer's next INV batch.
+    pub fn count_tx_inv_to_send(&self) {
+        let mut g = self.tx_inv();
+        g.inv_to_send = g.inv_to_send.saturating_add(1);
     }
 
-    pub fn set_inv_to_send(&self, n: u32) {
-        self.inv_to_send.store(n, Ordering::Relaxed);
+    /// Raise the last-INV mempool sequence to at least `mempool_seq`.
+    pub fn note_tx_inv_seq_at_least(&self, mempool_seq: u64) {
+        let mut g = self.tx_inv();
+        g.last_inv_sequence = g.last_inv_sequence.max(mempool_seq);
     }
 
-    pub fn note_tx_inv_seq(&self, mempool_seq: u64) {
-        self.last_inv_sequence.store(mempool_seq, Ordering::Relaxed);
+    /// An INV batch went out: raise the sequence and clear the queued count
+    /// in one step.
+    pub fn note_tx_inv_batch_sent(&self, mempool_seq: u64) {
+        let mut g = self.tx_inv();
+        g.last_inv_sequence = g.last_inv_sequence.max(mempool_seq);
+        g.inv_to_send = 0;
     }
 
     pub fn request_tx_inv(&self) {
-        self.tx_inv_requested.store(true, Ordering::Relaxed);
+        self.tx_inv().tx_inv_requested = true;
     }
 
     /// True when mock/wall clock jumped enough to announce queued mempool txs.
     pub fn take_tx_inv_due(&self, now: u64) -> bool {
-        if self.tx_inv_requested.swap(false, Ordering::Relaxed) {
-            self.last_tx_inv_now.store(now, Ordering::Relaxed);
+        let mut g = self.tx_inv();
+        if std::mem::take(&mut g.tx_inv_requested) {
+            g.last_tx_inv_now = now;
             return true;
         }
-        let prev = self.last_tx_inv_now.load(Ordering::Relaxed);
+        let prev = g.last_tx_inv_now;
         if prev == 0 {
-            self.last_tx_inv_now.store(now, Ordering::Relaxed);
+            g.last_tx_inv_now = now;
             return false;
         }
         if now.saturating_sub(prev) >= 30 {
-            self.last_tx_inv_now.store(now, Ordering::Relaxed);
+            g.last_tx_inv_now = now;
             return true;
         }
         false
@@ -1606,15 +1636,11 @@ impl LivePeer {
     }
 
     pub fn age_inv_seen(&self) -> (u64, u64) {
-        (
-            self.age_inv_seen_due.load(Ordering::Relaxed),
-            self.age_inv_seen_gen.load(Ordering::Relaxed),
-        )
+        self.tx_inv().age_inv_seen
     }
 
     pub fn note_age_inv_seen(&self, due: u64, gen: u64) {
-        self.age_inv_seen_due.store(due, Ordering::Relaxed);
-        self.age_inv_seen_gen.store(gen, Ordering::Relaxed);
+        self.tx_inv().age_inv_seen = (due, gen);
     }
 
     /// Core `BlockRequested`: the first block in flight from this peer
@@ -1832,6 +1858,10 @@ impl LivePeer {
                 bytessent_per_msg.values().sum(),
             )
         };
+        let (last_inv_sequence, inv_to_send) = {
+            let g = self.tx_inv();
+            (g.last_inv_sequence, g.inv_to_send)
+        };
         PeerInfo {
             id: self.id,
             addr: self.addr,
@@ -1854,8 +1884,8 @@ impl LivePeer {
             last_transaction: self.last_transaction.load(Ordering::Relaxed),
             last_block_announcement: self.last_block_announcement.load(Ordering::Relaxed),
             minfeefilter_sat_kvb: self.minfeefilter_sat_kvb.load(Ordering::Relaxed),
-            last_inv_sequence: self.last_inv_sequence(),
-            inv_to_send: self.inv_to_send(),
+            last_inv_sequence,
+            inv_to_send,
             addr_processed: self.addr_processed.load(Ordering::Relaxed),
             addr_rate_limited: self.addr_rate_limited.load(Ordering::Relaxed),
             bytesrecv,
@@ -3667,12 +3697,8 @@ impl PeerHub {
             sync_started: AtomicBool::new(false),
             headers_sync_timeout: AtomicU64::new(0),
             getheaders_sent_at: AtomicU64::new(0),
-            announced_wtx: Mutex::new(CappedSet::new()),
+            tx_inv: Mutex::new(TxInvState::new()),
             taken_cmpct: Mutex::new(Vec::new()),
-            last_inv_sequence: AtomicU64::new(1),
-            inv_to_send: AtomicU32::new(0),
-            last_tx_inv_now: AtomicU64::new(0),
-            tx_inv_requested: AtomicBool::new(false),
             ping_nonce_sent: AtomicU64::new(0),
             ping_start_secs: AtomicU64::new(0),
             ping_queued: AtomicBool::new(false),
@@ -3701,8 +3727,6 @@ impl PeerHub {
             conntime: AtomicU64::new(connected_at),
             netgroup: crate::eviction::eviction_netgroup(endpoint.addr),
             inv_gen_floor: AtomicU64::new(0),
-            age_inv_seen_due: AtomicU64::new(0),
-            age_inv_seen_gen: AtomicU64::new(0),
             writer_abort: Mutex::new(None),
             session_abort: Mutex::new(None),
             tcp_shutdown: Mutex::new(None),

@@ -1611,7 +1611,7 @@ mod peer_session_pins {
         assert!(tx_announce_should_queue(Some(&live), &mp, &txid));
         let inn = inbound();
         tx_announce_maybe_count(Some(&inn), &mp, &txid);
-        assert_eq!(inn.inv_to_send(), 1);
+        assert_eq!(inn.snapshot(0).inv_to_send, 1);
     }
 
     fn open_pool(
@@ -2523,7 +2523,7 @@ pub const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
 /// ask again. `sync_blocks` is 60s; 120s headers poll is too late.
 pub const BLOCK_GETDATA_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// INV-origin txids this session sent us. Cap matches `announced_wtx` (FIFO roll).
+/// INV-origin txids this session sent us. Cap matches the announced-wtxid set (FIFO roll).
 pub const FROM_THIS_PEER_CAP: usize = 50_000;
 
 /// Test/assert surface for the tip-follow pending-body cap (equals production).
@@ -4052,7 +4052,7 @@ pub fn tx_announce_maybe_count(
         return;
     }
     if mp.try_contains(txid) {
-        s.set_inv_to_send(s.inv_to_send().saturating_add(1));
+        s.count_tx_inv_to_send();
     }
 }
 
@@ -4121,7 +4121,7 @@ pub fn tx_announce_note_wtx(
     };
     s.note_announced_wtx(w);
     if let Some(seq) = mp.relay_seq_of(&w) {
-        s.note_tx_inv_seq(s.last_inv_sequence().max(seq.saturating_add(1)));
+        s.note_tx_inv_seq_at_least(seq.saturating_add(1));
     }
 }
 
@@ -5323,7 +5323,7 @@ pub fn force_announce_txid(hub: &ChainHub, peers: &crate::peers::PeerHub, txid: 
         }
         queue_tx_inv_batches(&s, &out, vec![Inventory::WTx(w)]);
         if let Some(seq) = mp.relay_seq_of(&w) {
-            s.note_tx_inv_seq(s.last_inv_sequence().max(seq.saturating_add(1)));
+            s.note_tx_inv_seq_at_least(seq.saturating_add(1));
         }
     }
 }
@@ -5447,7 +5447,7 @@ pub fn queue_due_tx_invs(
     }
     let inbound_age_gate = session.inbound && mp.relay_enabled() && !session.session_noban();
     let mut n = 0u32;
-    let mut max_ann = session.last_inv_sequence();
+    let mut max_ann = 0u64;
     let mp_now = mp.relay_now_secs();
     if clock_due || unbroadcast_due {
         let Some(live_wtx) = mp.try_list_live_wtxids() else {
@@ -5508,8 +5508,7 @@ pub fn queue_due_tx_invs(
         // Only INV txs that existed when this INV was built.
         // Never snap to the hub's next_relay_seq — a later accept can race in
         // and make the new entry servable (mempool_reorg.py:122).
-        session.note_tx_inv_seq(max_ann.max(session.last_inv_sequence()));
-        session.set_inv_to_send(0);
+        session.note_tx_inv_batch_sent(max_ann);
     }
 }
 
