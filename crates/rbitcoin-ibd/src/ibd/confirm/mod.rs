@@ -10,7 +10,7 @@ use rbitcoin_net::chain::ChainHub;
 use rbitcoin_query::WireLoadPipeline;
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1602,33 +1602,60 @@ pub fn confirm_row_is_ready(
 /// High-water marks (`*_hwm`) track max depth since the last
 /// [`ConfirmQueueDepths::sample_hwm_and_reset`] (≈5s status tick). Point
 /// samples alone almost always show 0 under a lookup-limited pipeline.
+///
+/// All counts sit under one leaf lock, so one queue event is one lock and a
+/// snapshot shows every field from the same moment. No method returns the
+/// guard, and none holds it across a channel send or recv.
 #[derive(Debug, Default)]
 pub struct ConfirmQueueDepths {
-    /// lookup → load (`loadq`; capacity [`load_queue_cap`]).
-    pub lookup_to_load: AtomicUsize,
-    /// Sum of `batch.len()` sitting in loadq.
-    pub load_blocks: AtomicUsize,
-    /// Approx decoded wire bytes sitting in loadq.
-    pub load_wire_bytes: AtomicUsize,
+    counts: std::sync::Mutex<QueueCounts>,
+}
+
+/// The counts [`ConfirmQueueDepths`] guards.
+#[derive(Clone, Copy, Debug, Default)]
+struct QueueCounts {
+    /// lookup → load (`loadq`; capacity [`load_queue_cap`]). No parents.
+    load: StageCounts,
     /// load → scripts (`scriptq`; capacity [`script_queue_cap`]).
-    pub load_to_scripts: AtomicUsize,
+    script: StageCounts,
     /// scripts → write (`writeq`; capacity [`write_queue_cap`]).
-    pub scripts_to_write: AtomicUsize,
-    /// Max load→scripts depth since last HWM sample.
-    pub script_hwm: AtomicUsize,
-    /// Max scripts→write depth since last HWM sample.
-    pub write_hwm: AtomicUsize,
-    /// Sum of `batch.len()` sitting in load→scripts.
-    pub script_blocks: AtomicUsize,
-    /// Sum of approx wire bytes of load→scripts batches.
-    pub script_wire_bytes: AtomicUsize,
-    /// Sum of `BatchParents` entries riding load→scripts batches.
-    pub script_parents: AtomicUsize,
-    /// Sum of `batch.len()` sitting in scripts→write.
-    pub write_blocks: AtomicUsize,
-    pub write_wire_bytes: AtomicUsize,
-    /// Sum of `BatchParents` entries in scripts→write (entry count, not unique Arc).
-    pub write_parents: AtomicUsize,
+    write: StageCounts,
+    /// Max load→scripts batch depth since last HWM sample.
+    script_hwm: usize,
+    /// Max scripts→write batch depth since last HWM sample.
+    write_hwm: usize,
+}
+
+/// One queue's batches and what they carry.
+#[derive(Clone, Copy, Debug, Default)]
+struct StageCounts {
+    batches: usize,
+    /// Sum of `batch.len()`.
+    blocks: usize,
+    /// Approx decoded wire bytes.
+    wire_bytes: usize,
+    /// `BatchParents` entries (entry count, not unique Arc).
+    parents: usize,
+}
+
+impl StageCounts {
+    /// Count one batch in. Returns the batch depth after it.
+    fn add(&mut self, blocks: usize, wire_bytes: usize, parents: usize) -> usize {
+        self.batches = self.batches.saturating_add(1);
+        self.blocks = self.blocks.saturating_add(blocks);
+        self.wire_bytes = self.wire_bytes.saturating_add(wire_bytes);
+        self.parents = self.parents.saturating_add(parents);
+        self.batches
+    }
+
+    /// Count one batch out. Saturating: a recv with no matching send (a
+    /// double recv under teardown) stops at 0 instead of wrapping.
+    fn sub(&mut self, blocks: usize, wire_bytes: usize, parents: usize) {
+        self.batches = self.batches.saturating_sub(1);
+        self.blocks = self.blocks.saturating_sub(blocks);
+        self.wire_bytes = self.wire_bytes.saturating_sub(wire_bytes);
+        self.parents = self.parents.saturating_sub(parents);
+    }
 }
 
 /// Snapshot of confirm pipeline retain (queue depths + batch contents + feed).
@@ -1699,114 +1726,66 @@ impl ConfirmQueueDepths {
         Arc::new(Self::default())
     }
 
+    /// Run `f` on the counts under the lock. Keep `f` to a few stores.
+    fn with<R>(&self, f: impl FnOnce(&mut QueueCounts) -> R) -> R {
+        f(&mut self.counts.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// `(lookup→load, load→scripts, scripts→write)`.
     pub fn snap(&self) -> (usize, usize, usize) {
-        (
-            self.lookup_to_load.load(Ordering::Relaxed),
-            self.load_to_scripts.load(Ordering::Relaxed),
-            self.scripts_to_write.load(Ordering::Relaxed),
-        )
+        self.with(|c| (c.load.batches, c.script.batches, c.write.batches))
     }
 
     /// Max scriptq and writeq depths since last call; resets those HWMs to 0.
     pub fn sample_hwm_and_reset(&self) -> (usize, usize) {
-        (
-            self.script_hwm.swap(0, Ordering::Relaxed),
-            self.write_hwm.swap(0, Ordering::Relaxed),
-        )
+        self.with(|c| {
+            (
+                std::mem::take(&mut c.script_hwm),
+                std::mem::take(&mut c.write_hwm),
+            )
+        })
     }
 
-    /// Full content snapshot (depths + blocks/wire/parents in each queue).
+    /// Full content snapshot (depths + blocks/wire/parents in each queue),
+    /// all from one moment.
     pub fn content_snap(&self) -> ConfirmPipelineSizes {
+        let c = self.with(|c| *c);
         ConfirmPipelineSizes {
-            load_batches: self.lookup_to_load.load(Ordering::Relaxed),
-            load_blocks: self.load_blocks.load(Ordering::Relaxed),
-            load_wire_bytes: self.load_wire_bytes.load(Ordering::Relaxed),
+            load_batches: c.load.batches,
+            load_blocks: c.load.blocks,
+            load_wire_bytes: c.load.wire_bytes,
             ready: 0,
-            script_batches: self.load_to_scripts.load(Ordering::Relaxed),
-            script_blocks: self.script_blocks.load(Ordering::Relaxed),
-            script_wire_bytes: self.script_wire_bytes.load(Ordering::Relaxed),
-            script_parents: self.script_parents.load(Ordering::Relaxed),
-            write_batches: self.scripts_to_write.load(Ordering::Relaxed),
-            write_blocks: self.write_blocks.load(Ordering::Relaxed),
-            write_wire_bytes: self.write_wire_bytes.load(Ordering::Relaxed),
-            write_parents: self.write_parents.load(Ordering::Relaxed),
+            script_batches: c.script.batches,
+            script_blocks: c.script.blocks,
+            script_wire_bytes: c.script.wire_bytes,
+            script_parents: c.script.parents,
+            write_batches: c.write.batches,
+            write_blocks: c.write.blocks,
+            write_wire_bytes: c.write.wire_bytes,
+            write_parents: c.write.parents,
             feed_ready: 0,
             feed_inflight: 0,
         }
-    }
-
-    #[inline]
-    #[doc(hidden)]
-    pub fn note_depth_hwm(hwm: &AtomicUsize, depth_after: usize) {
-        let _ = hwm.fetch_max(depth_after, Ordering::Relaxed);
-    }
-
-    /// Batch depth: saturating so a double-recv under teardown cannot wrap to
-    /// usize::MAX and panic debug overflow on the next send (`fetch_add + 1`).
-    #[inline]
-    #[doc(hidden)]
-    pub fn note_batch_depth_send(depth: &AtomicUsize, hwm: &AtomicUsize) {
-        let prev = depth
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(1))
-            })
-            .unwrap_or(0);
-        Self::note_depth_hwm(hwm, prev.saturating_add(1));
-    }
-
-    #[inline]
-    #[doc(hidden)]
-    pub fn note_batch_depth_recv(depth: &AtomicUsize) {
-        let _ = depth.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            Some(n.saturating_sub(1))
-        });
     }
 
     /// Count a lookup→load batch, then `send` it. Load can take the batch and
     /// count it out before `send` returns, so the count goes first: a late add
     /// would land after load's clamped decrement and stay. A sender parked on
     /// a full queue already counts. A failed send takes the count back out.
+    /// The lock is not held while `send` runs.
     pub fn send_load<E>(
         &self,
         blocks: usize,
         wire_bytes: usize,
         send: impl FnOnce() -> Result<(), E>,
     ) -> Result<(), E> {
-        self.note_load_send(blocks, wire_bytes);
+        self.with(|c| c.load.add(blocks, wire_bytes, 0));
         send().inspect_err(|_| self.note_load_recv(blocks, wire_bytes))
     }
 
-    fn note_load_send(&self, blocks: usize, wire_bytes: usize) {
-        let _ = self
-            .lookup_to_load
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(1))
-            });
-        self.load_blocks
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(blocks))
-            })
-            .ok();
-        self.load_wire_bytes
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(wire_bytes))
-            })
-            .ok();
-    }
     #[doc(hidden)]
     pub fn note_load_recv(&self, blocks: usize, wire_bytes: usize) {
-        Self::note_batch_depth_recv(&self.lookup_to_load);
-        self.load_blocks
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(blocks))
-            })
-            .ok();
-        self.load_wire_bytes
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(wire_bytes))
-            })
-            .ok();
+        self.with(|c| c.load.sub(blocks, wire_bytes, 0));
     }
 
     /// Count a load→scripts batch, then `send` it. Same order as
@@ -1818,32 +1797,16 @@ impl ConfirmQueueDepths {
         parents: usize,
         send: impl FnOnce() -> Result<(), E>,
     ) -> Result<(), E> {
-        self.note_script_send(blocks, wire_bytes, parents);
+        self.with(|c| {
+            let depth = c.script.add(blocks, wire_bytes, parents);
+            c.script_hwm = c.script_hwm.max(depth);
+        });
         send().inspect_err(|_| self.note_script_recv(blocks, wire_bytes, parents))
     }
 
-    fn note_script_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
-        Self::note_batch_depth_send(&self.load_to_scripts, &self.script_hwm);
-        Self::add_stage(
-            &self.script_blocks,
-            &self.script_wire_bytes,
-            &self.script_parents,
-            blocks,
-            wire_bytes,
-            parents,
-        );
-    }
     #[doc(hidden)]
     pub fn note_script_recv(&self, blocks: usize, wire_bytes: usize, parents: usize) {
-        Self::note_batch_depth_recv(&self.load_to_scripts);
-        Self::sub_stage(
-            &self.script_blocks,
-            &self.script_wire_bytes,
-            &self.script_parents,
-            blocks,
-            wire_bytes,
-            parents,
-        );
+        self.with(|c| c.script.sub(blocks, wire_bytes, parents));
     }
 
     /// Count a scripts→write batch, then `send` it. Same order as
@@ -1855,94 +1818,16 @@ impl ConfirmQueueDepths {
         parents: usize,
         send: impl FnOnce() -> Result<(), E>,
     ) -> Result<(), E> {
-        self.note_write_send(blocks, wire_bytes, parents);
+        self.with(|c| {
+            let depth = c.write.add(blocks, wire_bytes, parents);
+            c.write_hwm = c.write_hwm.max(depth);
+        });
         send().inspect_err(|_| self.note_write_recv(blocks, wire_bytes, parents))
     }
 
-    fn note_write_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
-        Self::note_batch_depth_send(&self.scripts_to_write, &self.write_hwm);
-        Self::add_stage(
-            &self.write_blocks,
-            &self.write_wire_bytes,
-            &self.write_parents,
-            blocks,
-            wire_bytes,
-            parents,
-        );
-    }
     #[doc(hidden)]
     pub fn note_write_recv(&self, blocks: usize, wire_bytes: usize, parents: usize) {
-        Self::note_batch_depth_recv(&self.scripts_to_write);
-        Self::sub_stage(
-            &self.write_blocks,
-            &self.write_wire_bytes,
-            &self.write_parents,
-            blocks,
-            wire_bytes,
-            parents,
-        );
-    }
-
-    // Saturating: concurrent sends under parallel load can race past
-    // usize::MAX on wire_bytes/parents counters in debug overflow checks.
-    #[doc(hidden)]
-    pub fn add_stage(
-        blocks: &AtomicUsize,
-        wire_bytes: &AtomicUsize,
-        parents: &AtomicUsize,
-        n_blocks: usize,
-        n_wire: usize,
-        n_parents: usize,
-    ) {
-        Self::update_stage(
-            blocks,
-            wire_bytes,
-            parents,
-            n_blocks,
-            n_wire,
-            n_parents,
-            usize::saturating_add,
-        );
-    }
-
-    #[doc(hidden)]
-    pub fn sub_stage(
-        blocks: &AtomicUsize,
-        wire_bytes: &AtomicUsize,
-        parents: &AtomicUsize,
-        n_blocks: usize,
-        n_wire: usize,
-        n_parents: usize,
-    ) {
-        Self::update_stage(
-            blocks,
-            wire_bytes,
-            parents,
-            n_blocks,
-            n_wire,
-            n_parents,
-            usize::saturating_sub,
-        );
-    }
-
-    #[doc(hidden)]
-    pub fn update_stage(
-        blocks: &AtomicUsize,
-        wire_bytes: &AtomicUsize,
-        parents: &AtomicUsize,
-        n_blocks: usize,
-        n_wire: usize,
-        n_parents: usize,
-        op: fn(usize, usize) -> usize,
-    ) {
-        for (slot, n) in [
-            (blocks, n_blocks),
-            (wire_bytes, n_wire),
-            (parents, n_parents),
-        ] {
-            slot.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| Some(op(cur, n)))
-                .ok();
-        }
+        self.with(|c| c.write.sub(blocks, wire_bytes, parents));
     }
 }
 
@@ -3216,7 +3101,7 @@ pub fn spawn_confirm_engine(
                     tip.unwrap_or(0).saturating_add(1)
                 };
                 let remaining = load_queue_cap()
-                    .saturating_sub(queues_lookup.lookup_to_load.load(Ordering::Relaxed));
+                    .saturating_sub(queues_lookup.snap().0);
                 if remaining == 0 {
                     let t_wait = Instant::now();
                     let g = feed.inner.lock().unwrap();

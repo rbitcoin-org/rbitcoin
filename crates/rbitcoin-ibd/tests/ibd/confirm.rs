@@ -736,6 +736,56 @@ fn queue_hwm_tracks_max_depth() {
     assert_eq!(sh2, 0, "hwm resets each sample window");
 }
 
+/// A snapshot taken while another thread counts batches in and out shows
+/// each queue's batches, blocks, bytes and parents from one event. Every
+/// batch here is 1 block of `WIRE` bytes with `PARENTS` parents, so each
+/// field is a fixed multiple of that queue's batch count.
+#[test]
+fn queue_depth_snapshot_is_one_event_per_queue() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const WIRE: usize = 1_000;
+    const PARENTS: usize = 7;
+    const ROUNDS: usize = 200_000;
+    let q = ConfirmQueueDepths::new();
+    let done = AtomicBool::new(false);
+    let torn = std::thread::scope(|s| {
+        s.spawn(|| {
+            for _ in 0..ROUNDS {
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                q.send_load(1, WIRE, || Ok::<(), ()>(())).unwrap();
+                q.send_script(1, WIRE, PARENTS, || Ok::<(), ()>(()))
+                    .unwrap();
+                q.send_write(1, WIRE, PARENTS, || Ok::<(), ()>(())).unwrap();
+                q.note_load_recv(1, WIRE);
+                q.note_script_recv(1, WIRE, PARENTS);
+                q.note_write_recv(1, WIRE, PARENTS);
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+        let consistent = |c: &ConfirmPipelineSizes| {
+            c.load_blocks == c.load_batches
+                && c.load_wire_bytes == c.load_batches * WIRE
+                && c.script_blocks == c.script_batches
+                && c.script_wire_bytes == c.script_batches * WIRE
+                && c.script_parents == c.script_batches * PARENTS
+                && c.write_blocks == c.write_batches
+                && c.write_wire_bytes == c.write_batches * WIRE
+                && c.write_parents == c.write_batches * PARENTS
+        };
+        while !done.load(Ordering::Relaxed) {
+            let c = q.content_snap();
+            if !consistent(&c) {
+                done.store(true, Ordering::Relaxed);
+                return Some(c);
+            }
+        }
+        None
+    });
+    assert!(torn.is_none(), "snapshot mixed two events: {torn:?}");
+}
+
 #[test]
 fn thr_stats_add_is_local() {
     use rbitcoin_ibd::ibd::confirm::confirm_thr_stats;
