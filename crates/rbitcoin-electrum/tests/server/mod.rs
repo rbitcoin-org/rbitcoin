@@ -2352,6 +2352,28 @@ async fn line_reader_keeps_a_partial_line_through_the_cap() {
     assert_eq!(line, "AA");
 }
 
+/// The cap counts the bytes a dropped `read_line` already took. A line that
+/// ends exactly at the cap after a drop is that whole line; one byte more is
+/// `InvalidData`, which the session answers with `-32600 request line too
+/// long` (owned by `electrum_protocol.rs` in rbitcoin-test).
+#[tokio::test(start_paused = true)]
+async fn line_reader_caps_a_line_across_a_dropped_read() {
+    async fn after_dropped_head(tail: &[u8]) -> std::io::Result<Option<String>> {
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut r = LineReader::new(server, 8);
+        client.write_all(b"abcd").await.unwrap();
+        let head = tokio::time::timeout(Duration::from_millis(1), r.read_line()).await;
+        assert!(head.is_err(), "no newline yet: {head:?}");
+        client.write_all(tail).await.unwrap();
+        r.read_line().await
+    }
+
+    let at_cap = after_dropped_head(b"efg\n").await.unwrap();
+    assert_eq!(at_cap.as_deref(), Some("abcdefg"));
+    let over = after_dropped_head(b"efgh\n").await.unwrap_err();
+    assert_eq!(over.kind(), std::io::ErrorKind::InvalidData, "{over}");
+}
+
 /// A connection on a listener whose broadcast hex cap is `max_hex`. The
 /// request line limit is raised so the hex cap answers first.
 async fn broadcast_client(q: &Arc<Query>, max_hex: usize) -> (ElectrumHandle, TcpStream) {

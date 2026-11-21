@@ -6,4 +6,4 @@ Fixed
   tweaks wave) ran between the pieces, and the client got
   `-32700 parse error` instead of its reply. The bytes read so far now
   stay with the connection until the line ends. The request-line cap and
-  its `-32600 request line too long` answer are unchanged.
+  its `-32600 request line too long` answer are unchanged (#1806).
