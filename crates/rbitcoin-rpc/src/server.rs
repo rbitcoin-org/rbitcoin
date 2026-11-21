@@ -40,7 +40,9 @@ use rbitcoin_primitives::Network;
 use rbitcoin_query::Query;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -423,8 +425,7 @@ pub async fn rest_entry(State(state): State<AppState>, req: axum::extract::Reque
         }
     };
     let ctx = Arc::clone(&state.ctx);
-    let waiters = store_budget_waiters(&ctx);
-    let store_permit = acquire_store_budget(&waiters, &state.ctx.query.api_read_budget()).await;
+    let store_permit = acquire_store_budget(&ctx).await;
     let reply = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
         let _store = store_permit;
@@ -658,6 +659,7 @@ pub enum WaitKind {
     New(String),
 }
 
+#[cfg(debug_assertions)]
 fn store_budget_waiters(ctx: &RpcContext) -> Arc<AtomicUsize> {
     Arc::clone(
         &ctx.active
@@ -667,33 +669,14 @@ fn store_budget_waiters(ctx: &RpcContext) -> Arc<AtomicUsize> {
     )
 }
 
-struct StoreBudgetWait(Arc<AtomicUsize>);
-
-impl StoreBudgetWait {
-    fn enter(counter: &Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(counter))
-    }
-}
-
-impl Drop for StoreBudgetWait {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-async fn acquire_store_budget(
-    counter: &Arc<AtomicUsize>,
-    budget: &Arc<Semaphore>,
-) -> tokio::sync::OwnedSemaphorePermit {
-    match Arc::clone(budget).try_acquire_owned() {
+async fn acquire_store_budget(ctx: &RpcContext) -> tokio::sync::OwnedSemaphorePermit {
+    let budget = ctx.query.api_read_budget();
+    match Arc::clone(&budget).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            let _waiting = StoreBudgetWait::enter(counter);
-            Arc::clone(budget)
-                .acquire_owned()
-                .await
-                .expect("store budget")
+            #[cfg(debug_assertions)]
+            let _waiting = rbitcoin_net::StoreBudgetWait::enter(store_budget_waiters(ctx));
+            budget.acquire_owned().await.expect("store budget")
         }
     }
 }
@@ -827,8 +810,6 @@ pub async fn rpc_post(State(state): State<AppState>, req: Request) -> Response {
         }
     };
     let ctx = Arc::clone(&state.ctx);
-    let budget = state.ctx.query.api_read_budget();
-    let waiters = store_budget_waiters(&ctx);
     // A long-poll, a template, or a tip connect is ordered per call. A
     // long-poll drops the work-queue slot and the disk permit while it
     // waits. A template that will not wait still takes the slot before any
@@ -837,14 +818,13 @@ pub async fn rpc_post(State(state): State<AppState>, req: Request) -> Response {
         || http_body_has_longpoll(&parsed)
         || http_body_has_template(&parsed)
     {
-        let out = rbitcoin_net::with_store_budget(
-            budget,
-            rbitcoin_net::with_store_budget_waiters(
-                waiters,
-                exec_http_rpc_async(ctx, parsed, &state.work_queue),
-            ),
-        )
-        .await;
+        let budget = ctx.query.api_read_budget();
+        #[cfg(debug_assertions)]
+        let waiters = store_budget_waiters(&ctx);
+        let rpc = exec_http_rpc_async(ctx, parsed, &state.work_queue);
+        #[cfg(debug_assertions)]
+        let rpc = rbitcoin_net::with_store_budget_waiters(waiters, rpc);
+        let out = rbitcoin_net::with_store_budget(budget, rpc).await;
         return match out {
             Err(()) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -869,7 +849,7 @@ pub async fn rpc_post(State(state): State<AppState>, req: Request) -> Response {
     // never reads it does not wait, so a full disk budget still answers
     // `getblockcount`.
     let store_permit = if http_body_reads_store(&parsed) {
-        Some(acquire_store_budget(&waiters, &budget).await)
+        Some(acquire_store_budget(&ctx).await)
     } else {
         None
     };

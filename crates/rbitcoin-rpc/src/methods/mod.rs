@@ -7,7 +7,9 @@ use rbitcoin_query::Query;
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -303,6 +305,8 @@ pub struct RpcActive {
     pub cmds: HashMap<u64, (String, Instant)>,
     /// Callers blocked on the API store-read budget. `dispatch` lists a
     /// method only after that permit is held, so this is the earlier signal.
+    /// Debug builds only: tests wait on it.
+    #[cfg(debug_assertions)]
     pub store_budget_waiters: Arc<AtomicUsize>,
 }
 

@@ -6,6 +6,7 @@
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
@@ -13,6 +14,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 tokio::task_local! {
     static API_STORE_BUDGET: Arc<Semaphore>;
+    #[cfg(debug_assertions)]
     static STORE_BUDGET_WAITERS: Arc<AtomicUsize>;
 }
 
@@ -113,7 +115,9 @@ pub async fn with_store_budget<R>(budget: Arc<Semaphore>, fut: impl Future<Outpu
 }
 
 /// Same task as [`with_store_budget`]. [`acquire_armed_store_budget`] counts a
-/// caller that found the budget empty.
+/// caller that found the budget empty. Debug builds only: tests wait on it.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
 pub async fn with_store_budget_waiters<R>(
     waiters: Arc<AtomicUsize>,
     fut: impl Future<Output = R>,
@@ -121,15 +125,21 @@ pub async fn with_store_budget_waiters<R>(
     STORE_BUDGET_WAITERS.scope(waiters, fut).await
 }
 
-struct StoreBudgetWait(Arc<AtomicUsize>);
+/// One caller parked on an empty store budget, counted while it waits.
+/// Debug builds only: tests wait on the count.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub struct StoreBudgetWait(Arc<AtomicUsize>);
 
+#[cfg(debug_assertions)]
 impl StoreBudgetWait {
-    fn enter(counter: Arc<AtomicUsize>) -> Self {
+    pub fn enter(counter: Arc<AtomicUsize>) -> Self {
         counter.fetch_add(1, Ordering::SeqCst);
         Self(counter)
     }
 }
 
+#[cfg(debug_assertions)]
 impl Drop for StoreBudgetWait {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
@@ -180,6 +190,7 @@ pub async fn acquire_armed_store_budget() -> Option<OwnedSemaphorePermit> {
     match Arc::clone(&sem).try_acquire_owned() {
         Ok(permit) => Some(permit),
         Err(_) => {
+            #[cfg(debug_assertions)]
             let _waiting = STORE_BUDGET_WAITERS
                 .try_with(Arc::clone)
                 .ok()

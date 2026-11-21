@@ -40,7 +40,7 @@ Assert what changes the result for a real user, peer, or operator. That includes
 
 ### Waits
 
-A test waits on a signal the production path already publishes: the tip, the template generation, the stop bit, `active_commands`, a peer row, or a semaphore the server acquires. `store_budget_waiters` is that signal when the call is blocked before `dispatch` lists it on a full disk budget. `template_prev_waiters` plays the same part when `template_prev` is waiting on the tip mutex; it is a `cfg(debug_assertions)` counter, so only debug builds publish it. The assert is what a session sees after that wake. Any other counter, park note, or thread-local that exists only so the test can see a thread park is not a signal.
+A test waits on a signal the production path already publishes: the tip, the template generation, the stop bit, `active_commands`, a peer row, or a semaphore the server acquires. `store_budget_waiters` and `template_prev_waiters` are that signal when the call is blocked before `dispatch` lists it: the disk budget is full, or `template_prev` is waiting on the tip mutex. Both are `cfg(debug_assertions)` counters, so only debug builds publish them. The assert is what a session sees after that wake. Any other counter, park note, or thread-local that exists only so the test can see a thread park is not a signal.
 
 A bare `sleep`, then an assert, is a flake. A poll until a condition the test already names, with a deadline, is a normal async test. Prefer `NodeClock`, `setmocktime`, `set_mock_now`, or a backdated `Instant` when that is the clock the code reads. `tokio::time::pause` plus `advance` is that clock. Do not add a new clock so a test can avoid a poll. The P2P wall table below is a budget. It is not permission to sleep.
 
