@@ -7,7 +7,7 @@ use std::sync::Arc;
 use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid, Wtxid};
 use rbitcoin_consensus::policy::fee_exceeds_max;
-use rbitcoin_mempool::TestedMembers;
+use rbitcoin_mempool::{ActiveMempool, TestedMembers, MAX_PACKAGE_WEIGHT};
 use rbitcoin_query::{Query, QueryError};
 
 use crate::{AcceptError, AcceptResult, MempoolHub};
@@ -78,16 +78,6 @@ impl TestAcceptRow {
             TestAcceptVerdict::Rejected {
                 reason: accept_reject_reason(e),
                 details: accept_reject_details(e, tx),
-            },
-        )
-    }
-
-    fn replacement_disallowed(tx: &Transaction) -> Self {
-        Self::of(
-            tx,
-            TestAcceptVerdict::Rejected {
-                reason: "bip125-replacement-disallowed".into(),
-                details: Some("bip125-replacement-disallowed".into()),
             },
         )
     }
@@ -165,7 +155,12 @@ pub fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
 /// Core `reject-details` for mempool rejects.
 fn accept_reject_details(e: &impl std::fmt::Display, tx: &Transaction) -> Option<String> {
     let reason = accept_reject_reason(e);
-    if reason == "txn-already-in-mempool" || reason == "txn-same-nonwitness-data-in-mempool" {
+    if matches!(
+        reason.as_str(),
+        "txn-already-in-mempool"
+            | "txn-same-nonwitness-data-in-mempool"
+            | "bip125-replacement-disallowed"
+    ) {
         return Some(reason);
     }
     if !reason.starts_with("mempool-script-verify-flag-failed") {
@@ -197,30 +192,28 @@ fn package_error(txs: &[Transaction], msg: &'static str) -> Vec<TestAcceptRow> {
 }
 
 impl MempoolHub {
+    /// Core `IsWellFormedPackage`, in Core's order, then the cluster limit.
+    /// Every surface caps the count at 25 before the walk.
     fn test_accept_precheck(&self, txs: &[Transaction]) -> Option<Vec<TestAcceptRow>> {
-        let mut ids = HashSet::new();
-        if txs.iter().any(|tx| !ids.insert(tx.compute_txid())) {
-            return Some(package_error(txs, "package-contains-duplicates"));
-        }
         if txs.len() < 2 {
             return None;
         }
-        if package_has_conflicts(txs) {
-            return Some(package_error(txs, "conflict-in-package"));
-        }
-        if let Err(AcceptError::PackageNotTopo) = Self::check_package_shape(txs) {
-            return Some(package_error(txs, "package-not-sorted"));
-        }
-        if self.package_would_exceed_cluster(txs) {
-            return Some(package_error(txs, "too-large-cluster"));
-        }
-        None
-    }
-
-    fn spends_mempool_outpoint(&self, tx: &Transaction) -> bool {
-        tx.input
-            .iter()
-            .any(|i| self.spending_txid(&i.previous_output).is_some())
+        let weight: u64 = txs.iter().map(|tx| tx.weight().to_wu()).sum();
+        let mut ids = HashSet::new();
+        let error = if weight > MAX_PACKAGE_WEIGHT {
+            "package-too-large"
+        } else if txs.iter().any(|tx| !ids.insert(tx.compute_txid())) {
+            "package-contains-duplicates"
+        } else if !ActiveMempool::package_is_sorted(txs) {
+            "package-not-sorted"
+        } else if package_has_conflicts(txs) {
+            "conflict-in-package"
+        } else if self.package_would_exceed_cluster(txs) {
+            "too-large-cluster"
+        } else {
+            return None;
+        };
+        Some(package_error(txs, error))
     }
 
     /// Test-accept `txs` without touching the pool, with script verify
@@ -276,12 +269,6 @@ impl MempoolHub {
         for tx in txs {
             if submit_tx_version_nonstandard(&tx) {
                 out.push(TestAcceptRow::rejected(&tx, "version"));
-                continue;
-            }
-            let hub = Arc::clone(self);
-            let tx_s = tx.clone();
-            if crate::reactor::off_pool(move || hub.spends_mempool_outpoint(&tx_s)).await {
-                out.push(TestAcceptRow::replacement_disallowed(&tx));
                 continue;
             }
             let outcome = self

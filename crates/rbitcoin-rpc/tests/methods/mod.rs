@@ -5014,6 +5014,38 @@ fn testmempoolaccept_package_applies_truc_to_an_untested_parent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A package dry run may not replace a pool tx, and says so with Core's
+/// `reject-details`. The refusal comes before any input resolves, so an
+/// input already spent on chain does not win.
+#[test]
+fn testmempoolaccept_package_conflict_follows_check_transaction() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let keep = 50_0000_0000 - 1_000;
+    let (_, mined) = spend_generated_coinbase(&ctx, 1, keep, spk.clone());
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex(&mined))]).unwrap();
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let (_, pooled) = spend_generated_coinbase(&ctx, 2, keep, spk.clone());
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex(&pooled))]).unwrap();
+    let (_, other) = spend_generated_coinbase(&ctx, 3, keep, spk);
+    let mut clash = pooled.clone();
+    clash.output[0].value -= Amount::from_sat(1_000);
+    let mut late = clash.clone();
+    late.input.insert(0, mined.input[0].clone());
+    let disallowed = "bip125-replacement-disallowed";
+    for (member, reason) in [(&clash, disallowed), (&late, disallowed)] {
+        let hexes = json!([hex(member), hex(&other)]);
+        let rows = dispatch(&ctx, "testmempoolaccept", vec![hexes]).unwrap();
+        assert_eq!(rows[0]["reject-reason"], reason, "{rows}");
+    }
+    let hexes = json!([hex(&clash), hex(&other)]);
+    let rows = dispatch(&ctx, "testmempoolaccept", vec![hexes]).unwrap();
+    assert_eq!(rows[0]["reject-details"], disallowed, "{rows}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn rpc_submit_nonstandard_version_is_version() {
     use bitcoin::absolute::LockTime;
@@ -7174,6 +7206,26 @@ fn testmempoolaccept_missing_inputs_is_missing_inputs() {
     assert_eq!(row[0]["allowed"], json!(false), "{row}");
     assert_eq!(row[0]["reject-reason"], json!("missing-inputs"), "{row}");
     assert_eq!(ctx.mempool.as_ref().unwrap().orphan_count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn testmempoolaccept_takes_1_to_25_transactions() {
+    let (ctx, dir) = ctx_empty();
+    let hex = "00".repeat(60);
+    // Core checks the count before it parses `maxfeerate`.
+    for rawtxs in [json!([]), json!(vec![hex; 26])] {
+        for maxfeerate in [None, Some(json!(5))] {
+            let params: Vec<_> = std::iter::once(rawtxs.clone()).chain(maxfeerate).collect();
+            let err = dispatch(&ctx, "testmempoolaccept", params).unwrap_err();
+            assert_eq!(err["code"], json!(-8), "{err}");
+            assert_eq!(
+                err["message"],
+                json!("Array must contain between 1 and 25 transactions."),
+                "{err}"
+            );
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

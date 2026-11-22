@@ -501,7 +501,8 @@ pub struct PrepareOpts {
     pub report_orphans: bool,
     pub min_relay: Option<u64>,
     pub waive: bool,
-    /// Earlier members of a package dry run. `None` for every real admit.
+    /// Earlier members of a package dry run, which also may not replace.
+    /// `None` for every real admit.
     pub tested: Option<Arc<TestedMembers>>,
 }
 
@@ -1383,6 +1384,16 @@ impl ActiveMempool {
             // Same txid, different witness (Core testmempoolaccept /
             // mempool_accept_wtxid.py).
             return Err(AcceptError::Policy("txn-same-nonwitness-data-in-mempool"));
+        }
+        // A package dry run may not replace (Core `m_allow_replacement`). Every
+        // input is asked before any resolves, as Core asks before the coins.
+        if tested.is_some()
+            && tx
+                .input
+                .iter()
+                .any(|i| self.graph.conflict_txid(&i.previous_output).is_some())
+        {
+            return Err(AcceptError::Policy("bip125-replacement-disallowed"));
         }
         let AdmitInputs {
             prevouts,
@@ -2272,18 +2283,27 @@ impl ActiveMempool {
                 return Err(AcceptError::Duplicate(id));
             }
         }
-        // `seen` still holds this tx and every tx after it. An input that
-        // names one of those txids spends a parent that is not earlier in
-        // the package, including a tx that spends its own txid.
-        for tx in txs {
-            for inp in &tx.input {
-                if seen.contains(&inp.previous_output.txid) {
-                    return Err(AcceptError::PackageNotTopo);
-                }
-            }
-            seen.remove(&tx.compute_txid());
+        if !Self::package_is_sorted(txs) {
+            return Err(AcceptError::PackageNotTopo);
         }
         Ok(())
+    }
+
+    /// Core `IsTopoSortedPackage`: no member spends itself or a member
+    /// listed after it.
+    pub fn package_is_sorted(txs: &[Transaction]) -> bool {
+        let mut later: BTreeSet<_> = txs.iter().map(|tx| tx.compute_txid()).collect();
+        for tx in txs {
+            if tx
+                .input
+                .iter()
+                .any(|inp| later.contains(&inp.previous_output.txid))
+            {
+                return false;
+            }
+            later.remove(&tx.compute_txid());
+        }
+        true
     }
 
     /// Core `IsChildWithParentsTree`: the last tx spends every other package

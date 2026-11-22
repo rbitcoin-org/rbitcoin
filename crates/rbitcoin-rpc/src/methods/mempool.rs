@@ -1201,10 +1201,17 @@ const MISSING_OR_SPENT: &str = "bad-txns-inputs-missingorspent";
 
 fn testmempoolaccept_args(params: &RpcParams) -> Result<(&[Value], u64), Value> {
     params.reject_unknown(&["rawtxs", "maxfeerate"])?;
-    let max_feerate = opt_maxfeerate_sat_kvb(params, 1)?;
     let arr = params
         .get_array(0, "rawtxs")
         .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "rawtxs array required"))?;
+    let max = MempoolHub::max_package_count();
+    if arr.is_empty() || arr.len() > max {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            format!("Array must contain between 1 and {max} transactions."),
+        ));
+    }
+    let max_feerate = opt_maxfeerate_sat_kvb(params, 1)?;
     Ok((arr, max_feerate))
 }
 

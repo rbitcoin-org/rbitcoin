@@ -506,6 +506,64 @@ async fn outspends_bounds_total_entries() {
     let _ = pad.dir;
 }
 
+/// A package `/txs/test` reports the error Core's `testmempoolaccept` would.
+#[tokio::test]
+async fn esplora_txs_test_reports_cores_package_errors() {
+    use bitcoin::consensus::encode::serialize_hex;
+
+    let pad = pad_hub("txs-test-core", 3);
+    let sock_dir = rbitcoin_query::testutil::TempDir::for_socket().expect("temp dir");
+    let (handle, sock) = run_unix(
+        sock_dir.path(),
+        Arc::clone(&pad.q),
+        Some(Arc::clone(&pad.hub)),
+    )
+    .await;
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let test = |txs: &[&Transaction]| {
+        let hexes: Vec<String> = txs.iter().map(|tx| serialize_hex(*tx)).collect();
+        let body = serde_json::to_vec(&hexes).unwrap();
+        let sock = sock.clone();
+        async move {
+            let (st, resp) = http_post_unix(&sock, "/txs/test", &body).await;
+            assert_eq!(st, 200, "{resp}");
+            serde_json::from_str::<Vec<Value>>(&resp).unwrap()
+        }
+    };
+
+    let pooled = spend_true(pad.cbs[0], 1_000, spk.clone());
+    pad.hub.admit(&pooled).expect("accept");
+    let pooled_child = spend_true(pooled.compute_txid(), 2_000, spk.clone());
+    let rows = test(&[&pooled, &pooled_child]).await;
+    assert_eq!(
+        rows[0]["reject-reason"], "txn-already-in-mempool",
+        "{rows:?}"
+    );
+
+    let parent = spend_true(pad.cbs[1], 1_000, spk.clone());
+    let child = spend_true(parent.compute_txid(), 2_000, spk.clone());
+    let rival = spend_true(pad.cbs[1], 3_000, spk);
+    let rows = test(&[&child, &parent, &rival]).await;
+    assert!(
+        rows.iter()
+            .all(|r| r["package-error"] == "package-not-sorted"),
+        "Core checks order before conflicts: {rows:?}"
+    );
+
+    let fat = ScriptBuf::from_bytes(vec![0x6a; 52_000]);
+    let big_a = spend_true(pad.cbs[1], 1_000, fat.clone());
+    let big_b = spend_true(pad.cbs[2], 1_000, fat);
+    let rows = test(&[&big_a, &big_b]).await;
+    assert!(
+        rows.iter()
+            .all(|r| r["package-error"] == "package-too-large"),
+        "{rows:?}"
+    );
+
+    handle.shutdown().await;
+    let _ = pad.dir;
+}
+
 /// Admission vsize rounds up. This spend has no sigops, so its admission
 /// weight equals its BIP141 weight.
 async fn test_rounds_vsize_up(sock: &std::path::Path, pad: &Pad) {
