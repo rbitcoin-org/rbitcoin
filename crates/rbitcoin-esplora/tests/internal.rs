@@ -570,10 +570,7 @@ async fn mempool_removed_lists_rows_on_the_unix_listener() {
         let (st, body) = http_post_unix(&sock, "/tx", serialize_hex(tx).as_bytes()).await;
         assert_eq!(st, 200, "{body}");
     }
-    pad.hub.remove_for_block(
-        &[bump.compute_txid()],
-        rbitcoin_net::Removal::Committed(rbitcoin_net::RemovalReason::Block),
-    );
+    pad.hub.remove_for_block(&[bump.compute_txid()]);
     assert_eq!(
         removed(sock.clone()).await,
         json!({"oldest": 1, "removed": [

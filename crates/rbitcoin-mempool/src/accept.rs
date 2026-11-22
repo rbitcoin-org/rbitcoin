@@ -501,6 +501,8 @@ pub struct PrepareOpts {
     pub report_orphans: bool,
     pub min_relay: Option<u64>,
     pub waive: bool,
+    /// Earlier members of a package dry run. `None` for every real admit.
+    pub tested: Option<Arc<TestedMembers>>,
 }
 
 /// Result of accept prepare (resolve + policy + structural), before script verify.
@@ -532,6 +534,86 @@ pub struct PreparedAdmit {
     /// Whether a second child of a version-3 parent may evict the first
     /// (BIP 431 sibling eviction). Off unless the admit turns it on.
     pub sibling_eviction: SiblingEviction,
+    /// From [`PrepareOpts::tested`]. The plan after script sees them too.
+    pub tested: Option<Arc<TestedMembers>>,
+}
+
+/// The members of a multi-tx `testmempoolaccept` that have passed so far.
+/// A later member spends their outputs as unconfirmed parents, and none of
+/// them enters the pool, so the dry run publishes nothing and has nothing to
+/// remove.
+///
+/// The cluster limit counts only a member's pool parents. The package
+/// precheck already bounds every member together with every pool parent's
+/// cluster, which holds any one member's cluster.
+#[derive(Debug, Clone, Default)]
+pub struct TestedMembers {
+    members: BTreeMap<Txid, TestedMember>,
+}
+
+#[derive(Debug, Clone)]
+struct TestedMember {
+    tx: Arc<Transaction>,
+    parents: BTreeSet<Txid>,
+}
+
+static NO_TESTED: TestedMembers = TestedMembers {
+    members: BTreeMap::new(),
+};
+
+impl TestedMembers {
+    fn of(tested: &Option<Arc<TestedMembers>>) -> &TestedMembers {
+        tested.as_deref().unwrap_or(&NO_TESTED)
+    }
+
+    /// Add a member that passed, for the members after it.
+    pub fn push(&mut self, tx: Arc<Transaction>) {
+        let txid = tx.compute_txid();
+        let parents: BTreeSet<Txid> = tx
+            .input
+            .iter()
+            .map(|i| i.previous_output.txid)
+            .filter(|p| self.members.contains_key(p))
+            .collect();
+        self.members.insert(txid, TestedMember { tx, parents });
+    }
+
+    fn contains(&self, txid: &Txid) -> bool {
+        self.members.contains_key(txid)
+    }
+
+    /// Some member spends an output of `parent`, a pool tx or a member.
+    fn has_child(&self, parent: &Txid) -> bool {
+        self.members
+            .values()
+            .any(|m| m.tx.input.iter().any(|i| i.previous_output.txid == *parent))
+    }
+
+    /// Member `txid` spends another member or a pool tx.
+    fn spends_unconfirmed(&self, txid: &Txid, graph: &TxGraph) -> bool {
+        self.members.get(txid).is_some_and(|m| {
+            !m.parents.is_empty()
+                || m.tx
+                    .input
+                    .iter()
+                    .any(|i| graph.contains(&i.previous_output.txid))
+        })
+    }
+
+    fn body(&self, txid: &Txid) -> Option<&Transaction> {
+        self.members.get(txid).map(|m| m.tx.as_ref())
+    }
+
+    /// Output `op` of a tested member, or `None` when no member created it.
+    fn output(&self, op: &OutPoint) -> Result<Option<TxOut>, AcceptError> {
+        let Some(m) = self.members.get(&op.txid) else {
+            return Ok(None);
+        };
+        match m.tx.output.get(op.vout as usize) {
+            Some(out) => Ok(Some(out.clone())),
+            None => Err(AcceptError::MissingPrevout(*op)),
+        }
+    }
 }
 
 /// BIP 431 sibling eviction for one admit. Core allows it only for a tx
@@ -573,6 +655,8 @@ struct AdmitInputs {
 pub struct ConflictScan {
     pub direct_conflicts: BTreeSet<Txid>,
     pub parent_txids: BTreeSet<Txid>,
+    /// Parents that are [`TestedMembers`].
+    pub tested_parents: BTreeSet<Txid>,
 }
 
 #[doc(hidden)]
@@ -696,8 +780,8 @@ impl ActiveMempool {
         std::mem::take(&mut self.undone_replacements)
     }
 
-    /// `admit` committed `txid` and may still take it back: a package, a
-    /// 1p1c pair, or a multi-tx `testmempoolaccept`.
+    /// `admit` committed `txid` and may still take it back: a package or a
+    /// 1p1c pair.
     pub fn hold_tentative(&mut self, txid: Txid, admit: u64) {
         let held_by = self.tentative.entry(txid).or_default();
         if !held_by.contains(&admit) {
@@ -1157,6 +1241,7 @@ impl ActiveMempool {
                 report_orphans,
                 min_relay,
                 waive,
+                tested: None,
             },
         )?;
         prep.sibling_eviction = sibling_eviction;
@@ -1224,13 +1309,19 @@ impl ActiveMempool {
         txid: Txid,
         tx: &Transaction,
         chain_coins: &[Option<Coin>],
+        tested: &TestedMembers,
     ) -> Result<ConflictScan, AcceptError> {
         let mut scan = ConflictScan {
             direct_conflicts: BTreeSet::new(),
             parent_txids: BTreeSet::new(),
+            tested_parents: BTreeSet::new(),
         };
         for (i, inp) in tx.input.iter().enumerate() {
             let op = inp.previous_output;
+            if tested.contains(&op.txid) {
+                scan.tested_parents.insert(op.txid);
+                continue;
+            }
             if let Some(creator) = self.note_conflict_and_parent(txid, op, Some(&mut scan))? {
                 if !self.bodies.contains_key(&creator) {
                     return Err(AcceptError::Durable("parent body missing".into()));
@@ -1258,6 +1349,7 @@ impl ActiveMempool {
             report_orphans,
             min_relay,
             waive,
+            tested,
         } = opts;
         let check_tx = |r: Result<(), rbitcoin_consensus::ConsensusError>| {
             r.map_err(|e| {
@@ -1297,7 +1389,8 @@ impl ActiveMempool {
             chain_coins,
             input_value,
             utxo_us,
-        } = self.collect_admit_inputs(tx, txid, utxos, report_orphans)?;
+        } =
+            self.collect_admit_inputs(tx, txid, utxos, report_orphans, TestedMembers::of(&tested))?;
 
         let trust_structural = match check_mempool_structural(tx, &chain_coins, tip) {
             Ok(()) => None,
@@ -1351,6 +1444,7 @@ impl ActiveMempool {
             trust_warn,
             keep_mark: false,
             sibling_eviction: SiblingEviction::Off,
+            tested,
         })
     }
 
@@ -1360,6 +1454,7 @@ impl ActiveMempool {
         txid: Txid,
         utxos: &impl UtxoProvider,
         report_orphans: bool,
+        tested: &TestedMembers,
     ) -> Result<AdmitInputs, AcceptError> {
         let t_utxo = Instant::now();
         let mut prevouts: Vec<TxOut> = Vec::with_capacity(tx.input.len());
@@ -1368,6 +1463,12 @@ impl ActiveMempool {
         let mut input_value = 0u64;
         for inp in &tx.input {
             let op = inp.previous_output;
+            if let Some(txout) = tested.output(&op)? {
+                input_value = input_value.saturating_add(txout.value.to_sat());
+                prevouts.push(txout);
+                chain_coins.push(None);
+                continue;
+            }
             let mempool_parent = self.note_conflict_and_parent(txid, op, None)?;
             let (txout, chain_coin) = if let Some(creator) = mempool_parent {
                 let parent_tx = self
@@ -1798,6 +1899,18 @@ impl ActiveMempool {
         Ok(())
     }
 
+    fn parent_body<'a>(
+        &'a self,
+        id: &Txid,
+        tested: &'a TestedMembers,
+    ) -> Result<&'a Transaction, AcceptError> {
+        self.bodies
+            .get(id)
+            .map(|b| b.as_ref())
+            .or_else(|| tested.body(id))
+            .ok_or_else(|| AcceptError::Durable("parent body missing".into()))
+    }
+
     /// BIP 431 TRUC, as Core `SingleTRUCChecks`. `Ok(Some(sibling))` is a
     /// second child whose only violation is the one-child limit, and whose
     /// sibling can be evicted: the parent's only descendant, with no other
@@ -1810,14 +1923,12 @@ impl ActiveMempool {
         tx: &Transaction,
         vsize: u64,
         scan: &ConflictScan,
+        tested: &TestedMembers,
     ) -> Result<Option<Txid>, AcceptError> {
         const VIOLATION: AcceptError = AcceptError::Policy("TRUC-violation");
         let is_truc = tx.version.0 == policy::TRUC_VERSION;
-        for id in &scan.parent_txids {
-            let body = self
-                .bodies
-                .get(id)
-                .ok_or_else(|| AcceptError::Durable("parent body missing".into()))?;
+        for id in scan.parent_txids.iter().chain(&scan.tested_parents) {
+            let body = self.parent_body(id, tested)?;
             if (body.version.0 == policy::TRUC_VERSION) != is_truc {
                 return Err(VIOLATION);
             }
@@ -1825,17 +1936,29 @@ impl ActiveMempool {
         if !is_truc {
             return Ok(None);
         }
-        if vsize > policy::TRUC_MAX_VSIZE || scan.parent_txids.len() > 1 {
+        if vsize > policy::TRUC_MAX_VSIZE || scan.parent_txids.len() + scan.tested_parents.len() > 1
+        {
             return Err(VIOLATION);
         }
-        let Some(parent) = scan.parent_txids.first() else {
+        let Some(parent) = scan.parent_txids.first().or(scan.tested_parents.first()) else {
             return Ok(None);
         };
+        // A dry run evicts no tested member, so a tested sibling is one too many.
+        if vsize > policy::TRUC_CHILD_MAX_VSIZE || tested.has_child(parent) {
+            return Err(VIOLATION);
+        }
+        if scan.tested_parents.contains(parent) {
+            return if tested.spends_unconfirmed(parent, &self.graph) {
+                Err(VIOLATION)
+            } else {
+                Ok(None)
+            };
+        }
         let entry = self
             .graph
             .get(parent)
             .ok_or_else(|| AcceptError::Durable("parent entry missing".into()))?;
-        if !entry.parents.is_empty() || vsize > policy::TRUC_CHILD_MAX_VSIZE {
+        if !entry.parents.is_empty() {
             return Err(VIOLATION);
         }
         let child_replaced = entry
@@ -1869,12 +1992,10 @@ impl ActiveMempool {
         &self,
         tx: &Transaction,
         scan: &ConflictScan,
+        tested: &TestedMembers,
     ) -> Result<(), AcceptError> {
-        for id in &scan.parent_txids {
-            let body = self
-                .bodies
-                .get(id)
-                .ok_or_else(|| AcceptError::Durable("parent body missing".into()))?;
+        for id in scan.parent_txids.iter().chain(&scan.tested_parents) {
+            let body = self.parent_body(id, tested)?;
             let unspent = policy::dust_vouts(body).any(|vout| {
                 let dust = OutPoint { txid: *id, vout };
                 !tx.input.iter().any(|i| i.previous_output == dust)
@@ -1901,14 +2022,15 @@ impl ActiveMempool {
             return Err(AcceptError::Policy("txn-same-nonwitness-data-in-mempool"));
         }
 
-        let scan = self.scan_conflicts_and_parents(txid, tx, &prep.chain_coins)?;
+        let tested = TestedMembers::of(&prep.tested);
+        let scan = self.scan_conflicts_and_parents(txid, tx, &prep.chain_coins, tested)?;
 
         let fee_sat = prep.fee_sat;
         let weight =
             sigops_adjusted_weight(prep.weight, prep.sigop_cost, self.graph.bytes_per_sigop());
         let admit_fee =
             (i128::from(fee_sat).saturating_add(i128::from(prep.fee_delta))).max(0) as u64;
-        let sibling = match self.check_truc(tx, weight.div_ceil(4), &scan)? {
+        let sibling = match self.check_truc(tx, weight.div_ceil(4), &scan, tested)? {
             Some(s)
                 if match prep.sibling_eviction {
                     SiblingEviction::Off => false,
@@ -1925,7 +2047,7 @@ impl ActiveMempool {
             Some(_) => return Err(AcceptError::Policy("TRUC-violation")),
             None => None,
         };
-        self.check_ephemeral_spends(tx, &scan)?;
+        self.check_ephemeral_spends(tx, &scan, tested)?;
 
         // The sibling joins the replaced set and pays for it like any
         // conflict (Core adds it to `m_conflicts`).
@@ -2451,6 +2573,7 @@ impl ActiveMempool {
                 report_orphans: false,
                 min_relay: Some(0),
                 waive,
+                tested: None,
             },
         )?;
         prep.keep_mark = waive;

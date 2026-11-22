@@ -45,7 +45,7 @@ Three thread kinds only. **Tokio workers must not wait on a `std` mutex/rwlock, 
 |------|-----|--------|
 | Reactor | `tokio-rt-worker` × nCPU | epoll, timers, framing. Node caps `spawn_blocking` at nCPU (min 4), not tokio’s 512. |
 | Role | `tip-accept`, `ibd-header`, `ibd-confirm-*`, `rbtc-tip-flush`, `rbtc-spend-sync`, `rbtc-sh-wb`, `rbtc-idx-wb` / `rbtc-idx-cpu`, `ibd-status` | Sole writer for a resource. Not a job pool. `ibd-status` is the exception: it writes nothing to the store and logs IBD progress every 5 s. |
-| Work pool | `rbtc-scripts-*` steal; tokio blocking pool; `rbtc-io-pool` | Independent jobs. `rbtc-io-pool` (process-shared, 1–16 workers) starts with the first IO session on the pool backend ([`io-modality.md`](./io-modality.md)). It runs the pread, pwrite, and `sync_data` jobs a thread's IO session submits, and owns no table. Mempool script verify is awaited on the request task (`run_cpu`); prepare and commit run on `rbtc-off-pool`, one thread started on first use, not the blocking pool. Jobs queue there, and a job does not enter that lane again. Prepare takes one `--store-read-budget` permit and drops it before script verify. The commit coin re-read takes one again and drops it before orphan promotion. Each promoted orphan, each package member put back after a failed package, each replaced conflict put back, and the orphan walk after a multi-tx `testmempoolaccept` removes its inserts takes a permit only for its coin read. A task spawned so package cleanup survives a dropped request keeps that budget. Electrum / Esplora / RPC / REST / BlindBit store joins still use the blocking pool, and they share that one budget. A waiter does not occupy a pool thread. An RPC method that does not read the store does not take a permit. `getblocktemplate` and Esplora `GET /block-template` read the template tip on `rbtc-off-pool` with no store permit, take one permit, and read it again with `try_lock`. They keep that permit for the header reads only when both reads match and the pool settle generation is even and unchanged, then drop it before transaction selection. Esplora checks its 15-second cache under the permit and does not hold that cache lock across the selection. Long-poll tip polls stay off the permit and drop it before they sleep. Heavy v2 encode, compact short ids, and JSON of at least 4 KiB run on `rbtc-scripts-*`. |
+| Work pool | `rbtc-scripts-*` steal; tokio blocking pool; `rbtc-io-pool` | Independent jobs. `rbtc-io-pool` (process-shared, 1–16 workers) starts with the first IO session on the pool backend ([`io-modality.md`](./io-modality.md)). It runs the pread, pwrite, and `sync_data` jobs a thread's IO session submits, and owns no table. Mempool script verify is awaited on the request task (`run_cpu`); prepare and commit run on `rbtc-off-pool`, one thread started on first use, not the blocking pool. Jobs queue there, and a job does not enter that lane again. Prepare takes one `--store-read-budget` permit and drops it before script verify. The commit coin re-read takes one again and drops it before orphan promotion. Each promoted orphan, each package member put back after a failed package, and each replaced conflict put back takes a permit only for its coin read. A task spawned so package cleanup survives a dropped request keeps that budget. Electrum / Esplora / RPC / REST / BlindBit store joins still use the blocking pool, and they share that one budget. A waiter does not occupy a pool thread. An RPC method that does not read the store does not take a permit. `getblocktemplate` and Esplora `GET /block-template` read the template tip on `rbtc-off-pool` with no store permit, take one permit, and read it again with `try_lock`. They keep that permit for the header reads only when both reads match and the pool settle generation is even and unchanged, then drop it before transaction selection. Esplora checks its 15-second cache under the permit and does not hold that cache lock across the selection. Long-poll tip polls stay off the permit and drop it before they sleep. Heavy v2 encode, compact short ids, and JSON of at least 4 KiB run on `rbtc-scripts-*`. |
 
 | Role | Notes |
 |------|--------|
@@ -235,16 +235,16 @@ for decode.
 **Fixed.** Production mempool admit (HTTP `sendrawtransaction`,
 `testmempoolaccept`, `submitpackage`, Electrum broadcast and package,
 Esplora `POST /tx` and package, BlindBit `forward-tx`, and P2P `tx`)
-awaits script verify off the blocking pool. Package accept, 1p1c,
-`submitpackage`, and a multi-tx `testmempoolaccept` run that work on a task
-the request cannot cancel, so a dropped caller still rolls back, trims, and
-removes the test inserts. A single-tx admit is awaited by the caller and
+awaits script verify off the blocking pool. Package accept, 1p1c, and
+`submitpackage` run that work on a task the request cannot cancel, so a
+dropped caller still rolls back and trims. A multi-tx `testmempoolaccept`
+inserts nothing (later members spend earlier ones as unconfirmed parents), so it
+runs on the request task. A single-tx admit is awaited by the caller and
 runs on a task that caller cannot cancel, so a dropped request still
 publishes or restores after the commit. BlindBit `forward-tx` already spawns its admit. A parked blocking pool
 can still admit. RPC `dispatch` has no admit method. An async admit promotes orphans on that admit task. A package
 that fails re-admits its parked members there too, and puts replaced
-conflicts back the same way. A multi-tx `testmempoolaccept` promotes after
-it removes the inserts. The sync publish path still walks orphans on the caller.
+conflicts back the same way. The sync publish path still walks orphans on the caller.
 
 **Fixed.** RPC, REST, Electrum, Esplora, and BlindBit store reads share one
 semaphore sized at listen. Omitted or `0` with `--datadir-hdd` is 1.

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid, Wtxid};
 use rbitcoin_consensus::policy::fee_exceeds_max;
+use rbitcoin_mempool::TestedMembers;
 use rbitcoin_query::{Query, QueryError};
 
 use crate::{AcceptError, AcceptResult, MempoolHub};
@@ -49,6 +50,12 @@ impl TestAcceptRow {
                 details: None,
             },
         )
+    }
+
+    /// Only an allowed member is a parent for a later one. A member over
+    /// `maxfeerate` is not, though it passed every other check.
+    fn is_allowed(&self) -> bool {
+        matches!(self.verdict, TestAcceptVerdict::Allowed { .. })
     }
 
     fn admitted(tx: &Transaction, r: &AcceptResult, max_feerate_sat_kvb: u64) -> Self {
@@ -216,9 +223,10 @@ impl MempoolHub {
             .any(|i| self.spending_txid(&i.previous_output).is_some())
     }
 
-    /// Test-accept `txs` without leaving any of them in the pool, with script
-    /// verify awaited on the caller. Two or more are a package: members enter
-    /// the pool in order so a child sees its parent, then all leave again.
+    /// Test-accept `txs` without touching the pool, with script verify
+    /// awaited on the caller. Two or more are a package: each member that
+    /// passes joins [`TestedMembers`], so a later child sees its parent
+    /// without the parent entering the pool.
     pub async fn test_accept_rows_async(
         self: &Arc<Self>,
         txs: Vec<Transaction>,
@@ -231,15 +239,9 @@ impl MempoolHub {
             return Ok(rows);
         }
         if txs.len() >= 2 {
-            // Members stay in the pool until the dry run takes them back. A
-            // dropped caller must not leave them there.
-            let hub = Arc::clone(self);
-            return Ok(crate::reactor::spawn_with_store_budget(async move {
-                hub.test_accept_package_rows_async(txs, max_feerate_sat_kvb)
-                    .await
-            })
-            .await
-            .expect("testmempoolaccept package"));
+            return Ok(self
+                .test_accept_package_rows_async(txs, max_feerate_sat_kvb)
+                .await);
         }
         let mut out = Vec::with_capacity(txs.len());
         for tx in txs {
@@ -256,7 +258,7 @@ impl MempoolHub {
                 out.push(TestAcceptRow::rejected(&tx, "version"));
                 continue;
             }
-            out.push(match self.test_accept_async(tx.clone()).await {
+            out.push(match self.test_accept_async(tx.clone(), None).await {
                 Ok(r) => TestAcceptRow::admitted(&tx, &r, max_feerate_sat_kvb),
                 Err(e) => TestAcceptRow::refused(&tx, &e),
             });
@@ -269,9 +271,7 @@ impl MempoolHub {
         txs: Vec<Transaction>,
         max_feerate_sat_kvb: u64,
     ) -> Vec<TestAcceptRow> {
-        let guard = self.begin_tentative_guard();
-        let admit = guard.admit();
-        let mut added = Vec::new();
+        let mut tested = Arc::new(TestedMembers::default());
         let mut out = Vec::with_capacity(txs.len());
         for tx in txs {
             if submit_tx_version_nonstandard(&tx) {
@@ -284,25 +284,18 @@ impl MempoolHub {
                 out.push(TestAcceptRow::replacement_disallowed(&tx));
                 continue;
             }
-            out.push(
-                match self
-                    .accept_test_package_member_async(tx.clone(), admit)
-                    .await
-                {
-                    Ok(r) => {
-                        let row = TestAcceptRow::admitted(&tx, &r, max_feerate_sat_kvb);
-                        added.push(r);
-                        row
-                    }
-                    Err(e) => TestAcceptRow::refused(&tx, &e),
-                },
-            );
+            let outcome = self
+                .test_accept_async(tx.clone(), Some(Arc::clone(&tested)))
+                .await;
+            let row = match outcome {
+                Ok(r) => TestAcceptRow::admitted(&tx, &r, max_feerate_sat_kvb),
+                Err(e) => TestAcceptRow::refused(&tx, &e),
+            };
+            if row.is_allowed() {
+                Arc::make_mut(&mut tested).push(Arc::new(tx));
+            }
+            out.push(row);
         }
-        if !added.is_empty() {
-            self.abandon_package_async(added).await;
-            self.maybe_compact_async().await;
-        }
-        guard.settle_async().await;
         out
     }
 }

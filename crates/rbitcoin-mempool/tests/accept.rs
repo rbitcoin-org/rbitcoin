@@ -475,6 +475,7 @@ fn prepare_admit_negative_output_is_check_transaction_not_panic() {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                tested: None,
             },
         )
         .expect_err("overflowing output sum");
@@ -501,10 +502,41 @@ fn prepare_admit_rejects_negative_fee() {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                tested: None,
             },
         )
         .expect_err("outputs exceed inputs");
     assert!(matches!(err, AcceptError::Policy("negative fee")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A vout past a tested member's outputs is a missing input, not an orphan
+/// waiting on a parent the walk already holds.
+#[test]
+fn prepare_admit_refuses_a_vout_past_a_tested_member() {
+    let dir = tmp_dir();
+    let (op, _, utxos) = chain_utxo(100_000);
+    let parent = spend_tx(op, 99_000);
+    let mut tested = TestedMembers::default();
+    tested.push(Arc::new(parent.clone()));
+    let past = OutPoint::new(parent.compute_txid(), 1);
+    let child = spend_tx(past, 98_000);
+    let mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let err = mp
+        .prepare_admit(
+            &child,
+            &utxos,
+            TIP_OK,
+            PrepareOpts {
+                fee_delta: 0,
+                report_orphans: true,
+                min_relay: None,
+                waive: false,
+                tested: Some(Arc::new(tested)),
+            },
+        )
+        .expect_err("no such output");
+    assert!(err == AcceptError::MissingPrevout(past), "got {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -867,6 +899,7 @@ fn truc_sibling_eviction_survives_a_floor_rise_before_commit() {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                tested: None,
             },
         )
         .unwrap();
@@ -898,6 +931,7 @@ fn truc_child_limit_holds_across_staged_admits() {
         report_orphans: false,
         min_relay: None,
         waive: false,
+        tested: None,
     };
     let prep_a = mp.prepare_admit(&a, &utxos, TIP_OK, opts()).unwrap();
     let prep_b = mp.prepare_admit(&b, &utxos, TIP_OK, opts()).unwrap();
@@ -1150,6 +1184,7 @@ fn evaluate_after_script_rbf_leaves_conflict() {
                 report_orphans: true,
                 min_relay: None,
                 waive: false,
+                tested: None,
             },
         )
         .unwrap();
@@ -1199,6 +1234,7 @@ fn evaluate_after_script_enforces_cluster_limits() {
                     report_orphans: true,
                     min_relay: None,
                     waive: false,
+                    tested: None,
                 },
             )
             .unwrap();
@@ -1239,6 +1275,7 @@ fn commit_after_script_does_not_take_utxo_provider() {
                 report_orphans: true,
                 min_relay: None,
                 waive: false,
+                tested: None,
             },
         )
         .unwrap();
@@ -1264,6 +1301,7 @@ fn prepare_admit_stashes_txid() {
                 report_orphans: true,
                 min_relay: None,
                 waive: false,
+                tested: None,
             },
         )
         .unwrap();
@@ -1291,6 +1329,7 @@ fn commit_after_script_parent_body_missing_is_durable() {
                 report_orphans: true,
                 min_relay: None,
                 waive: false,
+                tested: None,
             },
         )
         .unwrap();
@@ -2553,6 +2592,7 @@ fn duplicate_commit_after_prepare_is_duplicate() {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                tested: None,
             },
         )
         .unwrap();
@@ -2690,6 +2730,7 @@ fn waive_opts() -> PrepareOpts {
         report_orphans: true,
         min_relay: None,
         waive: true,
+        tested: None,
     }
 }
 
@@ -3131,6 +3172,7 @@ fn review_trust_failed_restore_drops_mark() {
                 report_orphans: false,
                 min_relay: Some(0),
                 waive: false,
+                tested: None,
             },
         )
         .expect("replacement prepares");

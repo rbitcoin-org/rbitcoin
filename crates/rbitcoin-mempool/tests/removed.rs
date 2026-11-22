@@ -483,6 +483,7 @@ fn a_failed_replacement_keeps_its_row_until_the_victim_is_back() {
                 report_orphans: false,
                 min_relay: Some(0),
                 waive: false,
+                tested: None,
             },
         )
         .expect("bump prepares");

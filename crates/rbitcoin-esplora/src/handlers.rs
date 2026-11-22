@@ -2441,7 +2441,7 @@ pub async fn post_txs_test(
             let wtxid = format!("{}", tx.compute_wtxid());
             match rbitcoin_net::with_store_budget(
                 st.query.api_read_budget(),
-                mp.test_accept_async(tx.clone()),
+                mp.test_accept_async(tx.clone(), None),
             )
             .await
             {
