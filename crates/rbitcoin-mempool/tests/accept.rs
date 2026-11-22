@@ -137,6 +137,68 @@ fn reject_immature_coinbase() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Finality needs only the tip, so a non-final tx is refused before its
+/// inputs resolve: one with an unknown parent is not an orphan (Core
+/// `PreChecks`).
+#[test]
+fn non_final_tx_is_refused_before_its_parent_is_looked_up() {
+    let dir = tmp_dir();
+    let unknown = OutPoint {
+        txid: Txid::from_byte_array([0x33; 32]),
+        vout: 0,
+    };
+    let mut tx = spend_tx(unknown, 49_000);
+    tx.lock_time = LockTime::from_height(1_000).unwrap();
+    let utxos = MapUtxoProvider {
+        map: HashMap::new(),
+    };
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let tip = ChainTipCtx {
+        height: 20,
+        mtp: 1_000_000,
+    };
+    let err = mp.accept_tx(&tx, &utxos, tip).unwrap_err();
+    assert!(matches!(err, AcceptError::NotFinal), "got {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core asks BIP68 before coinbase maturity, so a spend that fails both is
+/// `non-BIP68-final`.
+#[test]
+fn bip68_comes_before_coinbase_maturity() {
+    let dir = tmp_dir();
+    let op = OutPoint {
+        txid: Txid::from_byte_array([0x44; 32]),
+        vout: 0,
+    };
+    let mut map = HashMap::new();
+    map.insert(
+        op,
+        Coin {
+            txout: TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            create_height: 10,
+            create_mtp: 1_000_000,
+            is_coinbase: true,
+            create_fk: None,
+        },
+    );
+    let utxos = MapUtxoProvider { map };
+    let mut tx = spend_tx(op, 49_000);
+    // A 50-block relative lock and a coinbase 11 blocks deep: both unmet.
+    tx.input[0].sequence = Sequence::from_consensus(50);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let tip = ChainTipCtx {
+        height: 20,
+        mtp: 1_000_000,
+    };
+    let err = mp.accept_tx(&tx, &utxos, tip).unwrap_err();
+    assert!(matches!(err, AcceptError::NonBip68Final), "got {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn bip68_time_lock_uses_coin_create_mtp() {
     let dir = tmp_dir();

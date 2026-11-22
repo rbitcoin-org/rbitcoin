@@ -5106,8 +5106,9 @@ fn testmempoolaccept_package_reports_a_repeated_input_on_its_row() {
 }
 
 /// A package dry run may not replace a pool tx, and says so with Core's
-/// `reject-details`. The refusal comes after `CheckTransaction`, so a
-/// repeated input wins, and before any input resolves, so an input already
+/// `reject-details`. The refusal comes after the checks that need only the tx
+/// and the tip, so a repeated input, a non-standard shape, or a locktime not
+/// yet final wins. It comes before any input resolves, so an input already
 /// spent on chain does not.
 #[test]
 fn testmempoolaccept_package_conflict_follows_check_transaction() {
@@ -5128,10 +5129,21 @@ fn testmempoolaccept_package_conflict_follows_check_transaction() {
     repeated.input.push(clash.input[0].clone());
     let mut late = clash.clone();
     late.input.insert(0, mined.input[0].clone());
+    let mut dusty = clash.clone();
+    let zero = bitcoin::TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    };
+    dusty.output.extend([zero.clone(), zero]);
+    let mut locked = clash.clone();
+    locked.input[0].sequence = bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME;
+    locked.lock_time = bitcoin::absolute::LockTime::from_height(10_000).unwrap();
     let disallowed = "bip125-replacement-disallowed";
     for (member, reason) in [
         (&clash, disallowed),
         (&repeated, "bad-txns-inputs-duplicate"),
+        (&dusty, "dust"),
+        (&locked, "non-final"),
         (&late, disallowed),
     ] {
         let hexes = json!([hex(member), hex(&other)]);

@@ -378,21 +378,34 @@ pub fn check_transaction(tx: &Transaction, waive: bool) -> Result<(), AcceptErro
     check_tx(rbitcoin_consensus::block::reject_null_prevouts(tx))
 }
 
-/// Maturity, absolute finality (`is_final_tx`), and BIP68 at the next block.
+/// Absolute finality (`is_final_tx`), BIP68, then coinbase maturity at the
+/// next block, in Core's order.
 pub fn check_mempool_structural(
     tx: &Transaction,
     chain_coins: &[Option<Coin>],
     tip: ChainTipCtx,
 ) -> Result<(), AcceptError> {
+    check_final_at_tip(tx, tip)?;
+    check_coin_locks(tx, chain_coins, tip)
+}
+
+/// Absolute finality at the next block. It needs only the tip, so admission
+/// asks it before the pool and the coins (Core `PreChecks`).
+fn check_final_at_tip(tx: &Transaction, tip: ChainTipCtx) -> Result<(), AcceptError> {
+    if rbitcoin_consensus::is_final_tx(tx, tip.height.saturating_add(1), tip.mtp) {
+        Ok(())
+    } else {
+        Err(AcceptError::NotFinal)
+    }
+}
+
+/// BIP68, then coinbase maturity, at the next block. Both need the coins.
+fn check_coin_locks(
+    tx: &Transaction,
+    chain_coins: &[Option<Coin>],
+    tip: ChainTipCtx,
+) -> Result<(), AcceptError> {
     let next_height = tip.height.saturating_add(1);
-    for c in chain_coins.iter().flatten() {
-        if c.is_coinbase && next_height < c.create_height.saturating_add(100) {
-            return Err(AcceptError::ImmatureCoinbase);
-        }
-    }
-    if !rbitcoin_consensus::is_final_tx(tx, next_height, tip.mtp) {
-        return Err(AcceptError::NotFinal);
-    }
     if rbitcoin_consensus::tx_has_relative_lock(tx) {
         let mut prev_heights = Vec::with_capacity(tx.input.len());
         let mut prev_mtps = Vec::with_capacity(tx.input.len());
@@ -417,6 +430,11 @@ pub fn check_mempool_structural(
             tip.mtp,
         ) {
             return Err(AcceptError::NonBip68Final);
+        }
+    }
+    for c in chain_coins.iter().flatten() {
+        if c.is_coinbase && next_height < c.create_height.saturating_add(100) {
+            return Err(AcceptError::ImmatureCoinbase);
         }
     }
     Ok(())
@@ -1399,6 +1417,16 @@ impl ActiveMempool {
         if tx.is_coinbase() {
             return Err(AcceptError::Coinbase);
         }
+        // What needs only the tx and the tip comes before the pool and the
+        // coins (Core `PreChecks`).
+        let weight = tx.weight().to_wu();
+        if let PolicyResult::NonStandard(s) = policy::check_libre_shape(tx, weight) {
+            return Err(AcceptError::Policy(s));
+        }
+        let trust_final = match check_final_at_tip(tx, tip) {
+            Ok(()) => None,
+            Err(err) => kept_trust_structural(waive, err)?,
+        };
         let txid = tx.compute_txid();
         let wtxid = tx.compute_wtxid();
         if let Some(live) = self.graph.get(&txid) {
@@ -1427,9 +1455,13 @@ impl ActiveMempool {
         } =
             self.collect_admit_inputs(tx, txid, utxos, report_orphans, TestedMembers::of(&tested))?;
 
-        let trust_structural = match check_mempool_structural(tx, &chain_coins, tip) {
-            Ok(()) => None,
-            Err(err) => kept_trust_structural(waive, err)?,
+        // A trusted session keeps one structural fault, and the rest go unasked.
+        let trust_structural = match trust_final {
+            Some(err) => Some(err),
+            None => match check_coin_locks(tx, &chain_coins, tip) {
+                Ok(()) => None,
+                Err(err) => kept_trust_structural(waive, err)?,
+            },
         };
 
         if self.enforce_bip54 {
@@ -1442,14 +1474,13 @@ impl ActiveMempool {
         let sigop_cost = block_fit_sigop_cost(tx, &prevouts, self.graph.block_reserved_sigops())?;
 
         let fee_sat = checked_fee_sat(tx, input_value)?;
-        let weight = tx.weight().to_wu();
         let admit_fee = (i128::from(fee_sat).saturating_add(i128::from(fee_delta))).max(0) as u64;
 
         let floor = self.mempool_min_fee_sat_kvb();
         let min_relay = min_relay.unwrap_or(floor);
-        // Standardness on raw weight; the fee floor on sigop-adjusted vsize.
+        // The fee rules on raw weight; the fee floor on sigop-adjusted vsize.
         if let PolicyResult::NonStandard(s) =
-            policy::check_libre_admission_at(tx, fee_sat, fee_delta, weight, 0)
+            policy::check_libre_fees_at(tx, fee_sat, fee_delta, weight, 0)
         {
             return Err(AcceptError::Policy(s));
         }
@@ -1558,10 +1589,6 @@ impl ActiveMempool {
             return AcceptError::MissingPrevout(op);
         }
         if report_orphans {
-            match policy::check_libre_shape(tx, tx.weight().to_wu()) {
-                policy::PolicyResult::Standard => {}
-                policy::PolicyResult::NonStandard(s) => return AcceptError::Policy(s),
-            }
             return AcceptError::Orphaned {
                 txid,
                 missing: missing_parents,

@@ -7091,7 +7091,8 @@ fn review_trust_flag_off_open_drops_marked_tree() {
 }
 
 /// A non-final or script-invalid orphan announced by the trusted session is
-/// admitted when its parent arrives. Any other announcer is dropped.
+/// admitted when its parent arrives. From any other announcer a non-final tx
+/// is refused before it can park, and a script-invalid one is dropped.
 #[test]
 fn review_trust_orphan_keeps_session_waiver() {
     use bitcoin::WPubkeyHash;
@@ -7129,12 +7130,12 @@ fn review_trust_orphan_keeps_session_waiver() {
         .admit_from(&trusted, TxOrigin::Relay(Some(session)))
         .unwrap_err();
     assert!(matches!(parked, AcceptError::Orphaned { .. }), "{parked}");
-    let parked_other = hub
+    let refused_other = hub
         .admit_from(&other, TxOrigin::Relay(Some(99)))
         .unwrap_err();
     assert!(
-        matches!(parked_other, AcceptError::Orphaned { .. }),
-        "{parked_other}"
+        matches!(refused_other, AcceptError::NotFinal),
+        "{refused_other}"
     );
     hub.admit(&parent).expect("parent");
     hub.admit(&other_parent).expect("other parent");
