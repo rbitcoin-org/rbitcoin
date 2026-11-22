@@ -488,6 +488,143 @@ fn open_source_never_trims_a_locator() {
     cut_each_file_writes_nothing(&closed);
 }
 
+/// The `scripthash*` files under `dir`, by path.
+fn sh_bytes(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    tree_bytes(dir)
+        .into_iter()
+        .filter(|(p, _)| {
+            let rel = p.strip_prefix(dir).unwrap();
+            rel.to_string_lossy().starts_with("scripthash")
+        })
+        .collect()
+}
+
+/// Replace the ingest head with one past `OCC_SCAN_BYTE_CAP` whose `.occ`
+/// reads 0, with one live slot or none.
+fn plant_large_ingest(dir: &Path, live: bool) {
+    use rbitcoin_store::scripthash_head::{store_occ_sidecar, ScriptHashHead, OCC_SCAN_BYTE_CAP};
+    use rbitcoin_store::scripthash_layout::{ShHeadValue, SH_HEAD_SLOT_SIZE};
+    let path = rbitcoin_store::scripthash::ingest_path(dir);
+    let _ = std::fs::remove_file(&path);
+    let slots = (OCC_SCAN_BYTE_CAP / SH_HEAD_SLOT_SIZE as u64 + 1).next_power_of_two();
+    let h = ScriptHashHead::create_with_slots(&path, slots).unwrap();
+    if live {
+        h.insert(&[0x5a; 32], &ShHeadValue::inline_one(Fk(1)))
+            .unwrap();
+        h.flush().unwrap();
+    }
+    drop(h);
+    store_occ_sidecar(&path, 0).unwrap();
+}
+
+/// Set every `scripthash*` body's alloc header to version 2 (schema 14).
+fn plant_old_alloc_header(dir: &Path) {
+    let at = rbitcoin_store::file::FILE_HEADER_LEN;
+    for (p, mut bytes) in sh_bytes(dir) {
+        if bytes.len() >= at + 6 && &bytes[at..at + 4] == b"SHAL" {
+            bytes[at + 4..at + 6].copy_from_slice(&2u16.to_le_bytes());
+            std::fs::write(&p, bytes).unwrap();
+        }
+    }
+}
+
+/// Arm an unlink undo on the ingest home and leave its extent tail torn.
+fn plant_armed_undo(dir: &Path) {
+    use rbitcoin_store::scripthash::{ScriptHashRecord, ScriptHashTable};
+    let t = ScriptHashTable::open_tiny(dir).unwrap();
+    let sh = [0x36; 32];
+    let many: Vec<_> = (1..=300u64)
+        .map(|i| ScriptHashRecord::from_fk(sh, Fk(i)))
+        .collect();
+    t.put_create_batch_append(&many).unwrap();
+    t.test_tear_extent_tail(&sh).unwrap();
+}
+
+/// A scripthash index a node's open would repair is refused as a source and
+/// left as it was. Each case is one a node's open writes: an ingest past
+/// `OCC_SCAN_BYTE_CAP` whose `.occ` reads 0 (rewritten over live slots,
+/// deleted when empty), leftover head and overflow files, shards without
+/// their pack mark, a pre-schema-15 alloc header, and an armed unlink undo.
+#[test]
+fn open_source_never_repairs_the_scripthash_index() {
+    let [empty, _, closed] = source_moments();
+    Store::open_source(&empty).unwrap();
+    let write = |name: &'static str| {
+        move |d: &Path| {
+            let p = d.join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"leftover").unwrap();
+        }
+    };
+    let pack_marks = |d: &Path| {
+        let head = d.join("scripthash.head");
+        std::fs::create_dir_all(&head).unwrap();
+        for i in 0..=255u8 {
+            std::fs::write(head.join(format!("{i:02x}.mphf")), b"x").unwrap();
+            std::fs::write(head.join(format!("{i:02x}.val")), b"x").unwrap();
+        }
+    };
+    type Plant<'a> = Box<dyn Fn(&Path) + 'a>;
+    let cases: Vec<(&str, &Path, Plant)> = vec![
+        (
+            "large ingest, .occ 0 over live slots",
+            &closed,
+            Box::new(|d: &Path| plant_large_ingest(d, true)),
+        ),
+        (
+            "large empty ingest",
+            &closed,
+            Box::new(|d: &Path| plant_large_ingest(d, false)),
+        ),
+        (
+            "OA stub",
+            &closed,
+            Box::new(write("scripthash.head.oa_stub")),
+        ),
+        (
+            "legacy overflow head",
+            &closed,
+            Box::new(write("scripthash.ovf.head")),
+        ),
+        (
+            "legacy overflow fuse",
+            &closed,
+            Box::new(write("scripthash.ovf.head.fuse8")),
+        ),
+        (
+            "OA overflow segment",
+            &closed,
+            Box::new(write("scripthash.ovf/000001")),
+        ),
+        (
+            "incomplete head",
+            &closed,
+            Box::new(write("scripthash.head/leftover")),
+        ),
+        ("shards without pack marks", &closed, Box::new(pack_marks)),
+        (
+            "pre-schema-15 alloc header",
+            &empty,
+            Box::new(plant_old_alloc_header),
+        ),
+        ("armed unlink undo", &closed, Box::new(plant_armed_undo)),
+    ];
+    for (what, base, plant) in cases {
+        let src = tmp();
+        copy_tree(base, &src);
+        plant(&src);
+        let node = tmp();
+        copy_tree(&src, &node);
+        let left = sh_bytes(&node);
+        let _ = Store::open_tiny(&node);
+        assert!(sh_bytes(&node) != left, "{what}: a node's open repairs it");
+        assert!(
+            open_source_refused_untouched(&src, what),
+            "{what}: a source opens"
+        );
+    }
+}
+
 #[test]
 fn occupied_schema23_header_body_opens_as_24() {
     use rbitcoin_store::file::{TableFile, FILE_HEADER_LEN};

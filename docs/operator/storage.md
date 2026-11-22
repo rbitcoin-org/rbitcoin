@@ -288,7 +288,9 @@ torn page `tear_guard` would put back, `spent.delta` slots past
 `spent.body`), is
 refused instead of trimmed, rebuilt or dropped; copy it again from the
 stopped source. A source whose tip is past its `tip_seal` is
-refused, not shrunk back; start it once as a node to repair it.
+refused, not shrunk back; start it once as a node to repair it. So is a
+scripthash index that start would repair: an ingest count `.occ` left at 0,
+an unlink cut short, or leftover head or overflow files.
 
 A later start that still passes the flags finds `store/assumehot`. If it
 names the same digest, the node logs that the store is already imported and

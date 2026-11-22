@@ -553,7 +553,7 @@ impl Store {
             drop_unread_store_leftovers(&path);
         }
         let scripthash = if path.join("scripthash.body").exists() {
-            ScriptHashTable::open_with_scale(&path, layout.head_scale)?
+            ScriptHashTable::open_with_scale(&path, layout.head_scale, !source)?
         } else {
             ScriptHashTable::create_with_scale(&path, layout.head_scale)?
         };

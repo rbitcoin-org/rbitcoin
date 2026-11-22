@@ -191,16 +191,19 @@ impl ScriptHashHead {
         })
     }
 
-    pub fn open(path: impl Into<PathBuf>) -> Result<Option<Self>, StoreError> {
+    /// Open an ingest head. Without `repair` (an `--assumehot` source),
+    /// an open that would rewrite `.occ` or delete the file refuses instead.
+    pub fn open(path: impl Into<PathBuf>, repair: bool) -> Result<Option<Self>, StoreError> {
         let path = path.into();
         if !path.exists() {
             return Ok(None);
         }
         let file = TableFile::open(&path, TableKind::HashHead)?;
-        let head = Self::from_file(file)?;
+        let head = Self::from_file(file, repair)?;
         if !head.large_and_empty() {
             return Ok(Some(head));
         }
+        crate::tx_table::may_repair(repair, "source: the scripthash ingest is large and empty")?;
         let path = head.file.path().to_path_buf();
         drop(head);
         remove_ingest_files(&path)?;
@@ -214,7 +217,7 @@ impl ScriptHashHead {
     }
 
     #[doc(hidden)]
-    pub fn from_file(file: TableFile) -> Result<Self, StoreError> {
+    pub fn from_file(file: TableFile, repair: bool) -> Result<Self, StoreError> {
         let body = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         if !body.is_multiple_of(SH_HEAD_SLOT_SIZE as u64) || body == 0 {
             return Err(StoreError::Corrupt("scripthash head size"));
@@ -239,6 +242,10 @@ impl ScriptHashHead {
                     // start scan the same empty table.
                     (0, true)
                 } else {
+                    crate::tx_table::may_repair(
+                        repair,
+                        "source: the scripthash ingest .occ is 0 over live slots",
+                    )?;
                     store_occ_sidecar(file.path(), live)?;
                     (live, true)
                 }

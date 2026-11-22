@@ -15,9 +15,15 @@ pub const LEGACY_OVERFLOW_HEAD: &str = "scripthash.ovf.head";
 pub const LEGACY_OVERFLOW_FUSE: &str = "scripthash.ovf.head.fuse8";
 
 /// Remove interim full-size `scripthash.ovf.head` (+ fuse) so segmented ovf can start clean.
-pub fn wipe_legacy_fullsize_overflow(store_dir: &Path) -> Result<(), StoreError> {
+pub fn wipe_legacy_fullsize_overflow(store_dir: &Path, repair: bool) -> Result<(), StoreError> {
     let legacy = store_dir.join(LEGACY_OVERFLOW_HEAD);
     let legacy_fuse = store_dir.join(LEGACY_OVERFLOW_FUSE);
+    if legacy.exists() || legacy_fuse.exists() {
+        crate::tx_table::may_repair(
+            repair,
+            "source: a legacy scripthash overflow head is on disk",
+        )?;
+    }
     if legacy.exists() {
         rbitcoin_log::info!(
             "store: removing legacy full-size {} (leftover under {})",
