@@ -2440,6 +2440,17 @@ pub async fn post_txs_test(
             )
                 .into_response();
         }
+        if hexes.is_empty() {
+            // mempool/electrs leaves this to bitcoind and relays its error.
+            let max = rbitcoin_net::MempoolHub::max_package_count();
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    r#"testmempoolaccept RPC error: {{"code":-8,"message":"Array must contain between 1 and {max} transactions."}}"#
+                ),
+            )
+                .into_response();
+        }
         for (i, hex) in hexes.iter().enumerate() {
             if !(120..800_000).contains(&hex.len()) {
                 return (

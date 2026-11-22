@@ -918,7 +918,7 @@ paths:
         required: true
         content:
           application/json:
-            schema: { type: array, maxItems: 25, items: { type: string, description: raw tx hex } }
+            schema: { type: array, minItems: 1, maxItems: 25, items: { type: string, description: raw tx hex } }
       responses:
         "200":
           description: One result per transaction

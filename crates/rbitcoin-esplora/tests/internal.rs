@@ -214,6 +214,22 @@ async fn test_package_dry_run(sock: &std::path::Path, pad: &Pad, parent: &Transa
     );
 }
 
+/// `/txs/test` refuses more than 25 transactions, and none.
+async fn test_count_refusals(sock: &std::path::Path, hex: &str) {
+    let too: Vec<&str> = vec![hex; 26];
+    let body = serde_json::to_vec(&too).unwrap();
+    let (st, resp) = http_post_unix(sock, "/txs/test", &body).await;
+    assert_eq!(st, 400, "{resp}");
+    assert!(resp.contains("Exceeded maximum of 25"), "{resp}");
+    // mempool/electrs passes bitcoind's refusal of an empty array through.
+    let (st, resp) = http_post_unix(sock, "/txs/test", b"[]").await;
+    assert_eq!(st, 400, "{resp}");
+    assert_eq!(
+        resp,
+        r#"testmempoolaccept RPC error: {"code":-8,"message":"Array must contain between 1 and 25 transactions."}"#
+    );
+}
+
 /// `/txs/test` dry-runs; `POST /tx` admits. `GET /broadcast` is gone.
 async fn test_then_broadcast(sock: &std::path::Path, pad: &Pad, txs: &[Transaction]) {
     use bitcoin::consensus::encode::serialize_hex;
@@ -240,11 +256,7 @@ async fn test_then_broadcast(sock: &std::path::Path, pad: &Pad, txs: &[Transacti
 
     test_package_dry_run(sock, pad, &txs[0]).await;
 
-    let too: Vec<String> = (0..26).map(|_| hex.clone()).collect();
-    let body = serde_json::to_vec(&too).unwrap();
-    let (st, resp) = http_post_unix(sock, "/txs/test", &body).await;
-    assert_eq!(st, 400, "{resp}");
-    assert!(resp.contains("Exceeded maximum of 25"), "{resp}");
+    test_count_refusals(sock, &hex).await;
 
     let (st, resp) = http_get_unix(sock, &format!("/broadcast?tx={hex}")).await;
     assert_eq!(st, 404, "{resp}");

@@ -8,3 +8,5 @@ Fixed
   up as Core does, `fees` adds `effective-feerate` and
   `effective-includes`, and a package-wide failure such as
   `conflict-in-package` is one row per transaction with `package-error`.
+  An empty array is `400` with bitcoind's `Array must contain between 1
+  and 25 transactions.` error, as mempool/electrs relays it, not `200 []`.
