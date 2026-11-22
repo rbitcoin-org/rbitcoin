@@ -1,14 +1,14 @@
 {
   "new_base": "8e62e4ce4d60c30abc851cb0893e4b80149ac9e4",
-  "new_skip": 3960,
-  "old_index": 11961,
-  "old_name": "crates/rbitcoin-net/src/parent_req.rs:463:40: replace <= with > in ParentTracker::select",
-  "new_cap_used": false,
+  "new_skip": 4160,
+  "old_index": 12339,
+  "old_name": "crates/rbitcoin-node/src/error.rs:31:9: replace <impl fmt::Display for NodeError>::fmt -> fmt::Result with Ok(Default::default())",
+  "new_cap_used": true,
   "run_id": "44998627606",
   "new_len": 12410,
-  "new_remaining": 8450,
+  "new_remaining": 8250,
   "old_len": 26510,
-  "old_remaining": 26510,
-  "completed_new": 0,
-  "completed_old": 0
+  "old_remaining": 26132,
+  "completed_new": 200,
+  "completed_old": 378
 }
