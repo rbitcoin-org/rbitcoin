@@ -1769,8 +1769,8 @@ fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
     );
     let err = hub.admit(&confirmed).unwrap_err();
     assert!(
-        matches!(err, AcceptError::MissingPrevout(_)),
-        "confirmed body must not park as orphan, got {err}"
+        matches!(err, AcceptError::Policy("txn-already-known")),
+        "a confirmed body is txn-already-known, not an orphan, got {err}"
     );
     assert_eq!(hub.orphan_count(), 0);
     assert!(

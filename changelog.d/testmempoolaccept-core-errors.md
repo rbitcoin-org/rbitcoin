@@ -13,6 +13,11 @@ Fixed
   An input repeated inside one member is that member's
   `bad-txns-inputs-duplicate`, not `conflict-in-package`, here and in
   `submitpackage`.
+  A transaction the active chain already holds is `txn-already-known` on
+  every admit: a package member now says so, as a single transaction did,
+  and so do `submitpackage`, P2P, Esplora and Electrum, where it was
+  `missing-inputs` or `bad-txns-inputs-missingorspent`. `sendrawtransaction`
+  of one with every output spent is `-26 txn-already-known`, not `-25`.
   A package member that clashes with a pool tx and also fails
   `CheckTransaction`, such as a repeated input, reports the
   `CheckTransaction` reason, not `bip125-replacement-disallowed`.

@@ -3654,7 +3654,7 @@ fn gettxout_leftover_is_connected_not_unconfirmed() {
 
 /// Core `BroadcastTransaction` returns `-27` when any of the submitted
 /// transaction's own outputs is still a coin. A confirmed transaction whose
-/// outputs are all spent stays a missing-input reject.
+/// outputs are all spent is `txn-already-known`, as `testmempoolaccept` says.
 #[test]
 fn sendrawtransaction_confirmed_output_is_already_in_utxo_set() {
     let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
@@ -3739,23 +3739,20 @@ fn sendrawtransaction_confirmed_output_is_already_in_utxo_set() {
     .unwrap();
     dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     let spent = dispatch(&ctx, "sendrawtransaction", vec![json!(hex.clone())]).unwrap_err();
-    assert_eq!(spent["code"], ERR_VERIFY_ERROR, "{spent}");
-    assert_eq!(
-        spent["message"], "bad-txns-inputs-missingorspent",
-        "{spent}"
-    );
+    assert_eq!(spent["code"], ERR_VERIFY_REJECTED, "{spent}");
+    assert_eq!(spent["message"], "txn-already-known", "{spent}");
     // The parent output is spent, but the tx index still has its value.
-    // Core fee-checks only after the inputs resolve, so this stays
-    // the missing-input error rather than the max-fee error.
+    // The fee is checked only after the inputs resolve, so this stays
+    // txn-already-known rather than the max-fee error.
     let spent_capped = dispatch(
         &ctx,
         "sendrawtransaction",
         vec![json!(hex), json!("0.00000001")],
     )
     .unwrap_err();
-    assert_eq!(spent_capped["code"], ERR_VERIFY_ERROR, "{spent_capped}");
+    assert_eq!(spent_capped["code"], ERR_VERIFY_REJECTED, "{spent_capped}");
     assert_eq!(
-        spent_capped["message"], "bad-txns-inputs-missingorspent",
+        spent_capped["message"], "txn-already-known",
         "{spent_capped}"
     );
 
@@ -3810,8 +3807,8 @@ fn sendrawtransaction_confirmed_output_is_already_in_utxo_set() {
         "{archived_fee}"
     );
 
-    // OP_RETURN was never a coin. Once the spendable output is spent, the
-    // resubmit is the missing-input error. Treating the OP_RETURN as unspent is -27.
+    // OP_RETURN was never a coin, so it does not make the resubmit -27. Once
+    // the spendable output is spent, the resubmit is txn-already-known.
     let parent_sat = generated_coinbase_value(&ctx, 5) - 1_000;
     let (_, mut parent) =
         spend_generated_coinbase(&ctx, 5, parent_sat, ScriptBuf::from_bytes(vec![0x51]));
@@ -3833,9 +3830,9 @@ fn sendrawtransaction_confirmed_output_is_already_in_utxo_set() {
     .unwrap();
     dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     let parent_again = dispatch(&ctx, "sendrawtransaction", vec![json!(parent_hex)]).unwrap_err();
-    assert_eq!(parent_again["code"], ERR_VERIFY_ERROR, "{parent_again}");
+    assert_eq!(parent_again["code"], ERR_VERIFY_REJECTED, "{parent_again}");
     assert_eq!(
-        parent_again["message"], "bad-txns-inputs-missingorspent",
+        parent_again["message"], "txn-already-known",
         "{parent_again}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -10112,6 +10109,49 @@ mod decode;
 mod logging;
 mod mempool;
 mod submit_spent_race;
+
+/// A tx the active chain holds is `txn-already-known`, as a package member
+/// and alone. A spent output does not end it, nor do all of them. Every
+/// admit asks it, so `submitpackage` says so too.
+#[test]
+fn testmempoolaccept_package_member_already_known() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let (_, mut tx) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk.clone());
+    let half = tx.output[0].value / 2;
+    tx.output[0].value -= half;
+    tx.output.push(bitcoin::TxOut {
+        value: half,
+        script_pubkey: spk,
+    });
+    for sent in [&tx, &child_of(&tx, 1_000)] {
+        dispatch(&ctx, "sendrawtransaction", vec![json!(hex(sent))]).unwrap();
+    }
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let mut child = child_of(&tx, 1_000);
+    child.input[0].previous_output.vout = 1;
+    child.output[0].value = half - Amount::from_sat(1_000);
+    let params = vec![json!([hex(&tx), hex(&child)])];
+    let rows = dispatch(&ctx, "testmempoolaccept", params.clone()).unwrap();
+    assert_eq!(rows[0]["reject-reason"], "txn-already-known", "{rows}");
+    let sub = dispatch(&ctx, "submitpackage", params).unwrap();
+    let parent = &sub["tx-results"][tx.compute_wtxid().to_string()];
+    assert_eq!(parent["error"], "txn-already-known", "{sub}");
+    // Mined with every output spent, the chain still holds it.
+    assert!(
+        ctx.mempool
+            .as_ref()
+            .unwrap()
+            .contains(&child.compute_txid()),
+        "{sub}"
+    );
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let alone = dispatch(&ctx, "testmempoolaccept", vec![json!([hex(&tx)])]).unwrap();
+    assert_eq!(alone[0]["reject-reason"], "txn-already-known", "{alone}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
 /// A member over `maxfeerate` is rejected, so a later member may not spend
 /// it: the child is `missing-inputs`, not allowed beside a parent that is

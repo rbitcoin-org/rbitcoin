@@ -2473,21 +2473,11 @@ pub async fn post_txs_test(
                 }
             }
         }
-        let rows = match rbitcoin_net::with_store_budget(
+        let rows = rbitcoin_net::with_store_budget(
             st.query.api_read_budget(),
             mp.test_accept_rows_async(decoded, max_sat_kvb),
         )
-        .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("query failed: {e}"),
-                )
-                    .into_response();
-            }
-        };
+        .await;
         json_reply_here(rows.iter().map(test_accept_row_json).collect::<Vec<_>>())
     }
 }

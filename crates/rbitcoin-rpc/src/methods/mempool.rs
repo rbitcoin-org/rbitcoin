@@ -1226,14 +1226,8 @@ fn decode_rawtxs(arr: &[Value]) -> Result<Vec<Transaction>, Value> {
         .collect()
 }
 
-fn test_accept_json(
-    rows: Result<Vec<TestAcceptRow>, rbitcoin_query::QueryError>,
-) -> Result<Value, Value> {
-    let rows = rows.map_err(|e| rpc_error(ERR_MISC, format!("query failed: {e}")))?;
-    Ok(json!(rows
-        .iter()
-        .map(test_accept_row_json)
-        .collect::<Vec<_>>()))
+fn test_accept_json(rows: Vec<TestAcceptRow>) -> Value {
+    json!(rows.iter().map(test_accept_row_json).collect::<Vec<_>>())
 }
 
 fn test_accept_row_json(row: &TestAcceptRow) -> Value {
@@ -1284,7 +1278,9 @@ pub async fn testmempoolaccept_async(
         .clone()
         .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     let decoded = decode_rawtxs(arr)?;
-    test_accept_json(mp.test_accept_rows_async(decoded, max_feerate).await)
+    Ok(test_accept_json(
+        mp.test_accept_rows_async(decoded, max_feerate).await,
+    ))
 }
 
 /// Confirmed-strong create on the active chain, if this txid has one.

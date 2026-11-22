@@ -2938,8 +2938,7 @@ async fn testmempoolaccept_async(
         budget,
         mp.test_accept_rows_async(txs, DEFAULT_MAX_RAW_TX_FEE_SAT_KVB),
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await;
     Ok(json!(rows
         .iter()
         .map(test_accept_row_json)

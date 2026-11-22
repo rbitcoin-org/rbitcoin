@@ -4,11 +4,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid, Wtxid};
 use rbitcoin_consensus::policy::fee_exceeds_max;
 use rbitcoin_mempool::{ActiveMempool, TestedMembers, MAX_PACKAGE_WEIGHT};
-use rbitcoin_query::{Query, QueryError};
 
 use crate::{AcceptError, AcceptResult, MempoolHub};
 
@@ -179,13 +177,6 @@ fn accept_reject_details(e: &impl std::fmt::Display, tx: &Transaction) -> Option
     ))
 }
 
-fn confirmed_on_active_chain(query: &Query, tx: &Transaction) -> Result<bool, QueryError> {
-    let Some(fk) = query.tx_fk_by_txid_tip(&tx.compute_txid().to_byte_array())? else {
-        return Ok(false);
-    };
-    query.store().is_confirmed_strong(fk)
-}
-
 fn package_error(txs: &[Transaction], msg: &'static str) -> Vec<TestAcceptRow> {
     txs.iter()
         .map(|tx| TestAcceptRow::of(tx, TestAcceptVerdict::PackageError(msg)))
@@ -225,39 +216,30 @@ impl MempoolHub {
         self: &Arc<Self>,
         txs: Vec<Transaction>,
         max_feerate_sat_kvb: u64,
-    ) -> Result<Vec<TestAcceptRow>, QueryError> {
+    ) -> Vec<TestAcceptRow> {
         let hub = Arc::clone(self);
         let txs_c = txs.clone();
         if let Some(rows) = crate::reactor::off_pool(move || hub.test_accept_precheck(&txs_c)).await
         {
-            return Ok(rows);
+            return rows;
         }
         if txs.len() >= 2 {
-            return Ok(self
+            return self
                 .test_accept_package_rows_async(txs, max_feerate_sat_kvb)
-                .await);
+                .await;
         }
-        let mut out = Vec::with_capacity(txs.len());
-        for tx in txs {
-            let query = Arc::clone(&self.query);
-            let tx_c = tx.clone();
-            let known =
-                crate::reactor::off_pool_budgeted(move || confirmed_on_active_chain(&query, &tx_c))
-                    .await?;
-            if known {
-                out.push(TestAcceptRow::rejected(&tx, "txn-already-known"));
-                continue;
-            }
-            if submit_tx_version_nonstandard(&tx) {
-                out.push(TestAcceptRow::rejected(&tx, "version"));
-                continue;
-            }
-            out.push(match self.test_accept_async(tx.clone(), None).await {
+        let Some(tx) = txs.into_iter().next() else {
+            return Vec::new();
+        };
+        let row = if submit_tx_version_nonstandard(&tx) {
+            TestAcceptRow::rejected(&tx, "version")
+        } else {
+            match self.test_accept_async(tx.clone(), None).await {
                 Ok(r) => TestAcceptRow::admitted(&tx, &r, max_feerate_sat_kvb),
                 Err(e) => TestAcceptRow::refused(&tx, &e),
-            });
-        }
-        Ok(out)
+            }
+        };
+        vec![row]
     }
 
     async fn test_accept_package_rows_async(

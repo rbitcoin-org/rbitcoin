@@ -493,6 +493,17 @@ pub fn fee_and_adjusted_weight(
     ))
 }
 
+/// `txn-already-known`: the active chain holds this txid, its outputs spent
+/// or not. Only a tx the chain does not hold reads
+/// [`ChainPrevout::Unknown`], so output 0 answers for all of them. Asked
+/// only once an input is spent on chain, so an orphan costs no read.
+fn chain_holds_tx(txid: Txid, utxos: &impl UtxoProvider) -> bool {
+    !matches!(
+        utxos.chain_prevout(&OutPoint::new(txid, 0)),
+        ChainPrevout::Unknown
+    )
+}
+
 #[doc(hidden)]
 pub fn first_missing_outpoint(
     tx: &Transaction,
@@ -1506,6 +1517,9 @@ impl ActiveMempool {
             } else {
                 match utxos.chain_prevout(&op) {
                     ChainPrevout::Unspent(coin) => (coin.txout.clone(), Some(coin)),
+                    ChainPrevout::KnownUnavailable if chain_holds_tx(txid, utxos) => {
+                        return Err(AcceptError::Policy("txn-already-known"));
+                    }
                     ChainPrevout::KnownUnavailable => {
                         return Err(AcceptError::MissingPrevout(op));
                     }
