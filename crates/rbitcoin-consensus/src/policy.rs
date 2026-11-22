@@ -62,6 +62,9 @@ pub fn vbytes_ceil(weight: u64) -> u64 {
     Weight::from_wu(weight).to_vbytes_ceil()
 }
 
+/// Default submit cap: Core 0.10 BTC/kvB, in sat/kvB. `0` is unlimited.
+pub const DEFAULT_MAX_RAW_TX_FEE_SAT_KVB: u64 = 10_000_000;
+
 /// Core `CFeeRate::GetFee` cap (`sendrawtransaction`, `testmempoolaccept`).
 /// Zero `max_sat_kvb` is unlimited. Otherwise the fee is over
 /// `max_sat_kvb * vbytes_ceil(weight) / 1000`, rounded up to a whole sat.
