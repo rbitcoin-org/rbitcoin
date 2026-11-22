@@ -179,6 +179,41 @@ async fn maxfeerate_query_cases(sock: &std::path::Path, body: &[u8]) {
     assert_eq!(arr[0]["allowed"], true, "{resp}");
 }
 
+/// Two or more `/txs/test` items are one package: a child sees its parent,
+/// and a conflict fails the whole request.
+async fn test_package_dry_run(sock: &std::path::Path, pad: &Pad, parent: &Transaction) {
+    use bitcoin::consensus::encode::serialize_hex;
+
+    let hex = serialize_hex(parent);
+    let spk = parent.output[0].script_pubkey.clone();
+    let child = spend_true(parent.compute_txid(), 2_000, spk.clone());
+    let body = serde_json::to_vec(&json!([&hex, serialize_hex(&child)])).unwrap();
+    let (st, resp) = http_post_unix(sock, "/txs/test", &body).await;
+    assert_eq!(st, 200, "{resp}");
+    let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    assert_eq!(arr.len(), 2, "{resp}");
+    assert!(
+        arr.iter().all(|row| row["allowed"] == true),
+        "a child sees its parent from the same call: {resp}"
+    );
+    assert_eq!(arr[1]["txid"], child.compute_txid().to_string(), "{resp}");
+    assert!(
+        !pad.hub.contains(&parent.compute_txid()) && !pad.hub.contains(&child.compute_txid()),
+        "a package test must not admit"
+    );
+    let rival = spend_true(pad.cbs[0], 3_000, spk);
+    let body = serde_json::to_vec(&json!([&hex, serialize_hex(&rival)])).unwrap();
+    let (st, resp) = http_post_unix(sock, "/txs/test", &body).await;
+    assert_eq!(st, 200, "{resp}");
+    let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    assert!(
+        arr.iter().all(
+            |row| row["package-error"] == "conflict-in-package" && row.get("allowed").is_none()
+        ),
+        "{resp}"
+    );
+}
+
 /// `/txs/test` dry-runs; `POST /tx` admits. `GET /broadcast` is gone.
 async fn test_then_broadcast(sock: &std::path::Path, pad: &Pad, txs: &[Transaction]) {
     use bitcoin::consensus::encode::serialize_hex;
@@ -202,6 +237,9 @@ async fn test_then_broadcast(sock: &std::path::Path, pad: &Pad, txs: &[Transacti
     let (st, resp) = http_post_unix(sock, "/txs/test", &edge_body).await;
     assert_eq!(st, 200, "{resp}");
     assert!(resp.contains("package-contains-duplicates"), "{resp}");
+
+    test_package_dry_run(sock, pad, &txs[0]).await;
+
     let too: Vec<String> = (0..26).map(|_| hex.clone()).collect();
     let body = serde_json::to_vec(&too).unwrap();
     let (st, resp) = http_post_unix(sock, "/txs/test", &body).await;

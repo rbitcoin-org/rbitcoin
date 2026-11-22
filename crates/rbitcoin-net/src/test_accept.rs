@@ -1,5 +1,5 @@
 //! `testmempoolaccept`: one row per submitted transaction, in submission
-//! order. JSON-RPC and Electrum render the same rows.
+//! order. JSON-RPC, Electrum, and Esplora render the same rows.
 
 use std::collections::HashSet;
 use std::sync::Arc;
