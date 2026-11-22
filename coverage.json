@@ -1,15 +1,15 @@
 {
   "schemaVersion": 1,
   "label": "coverage",
-  "message": "92.62%",
+  "message": "92.66%",
   "color": "brightgreen",
-  "pct": 92.62,
-  "lh": 124462,
-  "lf": 134372,
+  "pct": 92.66,
+  "lh": 124649,
+  "lf": 134519,
   "gate": 91,
   "scope": "production",
-  "sha": "b25341e65460",
-  "date": "2026-11-21",
+  "sha": "e0b2c688487b",
+  "date": "2026-11-22",
   "crates": [
     {
       "name": "rbitcoin-cli",
@@ -19,15 +19,15 @@
     },
     {
       "name": "rbitcoin-consensus",
-      "lh": 6812,
+      "lh": 6815,
       "lf": 7014,
-      "pct": 97.12
+      "pct": 97.16
     },
     {
       "name": "rbitcoin-electrum",
-      "lh": 3344,
-      "lf": 3599,
-      "pct": 92.91
+      "lh": 3341,
+      "lf": 3597,
+      "pct": 92.88
     },
     {
       "name": "rbitcoin-esplora",
@@ -37,9 +37,9 @@
     },
     {
       "name": "rbitcoin-ibd",
-      "lh": 14234,
+      "lh": 14237,
       "lf": 15128,
-      "pct": 94.09
+      "pct": 94.11
     },
     {
       "name": "rbitcoin-log",
@@ -49,21 +49,21 @@
     },
     {
       "name": "rbitcoin-mempool",
-      "lh": 5246,
-      "lf": 5468,
-      "pct": 95.94
+      "lh": 5283,
+      "lf": 5504,
+      "pct": 95.98
     },
     {
       "name": "rbitcoin-net",
-      "lh": 26713,
-      "lf": 28532,
-      "pct": 93.62
+      "lh": 26874,
+      "lf": 28687,
+      "pct": 93.68
     },
     {
       "name": "rbitcoin-node",
-      "lh": 5295,
-      "lf": 6218,
-      "pct": 85.16
+      "lh": 5318,
+      "lf": 6219,
+      "pct": 85.51
     },
     {
       "name": "rbitcoin-primitives",
@@ -73,21 +73,21 @@
     },
     {
       "name": "rbitcoin-query",
-      "lh": 17738,
+      "lh": 17737,
       "lf": 19262,
-      "pct": 92.09
+      "pct": 92.08
     },
     {
       "name": "rbitcoin-rpc",
-      "lh": 8342,
-      "lf": 8896,
-      "pct": 93.77
+      "lh": 8340,
+      "lf": 8893,
+      "pct": 93.78
     },
     {
       "name": "rbitcoin-store",
-      "lh": 29803,
-      "lf": 32683,
-      "pct": 91.19
+      "lh": 29769,
+      "lf": 32643,
+      "pct": 91.2
     },
     {
       "name": "rbitcoin-sv2",
