@@ -114,18 +114,11 @@ pub fn parse_operator_flags(args: &[OsString]) -> Result<OperatorFlagEnd, ExitCo
                 hot_digest = true;
                 i += 1;
             }
-            "--assumehot-from" => match take_arg(args, &mut i, "--assumehot-from") {
-                Ok(v) => assumehot_from = Some(PathBuf::from(v)),
-                Err(c) => return Err(c),
-            },
-            "--assumehot" => match take_arg(args, &mut i, "--assumehot") {
-                Ok(v) => assumehot = Some(v),
-                Err(c) => return Err(c),
-            },
-            "--conf" => match take_arg(args, &mut i, "--conf") {
-                Ok(v) => conf_path = Some(PathBuf::from(v)),
-                Err(c) => return Err(c),
-            },
+            "--assumehot-from" => {
+                assumehot_from = Some(PathBuf::from(take_arg(args, &mut i, "--assumehot-from")?));
+            }
+            "--assumehot" => assumehot = Some(take_arg(args, &mut i, "--assumehot")?),
+            "--conf" => conf_path = Some(PathBuf::from(take_arg(args, &mut i, "--conf")?)),
             other if other.starts_with("--conf=") => {
                 let v = &other["--conf=".len()..];
                 if v.is_empty() {
@@ -135,25 +128,18 @@ pub fn parse_operator_flags(args: &[OsString]) -> Result<OperatorFlagEnd, ExitCo
                 conf_path = Some(PathBuf::from(v));
                 i += 1;
             }
-            "--log-level" => match take_arg(args, &mut i, "--log-level") {
-                Ok(raw) => match parse_log_level(&raw) {
-                    Ok(v) => log_level_cli = Some(v),
-                    Err(c) => return Err(c),
-                },
-                Err(c) => return Err(c),
-            },
+            "--log-level" => {
+                log_level_cli = Some(parse_log_level(&take_arg(args, &mut i, "--log-level")?)?);
+            }
             other if other.starts_with("--log-level=") => {
-                match parse_log_level(&other["--log-level=".len()..]) {
-                    Ok(v) => log_level_cli = Some(v),
-                    Err(c) => return Err(c),
-                }
+                log_level_cli = Some(parse_log_level(&other["--log-level=".len()..])?);
                 i += 1;
             }
-            other => match parse_cli_flag(args, &mut i, other) {
-                Ok(Some(kv)) => kvs.push(kv),
-                Ok(None) => {}
-                Err(c) => return Err(c),
-            },
+            other => {
+                if let Some(kv) = parse_cli_flag(args, &mut i, other)? {
+                    kvs.push(kv);
+                }
+            }
         }
     }
     Ok(OperatorFlagEnd::Flags(ParsedOperatorFlags {
