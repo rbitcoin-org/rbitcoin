@@ -125,7 +125,7 @@ pub fn accept_and_connect_block_preverified(
     }
     // Write skipped heights ≤ tip (idempotent race). A body we just ran
     // through lookup/load must have a header — missing is an invariant, not
-    // a soft NotFound (inflated confirmed[] used to hit this on tip+1).
+    // a soft NotFound.
     query
         .get_header_by_hash(&hash)
         .map_err(ConfirmError::from)?

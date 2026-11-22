@@ -41,9 +41,9 @@ impl Slot {
 
 /// Process-local Class A body presence cache.
 ///
-/// Assign/status used to call `is_archived` (store) for every ordered hash every
-/// loop — that contended with the archive writer and delayed getdata top-up
-/// (spiky receive). Probe each hash at most once until archive marks it ready.
+/// Assign/status must not call `is_archived` (store) for every ordered hash
+/// every loop: that contends with the archive writer and delays getdata
+/// top-up. Probe each hash at most once until archive marks it ready.
 ///
 /// `pending` covers the wire→confirm gap: we clear getdata inflight on body
 /// receipt, but must not re-request until confirm advances tip (or re-get after

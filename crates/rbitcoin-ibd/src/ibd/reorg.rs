@@ -344,10 +344,9 @@ pub fn connecting_hashes_heavier_disconnected_n(
             }
         }
     }
-    // Join must be a connected LCA. `!has_block(join)` used to return Some
-    // here so a mid-path hole still densified — but a capped walk from a far
-    // *linear* header horizon also lands on a header-only mid. That is early
-    // IBD, not a competing fork. Fork-start uses `is_connected`, not `has_block`.
+    // Join must be a connected LCA. A capped walk from a far *linear* header
+    // horizon lands on a header-only mid. That is early IBD, not a competing
+    // fork, so fork-start uses `is_connected`, not `has_block`.
     if !hub.is_connected(&join) && join.to_byte_array() != [0u8; 32] {
         return Ok(None);
     }

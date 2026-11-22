@@ -1,0 +1,21 @@
+id: comment-history
+language: rust
+severity: error
+message: State the rule the code keeps. What the code used to do belongs in the commit message (CONTRIBUTING.md principle 7).
+note: A purpose clause is written "is used to" or starts a sentence with "Used to". Comments in *tests*.rs and tests/ are not scanned.
+rule:
+  all:
+    - any:
+        - kind: line_comment
+        - kind: block_comment
+    - any:
+        - regex: "(?i)\\bnot a session result\\b"
+        - all:
+            - regex: "(?i)\\bused to\\b"
+            - not:
+                regex: "(?i)(\\b(is|are|was|were|be|been|being|not|only|also)\\s+used to\\b|([.!?:;(]\\s+|^/[/*]+!?\\s*)used to\\b)"
+ignores:
+  - "**/*tests*.rs"
+  - "**/tests/**"
+  - "**/benches/**"
+  - "crates/rbitcoin-bench/**"

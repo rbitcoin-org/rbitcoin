@@ -192,7 +192,9 @@ engineering.
    library or workaround constraint that would otherwise look like a bug)
    still requires it. Crate and public-item rustdoc (`//!` / `///`) that
    documents a surface, not a walkthrough of the next line, is not this
-   rule.
+   rule. A comment states the rule the code keeps, not what the code used
+   to do. That history is the commit message. The `comment-history` rule in
+   `./scripts/ast-grep.sh` fails `qc` on it.
 8. **Tests assert behavior, not the repo.** Default-suite tests drive a
    **shipped** function or scenario and assert an **observable** result
    (return, store after reopen, peer/RPC/log line). Do not `include_str!`

@@ -420,9 +420,9 @@ impl ScriptHashTable {
     /// A free that fails after the head sync stays queued. The retry frees
     /// only the pages that are still on the list.
     pub fn commit_deferred_empty_heads(&self) -> Result<(), StoreError> {
-        // One free error used to stop the loop and sit at the end, so the
-        // next pop retried it before any key that had not been tried. Drain
-        // the jobs already queued. Failures go back after that pass.
+        // Drain the jobs already queued. A failed free goes back after
+        // that pass, so the next pop cannot retry it ahead of a key that
+        // has not been tried.
         let mut failed = Vec::new();
         let mut first_err = None;
         loop {

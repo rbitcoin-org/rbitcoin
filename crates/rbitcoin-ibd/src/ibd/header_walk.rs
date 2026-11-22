@@ -602,7 +602,7 @@ pub fn header_status_view(st: &IbdWorkState, hub: &ChainHub) -> HeaderStatusView
 
 /// Debug stand-in for the status thread's header line. The thread keeps
 /// `saw_quiet` and emits the caught-up line itself.
-// Debug status line only. `announced_done` is not a session result.
+// Debug status line only.
 #[cfg(debug_assertions)]
 #[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn log_status(st: &mut IbdWorkState, hub: &ChainHub, horizon: u32) {

@@ -286,7 +286,7 @@ fn above_eta_floor(rate: f64) -> bool {
 pub struct TipRateTracker {
     /// EWMA of tip advance rate (blocks/s).
     pub rate_ema: Option<f64>,
-    /// Previous sample used to form the next instantaneous interval rate.
+    /// Previous sample. The next instantaneous interval rate is measured from it.
     pub last: Option<(Instant, u32)>,
     /// First sample time (gate ETA until we have a few ticks of history).
     pub first_at: Option<Instant>,

@@ -1,4 +1,4 @@
-//! Rule decisions the confirm pipeline used to construct inline.
+//! Rule decisions for the confirm pipeline.
 //!
 //! Query loads rows and then calls these. A missing store row stays a store
 //! error in the caller. The `if` that chooses the reject lives here.

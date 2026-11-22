@@ -157,8 +157,7 @@ struct HeavyJson(Arc<Value>);
 /// Encode on this thread when the body is under 4 KiB. A heavier body waits
 /// for [`ensure_json`] so a blocking-pool thread is not held across the encode.
 ///
-/// Callers pass the same values `Json` used to take: a [`Value`], a list, or
-/// a string.
+/// Callers pass what `Json` takes: a [`Value`], a list, or a string.
 #[doc(hidden)]
 pub fn json_reply_here(v: impl Serialize) -> Response {
     let v = match serde_json::to_value(v) {

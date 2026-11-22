@@ -975,8 +975,8 @@ pub async fn ibd_cancellable(
                 break;
             }
 
-            // Soft-cap `ordered_set` (not deque ghosts). Bypass only when the path is dense
-            // (sparse far-ready used to look empty forever → header flood / drain livelock).
+            // Soft-cap `ordered_set` (not deque ghosts). Bypass only when the path is dense:
+            // a sparse far-ready path that looked empty would flood headers and livelock drain.
             // Full-batch continuation still fires from apply_peer_event; this is the poll.
             let path_empty = header_path_empty(st.ordered.is_empty(), st.headers_done);
             // A block inv is not a queue-depth event. Ask on this turn, not

@@ -4,7 +4,8 @@
 # mem::forget/Box::leak, dropped thread::spawn, dropped crate-root pub,
 # direct TcpListener::bind, direct sync_all / sync_data as a method or a
 # path call, a flush-skip setter named outside skip_flushes_before_main!,
-# that macro outside a tests/suite.rs).
+# that macro outside a tests/suite.rs, a comment that tells what the code
+# used to do).
 # Does not scan crates/.
 # Missing binary: fail in CI, skip locally.
 set -euo pipefail
@@ -84,6 +85,11 @@ assert_ok "bad fixtures report skip-flushes-macro" \
   grep -q 'skip-flushes-macro' <<<"$bad_json"
 assert_ok "bad fixtures include path and bare skip_flushes_before_main!" \
   python3 -c 'import json,sys; d=json.load(sys.stdin); assert {e["text"] for e in d if e["ruleId"]=="skip-flushes-macro"} == {"rbitcoin_store::skip_flushes_before_main!()", "skip_flushes_before_main!()"}' <<<"$bad_json"
+
+assert_ok "bad fixtures report comment-history" \
+  grep -q 'comment-history' <<<"$bad_json"
+assert_ok "bad fixtures include history in a line, doc, and block comment" \
+  python3 -c 'import json,sys; d=json.load(sys.stdin); assert sorted(e["range"]["start"]["line"]+1 for e in d if e["ruleId"]=="comment-history") == [1, 4, 7]' <<<"$bad_json"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "ast-grep.test.sh: $PASS passed, $FAIL failed"

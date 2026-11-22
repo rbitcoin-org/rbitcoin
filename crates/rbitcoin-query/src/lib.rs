@@ -1383,8 +1383,8 @@ impl Query {
         self.prune_seqsigwit.store(on, AtomicOrdering::Release);
         if on {
             if self.pruneheight().is_none() {
-                // Record the real watermark before the stem cut. A crash
-                // in between used to reopen as "nothing dropped" with the
+                // Record the real watermark before the stem cut, so a crash
+                // in between cannot reopen as "nothing dropped" with the
                 // witnesses already gone. Tip below 288 still drops nothing.
                 // A tweak hold leaves the sidecar unset on purpose and keeps
                 // the window file. Writing the predicted height here unlinks
@@ -3579,8 +3579,8 @@ impl Query {
     /// per call was O(depth²) on long header bands (each path step re-walked the
     /// remaining chain).
     ///
-    /// Gray (`on_stack`) nodes are not re-pushed: a `prev_fk` cycle used to spin
-    /// the IBD thread after `resume seed walk start` with no further log.
+    /// Gray (`on_stack`) nodes are not re-pushed, so a `prev_fk` cycle ends
+    /// the walk instead of spinning the IBD thread.
     pub fn resume_subtree_score(
         index: &ResumeHeaderIndex,
         root: Fk,

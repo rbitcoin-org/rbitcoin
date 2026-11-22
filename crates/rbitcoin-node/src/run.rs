@@ -2577,9 +2577,8 @@ pub async fn run_ibd_or_skip(
         ibd_cfg.per_peer
     );
     // Cooperative cancel only: IBD polls `shutdown.flag` and exits its own
-    // teardown path. Do **not** `select!`+drop the IBD future on SIGINT —
-    // that used to drop a nested multi-thread runtime mid-async and panic
-    // (`Cannot drop a runtime in an async context`), making Ctrl+C slow/noisy.
+    // teardown path. Do **not** `select!`+drop the IBD future on SIGINT:
+    // a dropped future skips that teardown.
     let cancel = Some(Arc::clone(&shutdown.flag));
     let catch_up = match rbitcoin_ibd::sync_cancellable(node, &targets, ibd_cfg, cancel).await {
         Ok(n) => {

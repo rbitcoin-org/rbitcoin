@@ -1,9 +1,9 @@
 //! Wall-clock cadence for IBD main-loop housekeeping.
 //!
-//! Peer frames (and the idle 50 ms keepalive) used to run **assign**,
-//! peer-slow, work-path hygiene, and `getheaders` locator walks on every
-//! turn. During IBD that is event-rate, not 20 Hz — densify scans and
-//! `locator_hashes` store IO competed with confirm.
+//! **Assign**, peer-slow, work-path hygiene, and `getheaders` locator walks
+//! do not run on every peer frame or idle 50 ms keepalive. During IBD that
+//! is event-rate, not 20 Hz, and densify scans and `locator_hashes` store
+//! IO would compete with confirm.
 //!
 //! Drain / confirm-offer stay event-driven. Housekeeping below is “good
 //! enough” at these periods.

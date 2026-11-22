@@ -87,7 +87,7 @@ pub fn ordered_live_has_header_room(live: usize, need_ready_headroom: bool) -> b
     live < MAX_ORDERED_HEADERS && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
 }
 
-// Perf meter only. `drain_events` is not a session result; the drain returns `Ok(true)` either way.
+// Perf meter only. The drain returns `Ok(true)` either way.
 #[cfg_attr(feature = "mutants", mutants::skip)]
 fn count_drain_event(events: &mut u64) {
     *events += 1;

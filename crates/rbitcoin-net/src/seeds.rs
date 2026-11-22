@@ -1,7 +1,7 @@
 //! Fixed seeds, DNS seed names, and the process peer book ([`AddrMan`]).
 //!
-//! Each remembered address carries a **byte of informational flags** used to
-//! rank dial candidates: prefer untried / known-good / fast peers; only fall
+//! Each remembered address carries a **byte of informational flags** that
+//! ranks dial candidates: prefer untried / known-good / fast peers; only fall
 //! back to incompatible or recently-failed hosts when the good set is empty.
 //!
 //! The book can be **persisted** under the datadir (`peers` file) so discovered
@@ -547,7 +547,7 @@ impl AddrMan {
             }
         }
         let mut out = ip;
-        // A full clearnet batch used to return before any onion or I2P row.
+        // A full clearnet batch must not crowd out every onion or I2P row.
         // Keep one slot for the best eligible overlay. A one-peer batch keeps
         // it only while no overlay outbound is live. An overlay that was only
         // kept as a fallback (every row attempted inside the recent window)
