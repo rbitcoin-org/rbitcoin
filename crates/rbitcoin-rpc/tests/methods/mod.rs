@@ -5077,9 +5077,41 @@ fn testmempoolaccept_tells_a_witness_swap_from_a_duplicate() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core adds a member's inputs as a batch, so an input repeated inside one
+/// tx is that row's `bad-txns-inputs-duplicate`, not `conflict-in-package`
+/// (Core `IsConsistentPackage`). `submitpackage` reports it before the
+/// doubled input sum can trip `maxfeerate`.
+#[test]
+fn testmempoolaccept_package_reports_a_repeated_input_on_its_row() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let (_, mut dup) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk.clone());
+    dup.input.push(dup.input[0].clone());
+    let child = child_of(&dup, 1_000);
+    let hexes: Vec<String> = [&dup, &child]
+        .iter()
+        .map(|tx| rbitcoin_primitives::hex_encode(serialize(*tx)))
+        .collect();
+    let rows = dispatch(&ctx, "testmempoolaccept", vec![json!(hexes)]).unwrap();
+    assert!(rows[0].get("package-error").is_none(), "{rows}");
+    assert_eq!(
+        rows[0]["reject-reason"], "bad-txns-inputs-duplicate",
+        "{rows}"
+    );
+    let sub = dispatch(&ctx, "submitpackage", vec![json!(hexes)]).unwrap();
+    let dup_wtxid = dup.compute_wtxid().to_string();
+    assert_eq!(
+        sub["tx-results"][&dup_wtxid]["error"], "bad-txns-inputs-duplicate",
+        "{sub}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A package dry run may not replace a pool tx, and says so with Core's
-/// `reject-details`. The refusal comes before any input resolves, so an
-/// input already spent on chain does not win.
+/// `reject-details`. The refusal comes after `CheckTransaction`, so a
+/// repeated input wins, and before any input resolves, so an input already
+/// spent on chain does not.
 #[test]
 fn testmempoolaccept_package_conflict_follows_check_transaction() {
     use bitcoin::consensus::encode::serialize;
@@ -5095,10 +5127,16 @@ fn testmempoolaccept_package_conflict_follows_check_transaction() {
     let (_, other) = spend_generated_coinbase(&ctx, 3, keep, spk);
     let mut clash = pooled.clone();
     clash.output[0].value -= Amount::from_sat(1_000);
+    let mut repeated = clash.clone();
+    repeated.input.push(clash.input[0].clone());
     let mut late = clash.clone();
     late.input.insert(0, mined.input[0].clone());
     let disallowed = "bip125-replacement-disallowed";
-    for (member, reason) in [(&clash, disallowed), (&late, disallowed)] {
+    for (member, reason) in [
+        (&clash, disallowed),
+        (&repeated, "bad-txns-inputs-duplicate"),
+        (&late, disallowed),
+    ] {
         let hexes = json!([hex(member), hex(&other)]);
         let rows = dispatch(&ctx, "testmempoolaccept", vec![hexes]).unwrap();
         assert_eq!(rows[0]["reject-reason"], reason, "{rows}");

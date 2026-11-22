@@ -111,8 +111,8 @@ pub use peers::{
 pub use perf_meter::RequestMeter;
 pub use rbitcoin_mempool::MempoolGraphStats;
 pub use rbitcoin_mempool::{
-    AcceptError, AcceptResult, CoreDatTx, CoreMempoolDat, Removal, RemovalReason, RemovedRow,
-    RemovedRows, SelectBudget, Selected, UtxoProvider,
+    check_transaction, AcceptError, AcceptResult, CoreDatTx, CoreMempoolDat, Removal,
+    RemovalReason, RemovedRow, RemovedRows, SelectBudget, Selected, UtxoProvider,
 };
 pub use reactor::{
     acquire_armed_store_budget, finish_join, hold_store_permit, is_join_error, off_pool,

@@ -1942,6 +1942,8 @@ fn submitpackage_plan(
     // Core tries each member alone in package order, so a member that
     // spends a refused one (directly or through another) is missing inputs,
     // not over the cap.
+    // Core runs `CheckTransaction` before the cap, so a member that fails
+    // it is evaluated and reports that error.
     let mut eval_txs = Vec::new();
     let mut over_max = Vec::new();
     let mut refused = std::collections::HashSet::new();
@@ -1952,7 +1954,9 @@ fn submitpackage_plan(
             .any(|i| refused.contains(&i.previous_output.txid));
         if spends_refused {
             refused.insert(tx.compute_txid());
-        } else if package_tx_fee_exceeds_max(ctx, mp, &tx, txs, max_feerate) {
+        } else if rbitcoin_net::check_transaction(&tx, false).is_ok()
+            && package_tx_fee_exceeds_max(ctx, mp, &tx, txs, max_feerate)
+        {
             refused.insert(tx.compute_txid());
             over_max.push(tx);
             continue;

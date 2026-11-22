@@ -357,6 +357,27 @@ fn kept_trust_structural(
     }
 }
 
+/// Core `CheckTransaction`: the shape and output values, then repeated
+/// inputs before any value sum (Finding 011: phantom fee), then null
+/// prevouts. A coinbase passes the last.
+pub fn check_transaction(tx: &Transaction, waive: bool) -> Result<(), AcceptError> {
+    let check_tx = |r: Result<(), rbitcoin_consensus::ConsensusError>| {
+        r.map_err(|e| AcceptError::CheckTransaction(rbitcoin_consensus::block_reject_reason(&e)))
+    };
+    check_tx(rbitcoin_consensus::block::check_tx_shape(
+        tx,
+        tx.base_size(),
+    ))?;
+    // One input cannot repeat an outpoint.
+    if tx.input.len() >= 2 {
+        let mut seen = BTreeSet::new();
+        if !tx.input.iter().all(|inp| seen.insert(inp.previous_output)) {
+            return Err(duplicate_inputs(waive, tx.compute_txid()));
+        }
+    }
+    check_tx(rbitcoin_consensus::block::reject_null_prevouts(tx))
+}
+
 /// Maturity, absolute finality (`is_final_tx`), and BIP68 at the next block.
 pub fn check_mempool_structural(
     tx: &Transaction,
@@ -1352,30 +1373,22 @@ impl ActiveMempool {
             waive,
             tested,
         } = opts;
+        check_transaction(tx, waive)?;
         let check_tx = |r: Result<(), rbitcoin_consensus::ConsensusError>| {
             r.map_err(|e| {
                 AcceptError::CheckTransaction(rbitcoin_consensus::block_reject_reason(&e))
             })
         };
-        let base_size = tx.base_size();
-        check_tx(rbitcoin_consensus::block::check_tx_shape(tx, base_size))?;
-        if self.enforce_bip54 && rbitcoin_consensus::block::reject_bip54_tx_size(base_size).is_err()
+        // A 64-byte tx has one input, so the checks above cannot refuse it first.
+        if self.enforce_bip54
+            && rbitcoin_consensus::block::reject_bip54_tx_size(tx.base_size()).is_err()
         {
             return Err(AcceptError::CheckTransaction("txn-size-64".into()));
-        }
-        let txid = tx.compute_txid();
-        // Core CheckTransaction: repeated inputs after the outputs and before
-        // null prevouts, and before any value sum (Finding 011: phantom fee).
-        if tx.input.len() >= 2 {
-            let mut seen = BTreeSet::new();
-            if !tx.input.iter().all(|inp| seen.insert(inp.previous_output)) {
-                return Err(duplicate_inputs(waive, txid));
-            }
         }
         if tx.is_coinbase() {
             return Err(AcceptError::Coinbase);
         }
-        check_tx(rbitcoin_consensus::block::reject_null_prevouts(tx))?;
+        let txid = tx.compute_txid();
         let wtxid = tx.compute_wtxid();
         if let Some(live) = self.graph.get(&txid) {
             if live.wtxid == wtxid {

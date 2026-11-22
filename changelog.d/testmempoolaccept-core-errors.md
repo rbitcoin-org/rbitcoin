@@ -10,5 +10,11 @@ Fixed
   array or more than 25 transactions with Core's `Array must contain between
   1 and 25 transactions.`, and checks that before `maxfeerate`, as Core
   does.
+  An input repeated inside one member is that member's
+  `bad-txns-inputs-duplicate`, not `conflict-in-package`, here and in
+  `submitpackage`.
+  A package member that clashes with a pool tx and also fails
+  `CheckTransaction`, such as a repeated input, reports the
+  `CheckTransaction` reason, not `bip125-replacement-disallowed`.
   Unlike Core, a multi-transaction call does not stop at the first failed
   member: every member still gets its own row.
