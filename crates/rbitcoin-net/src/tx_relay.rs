@@ -6849,25 +6849,52 @@ impl MempoolHub {
         self.lock_read().graph.get(txid).map(|e| e.wtxid)
     }
 
-    /// True if `txs` plus in-mempool parents would exceed cluster count/size.
+    /// True if one cluster that `txs` would make with the pool exceeds the
+    /// count or size cap (Core `CheckMemPoolPolicyLimits`). Members share a
+    /// cluster through a spend inside the package or a pool cluster both
+    /// spend from. A member that touches neither is a cluster of its own.
     pub fn package_would_exceed_cluster(&self, txs: &[bitcoin::Transaction]) -> bool {
-        if txs.is_empty() {
-            return false;
+        fn root(group: &mut [usize], mut i: usize) -> usize {
+            while group[i] != i {
+                group[i] = group[group[i]];
+                i = group[i];
+            }
+            i
         }
-        let pkg: std::collections::HashSet<Txid> = txs.iter().map(|t| t.compute_txid()).collect();
+        let index: HashMap<Txid, usize> = txs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.compute_txid(), i))
+            .collect();
         let g = self.lock_read();
-        let mut parents = std::collections::BTreeSet::new();
-        let mut extra_w = 0u64;
-        for tx in txs {
-            extra_w = extra_w.saturating_add(tx.weight().to_wu());
+        let mut group: Vec<usize> = (0..txs.len()).collect();
+        let mut pool_parents = vec![BTreeSet::new(); txs.len()];
+        let mut first_spender: HashMap<Txid, usize> = HashMap::new();
+        for (i, tx) in txs.iter().enumerate() {
             for inp in &tx.input {
                 let pid = inp.previous_output.txid;
-                if !pkg.contains(&pid) && g.graph.contains(&pid) {
-                    parents.insert(pid);
-                }
+                let joined = if let Some(&j) = index.get(&pid) {
+                    j
+                } else if let Some(rep) = g.graph.cluster_rep(&pid) {
+                    pool_parents[i].insert(pid);
+                    *first_spender.entry(rep).or_insert(i)
+                } else {
+                    continue;
+                };
+                let (a, b) = (root(&mut group, i), root(&mut group, joined));
+                group[a] = b;
             }
         }
-        g.graph.cluster_would_exceed(&parents, txs.len(), extra_w)
+        let mut clusters: BTreeMap<usize, (BTreeSet<Txid>, usize, u64)> = BTreeMap::new();
+        for (i, tx) in txs.iter().enumerate() {
+            let c = clusters.entry(root(&mut group, i)).or_default();
+            c.0.append(&mut pool_parents[i]);
+            c.1 += 1;
+            c.2 = c.2.saturating_add(tx.weight().to_wu());
+        }
+        clusters
+            .values()
+            .any(|(parents, count, weight)| g.graph.cluster_would_exceed(parents, *count, *weight))
     }
 
     /// Direct in-mempool parents and children (`depends` / `spentby`).

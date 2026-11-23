@@ -5011,6 +5011,56 @@ fn testmempoolaccept_package_applies_truc_to_an_untested_parent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A package is over the cluster cap only when one cluster it makes is (Core
+/// `CheckMemPoolPolicyLimits`). At a cap of two, a child of a pooled tx and a
+/// tx that spends a confirmed coin make clusters of two and one, and both
+/// are allowed. Two children of the pooled tx make one cluster of three.
+#[test]
+fn testmempoolaccept_package_counts_each_cluster_alone() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let op_true = || ScriptBuf::from_bytes(vec![0x51]);
+    let half = 25_0000_0000u64;
+    let (_, mut pooled) = spend_generated_coinbase(&ctx, 1, half - 500, op_true());
+    pooled.output.push(TxOut {
+        value: Amount::from_sat(half - 500),
+        script_pubkey: op_true(),
+    });
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex(&pooled))]).unwrap();
+    let (_, unrelated) = spend_generated_coinbase(&ctx, 2, 50_0000_0000 - 1_000, op_true());
+    let spend = |vout: u32| Transaction {
+        version: TxVersion::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(pooled.compute_txid(), vout),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(half - 1_500),
+            script_pubkey: op_true(),
+        }],
+    };
+    let mp = ctx.mempool.as_ref().unwrap();
+    mp.set_cluster_limits(Some(2), None);
+    let test = |txs: &[&Transaction]| {
+        let hexes: Vec<String> = txs.iter().map(|tx| hex(tx)).collect();
+        dispatch(&ctx, "testmempoolaccept", vec![json!(hexes)]).unwrap()
+    };
+    let rows = test(&[&spend(0), &unrelated]);
+    assert_eq!(rows[0]["allowed"], true, "{rows}");
+    assert_eq!(rows[1]["allowed"], true, "{rows}");
+    let rows = test(&[&spend(0), &spend(1)]);
+    for row in rows.as_array().unwrap() {
+        assert_eq!(row["package-error"], "too-large-cluster", "{rows}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A tx with the txid of a pool entry but another witness is
 /// `txn-same-nonwitness-data-in-mempool`, alone and as a package member. The
 /// pooled witness itself is `txn-already-in-mempool`. Core gives each the

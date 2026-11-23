@@ -595,8 +595,8 @@ pub struct PreparedAdmit {
 /// remove.
 ///
 /// The cluster limit counts only a member's pool parents. The package
-/// precheck already bounds every member together with every pool parent's
-/// cluster, which holds any one member's cluster.
+/// precheck already bounds each cluster the members make with the pool,
+/// which holds any one member's cluster.
 #[derive(Debug, Clone, Default)]
 pub struct TestedMembers {
     members: BTreeMap<Txid, TestedMember>,
