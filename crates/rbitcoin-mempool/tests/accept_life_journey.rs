@@ -705,7 +705,8 @@ fn bip54_sigop_script(checksigs: usize) -> ScriptBuf {
 /// On a chain that enforces BIP 54 the pool refuses what no block there can
 /// hold: a 64-byte transaction, and one whose inputs carry more than 2,500
 /// signature operations. One byte or one operation away is admitted, and
-/// without BIP 54 so are both.
+/// without BIP 54 so are both. A 64-byte coinbase is `coinbase` first, as
+/// Core `PreChecks` asks.
 #[test]
 fn bip54_refuses_what_no_block_can_hold() {
     let dir = tmp_dir();
@@ -735,6 +736,22 @@ fn bip54_refuses_what_no_block_can_hold() {
         matches!(&err, AcceptError::CheckTransaction(reason) if reason == "txn-size-64"),
         "{err}"
     );
+    let coinbase = Transaction {
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![0x51; 2]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(90_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; 2]),
+        }],
+        ..small.clone()
+    };
+    assert_eq!(coinbase.base_size(), 64);
+    let err = life.accept(&coinbase).unwrap_err();
+    assert!(matches!(err, AcceptError::Coinbase), "{err}");
     for script_len in [3, 5] {
         let tx = sized(&mut life, script_len);
         life.accept(&tx).expect("63 and 65 bytes");

@@ -1408,14 +1408,15 @@ impl ActiveMempool {
                 AcceptError::CheckTransaction(rbitcoin_consensus::block_reject_reason(&e))
             })
         };
-        // A 64-byte tx has one input, so the checks above cannot refuse it first.
+        if tx.is_coinbase() {
+            return Err(AcceptError::Coinbase);
+        }
+        // A 64-byte tx has one input, so `check_transaction` cannot refuse it
+        // first. A coinbase is `coinbase` before its size (Core `PreChecks`).
         if self.enforce_bip54
             && rbitcoin_consensus::block::reject_bip54_tx_size(tx.base_size()).is_err()
         {
             return Err(AcceptError::CheckTransaction("txn-size-64".into()));
-        }
-        if tx.is_coinbase() {
-            return Err(AcceptError::Coinbase);
         }
         // What needs only the tx and the tip comes before the pool and the
         // coins (Core `PreChecks`).
