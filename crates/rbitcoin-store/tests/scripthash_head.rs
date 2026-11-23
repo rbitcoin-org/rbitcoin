@@ -52,7 +52,9 @@ fn head_insert_get_clear() {
     assert!(h.get(&key).unwrap().is_none());
     // Sidecar tracks occupied; reopen without full scan path for tiny files.
     drop(h);
-    let h2 = ScriptHashHead::open(&path).unwrap().expect("live head");
+    let h2 = ScriptHashHead::open(&path, true)
+        .unwrap()
+        .expect("live head");
     assert!(h2.is_known_empty() || h2.occupied() >= 1); // soft-clear keeps slot
     assert!(h2.get(&key).unwrap().is_none());
     let _ = std::fs::remove_file(&path);
@@ -85,7 +87,9 @@ fn open_large_without_occ_skips_scan_not_empty() {
     // Drop sidecar only — reopen must not scan body and must not claim empty.
     let _ = std::fs::remove_file(occ_sidecar_path(&path));
     let t0 = Instant::now();
-    let h2 = ScriptHashHead::open(&path).unwrap().expect("live head");
+    let h2 = ScriptHashHead::open(&path, true)
+        .unwrap()
+        .expect("live head");
     let open_ms = t0.elapsed().as_millis();
     assert!(
         !h2.is_known_empty(),
@@ -126,7 +130,9 @@ fn zero_occ_sidecar_does_not_bulk_fill_over_live_slots() {
     assert_eq!(h.get(&key_a).unwrap().unwrap(), val_a);
     drop(h);
     store_occ_sidecar(&path, 0).unwrap();
-    let h = ScriptHashHead::open(&path).unwrap().expect("live head");
+    let h = ScriptHashHead::open(&path, true)
+        .unwrap()
+        .expect("live head");
     assert!(
         !h.is_known_empty(),
         "a zero .occ on a live head reported empty"
@@ -168,7 +174,7 @@ fn open_removes_a_large_empty_zero_occ() {
     assert!(h.is_known_empty());
     drop(h);
     assert!(path.exists());
-    let opened = ScriptHashHead::open(&path).unwrap();
+    let opened = ScriptHashHead::open(&path, true).unwrap();
     assert!(opened.is_none(), "open kept a large empty ingest");
     assert!(!path.exists(), "open left a large empty ingest on disk");
     assert!(
@@ -244,7 +250,9 @@ fn scripthash_head_insert_many_full_without_rehash() {
     h.flush().unwrap();
     h.flush_async().unwrap();
     drop(h);
-    let h2 = ScriptHashHead::open(&path).unwrap().expect("live head");
+    let h2 = ScriptHashHead::open(&path, true)
+        .unwrap()
+        .expect("live head");
     let mut key = [0u8; 32];
     key[0..8].copy_from_slice(&5u64.to_le_bytes());
     assert!(h2.get(&key).unwrap().is_some());
@@ -257,7 +265,7 @@ fn scripthash_head_insert_many_full_without_rehash() {
             .unwrap();
     }
     assert!(matches!(
-        ScriptHashHead::open(&path),
+        ScriptHashHead::open(&path, true),
         Err(StoreError::Corrupt(_))
     ));
     let _ = std::fs::remove_file(&path);

@@ -9,6 +9,7 @@ use crate::durability::Durable;
 use crate::error::StoreError;
 use crate::file::{self, TableFile, FILE_HEADER_LEN};
 use crate::io_handle::IoHandle;
+use crate::tx_table::may_repair;
 use bitcoin_hashes::{sha256, Hash, HashEngine};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -307,7 +308,7 @@ fn create_zero_file(path: &Path, len: u64) -> Result<bool, StoreError> {
 }
 
 /// A missing tail file, or one that is not yet a `CAPT` header, becomes generation 0.
-fn write_vacant_tail(path: &Path) -> Result<(), StoreError> {
+fn write_vacant_tail(path: &Path, repair: bool) -> Result<(), StoreError> {
     let file = open_rw(path)?;
     let len = file.metadata().map_err(|e| StoreError::io(path, e))?.len();
     if len >= 4 {
@@ -317,6 +318,7 @@ fn write_vacant_tail(path: &Path) -> Result<(), StoreError> {
             return Ok(());
         }
     }
+    may_repair(repair, "source: a tear_guard tail is not a tail")?;
     if len < TAIL_BYTES {
         file.set_len(TAIL_BYTES)
             .map_err(|e| StoreError::io(path, e))?;
@@ -335,9 +337,9 @@ const CATK: &[u8; 4] = b"CATK";
 const CATK_HEAD: usize = 16;
 
 /// Apply a leftover `CATK` `{stem}.kept` when its range is zeroes, then unlink it.
-fn migrate_kept(hot: &Path, seq: &Path) -> Result<(), StoreError> {
+fn migrate_kept(hot: &Path, seq: &Path, repair: bool) -> Result<(), StoreError> {
     for name in STEMS {
-        migrate_one_kept(&stem_path(hot, seq, name))?;
+        migrate_one_kept(&stem_path(hot, seq, name), repair)?;
     }
     Ok(())
 }
@@ -354,11 +356,15 @@ fn kept_side(path: &Path) -> PathBuf {
     }
 }
 
-fn migrate_one_kept(path: &Path) -> Result<(), StoreError> {
+fn migrate_one_kept(path: &Path, repair: bool) -> Result<(), StoreError> {
     let side = kept_side(path);
     if !side.try_exists().map_err(|e| StoreError::io(&side, e))? {
         return Ok(());
     }
+    may_repair(
+        repair,
+        "source: a Class A kept block is still beside its stem",
+    )?;
     let raw = read_side(&side)?;
     if let Some((block, image)) = parse_catk(&raw) {
         if path.try_exists().map_err(|e| StoreError::io(path, e))? {
@@ -409,19 +415,24 @@ fn parse_catk(raw: &[u8]) -> Option<(u64, &[u8])> {
     Some((block, &raw[CATK_HEAD..]))
 }
 
-fn ensure_guard(hot: &Path) -> Result<(), StoreError> {
+fn ensure_guard(hot: &Path, repair: bool) -> Result<(), StoreError> {
     let dir = guard_dir(hot);
-    let created_dir = !dir.try_exists().map_err(|e| StoreError::io(&dir, e))?;
-    std::fs::create_dir_all(&dir).map_err(|e| StoreError::io(&dir, e))?;
     let first = dir.join("first");
     let tail0 = dir.join("tail.0");
     let tail1 = dir.join("tail.1");
+    for path in [&dir, &first, &tail0, &tail1] {
+        if !path.try_exists().map_err(|e| StoreError::io(path, e))? {
+            may_repair(repair, "source: tear_guard is missing a file")?;
+        }
+    }
+    let created_dir = !dir.try_exists().map_err(|e| StoreError::io(&dir, e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| StoreError::io(&dir, e))?;
     let mut created = created_dir;
     created |= create_zero_file(&first, FIRST_BYTES)?;
     created |= create_zero_file(&tail0, TAIL_BYTES)?;
     created |= create_zero_file(&tail1, TAIL_BYTES)?;
-    write_vacant_tail(&tail0)?;
-    write_vacant_tail(&tail1)?;
+    write_vacant_tail(&tail0, repair)?;
+    write_vacant_tail(&tail1, repair)?;
     if created {
         file::fsync_parent_dir(hot).map_err(|e| StoreError::io(hot, e))?;
         file::fsync_parent_dir(&dir).map_err(|e| StoreError::io(&dir, e))?;
@@ -450,9 +461,12 @@ fn all_zero(bytes: &[u8]) -> bool {
 ///
 /// When neither tail slot is usable, write `tail.0` as generation 1 from the
 /// bytes already on disk so a later tear has a synced image.
-pub(crate) fn prepare_and_restore(hot: &Path, seq: &Path) -> Result<(), StoreError> {
-    migrate_kept(hot, seq)?;
-    ensure_guard(hot)?;
+///
+/// With `repair` false a page to restore, a seal or tail to write, or a
+/// missing guard file refuses the open instead: an `--assumehot` source.
+pub(crate) fn prepare_and_restore(hot: &Path, seq: &Path, repair: bool) -> Result<(), StoreError> {
+    migrate_kept(hot, seq, repair)?;
+    ensure_guard(hot, repair)?;
     let dir = guard_dir(hot);
     let first_path = dir.join("first");
     let first_raw = read_fixed(&first_path, FIRST_BYTES)?.unwrap_or_default();
@@ -463,10 +477,11 @@ pub(crate) fn prepare_and_restore(hot: &Path, seq: &Path) -> Result<(), StoreErr
         (None, None) => None,
     };
     for (i, name) in STEMS.iter().enumerate() {
-        restore_stem(hot, seq, name, i, &first_raw, best)?;
+        restore_stem(hot, seq, name, i, &first_raw, best, repair)?;
     }
-    seal_vacant_from_disk(hot, seq, &first_path, &first_raw)?;
+    seal_vacant_from_disk(hot, seq, &first_path, &first_raw, repair)?;
     if best.is_none() {
+        may_repair(repair, "source: tear_guard has no tail")?;
         let named = crate::tx_table::read_class_a_synced(hot)?;
         publish_tail_from_disk(hot, seq, &dir, named)?;
     }
@@ -480,6 +495,7 @@ fn restore_stem(
     stem: usize,
     first_raw: &[u8],
     best: Option<&TailSlot>,
+    repair: bool,
 ) -> Result<(), StoreError> {
     let path = stem_path(hot, seq, name);
     if !path.try_exists().map_err(|e| StoreError::io(&path, e))? {
@@ -499,7 +515,14 @@ fn restore_stem(
     let mut page0 = vec![0u8; page_n];
     pread_exact(&file, &path, 0, &mut page0)?;
     let page0_zero = all_zero(&page0);
-    let page0_restored = restore_page0(&file, &path, stem, published, first_raw, best, &page0)?;
+    let page0_restored = match page0_image(stem, published, first_raw, best, &page0) {
+        Some(image) => {
+            may_repair(repair, "source: a Class A first page is torn")?;
+            pwrite_exact(&file, &path, 0, &image)?;
+            true
+        }
+        None => false,
+    };
     if page0_restored {
         // The live header was zeros, so `published` was 0 when no slot parsed.
         // The length just written is the one the tail check has to use.
@@ -508,7 +531,7 @@ fn restore_stem(
             published = restored_len;
         }
     }
-    let tail_restored = restore_tail_block(&file, &path, stem, published, file_len, best)?;
+    let tail_restored = restore_tail_block(&file, &path, stem, published, file_len, best, repair)?;
     if page0_restored || tail_restored {
         sync_files(&[(&path, &file)])?;
     }
@@ -532,29 +555,25 @@ struct ZeroRefuse {
     no_slot: bool,
 }
 
-fn restore_page0(
-    file: &File,
-    path: &Path,
+/// The first page open writes back over `page0`, if any.
+fn page0_image(
     stem: usize,
     published: u64,
     first_raw: &[u8],
     best: Option<&TailSlot>,
     page0: &[u8],
-) -> Result<bool, StoreError> {
+) -> Option<Vec<u8>> {
     if all_zero(page0) {
         if let Some(commit) = parse_commit(first_raw, stem) {
             let mut image = commit.image;
             let len = recorded_len(best, stem, published, le_u64(&image[8..16]));
             image[8..16].copy_from_slice(&len.to_le_bytes());
-            pwrite_exact(file, path, 0, &image)?;
-            return Ok(true);
+            return Some(image);
         }
     }
-    let Some(slot) = best else {
-        return Ok(false);
-    };
+    let slot = best?;
     if slot.tail_off[stem] != 0 || slot.tail_len[stem] == 0 {
-        return Ok(false);
+        return None;
     }
     let raw = image_of(slot, stem);
     let mut image = raw.to_vec();
@@ -562,13 +581,9 @@ fn restore_page0(
     // One write. A page that is still the unstamped image is that write
     // without the slot length, so the next open would otherwise keep it.
     if page_holds(page0, &image) {
-        return Ok(false);
+        return None;
     }
-    if all_zero(page0) || page_holds(page0, raw) {
-        pwrite_exact(file, path, 0, &image)?;
-        return Ok(true);
-    }
-    Ok(false)
+    (all_zero(page0) || page_holds(page0, raw)).then_some(image)
 }
 
 fn page_holds(page: &[u8], image: &[u8]) -> bool {
@@ -605,6 +620,7 @@ fn restore_tail_block(
     published: u64,
     file_len: u64,
     best: Option<&TailSlot>,
+    repair: bool,
 ) -> Result<bool, StoreError> {
     let (off, n) = tail_span(published, file_len);
     if n == 0 || off < PAGE as u64 {
@@ -623,6 +639,11 @@ fn restore_tail_block(
     }
     let image = image_of(slot, stem);
     let take = (n as usize).min(image.len());
+    // A synced zero image is the block on disk: nothing to put back.
+    if all_zero(&image[..take]) {
+        return Ok(true);
+    }
+    may_repair(repair, "source: a Class A tail block is torn")?;
     pwrite_exact(file, path, off, &image[..take])?;
     Ok(true)
 }
@@ -681,6 +702,7 @@ fn seal_vacant_from_disk(
     seq: &Path,
     first_path: &Path,
     first_raw: &[u8],
+    repair: bool,
 ) -> Result<(), StoreError> {
     let mut images = Vec::new();
     for (i, name) in STEMS.iter().enumerate() {
@@ -692,6 +714,9 @@ fn seal_vacant_from_disk(
             continue;
         };
         images.push((i, image));
+    }
+    if !images.is_empty() {
+        may_repair(repair, "source: a Class A first page has no seal")?;
     }
     write_seals(first_path, &images)
 }
@@ -895,6 +920,22 @@ fn inactive_slot(slot0: &Option<TailSlot>, slot1: &Option<TailSlot>) -> (u8, u64
     }
 }
 
+/// The newest valid slot already records `buf` (all but its generation and
+/// checksum): the barrier has nothing new to guard, so neither slot is
+/// written and a clean open and shutdown leave the guard as it was.
+fn newest_holds(slot0: &Option<TailSlot>, slot1: &Option<TailSlot>, buf: &[u8]) -> bool {
+    let newest = match (slot0, slot1) {
+        (Some(a), b) => newer(a, b),
+        (None, Some(b)) => b,
+        (None, None) => return false,
+    };
+    let raw = &newest.raw;
+    raw.len() == buf.len()
+        && raw[..8] == buf[..8]
+        && raw[16..CHECKSUM_AT] == buf[16..CHECKSUM_AT]
+        && raw[CHECKSUM_END..] == buf[CHECKSUM_END..]
+}
+
 /// Copy partial tails into the inactive slot and seal any full page 0 once.
 ///
 /// One thread appends each stem and stores `published_len` after that
@@ -911,7 +952,7 @@ pub(crate) fn write_barrier(
             "class A stem order drifted at {name}"
         );
     }
-    ensure_guard(hot)?;
+    ensure_guard(hot, true)?;
     let dir = guard_dir(hot);
     let (slot0, slot1) = load_tails(&dir)?;
     let (inactive, generation) = inactive_slot(&slot0, &slot1);
@@ -947,6 +988,9 @@ pub(crate) fn write_barrier(
         }
         stamp_loaded_len(&mut image, specs[i].0);
         images.push((i, image));
+    }
+    if images.is_empty() && newest_holds(&slot0, &slot1, &tail_buf) {
+        return crate::file::TableFile::sync_data_all_with(files, &[]);
     }
     let len = tail
         .metadata()

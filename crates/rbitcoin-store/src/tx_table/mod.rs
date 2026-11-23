@@ -812,16 +812,20 @@ pub(crate) fn refuse_below_committed(count: u64, committed: u64) -> Result<(), S
 }
 
 #[doc(hidden)]
-pub fn open_or_create_create_loc(dir: &Path) -> Result<crate::create_loc::CreateLoc, StoreError> {
-    open_or_create_create_loc_above(dir, 0)
+pub fn open_or_create_create_loc(
+    dir: &Path,
+    repair: bool,
+) -> Result<crate::create_loc::CreateLoc, StoreError> {
+    open_or_create_create_loc_above(dir, 0, repair)
 }
 
 fn open_or_create_create_loc_above(
     dir: &Path,
     floor: u64,
+    repair: bool,
 ) -> Result<crate::create_loc::CreateLoc, StoreError> {
     if dir.join("create.loc").exists() {
-        crate::create_loc::CreateLoc::open_above(dir, floor)
+        crate::create_loc::CreateLoc::open_above(dir, floor, repair)
     } else if class_a_body_occupied(dir, "txout") {
         Err(StoreError::Corrupt("invariant: create.loc missing"))
     } else {
@@ -832,16 +836,18 @@ fn open_or_create_create_loc_above(
 #[doc(hidden)]
 pub fn open_or_create_seqsigwit_loc(
     seqsigwit_dir: &Path,
+    repair: bool,
 ) -> Result<crate::delta_loc::DeltaLoc, StoreError> {
-    open_or_create_seqsigwit_loc_above(seqsigwit_dir, 0)
+    open_or_create_seqsigwit_loc_above(seqsigwit_dir, 0, repair)
 }
 
 fn open_or_create_seqsigwit_loc_above(
     seqsigwit_dir: &Path,
     floor: u64,
+    repair: bool,
 ) -> Result<crate::delta_loc::DeltaLoc, StoreError> {
     if seqsigwit_dir.join("seqsigwit.loc").exists() {
-        crate::delta_loc::DeltaLoc::open_above(seqsigwit_dir, "seqsigwit", floor)
+        crate::delta_loc::DeltaLoc::open_above(seqsigwit_dir, "seqsigwit", floor, repair)
     } else if class_a_body_occupied(seqsigwit_dir, "seqsigwit") {
         Err(StoreError::Corrupt("invariant: seqsigwit.loc missing"))
     } else {
@@ -1069,6 +1075,16 @@ pub fn class_a_skew_assert_aligned(
     Ok(())
 }
 
+/// `Ok` when the open may repair; otherwise `what` refuses the store, which
+/// is an `--assumehot` source opened as it is.
+pub(crate) fn may_repair(repair: bool, what: &'static str) -> Result<(), StoreError> {
+    if repair {
+        Ok(())
+    } else {
+        Err(StoreError::Corrupt(what))
+    }
+}
+
 #[doc(hidden)]
 ///
 /// `named` is the highest create a durable record names: a `header_txs`
@@ -1086,6 +1102,7 @@ pub fn repair_class_a_count_skew(
     prune_seqsigwit_mode: bool,
     input_existed: bool,
     named: Option<u64>,
+    repair: bool,
 ) -> Result<bool, StoreError> {
     let committed = named.unwrap_or(0);
     let n_loc = stems.create_loc.count();
@@ -1096,6 +1113,14 @@ pub fn repair_class_a_count_skew(
             .unwrap_or(n_loc);
     refuse_below_committed(stem, committed)?;
     let stem = named.unwrap_or(stem);
+    if stems.create_loc.count() > stem
+        || (!prune_seqsigwit_mode && stems.seqsigwit_loc.count() > stem)
+    {
+        may_repair(
+            repair,
+            "source: a locator names creates past the committed count",
+        )?;
+    }
     // A range read decodes its whole locator window up to the count, so a
     // zeroed row past `stem` would fail reads of the creates kept below it.
     if stems.create_loc.count() > stem {
@@ -1150,6 +1175,10 @@ pub fn repair_class_a_count_skew(
     if skewed.is_none() && !ahead {
         return Ok(false);
     }
+    may_repair(
+        repair,
+        "source: Class A stems differ in length (a copy cut short)",
+    )?;
     let n_input = stems.input.count();
     rbitcoin_log::warn!(
         "store: Class A count skew loc={n_loc} seqsigwit.loc={n_seqsigwit_loc} \
@@ -1387,6 +1416,7 @@ impl crate::spend_delta::SpentBody for SpentFold<'_> {
 fn open_spend_delta(
     dir: &Path,
     spent: &VarTable,
+    repair: bool,
 ) -> Result<crate::spend_delta::SpendPageLog, StoreError> {
     let body_end = spent.body_published_len();
     let path = spent.body_file_path();
@@ -1404,11 +1434,15 @@ fn open_spend_delta(
         dir,
         &mut SpentFold::at_open(spent),
         crate::spend_delta::Policy::DEFAULT,
+        repair,
     )?;
+    if crate::spend_pages_v29::present(dir)? {
+        may_repair(repair, "source: schema-29 spend pages are still on disk")?;
+    }
     let v29 = crate::spend_pages_v29::read(dir, body_end)?;
     if populated && filled_by_class_a {
         let (images, tip) = v29.map_or((Vec::new(), 0), |v| (v.images, v.tip));
-        log.adopt_v29(images, tip, &SpentFold::at_open(spent))?;
+        log.adopt_v29(images, tip, &SpentFold::at_open(spent), repair)?;
     }
     crate::spend_pages_v29::remove(dir)?;
     Ok(log)
@@ -1528,7 +1562,7 @@ impl TxTable {
     }
 
     pub fn open_with_opts(dir: &Path, opts: HeadOpenOpts) -> Result<Self, StoreError> {
-        Self::open_seqsigwit(dir, dir, opts, None)
+        Self::open_seqsigwit(dir, dir, opts, None, true)
     }
 
     /// Open Class A stems; `seqsigwit` may live in a different directory.
@@ -1538,13 +1572,20 @@ impl TxTable {
     /// or [`CLASS_A_SYNCED_NAME`], whichever is higher. `None` (a table
     /// opened alone) keeps the prefix every file covers. See
     /// [`repair_class_a_count_skew`].
+    ///
+    /// With `repair` false, Class A counts that differ, a locator longer than
+    /// its checkpoint, overflow or input body names, a `txstat` of another
+    /// length, or a `tx.head` that is unreadable, empty, ahead of or behind
+    /// the bodies refuse the open instead of being trimmed, aligned,
+    /// backfilled or rebuilt: an `--assumehot` source.
     pub fn open_seqsigwit(
         dir: &Path,
         seqsigwit_dir: &Path,
         opts: HeadOpenOpts,
         committed: Option<u64>,
+        repair: bool,
     ) -> Result<Self, StoreError> {
-        crate::class_a_pages::prepare_and_restore(dir, seqsigwit_dir)?;
+        crate::class_a_pages::prepare_and_restore(dir, seqsigwit_dir, repair)?;
         crate::store::rename_legacy_inwit_files(dir)?;
         crate::store::rename_legacy_input_files(dir)?;
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
@@ -1563,10 +1604,11 @@ impl TxTable {
         let synced_named = read_class_a_synced(dir)?;
         let named = committed.map(|c| c.max(synced_named));
         let at_least = named.unwrap_or(0);
-        let create_loc = open_or_create_create_loc_above(dir, at_least)?;
+        let create_loc = open_or_create_create_loc_above(dir, at_least, repair)?;
         // A pruned witness locator is cut on purpose: no floor.
         let witness_floor = if prune_seqsigwit_mode { 0 } else { at_least };
-        let seqsigwit_loc = open_or_create_seqsigwit_loc_above(seqsigwit_dir, witness_floor)?;
+        let seqsigwit_loc =
+            open_or_create_seqsigwit_loc_above(seqsigwit_dir, witness_floor, repair)?;
         let loc_count = create_loc.count();
         // The sidecar is prune mode for reads and later appends. The witness
         // stem still seals the tip until its locator no longer covers creates.
@@ -1623,7 +1665,7 @@ impl TxTable {
         let txstat = crate::txstat::TxStat::open(seqsigwit_dir)?;
         let input_existed = seqsigwit_dir.join("input.loc").exists();
         let input = if input_existed {
-            crate::input::Input::open(seqsigwit_dir)?
+            crate::input::Input::open(seqsigwit_dir, repair)?
         } else if seqsigwit_dir.join("input.body").exists()
             || seqsigwit_dir.join("input.off").exists()
         {
@@ -1649,9 +1691,11 @@ impl TxTable {
             stem_retired,
             input_existed,
             named,
+            repair,
         )?;
         let n_bodies = create_loc.count();
         if txstat.count() != n_bodies {
+            may_repair(repair, "source: txstat count differs from Class A")?;
             rbitcoin_log::warn!(
                 "store: txstat.body count={} loc={} — aligning to loc",
                 txstat.count(),
@@ -1677,6 +1721,9 @@ impl TxTable {
             match SegmentedTxHead::open(dir) {
                 Ok(h) => {
                     let covered = h.last_inserted_fk();
+                    if covered > n_bodies {
+                        may_repair(repair, "source: tx.head leads Class A")?;
+                    }
                     if covered > n_bodies && h.drop_segments_past(n_bodies)? {
                         // Inserts ran ahead of the barrier, and open cut
                         // their creates. The segments below the cut stay;
@@ -1702,13 +1749,14 @@ impl TxTable {
                         )?
                     } else {
                         if n_bodies > 0 && h.occupied() == 0 {
+                            may_repair(repair, "source: tx.head is empty")?;
                             need_rebuild = true;
                         }
                         h
                     }
                 }
                 Err(e) => {
-                    if crate::segmented_head::is_index_open_refuse(&e) {
+                    if crate::segmented_head::is_index_open_refuse(&e) || !repair {
                         return Err(e);
                     }
                     if n_bodies > 0 {
@@ -1729,7 +1777,7 @@ impl TxTable {
             }
         };
         let secret = crate::store_secret::StoreSecret::load_existing(dir)?;
-        let spend_pages = open_spend_delta(dir, &spent)?;
+        let spend_pages = open_spend_delta(dir, &spent, repair)?;
         let t = Self {
             body,
             seqsigwit,
@@ -1815,6 +1863,9 @@ impl TxTable {
             t.seal_unsealed_nontail_from_body()?;
             let n = t.count();
             let covered = t.head.last_inserted_fk();
+            if t.head.open_tail_untrusted() {
+                may_repair(repair, "source: tx.head open tail has no matching snapshot")?;
+            }
             if let Some(first) = t.head.open_tail_rebuild_from()? {
                 rbitcoin_log::info!(
                     "store: tx.head open tail snapshot missing first_fk={first} \
@@ -1823,6 +1874,7 @@ impl TxTable {
                 t.backfill_head_from(first)?;
                 t.head.flush()?;
             } else if covered < n {
+                may_repair(repair, "source: tx.head lags Class A")?;
                 rbitcoin_log::info!(
                     "store: tx.head lags Class A covered={covered} n={n} — backfill tail"
                 );

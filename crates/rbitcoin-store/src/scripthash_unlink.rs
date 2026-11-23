@@ -195,12 +195,12 @@ impl ScriptHashTable {
         self.unlink_creates(scripthash, &[create_tx_fk])
     }
 
-    pub fn recover_unlink_undos(&self) -> Result<(), StoreError> {
+    pub fn recover_unlink_undos(&self, repair: bool) -> Result<(), StoreError> {
         for (i, body) in self.bodies.iter().enumerate() {
-            self.recover_one_undo(body, &self.allocs[i])?;
+            self.recover_one_undo(body, &self.allocs[i], repair)?;
         }
         if let (Some(body), Some(mu)) = (&self.ovf_body, &self.ovf_alloc) {
-            self.recover_one_undo(body, mu)?;
+            self.recover_one_undo(body, mu, repair)?;
         }
         Ok(())
     }
@@ -748,10 +748,12 @@ impl ScriptHashTable {
         &self,
         body: &TableFile,
         alloc_mu: &std::sync::Mutex<AllocState>,
+        repair: bool,
     ) -> Result<(), StoreError> {
         let Some(rec) = read_undo(body)? else {
             return Ok(());
         };
+        crate::tx_table::may_repair(repair, "source: a scripthash unlink undo is armed")?;
         let mut alloc = alloc_mu.lock().unwrap();
         self.rollback_undo(body, &mut alloc, &rec)?;
         write_alloc_header(body, &alloc)?;

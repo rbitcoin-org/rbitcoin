@@ -494,6 +494,7 @@ pub fn migrate_legacy_pack_marks(
     dir: &Path,
     n_shards: usize,
     create_count: u64,
+    repair: bool,
 ) -> Result<(), StoreError> {
     if sh_unsorted_extract_in_progress(dir) {
         return Ok(());
@@ -508,6 +509,7 @@ pub fn migrate_legacy_pack_marks(
         if shard_pack_mark_path(b).is_file() {
             continue;
         }
+        crate::tx_table::may_repair(repair, "source: a scripthash head shard has no pack mark")?;
         write_shard_pack_mark(b)?;
         wrote = true;
     }
@@ -610,12 +612,12 @@ pub fn open_sealed_sorted_ovf(dir: &Path) -> Result<Vec<SortedHead>, StoreError>
 #[doc(hidden)]
 /// Open an ingest left by an earlier insert. A missing file, and a large file
 /// whose sidecar is 0 and whose slots are empty, are both `None`.
-pub fn open_ingest(dir: &Path) -> Result<Option<ScriptHashHead>, StoreError> {
+pub fn open_ingest(dir: &Path, repair: bool) -> Result<Option<ScriptHashHead>, StoreError> {
     let p = ingest_path(dir);
-    if let Some(parent) = p.parent() {
+    if let Some(parent) = p.parent().filter(|_| repair) {
         std::fs::create_dir_all(parent).map_err(|e| StoreError::io(parent, e))?;
     }
-    ScriptHashHead::open(p)
+    ScriptHashHead::open(p, repair)
 }
 
 #[doc(hidden)]
@@ -625,15 +627,21 @@ pub fn sorted_main_present(dir: &Path, n_shards: usize) -> bool {
 }
 
 #[doc(hidden)]
-pub fn discard_incomplete_scripthash_head(dir: &Path, n_shards: usize) -> Result<(), StoreError> {
-    if sorted_main_present(dir, n_shards) {
+pub fn discard_incomplete_scripthash_head(
+    dir: &Path,
+    n_shards: usize,
+    repair: bool,
+) -> Result<(), StoreError> {
+    let head = dir.join("scripthash.head");
+    if sorted_main_present(dir, n_shards) || !head.exists() {
         return Ok(());
     }
-    remove_store_path(&dir.join("scripthash.head"))
+    crate::tx_table::may_repair(repair, "source: an incomplete scripthash head is on disk")?;
+    remove_store_path(&head)
 }
 
 #[doc(hidden)]
-pub fn discard_leftover_oa_overflow(dir: &Path) -> Result<(), StoreError> {
+pub fn discard_leftover_oa_overflow(dir: &Path, repair: bool) -> Result<(), StoreError> {
     let ovf = dir.join("scripthash.ovf");
     let Ok(rd) = std::fs::read_dir(&ovf) else {
         return Ok(());
@@ -644,6 +652,10 @@ pub fn discard_leftover_oa_overflow(dir: &Path) -> Result<(), StoreError> {
         let name = name.to_string_lossy();
         let path = ent.path();
         if six_digit_name(&name).is_some() && path.is_file() && !read_shsr_magic(&path)? {
+            crate::tx_table::may_repair(
+                repair,
+                "source: a leftover scripthash overflow file is on disk",
+            )?;
             std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
         }
     }
@@ -660,13 +672,17 @@ fn remove_store_path(path: &Path) -> Result<(), StoreError> {
 }
 
 #[doc(hidden)]
-pub fn unlink_leftover_oa_stub(dir: &Path) {
+pub fn unlink_leftover_oa_stub(dir: &Path, repair: bool) -> Result<(), StoreError> {
     let stub = dir.join("scripthash.head.oa_stub");
+    if stub.exists() {
+        crate::tx_table::may_repair(repair, "source: a scripthash OA stub is on disk")?;
+    }
     if stub.is_dir() {
         let _ = std::fs::remove_dir_all(&stub);
     } else if stub.is_file() {
         let _ = std::fs::remove_file(&stub);
     }
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -977,7 +993,7 @@ impl ScriptHashTable {
             n_shards,
             scale,
             sorted_main: wrap_sorted_slots((0..n_shards).map(|_| None).collect()),
-            ingest: Mutex::new(open_ingest(dir)?),
+            ingest: Mutex::new(open_ingest(dir, true)?),
             sealed_ovf: Mutex::new(Vec::new()),
             ovf_l1: Mutex::new(None),
             l1_frozen_warned: AtomicBool::new(false),
@@ -993,21 +1009,29 @@ impl ScriptHashTable {
     }
 
     pub fn open(dir: &std::path::Path) -> Result<Self, StoreError> {
-        Self::open_with_scale(dir, HeadScale::Mainnet)
+        Self::open_with_scale(dir, HeadScale::Mainnet, true)
     }
 
     pub fn open_tiny(dir: &std::path::Path) -> Result<Self, StoreError> {
-        Self::open_with_scale(dir, HeadScale::Tiny)
+        Self::open_with_scale(dir, HeadScale::Tiny, true)
     }
 
-    pub fn open_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
+    /// Open the index at `dir`. Without `repair` (an `--assumehot` source),
+    /// an open that would delete a leftover, write a pack mark, reset an
+    /// older alloc header, roll back an unlink, or rewrite or delete the
+    /// ingest head refuses instead.
+    pub fn open_with_scale(
+        dir: &std::path::Path,
+        scale: HeadScale,
+        repair: bool,
+    ) -> Result<Self, StoreError> {
         let expected = sh_main_shard_count(scale);
-        discard_incomplete_scripthash_head(dir, expected)?;
-        discard_leftover_oa_overflow(dir)?;
+        discard_incomplete_scripthash_head(dir, expected, repair)?;
+        discard_leftover_oa_overflow(dir, repair)?;
         let layout = detect_sh_body_layout(dir)?;
-        unlink_leftover_oa_stub(dir);
+        unlink_leftover_oa_stub(dir, repair)?;
         let n_shards = sharded_body_n_shards(dir)?;
-        Self::from_layout_and_n_shards(dir, layout, n_shards, scale)
+        Self::from_layout_and_n_shards(dir, layout, n_shards, scale, repair)
     }
 
     #[doc(hidden)]
@@ -1016,6 +1040,7 @@ impl ScriptHashTable {
         layout: ShBodyLayout,
         n_shards: usize,
         scale: HeadScale,
+        repair: bool,
     ) -> Result<Self, StoreError> {
         let n_shards = n_shards.max(1);
         let mut bodies = Vec::with_capacity(n_shards);
@@ -1036,14 +1061,14 @@ impl ScriptHashTable {
         let (ost, _) = read_alloc_header(&ovf)?;
         let ovf_body = Some(ovf);
         let ovf_alloc = Some(Mutex::new(ost));
-        wipe_legacy_fullsize_overflow(dir)?;
+        wipe_legacy_fullsize_overflow(dir, repair)?;
         let mut create_count = 0u64;
         for a in &allocs {
             create_count = create_count.saturating_add(a.lock().unwrap().live_count);
         }
         create_count =
             create_count.saturating_add(ovf_alloc.as_ref().unwrap().lock().unwrap().live_count);
-        migrate_legacy_pack_marks(dir, n_shards, create_count)?;
+        migrate_legacy_pack_marks(dir, n_shards, create_count, repair)?;
         let sorted_main = open_sorted_main_shards(dir, n_shards)?;
         let sealed_ovf = open_sealed_sorted_ovf(dir)?;
         let ovf_l1 = open_ovf_l1(dir)?;
@@ -1061,7 +1086,7 @@ impl ScriptHashTable {
             n_shards,
             scale,
             sorted_main: wrap_sorted_slots(sorted_main),
-            ingest: Mutex::new(open_ingest(dir)?),
+            ingest: Mutex::new(open_ingest(dir, repair)?),
             sealed_ovf: Mutex::new(sealed_ovf),
             ovf_l1: Mutex::new(ovf_l1),
             l1_frozen_warned: AtomicBool::new(false),
@@ -1079,9 +1104,13 @@ impl ScriptHashTable {
                     "scripthash alloc is a pre-schema-15 body; wipe store/scripthash* (head, body, ovf, runs, include_hwm, cold_progress) and rematerialize",
                 ));
             }
+            crate::tx_table::may_repair(
+                repair,
+                "source: a scripthash alloc header is older than schema 15",
+            )?;
             table.reset_all_bodies()?;
         }
-        table.recover_unlink_undos()?;
+        table.recover_unlink_undos(repair)?;
         Ok(table)
     }
 

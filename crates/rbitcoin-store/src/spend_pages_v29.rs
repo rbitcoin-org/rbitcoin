@@ -154,6 +154,24 @@ fn open_image(
     Ok((file, limit))
 }
 
+fn is_v29_name(name: &str) -> bool {
+    name == SPEND_PAGES_NAME || name.starts_with("spend.pages.")
+}
+
+/// True when [`remove`] would remove a file.
+pub(crate) fn present(dir: &Path) -> Result<bool, StoreError> {
+    if dir.join(SPEND_PAGES_COMMIT_NAME).exists() {
+        return Ok(true);
+    }
+    for entry in std::fs::read_dir(dir).map_err(|e| StoreError::io(dir, e))? {
+        let entry = entry.map_err(|e| StoreError::io(dir, e))?;
+        if entry.file_name().to_str().is_some_and(is_v29_name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Remove the schema-29 files: the commit first, durably, then the images.
 /// A crash in between leaves images with no commit, which this removes.
 pub(crate) fn remove(dir: &Path) -> Result<(), StoreError> {
@@ -173,7 +191,7 @@ pub(crate) fn remove(dir: &Path) -> Result<(), StoreError> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name == SPEND_PAGES_NAME || name.starts_with("spend.pages.") {
+        if is_v29_name(name) {
             std::fs::remove_file(entry.path()).map_err(|e| StoreError::io(entry.path(), e))?;
             removed = true;
         }

@@ -58,7 +58,7 @@ fn roundtrip_coinbase_and_parents_across_reopen() {
     assert_eq!(t.n_in(Fk(3)).unwrap(), None);
     assert!(t.edges(Fk(3)).unwrap().is_none());
     drop(t);
-    let t = Input::open(dir.path()).unwrap();
+    let t = Input::open(dir.path(), true).unwrap();
     assert_eq!(t.count(), 3);
     assert_eq!(
         t.edges(Fk(2)).unwrap().unwrap(),
@@ -84,7 +84,7 @@ fn window_checkpoint_serves_create_1025() {
     assert_eq!(t.edges(Fk(1024)).unwrap().unwrap(), vec![edge(7, 1)]);
     assert_eq!(t.edges(Fk(1025)).unwrap().unwrap(), vec![edge(7, 1)]);
     drop(t);
-    let t = Input::open(dir.path()).unwrap();
+    let t = Input::open(dir.path(), true).unwrap();
     assert_eq!(t.edges(Fk(1025)).unwrap().unwrap(), vec![edge(7, 1)]);
     assert_eq!(t.n_in(Fk(1025)).unwrap(), Some(1));
 }
@@ -123,7 +123,7 @@ fn input_append_reopen_reads_last_edges() {
     batch.push(vec![edge(9, 3), edge(9, 4)]);
     t.append(&batch).unwrap();
     drop(t);
-    let t = Input::open(dir.path()).unwrap();
+    let t = Input::open(dir.path(), true).unwrap();
     assert_eq!(t.n_in(Fk(1025)).unwrap(), Some(2));
     assert_eq!(
         t.edges(Fk(1025)).unwrap().unwrap(),
@@ -141,7 +141,7 @@ fn input_open_reads_the_checkpoint() {
     batch.push(vec![edge(9, 3), edge(9, 4)]);
     t.append(&batch).unwrap();
     drop(t);
-    let t = Input::open(dir.path()).unwrap();
+    let t = Input::open(dir.path(), true).unwrap();
     let cps = t.checkpoints.read().unwrap_or_else(|e| e.into_inner());
     assert_eq!(cps.as_slice(), &[FILE_HEADER_LEN as u64 + 1024 * REC_LEN]);
     drop(cps);
@@ -179,13 +179,13 @@ fn reopen_after_short_body_keeps_the_prefix_inputs() {
     let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
     write_hwm(&path.join("input.off"), header);
     write_hwm(&path.join("input.body"), header + 1023 * REC_LEN);
-    let t = Input::open(&path).expect("a short body with a long locator opens");
+    let t = Input::open(&path, true).expect("a short body with a long locator opens");
     assert_eq!(t.count(), 1023);
     assert_eq!(t.body.logical_len(), header + 1023 * REC_LEN);
     assert_eq!(t.edges(Fk(1)).unwrap().unwrap(), vec![edge(1, 0)]);
     assert_eq!(t.edges(Fk(1023)).unwrap(), kept);
     drop(t);
-    let t = Input::open(&path).unwrap();
+    let t = Input::open(&path, true).unwrap();
     assert_eq!(t.count(), 1023);
     assert_eq!(t.edges(Fk(1023)).unwrap(), kept);
 }
@@ -204,7 +204,7 @@ fn open_keeps_a_body_short_of_the_checkpoint_prefix() {
     let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
     write_hwm(&path.join("input.off"), header);
     write_hwm(&path.join("input.body"), header + 1000 * REC_LEN);
-    let t = Input::open(&path).expect("a short body under the checkpoint truncates");
+    let t = Input::open(&path, true).expect("a short body under the checkpoint truncates");
     assert_eq!(t.count(), 1000);
     assert_eq!(t.edges(Fk(1000)).unwrap().unwrap(), vec![edge(1, 0)]);
     assert!(t.edges(Fk(1001)).is_err());
@@ -223,7 +223,7 @@ fn long_body_reopen_cuts_back_to_the_locator_prefix() {
 
     let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
     write_hwm(&path.join("input.loc"), header + 1023 * LOC_SLOT);
-    let t = Input::open(&path).expect("a long body with a short locator opens");
+    let t = Input::open(&path, true).expect("a long body with a short locator opens");
     assert_eq!(t.count(), 1023);
     assert_eq!(t.body.logical_len(), header + 1023 * REC_LEN);
     assert_eq!(t.edges(Fk(1023)).unwrap().unwrap(), vec![edge(1, 1022)]);
@@ -244,7 +244,7 @@ fn open_keeps_creates_a_short_body_header_still_names() {
 
     let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
     write_hwm(&path.join("input.body"), header + 80 * REC_LEN);
-    let t = Input::open(&path).expect("a short body header truncates the locator");
+    let t = Input::open(&path, true).expect("a short body header truncates the locator");
     assert_eq!(t.count(), 80);
     assert_eq!(t.edges(Fk(80)).unwrap().unwrap(), vec![edge(1, 0)]);
     assert!(t.edges(Fk(81)).is_err());
@@ -263,7 +263,7 @@ fn open_cuts_the_locator_when_the_body_header_is_short() {
 
     let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
     write_hwm(&path.join("input.body"), header + 100 * REC_LEN);
-    let t = Input::open(&path).expect("a short body header truncates the locator");
+    let t = Input::open(&path, true).expect("a short body header truncates the locator");
     assert_eq!(t.count(), 100);
     assert_eq!(t.edges(Fk(100)).unwrap().unwrap(), vec![edge(1, 0)]);
     assert!(t.edges(Fk(101)).is_err());
@@ -282,7 +282,7 @@ fn short_locator_in_one_window_cuts_the_long_body() {
 
     let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
     write_hwm(&path.join("input.loc"), header + 40 * LOC_SLOT);
-    let t = Input::open(&path).expect("a long body with a short locator opens");
+    let t = Input::open(&path, true).expect("a long body with a short locator opens");
     assert_eq!(t.count(), 40);
     assert_eq!(t.body.logical_len(), header + 40 * REC_LEN);
     assert_eq!(t.edges(Fk(40)).unwrap().unwrap(), vec![edge(1, 39)]);
@@ -314,7 +314,7 @@ fn append_body_enospc_reopens_at_the_prefix() {
     assert_eq!(t.count(), 10);
     let path = dir.path().to_path_buf();
     drop(t);
-    let t = Input::open(&path).expect("a failed body write reopens");
+    let t = Input::open(&path, true).expect("a failed body write reopens");
     assert_eq!(t.count(), 10);
     assert_eq!(t.edges(Fk(10)).unwrap().unwrap(), vec![edge(1, 9)]);
     t.append(&[vec![edge(9, 4)]]).unwrap();

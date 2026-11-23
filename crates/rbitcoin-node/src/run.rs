@@ -366,6 +366,9 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     let dir_locks = crate::lock::lock_node_dirs(&config)?;
     let params = config.chain_params()?;
     let marker = DatadirNetwork::check(config.datadir.path(), config.network, &params)?;
+    if let Some((ref src, digest)) = config.assumehot {
+        assumehot_import(&config, &params, src, digest)?;
+    }
     let query = Query::open_or_create_layout_checkblocks(
         config.store_layout(),
         config.check_blocks_window(),
@@ -547,6 +550,39 @@ fn os_error_text(e: &std::io::Error) -> String {
         }
         None => text,
     }
+}
+
+/// Import `src`'s store into this datadir's empty store before the node opens
+/// it, holding the source datadir's lock. A store an earlier start imported
+/// with this digest is opened as it is, without the source. Refusals are one
+/// line each; see `import_hot_store`.
+fn assumehot_import(
+    config: &NodeConfig,
+    params: &rbitcoin_consensus::ChainParams,
+    src: &Path,
+    digest: [u8; 32],
+) -> Result<(), NodeError> {
+    use rbitcoin_query::hot_digest::{import_hot_store, kept_import};
+    let layout = config.store_layout();
+    let refused = |e: rbitcoin_query::hot_digest::HotImportError| NodeError::Init(e.to_string());
+    if let Some(d) = kept_import(&layout.dir, digest).map_err(refused)? {
+        info!(
+            "assumehot: store already imported {}; flags ignored",
+            crate::cli::hot_digest_line(config.network, &d)
+        );
+        return Ok(());
+    }
+    let _src_lock = crate::lock::lock_dir(src)?;
+    info!(
+        "assumehot: importing {} (progress every 10s)",
+        src.display()
+    );
+    let d = import_hot_store(src, layout, params, digest, config.shindex).map_err(refused)?;
+    info!(
+        "assumehot: imported {}",
+        crate::cli::hot_digest_line(config.network, &d)
+    );
+    Ok(())
 }
 
 /// Long-running P2P (+ optional Electrum): seed resolve, catch-up, persistent follow, progress logs.

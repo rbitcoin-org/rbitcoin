@@ -384,6 +384,29 @@ fn second_barrier_alternates_and_keeps_first() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A barrier with nothing new since the last one writes neither slot, so a
+/// clean open and shutdown leave the guard as it was (`--hot-digest`).
+#[test]
+fn barrier_with_nothing_new_keeps_both_slots() {
+    let named = 128u64;
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let batch: Vec<_> = (1..=named).map(|i| coinbase([i as u8; 32])).collect();
+    s.put_tx_full_batch_indexed(&batch, false).unwrap();
+    s.txs.sync_class_a_named(named).unwrap();
+    let guard = dir.join("tear_guard");
+    let read = |name: &str| std::fs::read(guard.join(name)).unwrap();
+    let before = (read("tail.0"), read("tail.1"), read("first"));
+    s.txs.sync_class_a_named(named).unwrap();
+    s.txs.sync_class_a_data().unwrap();
+    assert!(
+        (read("tail.0"), read("tail.1"), read("first")) == before,
+        "an idle barrier rewrote the guard"
+    );
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A txstat stamp in page 0 does not refresh the sealed image.
 #[test]
 fn txstat_stamp_does_not_rewrite_first() {
@@ -535,6 +558,7 @@ fn zeroed_cold_seqsigwit_page0_restores_from_the_hot_guard() {
         &cold,
         rbitcoin_store::HeadOpenOpts::TINY,
         Some(1),
+        true,
     )
     .unwrap();
     drop(table);

@@ -290,8 +290,14 @@ fn open_cut_keeps_the_tx_head_segments_below_it() {
     assert_eq!(t.head.last_inserted_fk(), 451);
     drop((before, t));
 
-    let t =
-        TxTable::open_seqsigwit(&dir, &dir, rbitcoin_store::HeadOpenOpts::TINY, Some(300)).unwrap();
+    let t = TxTable::open_seqsigwit(
+        &dir,
+        &dir,
+        rbitcoin_store::HeadOpenOpts::TINY,
+        Some(300),
+        true,
+    )
+    .unwrap();
     assert_eq!(t.count(), 300);
     let after = t.head.segments_snapshot();
     assert_eq!(t.head.bits(), 8, "open wiped and rebuilt the whole head");

@@ -772,18 +772,9 @@ impl SegmentedTxHead {
     #[doc(hidden)]
     pub fn open_tail_rebuild_from(&self) -> Result<Option<u64>, StoreError> {
         let segs = self.segments_snapshot();
-        let Some(tail) = segs.last() else {
+        let Some(tail) = segs.last().filter(|t| tail_untrusted(t)) else {
             return Ok(None);
         };
-        if tail.sealed {
-            return Ok(None);
-        }
-        let count = tail.count.load(Ordering::Relaxed);
-        match tail.loaded_generation {
-            Some(g) if g == count => return Ok(None),
-            _ if count == 0 => return Ok(None),
-            _ => {}
-        }
         let path = segment_head_path(&self.dir, tail.file_id);
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -792,6 +783,15 @@ impl SegmentedTxHead {
         }
         tail.count.store(0, Ordering::Relaxed);
         Ok(Some(tail.first_fk))
+    }
+
+    /// True when [`Self::open_tail_rebuild_from`] would clear the open tail.
+    /// Reads only.
+    #[doc(hidden)]
+    pub fn open_tail_untrusted(&self) -> bool {
+        self.segments_snapshot()
+            .last()
+            .is_some_and(|t| tail_untrusted(t))
     }
 
     fn snapshot_open_heads_locked(&self) -> Result<(), StoreError> {
@@ -1358,6 +1358,19 @@ pub fn ensure_head_layout(dir: &Path) -> Result<(), StoreError> {
     }
     std::fs::create_dir_all(&root).map_err(|e| StoreError::io(&root, e))?;
     Ok(())
+}
+
+/// An open tail whose slots were not loaded from a snapshot whose
+/// generation equals its meta count.
+fn tail_untrusted(tail: &Segment) -> bool {
+    if tail.sealed {
+        return false;
+    }
+    let count = tail.count.load(Ordering::Relaxed);
+    match tail.loaded_generation {
+        Some(g) if g == count => false,
+        _ => count != 0,
+    }
 }
 
 #[doc(hidden)]

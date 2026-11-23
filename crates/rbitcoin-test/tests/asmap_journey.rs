@@ -87,7 +87,8 @@ async fn wait_peers(rpc: SocketAddr, n: usize) -> Value {
     }
 }
 
-fn node_bin() -> PathBuf {
+/// The operator CLI binary (`journey-node`), for tests that read its output.
+pub(crate) fn node_bin() -> PathBuf {
     // Cargo 1.95 keeps the hyphen in `CARGO_BIN_EXE_journey-node`.
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_journey-node"));
     assert!(

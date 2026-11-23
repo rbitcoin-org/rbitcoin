@@ -83,13 +83,15 @@ impl CreateLoc {
         })
     }
 
-    pub fn open(dir: &Path) -> Result<Self, StoreError> {
-        Self::open_above(dir, 0)
+    /// With `repair` false, a locator that its checkpoint or overflow file
+    /// would trim refuses the open instead.
+    pub fn open(dir: &Path, repair: bool) -> Result<Self, StoreError> {
+        Self::open_above(dir, 0, repair)
     }
 
     /// [`Self::open`] that refuses, before it cuts anything, to keep fewer
     /// than `floor` creates.
-    pub fn open_above(dir: &Path, floor: u64) -> Result<Self, StoreError> {
+    pub fn open_above(dir: &Path, floor: u64, repair: bool) -> Result<Self, StoreError> {
         let loc = open_table_file(&dir.join("create.loc"), TableKind::DeltaLoc)?;
         let ovf_path = dir.join("create.loc.ovf");
         if ovf_path.exists() {
@@ -131,6 +133,12 @@ impl CreateLoc {
         if full > 0 {
             crate::tx_table::refuse_below_committed(count, floor)?;
         }
+        if opened.trims_to(count) {
+            crate::tx_table::may_repair(
+                repair,
+                "source: create.loc, create.off and create.loc.ovf differ in length",
+            )?;
+        }
         opened.truncate_to_count(count)?;
         // A row past the overflow header belongs to a create this file does not name.
         let last_ovf = opened
@@ -144,6 +152,10 @@ impl CreateLoc {
             unresolved_ovf_cut(&opened.loc, &opened.ovf, opened.count(), last_ovf, true)?
         {
             crate::tx_table::refuse_below_committed(cut, floor)?;
+            crate::tx_table::may_repair(
+                repair,
+                "source: create.loc.ovf holds a row past its header",
+            )?;
             opened.truncate_to_count(cut)?;
         }
         Ok(opened)
@@ -173,10 +185,9 @@ impl CreateLoc {
         Ok(())
     }
 
-    /// Shorten the checkpoint and overflow files to the creates `new_count` names.
-    fn fit_off_and_ovf(&self, new_count: u64) -> Result<(), StoreError> {
+    /// Checkpoint and overflow file ends for the creates `new_count` names.
+    fn off_and_ovf_ends(&self, new_count: u64) -> (u64, u64) {
         let n_win = new_count / LOC_WINDOW;
-        let off_end = FILE_HEADER_LEN as u64 + n_win * OFF_SLOT;
         let kept = self
             .ovf_rows
             .read()
@@ -184,7 +195,23 @@ impl CreateLoc {
             .iter()
             .filter(|r| r.0 <= new_count)
             .count();
-        let ovf_end = FILE_HEADER_LEN as u64 + kept as u64 * CREATE_OVF_SLOT;
+        (
+            FILE_HEADER_LEN as u64 + n_win * OFF_SLOT,
+            FILE_HEADER_LEN as u64 + kept as u64 * CREATE_OVF_SLOT,
+        )
+    }
+
+    /// `truncate_to_count(new_count)` would change a file.
+    fn trims_to(&self, new_count: u64) -> bool {
+        let (off_end, ovf_end) = self.off_and_ovf_ends(new_count);
+        new_count != self.count()
+            || self.off.logical_len() != off_end
+            || self.ovf.logical_len() != ovf_end
+    }
+
+    /// Shorten the checkpoint and overflow files to the creates `new_count` names.
+    fn fit_off_and_ovf(&self, new_count: u64) -> Result<(), StoreError> {
+        let (off_end, ovf_end) = self.off_and_ovf_ends(new_count);
         if self.off.logical_len() != off_end {
             self.off.set_logical_len(off_end)?;
         }
