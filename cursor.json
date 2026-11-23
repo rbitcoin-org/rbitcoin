@@ -1,14 +1,14 @@
 {
   "new_base": "8e62e4ce4d60c30abc851cb0893e4b80149ac9e4",
-  "new_skip": 4160,
-  "old_index": 12286,
-  "old_name": "crates/rbitcoin-node/src/error.rs:31:9: replace <impl fmt::Display for NodeError>::fmt -> fmt::Result with Ok(Default::default())",
-  "new_cap_used": false,
-  "run_id": "45248176819",
-  "new_len": 12410,
-  "new_remaining": 8250,
-  "old_len": 26510,
-  "old_remaining": 26132,
-  "completed_new": 200,
-  "completed_old": 378
+  "new_skip": 4398,
+  "old_index": 13000,
+  "old_name": "crates/rbitcoin-primitives/src/script_sigops.rs:13:5: replace script_sigop_count -> u64 with 0",
+  "new_cap_used": true,
+  "run_id": "45251085187",
+  "new_len": 12474,
+  "new_remaining": 8076,
+  "old_len": 26457,
+  "old_remaining": 25743,
+  "completed_new": 238,
+  "completed_old": 714
 }
