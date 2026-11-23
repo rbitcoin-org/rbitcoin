@@ -1,7 +1,7 @@
 //! `testmempoolaccept`: one row per submitted transaction, in submission
 //! order. JSON-RPC, Electrum, and Esplora render the same rows.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use bitcoin::{Transaction, Txid, Wtxid};
@@ -184,11 +184,16 @@ fn package_error(txs: &[Transaction], msg: &'static str) -> Vec<TestAcceptRow> {
 }
 
 impl MempoolHub {
-    /// Core `IsWellFormedPackage`, in Core's order, then the cluster limit.
-    /// Every surface caps the count at 25 before the walk.
-    fn test_accept_precheck(&self, txs: &[Transaction]) -> Option<Vec<TestAcceptRow>> {
+    /// Core `IsWellFormedPackage`, in Core's order. A failure there is the
+    /// whole package's. Otherwise the positions of the members of each
+    /// cluster over the cap, which only their own rows report. Every surface
+    /// caps the count at 25 before the walk.
+    fn test_accept_precheck(
+        &self,
+        txs: &[Transaction],
+    ) -> Result<BTreeSet<usize>, Vec<TestAcceptRow>> {
         if txs.len() < 2 {
-            return None;
+            return Ok(BTreeSet::new());
         }
         let weight: u64 = txs.iter().map(|tx| tx.weight().to_wu()).sum();
         let mut ids = HashSet::new();
@@ -200,12 +205,10 @@ impl MempoolHub {
             "package-not-sorted"
         } else if package_has_conflicts(txs) {
             "conflict-in-package"
-        } else if self.package_would_exceed_cluster(txs) {
-            "too-large-cluster"
         } else {
-            return None;
+            return Ok(self.package_clusters_over_cap(txs));
         };
-        Some(package_error(txs, error))
+        Err(package_error(txs, error))
     }
 
     /// Test-accept `txs` without touching the pool, with script verify
@@ -219,13 +222,14 @@ impl MempoolHub {
     ) -> Vec<TestAcceptRow> {
         let hub = Arc::clone(self);
         let txs_c = txs.clone();
-        if let Some(rows) = crate::reactor::off_pool(move || hub.test_accept_precheck(&txs_c)).await
-        {
-            return rows;
-        }
+        let over_cap =
+            match crate::reactor::off_pool(move || hub.test_accept_precheck(&txs_c)).await {
+                Ok(over_cap) => over_cap,
+                Err(rows) => return rows,
+            };
         if txs.len() >= 2 {
             return self
-                .test_accept_package_rows_async(txs, max_feerate_sat_kvb)
+                .test_accept_package_rows_async(txs, &over_cap, max_feerate_sat_kvb)
                 .await;
         }
         let Some(tx) = txs.into_iter().next() else {
@@ -242,14 +246,21 @@ impl MempoolHub {
         vec![row]
     }
 
+    /// A member of an over-cap cluster is `too-large-cluster` and no parent
+    /// for a later member, which is in the same cluster if it spends one.
     async fn test_accept_package_rows_async(
         self: &Arc<Self>,
         txs: Vec<Transaction>,
+        over_cap: &BTreeSet<usize>,
         max_feerate_sat_kvb: u64,
     ) -> Vec<TestAcceptRow> {
         let mut tested = Arc::new(TestedMembers::default());
         let mut out = Vec::with_capacity(txs.len());
-        for tx in txs {
+        for (i, tx) in txs.into_iter().enumerate() {
+            if over_cap.contains(&i) {
+                out.push(TestAcceptRow::rejected(&tx, "too-large-cluster"));
+                continue;
+            }
             if submit_tx_version_nonstandard(&tx) {
                 out.push(TestAcceptRow::rejected(&tx, "version"));
                 continue;

@@ -6849,11 +6849,11 @@ impl MempoolHub {
         self.lock_read().graph.get(txid).map(|e| e.wtxid)
     }
 
-    /// True if one cluster that `txs` would make with the pool exceeds the
-    /// count or size cap (Core `CheckMemPoolPolicyLimits`). Members share a
-    /// cluster through a spend inside the package or a pool cluster both
-    /// spend from. A member that touches neither is a cluster of its own.
-    pub fn package_would_exceed_cluster(&self, txs: &[bitcoin::Transaction]) -> bool {
+    /// Positions in `txs` of the members of each cluster they would make with
+    /// the pool that exceeds the count or size cap. Members share a cluster
+    /// through a spend inside the package or a pool cluster both spend from.
+    /// A member that touches neither is a cluster of its own.
+    pub fn package_clusters_over_cap(&self, txs: &[bitcoin::Transaction]) -> BTreeSet<usize> {
         fn root(group: &mut [usize], mut i: usize) -> usize {
             while group[i] != i {
                 group[i] = group[group[i]];
@@ -6885,16 +6885,21 @@ impl MempoolHub {
                 group[a] = b;
             }
         }
-        let mut clusters: BTreeMap<usize, (BTreeSet<Txid>, usize, u64)> = BTreeMap::new();
+        let mut clusters: BTreeMap<usize, (BTreeSet<Txid>, Vec<usize>, u64)> = BTreeMap::new();
         for (i, tx) in txs.iter().enumerate() {
             let c = clusters.entry(root(&mut group, i)).or_default();
             c.0.append(&mut pool_parents[i]);
-            c.1 += 1;
+            c.1.push(i);
             c.2 = c.2.saturating_add(tx.weight().to_wu());
         }
         clusters
-            .values()
-            .any(|(parents, count, weight)| g.graph.cluster_would_exceed(parents, *count, *weight))
+            .into_values()
+            .filter(|(parents, members, weight)| {
+                g.graph
+                    .cluster_would_exceed(parents, members.len(), *weight)
+            })
+            .flat_map(|(_, members, _)| members)
+            .collect()
     }
 
     /// Direct in-mempool parents and children (`depends` / `spentby`).

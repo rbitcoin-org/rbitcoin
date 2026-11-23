@@ -21,9 +21,11 @@ Fixed
   A package member that clashes with a pool tx and also fails
   `CheckTransaction`, such as a repeated input, reports the
   `CheckTransaction` reason, not `bip125-replacement-disallowed`.
-  A package is `too-large-cluster` only when one cluster it would make with
-  the mempool is over the cap. It used to add every member onto every pool
-  parent's cluster, so a member that touches none of them failed the
-  package.
+  The cluster cap holds for each cluster a package would make with the
+  mempool, and only that cluster's members are refused, with
+  `reject-reason` `too-large-cluster` as a single transaction over the cap
+  gets. It used to add every member onto every pool parent's cluster and
+  give every row `package-error`, so a member that touches none of them
+  failed too. Core gives every row `package-error`.
   Unlike Core, a multi-transaction call does not stop at the first failed
   member: every member still gets its own row.

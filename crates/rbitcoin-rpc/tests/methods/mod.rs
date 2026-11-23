@@ -5011,10 +5011,12 @@ fn testmempoolaccept_package_applies_truc_to_an_untested_parent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A package is over the cluster cap only when one cluster it makes is (Core
-/// `CheckMemPoolPolicyLimits`). At a cap of two, a child of a pooled tx and a
-/// tx that spends a confirmed coin make clusters of two and one, and both
-/// are allowed. Two children of the pooled tx make one cluster of three.
+/// The cluster cap holds for each cluster a package makes, and only that
+/// cluster's members are `too-large-cluster`. At a cap of two, a child of a
+/// pooled tx and a tx that spends a confirmed coin make clusters of two and
+/// one, and both are allowed. Two children of the pooled tx make one cluster
+/// of three, and so does a chain of three that spends only a confirmed coin.
+/// Beside the two children, the unrelated tx is still allowed.
 #[test]
 fn testmempoolaccept_package_counts_each_cluster_alone() {
     use bitcoin::consensus::encode::serialize;
@@ -5054,10 +5056,19 @@ fn testmempoolaccept_package_counts_each_cluster_alone() {
     let rows = test(&[&spend(0), &unrelated]);
     assert_eq!(rows[0]["allowed"], true, "{rows}");
     assert_eq!(rows[1]["allowed"], true, "{rows}");
+    let over_cap = |row: &serde_json::Value| {
+        row["allowed"] == false
+            && row["reject-reason"] == "too-large-cluster"
+            && row.get("package-error").is_none()
+    };
     let rows = test(&[&spend(0), &spend(1)]);
-    for row in rows.as_array().unwrap() {
-        assert_eq!(row["package-error"], "too-large-cluster", "{rows}");
-    }
+    assert!(rows.as_array().unwrap().iter().all(over_cap), "{rows}");
+    let child = child_of(&unrelated, 1_000);
+    let rows = test(&[&unrelated, &child, &child_of(&child, 1_000)]);
+    assert!(rows.as_array().unwrap().iter().all(over_cap), "{rows}");
+    let rows = test(&[&spend(0), &spend(1), &unrelated]);
+    assert!(over_cap(&rows[0]) && over_cap(&rows[1]), "{rows}");
+    assert_eq!(rows[2]["allowed"], true, "{rows}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5768,8 +5779,7 @@ fn pressure_admit_then_cluster(ctx: &RpcContext, spk: &ScriptBuf) {
     let arr = res.as_array().expect("package result");
     assert_eq!(arr.len(), 2);
     for row in arr {
-        let err = row["package-error"].as_str().expect("package-error");
-        assert!(err.contains("too-large-cluster"), "got {row}");
+        assert_eq!(row["reject-reason"], "too-large-cluster", "got {row}");
     }
 
     // Each fails alone only on fee or missing inputs, so the pair goes to
