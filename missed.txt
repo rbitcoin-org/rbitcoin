@@ -2954,3 +2954,60 @@ MISSED   crates/rbitcoin-query/src/archive.rs:915:39: replace < with <= in batch
 MISSED   crates/rbitcoin-query/src/archive.rs:951:32: replace || with && in collect_plan_need_external in 8s build + 84s test
 MISSED   crates/rbitcoin-query/src/archive.rs:1057:13: replace || with && in wire_edges_match in 9s build + 84s test
 MISSED   crates/rbitcoin-query/src/archive.rs:1111:48: replace || with && in stamp_txstat_rows in 8s build + 84s test
+# 45375080218 1 336329e258532d7e4b31fe3139eee8555bc0c1ae
+MISSED   crates/rbitcoin-net/src/peer.rs:7319:44: replace && with || in on_tx in 113s build + 50s test
+MISSED   crates/rbitcoin-net/src/peer.rs:7994:58: replace + with - in PathWorkMemo::entries in 8s build + 49s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8098:13: replace && with || in PathWorkMemo::path_connects in 8s build + 49s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8116:27: replace >= with < in PathWorkMemo::path_fails_claimed_pow in 8s build + 50s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8132:21: replace == with != in PathWorkMemo::path_fails_claimed_pow in 8s build + 49s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8156:56: replace < with <= in PathWorkMemo::better_path_connects in 8s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8183:36: replace match guard path.len() + 1 >= PENDING_WALK_LIMIT with false in memo_path_work in 17s build + 49s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8183:47: replace + with * in memo_path_work in 17s build + 50s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8199:22: replace + with * in memo_path_work in 8s build + 49s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8203:31: replace + with * in memo_path_work in 8s build + 49s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8425:34: replace && with || in any_header_path_meets_minwork in 8s build + 50s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8425:21: replace != with == in any_header_path_meets_minwork in 8s build + 50s test
+MISSED   crates/rbitcoin-net/src/peer.rs:8464:33: replace || with && in header_path_above in 8s build + 49s test
+MISSED   crates/rbitcoin-net/src/peers.rs:62:65: replace + with * in outbound_msg_bytes in 115s build + 50s test
+MISSED   crates/rbitcoin-net/src/peers.rs:98:9: replace + with - in compact_block_len in 8s build + 49s test
+MISSED   crates/rbitcoin-net/src/peers.rs:735:9: replace LivePeer::raw_sent -> u64 with 0 in 9s build + 51s test
+MISSED   crates/rbitcoin-net/src/peers.rs:750:9: replace LivePeer::held_front_queued -> bool with true in 9s build + 50s test
+MISSED   crates/rbitcoin-net/src/peers.rs:1009:42: replace && with || in LivePeer::self_announce_link in 8s build + 49s test
+MISSED   crates/rbitcoin-net/src/peers.rs:1597:22: replace > with == in LivePeer::claim_hb_body_fanout in 8s build + 49s test
+MISSED   crates/rbitcoin-net/src/peers.rs:1597:22: replace > with < in LivePeer::claim_hb_body_fanout in 8s build + 49s test
+MISSED   crates/rbitcoin-net/src/peers.rs:1597:22: replace > with >= in LivePeer::claim_hb_body_fanout in 8s build + 50s test
+MISSED   crates/rbitcoin-net/src/peers.rs:1637:9: replace LivePeer::inv_released_seen -> u64 with 0 in 8s build + 49s test
+MISSED   crates/rbitcoin-query/src/archive.rs:1566:56: delete ! in Query::archive_plan_batch_from_wire in 125s build + 70s test
+MISSED   crates/rbitcoin-query/src/archive.rs:1763:36: replace + with * in Query::finish_archive_plan in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/archive.rs:1971:9: replace Query::drain_pending_tx_head_if_full -> Result<(), QueryError> with Ok(()) in 10s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:247:54: delete ! in PinOuts::compose in 126s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:611:9: replace <impl Clone for BatchParents>::clone -> Self with Default::default() in 12s build + 70s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:637:52: replace == with != in BatchParents::invalidate_sticky in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:738:33: delete ! in BatchParents::insert_create_pin in 10s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:914:17: replace || with && in BatchParents::set_layout_for_need in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:913:65: replace && with || in BatchParents::set_layout_for_need in 10s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:913:40: replace && with || in BatchParents::set_layout_for_need in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:913:68: delete ! in BatchParents::set_layout_for_need in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:914:20: delete ! in BatchParents::set_layout_for_need in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:918:64: replace && with || in BatchParents::set_layout_for_need in 12s build + 70s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:918:39: replace && with || in BatchParents::set_layout_for_need in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:918:67: delete ! in BatchParents::set_layout_for_need in 12s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:921:20: delete ! in BatchParents::set_layout_for_need in 12s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:926:28: replace == with != in BatchParents::set_layout_for_need in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:936:51: replace && with || in BatchParents::set_layout_for_need in 11s build + 70s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:936:31: replace == with != in BatchParents::set_layout_for_need in 17s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:972:12: delete ! in BatchParents::set_layout_sparse in 16s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:978:28: replace == with != in BatchParents::set_layout_sparse in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:987:17: replace && with || in BatchParents::set_layout_sparse in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:986:31: replace == with != in BatchParents::set_layout_sparse in 17s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:1140:13: replace && with || in BatchParents::get_parent_outs_needed in 16s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:1139:23: delete ! in BatchParents::get_parent_outs_needed in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:1181:39: replace > with == in ensure_outs_sorted in 12s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:1181:39: replace > with < in ensure_outs_sorted in 10s build + 70s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:1181:39: replace > with >= in ensure_outs_sorted in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:1190:40: replace > with == in ensure_checked_sorted in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:1190:40: replace > with < in ensure_checked_sorted in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:1190:40: replace > with >= in ensure_checked_sorted in 11s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:1194:40: replace == with != in ensure_checked_sorted in 12s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:1239:37: replace && with || in layout_covers_need in 128s build + 71s test
+MISSED   crates/rbitcoin-query/src/batch_parents.rs:1245:34: replace || with && in layout_covers_need in 2s build + 13s test
