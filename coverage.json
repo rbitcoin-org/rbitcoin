@@ -4,11 +4,11 @@
   "message": "92.88%",
   "color": "brightgreen",
   "pct": 92.88,
-  "lh": 125471,
-  "lf": 135091,
+  "lh": 125536,
+  "lf": 135155,
   "gate": 91,
   "scope": "production",
-  "sha": "a7ce44ce8ecd",
+  "sha": "72af0cfe2401",
   "date": "2026-11-24",
   "crates": [
     {
@@ -19,33 +19,33 @@
     },
     {
       "name": "rbitcoin-consensus",
-      "lh": 6864,
+      "lh": 6865,
       "lf": 7021,
-      "pct": 97.76
+      "pct": 97.78
     },
     {
       "name": "rbitcoin-electrum",
-      "lh": 3438,
+      "lh": 3439,
       "lf": 3697,
-      "pct": 92.99
+      "pct": 93.02
     },
     {
       "name": "rbitcoin-esplora",
-      "lh": 4461,
-      "lf": 4916,
-      "pct": 90.74
+      "lh": 4357,
+      "lf": 4791,
+      "pct": 90.94
     },
     {
       "name": "rbitcoin-ibd",
-      "lh": 14169,
+      "lh": 14164,
       "lf": 15073,
-      "pct": 94.0
+      "pct": 93.97
     },
     {
       "name": "rbitcoin-log",
-      "lh": 527,
+      "lh": 529,
       "lf": 542,
-      "pct": 97.23
+      "pct": 97.6
     },
     {
       "name": "rbitcoin-mempool",
@@ -55,15 +55,15 @@
     },
     {
       "name": "rbitcoin-net",
-      "lh": 27221,
-      "lf": 28973,
-      "pct": 93.95
+      "lh": 27334,
+      "lf": 29110,
+      "pct": 93.9
     },
     {
       "name": "rbitcoin-node",
-      "lh": 5348,
+      "lh": 5355,
       "lf": 6245,
-      "pct": 85.64
+      "pct": 85.75
     },
     {
       "name": "rbitcoin-primitives",
@@ -73,27 +73,27 @@
     },
     {
       "name": "rbitcoin-query",
-      "lh": 17779,
-      "lf": 19294,
-      "pct": 92.15
+      "lh": 17765,
+      "lf": 19281,
+      "pct": 92.14
     },
     {
       "name": "rbitcoin-rpc",
-      "lh": 8302,
-      "lf": 8848,
-      "pct": 93.83
+      "lh": 8331,
+      "lf": 8877,
+      "pct": 93.85
     },
     {
       "name": "rbitcoin-store",
-      "lh": 29800,
-      "lf": 32544,
+      "lh": 29834,
+      "lf": 32580,
       "pct": 91.57
     },
     {
       "name": "rbitcoin-sv2",
-      "lh": 964,
+      "lh": 965,
       "lf": 1048,
-      "pct": 91.98
+      "pct": 92.08
     }
   ]
 }
