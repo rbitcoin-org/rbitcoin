@@ -6,6 +6,7 @@
 //! is not in rust-bitcoin 0.32 `NetworkMessage`; the old private `rbtpkg`
 //! name is gone).
 
+use crate::broadcast_reject::BroadcastReject;
 use crate::fee_history::{FeeHistory, HistoricalFeeBlock};
 use crate::fee_history_file;
 use crate::inv_bucket::{InvBuckets, InvDirection};
@@ -4565,6 +4566,26 @@ impl MempoolHub {
                 return admitted;
             }
         }
+    }
+
+    /// An Electrum or Esplora client's broadcast: Core's `-27` for a tx whose
+    /// outputs are still coins, else [`Self::broadcast_local_async`], with a
+    /// refusal answered as `sendrawtransaction` answers it. The caller holds a
+    /// store budget ([`crate::with_store_budget`]).
+    pub async fn broadcast_client_async(
+        self: &Arc<Self>,
+        tx: Transaction,
+    ) -> Result<LocalBroadcast, BroadcastReject> {
+        let query = Arc::clone(&self.query);
+        let coins = tx.clone();
+        let confirmed =
+            crate::off_pool_budgeted(move || query.outputs_already_in_utxo_set(&coins)).await;
+        if confirmed.map_err(BroadcastReject::query)? {
+            return Err(BroadcastReject::already_in_utxo_set());
+        }
+        self.broadcast_local_async(tx)
+            .await
+            .map_err(|e| BroadcastReject::of(&e))
     }
 
     /// [`Self::accept_tx_defer_trim`] without a blocking thread across scripts.

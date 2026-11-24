@@ -2356,15 +2356,21 @@ pub fn decode_tx_hex_str(hex: &str) -> Result<bitcoin::Transaction, Response> {
     }
 }
 
+/// A refusal is 400 with electrs's body: `sendrawtransaction RPC error: `
+/// and the code and message `sendrawtransaction` gives.
 pub async fn admit_broadcast(st: AppState, tx: bitcoin::Transaction) -> Response {
     let Some(mp) = st.mempool.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "mempool not available").into_response();
     };
     let txid = tx.compute_txid();
     let budget = st.query.api_read_budget();
-    match rbitcoin_net::with_store_budget(budget, mp.broadcast_local_async(tx)).await {
+    match rbitcoin_net::with_store_budget(budget, mp.broadcast_client_async(tx)).await {
         Ok(_) => plain_ok(block_hash_hex(&txid.to_byte_array())),
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(reject) => {
+            let rpc_error = json!({ "code": reject.code, "message": reject.message });
+            let body = format!("sendrawtransaction RPC error: {rpc_error}");
+            (StatusCode::BAD_REQUEST, body).into_response()
+        }
     }
 }
 

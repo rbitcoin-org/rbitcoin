@@ -3,6 +3,8 @@
 #[doc(hidden)]
 pub mod asmap;
 #[doc(hidden)]
+pub mod broadcast_reject;
+#[doc(hidden)]
 pub mod cache;
 #[doc(hidden)]
 pub mod chain;
@@ -74,6 +76,7 @@ pub use asmap::{
     ASMAP_JUMP_SHORT_TAIL, ASMAP_MATCH_PAST_END, ASMAP_SECOND_DEFAULT, ASMAP_TRAILING_ONE,
     ASMAP_TWO_SHORT_MATCHES, LONE_RETURN_ASMAP, LOOPBACK_ASMAP, TWO_PREFIX_ASMAP,
 };
+pub use broadcast_reject::{accept_reject_reason, BroadcastReject};
 pub use cache::BlockCache;
 pub use chain::{check_block_proposal_with, AcceptOutcome, ChainHub, ChainTipInfo, TipEvent};
 pub use compact::{

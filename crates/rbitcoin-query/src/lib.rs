@@ -2369,6 +2369,34 @@ impl Query {
         self.store.unspent_create_vouts(create_fk, vouts, None)
     }
 
+    /// Core `BroadcastTransaction`'s `-27` test: a spendable output of `tx` is
+    /// an unspent coin of a best-chain block. The genesis coinbase never is
+    /// one, as ConnectBlock never adds it.
+    pub fn outputs_already_in_utxo_set(&self, tx: &Transaction) -> Result<bool, QueryError> {
+        let Some(fk) = self.tx_fk_by_txid_tip(&tx.compute_txid().to_byte_array())? else {
+            return Ok(false);
+        };
+        if !self.store.is_confirmed_strong(fk)? {
+            return Ok(false);
+        }
+        if self.store.tx_height_get(fk)? == Some(0) && self.is_coinbase_create(fk, 0)? {
+            return Ok(false);
+        }
+        let vouts: Vec<u32> = tx
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_, out)| {
+                !rbitcoin_consensus::policy::is_unspendable(out.script_pubkey.as_bytes())
+            })
+            .map(|(i, _)| i as u32)
+            .collect();
+        if vouts.is_empty() {
+            return Ok(false);
+        }
+        Ok(!self.unspent_create_vouts(fk, &vouts)?.is_empty())
+    }
+
     /// Batch [`Self::unspent_create_vouts`]: one spent-range walk across creates.
     pub fn unspent_create_vouts_batch(
         &self,

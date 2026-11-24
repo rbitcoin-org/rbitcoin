@@ -498,11 +498,9 @@ async fn broadcast_of_a_pooled_tx_answers_its_txid(
         broadcast(relayed).await,
         Ok(json!(relayed.compute_txid().to_string()))
     );
-    let got = broadcast(&orphan).await;
-    assert!(
-        got.as_ref()
-            .is_err_and(|e| e.starts_with("broadcast reject")),
-        "{got:?}"
+    assert_eq!(
+        broadcast(&orphan).await,
+        Err("bad-txns-inputs-missingorspent".to_string())
     );
     handle.shutdown().await;
 }

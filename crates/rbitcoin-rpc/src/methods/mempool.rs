@@ -1147,15 +1147,8 @@ fn sendraw_after_accept(
             Ok(json!(hash_hex_display(&tid.to_byte_array())))
         }
         Err(e) => {
-            let reason = accept_reject_reason(&e);
-            // Core maps MISSING_INPUTS to RPC_TRANSACTION_ERROR (-25) and
-            // `bad-txns-inputs-missingorspent`. testmempoolaccept keeps
-            // the reason string `missing-inputs`.
-            if reason == "missing-inputs" {
-                Err(rpc_error(ERR_VERIFY_ERROR, MISSING_OR_SPENT))
-            } else {
-                Err(rpc_error(ERR_VERIFY_REJECTED, reason))
-            }
+            let reject = rbitcoin_net::BroadcastReject::of(&e);
+            Err(rpc_error(reject.code, reject.message))
         }
     }
 }
@@ -1163,100 +1156,20 @@ fn sendraw_after_accept(
 /// Core `BroadcastTransaction` returns `-27` when one of the tx's own outputs
 /// is still a coin. Burn is already handled. Version and max fee are later.
 fn reject_outputs_already_in_utxo_set(ctx: &RpcContext, tx: &Transaction) -> Result<(), Value> {
-    if outputs_already_in_utxo_set(ctx, tx)? {
-        return Err(rpc_error(
-            ERR_VERIFY_ALREADY_IN_UTXO_SET,
-            "Transaction outputs already in utxo set",
-        ));
+    let confirmed = ctx
+        .query
+        .outputs_already_in_utxo_set(tx)
+        .map_err(|e| rpc_error(ERR_MISC, format!("query failed: {e}")))?;
+    if confirmed {
+        let reject = rbitcoin_net::BroadcastReject::already_in_utxo_set();
+        return Err(rpc_error(reject.code, reject.message));
     }
     Ok(())
 }
 
-/// True when a spendable output of `tx` is an unspent confirmed coin.
-fn outputs_already_in_utxo_set(ctx: &RpcContext, tx: &Transaction) -> Result<bool, Value> {
-    let txid = tx.compute_txid().to_byte_array();
-    // ConnectBlock never adds the genesis coinbase. No spender does not
-    // make that output a coin.
-    if txid == genesis_coinbase_txid(ctx) {
-        return Ok(false);
-    }
-    let Some(fk) = confirmed_tip_fk(ctx, &txid)? else {
-        return Ok(false);
-    };
-    let vouts: Vec<u32> = tx
-        .output
-        .iter()
-        .enumerate()
-        .filter(|(_, out)| {
-            !rbitcoin_consensus::policy::is_unspendable(out.script_pubkey.as_bytes())
-        })
-        .map(|(i, _)| i as u32)
-        .collect();
-    if vouts.is_empty() {
-        return Ok(false);
-    }
-    let unspent = ctx
-        .query
-        .unspent_create_vouts(fk, &vouts)
-        .map_err(|e| rpc_error(ERR_MISC, format!("query failed: {e}")))?;
-    Ok(!unspent.is_empty())
-}
-
-/// Core `TransactionError::MISSING_INPUTS` text on `sendrawtransaction`.
-const MISSING_OR_SPENT: &str = "bad-txns-inputs-missingorspent";
-
-pub fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
-    let owned = e.to_string();
-    let s = owned.strip_prefix("policy: ").unwrap_or(owned.as_str());
-    if s == "coinbase immature" {
-        return "bad-txns-premature-spend-of-coinbase".into();
-    }
-    if s == "coinbase" {
-        return "bad-txns-is-coinbase".into();
-    }
-    if s.starts_with("missing prevout") || s.starts_with("orphaned ") {
-        return "missing-inputs".into();
-    }
-    if s.starts_with("duplicate ") {
-        return "txn-already-in-mempool".into();
-    }
-    if s == "inputs-duplicate" {
-        return "bad-txns-inputs-duplicate".into();
-    }
-    if s == "not final" {
-        return "non-final".into();
-    }
-    if s == "negative fee" {
-        return "bad-txns-in-belowout".into();
-    }
-    if s == "non-BIP68-final" {
-        return "non-BIP68-final".into();
-    }
-    if s == "rbf insufficient fee" {
-        return "insufficient fee".into();
-    }
-    if s == "rbf insufficient fee (including sibling eviction)" {
-        return "insufficient fee (including sibling eviction)".into();
-    }
-    if s == "min relay fee" {
-        return "min relay fee not met".into();
-    }
-    if s == "mempool min fee" {
-        return "mempool min fee not met".into();
-    }
-    if let Some(rest) = s.strip_prefix("script: ") {
-        let rest = rest
-            .strip_prefix("script verification failed: ")
-            .unwrap_or(rest);
-        let paren = rbitcoin_consensus::script_flag_paren(rest);
-        return format!("mempool-script-verify-flag-failed ({paren})");
-    }
-    s.to_string()
-}
-
 /// Core `reject-details` for mempool rejects.
 pub fn accept_reject_details(e: &impl std::fmt::Display, tx: &Transaction) -> Option<String> {
-    let reason = accept_reject_reason(e);
+    let reason = rbitcoin_net::accept_reject_reason(e);
     if reason == "txn-already-in-mempool" || reason == "txn-same-nonwitness-data-in-mempool" {
         return Some(reason);
     }
@@ -1384,7 +1297,7 @@ fn tma_from_accept(
 }
 
 fn tma_from_err(tx: &Transaction, txid: &str, wtxid: &str, e: &impl std::fmt::Display) -> Value {
-    let mut row = tma_reject(txid, wtxid, &accept_reject_reason(e));
+    let mut row = tma_reject(txid, wtxid, &rbitcoin_net::accept_reject_reason(e));
     if let Some(details) = accept_reject_details(e, tx) {
         row["reject-details"] = json!(details);
     }
@@ -2318,11 +2231,7 @@ fn submitpackage_apply(
 
 #[doc(hidden)]
 pub fn submitpackage_member_error(e: &impl std::fmt::Display) -> String {
-    let mapped = accept_reject_reason(e);
-    if mapped == "missing-inputs" {
-        return MISSING_OR_SPENT.into();
-    }
-    mapped
+    rbitcoin_net::BroadcastReject::of(e).message
 }
 
 pub fn gettxspendingprevout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {

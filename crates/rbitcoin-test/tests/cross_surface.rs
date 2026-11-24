@@ -1465,6 +1465,43 @@ async fn pin_rest_deployment_and_filter(rpc_addr: SocketAddr, tip: &str) {
     assert_eq!(st, 400, "{body}");
 }
 
+/// Electrum `blockchain.transaction.broadcast` and Esplora `POST /tx` refuse
+/// `tx_hex` with the code and reason `sendrawtransaction` gives, in the
+/// shape electrs forwards Core's: the bare reason on Electrum, and
+/// `sendrawtransaction RPC error: {"code":..,"message":..}` on Esplora.
+async fn pin_broadcast_reject_matches_sendraw(
+    rpc_addr: SocketAddr,
+    electrum_addr: SocketAddr,
+    esplora_addr: SocketAddr,
+    tx_hex: &str,
+    code: i64,
+    reason: &str,
+) {
+    let mut el = TcpStream::connect(electrum_addr).await.unwrap();
+    let _ = electrum_rpc(&mut el, 1, "server.version", json!(["test", "1.4"])).await;
+    let got = electrum_rpc(
+        &mut el,
+        2,
+        "blockchain.transaction.broadcast",
+        json!([tx_hex]),
+    )
+    .await;
+    assert_eq!(got["error"]["message"], reason, "electrum: {got}");
+    let (st, body) = http_post(esplora_addr, "/tx", tx_hex).await;
+    assert_eq!(
+        (st, body.as_str()),
+        (
+            400,
+            format!(r#"sendrawtransaction RPC error: {{"code":{code},"message":"{reason}"}}"#)
+                .as_str()
+        ),
+        "esplora"
+    );
+    let sent = jsonrpc(rpc_addr, "sendrawtransaction", json!([tx_hex])).await;
+    assert_eq!(sent["error"]["code"], code, "{sent}");
+    assert_eq!(sent["error"]["message"], reason, "{sent}");
+}
+
 async fn electrum_rpc(stream: &mut TcpStream, id: u64, method: &str, params: Value) -> Value {
     let req = json!({"jsonrpc":"2.0","id": id, "method": method, "params": params});
     let mut line = serde_json::to_string(&req).unwrap();
@@ -2040,6 +2077,15 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         tma["result"][0]["reject-reason"], "min relay fee not met",
         "{tma}"
     );
+    pin_broadcast_reject_matches_sendraw(
+        rpc_addr,
+        electrum_addr,
+        esplora_addr,
+        &encode_tx(&under_min),
+        -26,
+        "min relay fee not met",
+    )
+    .await;
     let at_min = acs_spend(
         exact_cb,
         50_0000_0000,
@@ -2096,6 +2142,15 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     for field in ["vsize", "vsize_bip141", "vsize_adjusted"] {
         assert!(tma["result"][0].get(field).is_none(), "{tma}");
     }
+    pin_broadcast_reject_matches_sendraw(
+        rpc_addr,
+        electrum_addr,
+        esplora_addr,
+        &miss_hex,
+        -25,
+        "bad-txns-inputs-missingorspent",
+    )
+    .await;
 
     let spk = ScriptBuf::from_bytes(vec![0x52]);
     let spend = acs_spend(coinbase_txid, 50_0000_0000, 1_000, spk.clone());
@@ -2780,6 +2835,24 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    pin_broadcast_reject_matches_sendraw(
+        rpc_addr,
+        electrum_addr,
+        esplora_addr,
+        &encode_tx(&at_min),
+        -27,
+        "Transaction outputs already in utxo set",
+    )
+    .await;
+    pin_broadcast_reject_matches_sendraw(
+        rpc_addr,
+        electrum_addr,
+        esplora_addr,
+        &encode_tx(&under_min),
+        -25,
+        "bad-txns-inputs-missingorspent",
+    )
+    .await;
     let chain = jsonrpc(rpc_addr, "getblockchaininfo", json!([])).await;
     assert_eq!(chain["result"]["initialblockdownload"], false, "{chain}");
     assert_eq!(

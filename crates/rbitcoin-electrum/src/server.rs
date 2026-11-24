@@ -3018,7 +3018,8 @@ fn package_broadcast_value(verbose: bool, accepted: &[rbitcoin_net::AcceptResult
 }
 
 /// Accept one raw tx, with script verify awaited on the connection task. A tx
-/// whose txid is already pooled answers the txid too.
+/// whose txid is already pooled answers the txid too. A refusal is the
+/// message `sendrawtransaction` gives, which electrs forwards from Core.
 pub async fn broadcast_raw_tx_async(
     params: &Value,
     config: &ElectrumConfig,
@@ -3030,9 +3031,9 @@ pub async fn broadcast_raw_tx_async(
         .clone();
     let txid = tx.compute_txid();
     let budget = mp.query.api_read_budget();
-    rbitcoin_net::with_store_budget(budget, mp.broadcast_local_async(tx))
+    rbitcoin_net::with_store_budget(budget, mp.broadcast_client_async(tx))
         .await
-        .map_err(|e| format!("broadcast reject: {e}"))?;
+        .map_err(|reject| reject.message)?;
     Ok(json!(txid.to_string()))
 }
 

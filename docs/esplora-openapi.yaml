@@ -892,6 +892,13 @@ paths:
     post:
       tags: [broadcast]
       summary: Broadcast a raw transaction
+      description: |
+        A refused tx is **400** with Esplora's body for Core's
+        `sendrawtransaction` error: `sendrawtransaction RPC error: ` and
+        `{"code":<code>,"message":"<reason>"}`, the code and reason
+        `sendrawtransaction` gives (`-26 min relay fee not met`,
+        `-25 bad-txns-inputs-missingorspent`,
+        `-27 Transaction outputs already in utxo set`).
       requestBody:
         required: true
         content:

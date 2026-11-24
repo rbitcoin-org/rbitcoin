@@ -3076,14 +3076,9 @@ async fn pin_blocksonly_electrum_esplora_broadcast(
         json!([miss_hex]),
     )
     .await;
-    let bad_msg = bad["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        bad_msg.contains("broadcast reject"),
-        "electrum consensus-invalid must hit hub, got {bad}"
-    );
-    assert!(
-        !bad_msg.contains("mempool not available") && !bad_msg.contains("relay disabled"),
-        "electrum broadcast hub-attached: {bad}"
+    assert_eq!(
+        bad["error"]["message"], "bad-txns-inputs-missingorspent",
+        "electrum missing-input broadcast must hit the hub: {bad}"
     );
 
     let (st, body) = http_post(esplora_addr, "/tx", "zz").await;

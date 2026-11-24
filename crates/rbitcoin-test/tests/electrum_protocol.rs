@@ -1664,10 +1664,9 @@ async fn electrum_leftover_mempool_does_not_double_count() {
         json!([miss_hex]),
     )
     .await;
-    let tx_msg = bad_tx["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        tx_msg.contains("broadcast reject"),
-        "consensus-invalid broadcast with hub: {bad_tx}"
+    assert_eq!(
+        bad_tx["error"]["message"], "bad-txns-inputs-missingorspent",
+        "missing-input broadcast with hub: {bad_tx}"
     );
 
     let cb1 = coinbase_txids[0].to_string();
