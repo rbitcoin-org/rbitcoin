@@ -179,6 +179,57 @@ async fn maxfeerate_query_cases(sock: &std::path::Path, body: &[u8]) {
     assert_eq!(arr[0]["allowed"], true, "{resp}");
 }
 
+/// Two or more `/txs/test` items are one package: a child sees its parent,
+/// and a conflict fails the whole request.
+async fn test_package_dry_run(sock: &std::path::Path, pad: &Pad, parent: &Transaction) {
+    use bitcoin::consensus::encode::serialize_hex;
+
+    let hex = serialize_hex(parent);
+    let spk = parent.output[0].script_pubkey.clone();
+    let child = spend_true(parent.compute_txid(), 2_000, spk.clone());
+    let body = serde_json::to_vec(&json!([&hex, serialize_hex(&child)])).unwrap();
+    let (st, resp) = http_post_unix(sock, "/txs/test", &body).await;
+    assert_eq!(st, 200, "{resp}");
+    let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    assert_eq!(arr.len(), 2, "{resp}");
+    assert!(
+        arr.iter().all(|row| row["allowed"] == true),
+        "a child sees its parent from the same call: {resp}"
+    );
+    assert_eq!(arr[1]["txid"], child.compute_txid().to_string(), "{resp}");
+    assert!(
+        !pad.hub.contains(&parent.compute_txid()) && !pad.hub.contains(&child.compute_txid()),
+        "a package test must not admit"
+    );
+    let rival = spend_true(pad.cbs[0], 3_000, spk);
+    let body = serde_json::to_vec(&json!([&hex, serialize_hex(&rival)])).unwrap();
+    let (st, resp) = http_post_unix(sock, "/txs/test", &body).await;
+    assert_eq!(st, 200, "{resp}");
+    let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    assert!(
+        arr.iter().all(
+            |row| row["package-error"] == "conflict-in-package" && row.get("allowed").is_none()
+        ),
+        "{resp}"
+    );
+}
+
+/// `/txs/test` refuses more than 25 transactions, and none.
+async fn test_count_refusals(sock: &std::path::Path, hex: &str) {
+    let too: Vec<&str> = vec![hex; 26];
+    let body = serde_json::to_vec(&too).unwrap();
+    let (st, resp) = http_post_unix(sock, "/txs/test", &body).await;
+    assert_eq!(st, 400, "{resp}");
+    assert!(resp.contains("Exceeded maximum of 25"), "{resp}");
+    // mempool/electrs passes bitcoind's refusal of an empty array through.
+    let (st, resp) = http_post_unix(sock, "/txs/test", b"[]").await;
+    assert_eq!(st, 400, "{resp}");
+    assert_eq!(
+        resp,
+        r#"testmempoolaccept RPC error: {"code":-8,"message":"Array must contain between 1 and 25 transactions."}"#
+    );
+}
+
 /// `/txs/test` dry-runs; `POST /tx` admits. `GET /broadcast` is gone.
 async fn test_then_broadcast(sock: &std::path::Path, pad: &Pad, txs: &[Transaction]) {
     use bitcoin::consensus::encode::serialize_hex;
@@ -202,11 +253,10 @@ async fn test_then_broadcast(sock: &std::path::Path, pad: &Pad, txs: &[Transacti
     let (st, resp) = http_post_unix(sock, "/txs/test", &edge_body).await;
     assert_eq!(st, 200, "{resp}");
     assert!(resp.contains("package-contains-duplicates"), "{resp}");
-    let too: Vec<String> = (0..26).map(|_| hex.clone()).collect();
-    let body = serde_json::to_vec(&too).unwrap();
-    let (st, resp) = http_post_unix(sock, "/txs/test", &body).await;
-    assert_eq!(st, 400, "{resp}");
-    assert!(resp.contains("Exceeded maximum of 25"), "{resp}");
+
+    test_package_dry_run(sock, pad, &txs[0]).await;
+
+    test_count_refusals(sock, &hex).await;
 
     let (st, resp) = http_get_unix(sock, &format!("/broadcast?tx={hex}")).await;
     assert_eq!(st, 404, "{resp}");
@@ -468,6 +518,64 @@ async fn outspends_bounds_total_entries() {
     let _ = pad.dir;
 }
 
+/// A package `/txs/test` reports the error Core's `testmempoolaccept` would.
+#[tokio::test]
+async fn esplora_txs_test_reports_cores_package_errors() {
+    use bitcoin::consensus::encode::serialize_hex;
+
+    let pad = pad_hub("txs-test-core", 3);
+    let sock_dir = rbitcoin_query::testutil::TempDir::for_socket().expect("temp dir");
+    let (handle, sock) = run_unix(
+        sock_dir.path(),
+        Arc::clone(&pad.q),
+        Some(Arc::clone(&pad.hub)),
+    )
+    .await;
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let test = |txs: &[&Transaction]| {
+        let hexes: Vec<String> = txs.iter().map(|tx| serialize_hex(*tx)).collect();
+        let body = serde_json::to_vec(&hexes).unwrap();
+        let sock = sock.clone();
+        async move {
+            let (st, resp) = http_post_unix(&sock, "/txs/test", &body).await;
+            assert_eq!(st, 200, "{resp}");
+            serde_json::from_str::<Vec<Value>>(&resp).unwrap()
+        }
+    };
+
+    let pooled = spend_true(pad.cbs[0], 1_000, spk.clone());
+    pad.hub.admit(&pooled).expect("accept");
+    let pooled_child = spend_true(pooled.compute_txid(), 2_000, spk.clone());
+    let rows = test(&[&pooled, &pooled_child]).await;
+    assert_eq!(
+        rows[0]["reject-reason"], "txn-already-in-mempool",
+        "{rows:?}"
+    );
+
+    let parent = spend_true(pad.cbs[1], 1_000, spk.clone());
+    let child = spend_true(parent.compute_txid(), 2_000, spk.clone());
+    let rival = spend_true(pad.cbs[1], 3_000, spk);
+    let rows = test(&[&child, &parent, &rival]).await;
+    assert!(
+        rows.iter()
+            .all(|r| r["package-error"] == "package-not-sorted"),
+        "Core checks order before conflicts: {rows:?}"
+    );
+
+    let fat = ScriptBuf::from_bytes(vec![0x6a; 52_000]);
+    let big_a = spend_true(pad.cbs[1], 1_000, fat.clone());
+    let big_b = spend_true(pad.cbs[2], 1_000, fat);
+    let rows = test(&[&big_a, &big_b]).await;
+    assert!(
+        rows.iter()
+            .all(|r| r["package-error"] == "package-too-large"),
+        "{rows:?}"
+    );
+
+    handle.shutdown().await;
+    let _ = pad.dir;
+}
+
 /// Admission vsize rounds up. This spend has no sigops, so its admission
 /// weight equals its BIP141 weight.
 async fn test_rounds_vsize_up(sock: &std::path::Path, pad: &Pad) {
@@ -570,10 +678,7 @@ async fn mempool_removed_lists_rows_on_the_unix_listener() {
         let (st, body) = http_post_unix(&sock, "/tx", serialize_hex(tx).as_bytes()).await;
         assert_eq!(st, 200, "{body}");
     }
-    pad.hub.remove_for_block(
-        &[bump.compute_txid()],
-        rbitcoin_net::Removal::Committed(rbitcoin_net::RemovalReason::Block),
-    );
+    pad.hub.remove_for_block(&[bump.compute_txid()]);
     assert_eq!(
         removed(sock.clone()).await,
         json!({"oldest": 1, "removed": [

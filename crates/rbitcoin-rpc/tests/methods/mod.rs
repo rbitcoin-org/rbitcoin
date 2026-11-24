@@ -3654,7 +3654,7 @@ fn gettxout_leftover_is_connected_not_unconfirmed() {
 
 /// Core `BroadcastTransaction` returns `-27` when any of the submitted
 /// transaction's own outputs is still a coin. A confirmed transaction whose
-/// outputs are all spent stays a missing-input reject.
+/// outputs are all spent is `txn-already-known`, as `testmempoolaccept` says.
 #[test]
 fn sendrawtransaction_confirmed_output_is_already_in_utxo_set() {
     let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
@@ -3739,23 +3739,20 @@ fn sendrawtransaction_confirmed_output_is_already_in_utxo_set() {
     .unwrap();
     dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     let spent = dispatch(&ctx, "sendrawtransaction", vec![json!(hex.clone())]).unwrap_err();
-    assert_eq!(spent["code"], ERR_VERIFY_ERROR, "{spent}");
-    assert_eq!(
-        spent["message"], "bad-txns-inputs-missingorspent",
-        "{spent}"
-    );
+    assert_eq!(spent["code"], ERR_VERIFY_REJECTED, "{spent}");
+    assert_eq!(spent["message"], "txn-already-known", "{spent}");
     // The parent output is spent, but the tx index still has its value.
-    // Core fee-checks only after the inputs resolve, so this stays
-    // the missing-input error rather than the max-fee error.
+    // The fee is checked only after the inputs resolve, so this stays
+    // txn-already-known rather than the max-fee error.
     let spent_capped = dispatch(
         &ctx,
         "sendrawtransaction",
         vec![json!(hex), json!("0.00000001")],
     )
     .unwrap_err();
-    assert_eq!(spent_capped["code"], ERR_VERIFY_ERROR, "{spent_capped}");
+    assert_eq!(spent_capped["code"], ERR_VERIFY_REJECTED, "{spent_capped}");
     assert_eq!(
-        spent_capped["message"], "bad-txns-inputs-missingorspent",
+        spent_capped["message"], "txn-already-known",
         "{spent_capped}"
     );
 
@@ -3810,8 +3807,8 @@ fn sendrawtransaction_confirmed_output_is_already_in_utxo_set() {
         "{archived_fee}"
     );
 
-    // OP_RETURN was never a coin. Once the spendable output is spent, the
-    // resubmit is the missing-input error. Treating the OP_RETURN as unspent is -27.
+    // OP_RETURN was never a coin, so it does not make the resubmit -27. Once
+    // the spendable output is spent, the resubmit is txn-already-known.
     let parent_sat = generated_coinbase_value(&ctx, 5) - 1_000;
     let (_, mut parent) =
         spend_generated_coinbase(&ctx, 5, parent_sat, ScriptBuf::from_bytes(vec![0x51]));
@@ -3833,9 +3830,9 @@ fn sendrawtransaction_confirmed_output_is_already_in_utxo_set() {
     .unwrap();
     dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     let parent_again = dispatch(&ctx, "sendrawtransaction", vec![json!(parent_hex)]).unwrap_err();
-    assert_eq!(parent_again["code"], ERR_VERIFY_ERROR, "{parent_again}");
+    assert_eq!(parent_again["code"], ERR_VERIFY_REJECTED, "{parent_again}");
     assert_eq!(
-        parent_again["message"], "bad-txns-inputs-missingorspent",
+        parent_again["message"], "txn-already-known",
         "{parent_again}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -4745,32 +4742,57 @@ fn testmempoolaccept_admitting_nothing_leaves_the_store_alone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Multi-tx `testmempoolaccept` admits each member and takes it back. The
-/// pool numbers those changes and keeps no removal row: nothing was mined.
+/// A parent with two outputs and a child of output 0, both paying a fee.
+fn package_dry_run_pair(ctx: &RpcContext) -> (Transaction, Transaction) {
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, TxIn, TxOut, Witness};
+    let op_true = || ScriptBuf::from_bytes(vec![0x51]);
+    let half = 25_0000_0000u64;
+    let (_, mut parent) = spend_generated_coinbase(ctx, 1, half, op_true());
+    parent.output.push(TxOut {
+        value: Amount::from_sat(half - 20_000),
+        script_pubkey: op_true(),
+    });
+    let child = Transaction {
+        version: TxVersion::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(parent.compute_txid(), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(half - 20_000),
+            script_pubkey: op_true(),
+        }],
+    };
+    (parent, child)
+}
+
+/// Before pool maintenance starts (IBD, relay off), the pool keeps what it
+/// admits. A package dry run must not admit anything, so neither member is
+/// in the pool afterwards, the pool numbers no change, and it keeps no
+/// removal row.
 #[test]
-fn testmempoolaccept_package_undo_leaves_no_removed_row() {
-    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
-    let spk = ScriptBuf::from_bytes(vec![0x51]);
-    let (parent_hex, parent) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk);
-    let child_hex = rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(
-        &child_of(&parent, 1_000),
-    ));
+fn testmempoolaccept_package_admits_nothing_before_maintenance() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad_relay(300_000_000, false);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let (parent, child) = package_dry_run_pair(&ctx);
     let mp = ctx.mempool.as_ref().unwrap();
     let before = mp.lock_read().mempool_sequence();
     let rows = dispatch(
         &ctx,
         "testmempoolaccept",
-        vec![json!([parent_hex, child_hex])],
+        vec![json!([hex(&parent), hex(&child)])],
     )
     .unwrap();
-    assert_eq!(rows[0]["allowed"], json!(true), "{rows}");
-    assert_eq!(rows[1]["allowed"], json!(true), "{rows}");
-    assert!(!mp.contains(&parent.compute_txid()));
-    assert_eq!(
-        mp.lock_read().mempool_sequence(),
-        before + 4,
-        "two in, two out"
-    );
+    assert_eq!(rows[0]["allowed"], true, "{rows}");
+    assert_eq!(rows[1]["allowed"], true, "{rows}");
+    assert!(!mp.contains(&parent.compute_txid()), "{rows}");
+    assert!(!mp.contains(&child.compute_txid()), "{rows}");
+    assert_eq!(mp.lock_read().mempool_sequence(), before, "nothing in");
     assert_eq!(mp.lock_read().removed_rows().rows, vec![]);
     let (_free, live, dead) = mp.lock_read().store.slot_stats();
     assert_eq!(
@@ -4781,9 +4803,84 @@ fn testmempoolaccept_package_undo_leaves_no_removed_row() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Multi-tx `testmempoolaccept` admits each member and then removes it, so a
-/// TRUC sibling eviction there would lose the real child. Core allows no
-/// replacement in that call: the sibling is `TRUC-violation`.
+/// A package dry run leaves the node as it found it: an operator's fee delta
+/// on a member survives, and an orphan waiting on a member stays parked.
+/// Tested after that member, the orphan spends it like any later member.
+#[test]
+fn testmempoolaccept_package_keeps_fee_deltas_and_orphans() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::{OutPoint, Sequence, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let (parent, child) = package_dry_run_pair(&ctx);
+    let orphan = Transaction {
+        input: vec![TxIn {
+            previous_output: OutPoint::new(parent.compute_txid(), 1),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(25_0000_0000 - 40_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+        ..child.clone()
+    };
+    let mp = ctx.mempool.as_ref().unwrap();
+    assert!(
+        matches!(
+            mp.accept_with_utxo(
+                &orphan,
+                &mp.utxo_provider(),
+                rbitcoin_net::TxOrigin::Relay(Some(3)),
+                rbitcoin_net::tx_relay::AcceptPath::Relay,
+                &[],
+            ),
+            Err(rbitcoin_net::AcceptError::Orphaned { .. })
+        ),
+        "the orphan parks"
+    );
+    let parent_id = parent.compute_txid().to_string();
+    dispatch(
+        &ctx,
+        "prioritisetransaction",
+        vec![json!(parent_id), json!(0), json!(1_000)],
+    )
+    .unwrap();
+    let rows = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([hex(&parent), hex(&child)])],
+    )
+    .unwrap();
+    assert_eq!(rows[0]["allowed"], true, "{rows}");
+    assert_eq!(rows[1]["allowed"], true, "{rows}");
+    let deltas = dispatch(&ctx, "getprioritisedtransactions", vec![]).unwrap();
+    assert_eq!(deltas[&parent_id]["fee_delta"], 1_000, "{deltas}");
+    assert!(!mp.contains(&parent.compute_txid()), "{rows}");
+    let still_parked = || {
+        !mp.contains(&orphan.compute_txid())
+            && mp
+                .lock_read()
+                .orphanage
+                .announcers_of(&orphan.compute_wtxid())
+                == vec![3]
+    };
+    assert!(still_parked(), "the orphan stays parked under its peer");
+    let rows = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([hex(&parent), hex(&orphan)])],
+    )
+    .unwrap();
+    assert_eq!(rows[0]["allowed"], true, "{rows}");
+    assert_eq!(rows[1]["allowed"], true, "{rows}");
+    assert!(still_parked(), "the orphan stays parked under its peer");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core allows no replacement in a multi-tx `testmempoolaccept`, so a second
+/// child of a TRUC parent there is `TRUC-violation`, and the real child stays.
 #[test]
 fn testmempoolaccept_package_keeps_the_truc_sibling() {
     use bitcoin::consensus::encode::serialize;
@@ -4838,6 +4935,285 @@ fn testmempoolaccept_package_keeps_the_truc_sibling() {
     );
     dispatch(&ctx, "sendrawtransaction", vec![json!(hex(&sibling))]).unwrap();
     assert!(!mp.contains(&first.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A TRUC parent tested in the same call as its children holds the TRUC
+/// rules there too: one version-3 child is allowed, and a second child, a
+/// grandchild, a version-2 child, or a child over 1,000 vB is
+/// `TRUC-violation`. Once the parent is pooled, two of its children tested
+/// together are still one too many (Core `PackageTRUCChecks`).
+#[test]
+fn testmempoolaccept_package_applies_truc_to_an_untested_parent() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let op_true = || ScriptBuf::from_bytes(vec![0x51]);
+    let half = 25_0000_0000u64;
+    let (_, mut parent) = spend_generated_coinbase(&ctx, 1, half - 500, op_true());
+    parent.version = TxVersion::non_standard(3);
+    parent.output.push(TxOut {
+        value: Amount::from_sat(half - 500),
+        script_pubkey: op_true(),
+    });
+    let spend = |version: i32, prev: &Transaction, vout: u32, keep: u64| Transaction {
+        version: TxVersion::non_standard(version),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(prev.compute_txid(), vout),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(keep),
+            script_pubkey: op_true(),
+        }],
+    };
+    let first = spend(3, &parent, 0, half - 1_500);
+    let test = |txs: &[&Transaction]| {
+        let hexes: Vec<String> = txs.iter().map(|tx| hex(tx)).collect();
+        dispatch(&ctx, "testmempoolaccept", vec![json!(hexes)]).unwrap()
+    };
+    let rows = test(&[&parent, &first]);
+    assert_eq!(rows[0]["allowed"], true, "{rows}");
+    assert_eq!(rows[1]["allowed"], true, "{rows}");
+    let sibling = spend(3, &parent, 1, half - 1_500);
+    let grandchild = spend(3, &first, 0, half - 2_500);
+    let v2_child = spend(2, &parent, 1, half - 1_500);
+    for third in [&sibling, &grandchild] {
+        let rows = test(&[&parent, &first, third]);
+        assert_eq!(rows[1]["allowed"], true, "{rows}");
+        assert_eq!(rows[2]["reject-reason"], "TRUC-violation", "{rows}");
+    }
+    let rows = test(&[&parent, &v2_child]);
+    assert_eq!(rows[1]["reject-reason"], "TRUC-violation", "{rows}");
+    let mut big_child = spend(3, &parent, 1, 0);
+    let outs = 110u64;
+    big_child.output = (0..outs)
+        .map(|_| TxOut {
+            value: Amount::from_sat((half - 20_000) / outs),
+            script_pubkey: op_true(),
+        })
+        .collect();
+    assert!(big_child.vsize() as u64 > rbitcoin_consensus::policy::TRUC_CHILD_MAX_VSIZE);
+    let rows = test(&[&parent, &big_child]);
+    assert_eq!(rows[1]["reject-reason"], "TRUC-violation", "{rows}");
+    let mp = ctx.mempool.as_ref().unwrap();
+    assert!(!mp.contains(&parent.compute_txid()));
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex(&parent))]).unwrap();
+    let rows = test(&[&first, &sibling]);
+    assert_eq!(rows[0]["allowed"], true, "{rows}");
+    assert_eq!(rows[1]["reject-reason"], "TRUC-violation", "{rows}");
+    assert!(!mp.contains(&first.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cluster cap holds for each cluster a package makes, and only that
+/// cluster's members are `too-large-cluster`. At a cap of two, a child of a
+/// pooled tx and a tx that spends a confirmed coin make clusters of two and
+/// one, and both are allowed. Two children of the pooled tx make one cluster
+/// of three, and so does a chain of three that spends only a confirmed coin.
+/// Beside the two children, the unrelated tx is still allowed.
+#[test]
+fn testmempoolaccept_package_counts_each_cluster_alone() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let op_true = || ScriptBuf::from_bytes(vec![0x51]);
+    let half = 25_0000_0000u64;
+    let (_, mut pooled) = spend_generated_coinbase(&ctx, 1, half - 500, op_true());
+    pooled.output.push(TxOut {
+        value: Amount::from_sat(half - 500),
+        script_pubkey: op_true(),
+    });
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex(&pooled))]).unwrap();
+    let (_, unrelated) = spend_generated_coinbase(&ctx, 2, 50_0000_0000 - 1_000, op_true());
+    let spend = |vout: u32| Transaction {
+        version: TxVersion::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(pooled.compute_txid(), vout),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(half - 1_500),
+            script_pubkey: op_true(),
+        }],
+    };
+    let mp = ctx.mempool.as_ref().unwrap();
+    mp.set_cluster_limits(Some(2), None);
+    let test = |txs: &[&Transaction]| {
+        let hexes: Vec<String> = txs.iter().map(|tx| hex(tx)).collect();
+        dispatch(&ctx, "testmempoolaccept", vec![json!(hexes)]).unwrap()
+    };
+    let rows = test(&[&spend(0), &unrelated]);
+    assert_eq!(rows[0]["allowed"], true, "{rows}");
+    assert_eq!(rows[1]["allowed"], true, "{rows}");
+    let over_cap = |row: &serde_json::Value| {
+        row["allowed"] == false
+            && row["reject-reason"] == "too-large-cluster"
+            && row.get("package-error").is_none()
+    };
+    let rows = test(&[&spend(0), &spend(1)]);
+    assert!(rows.as_array().unwrap().iter().all(over_cap), "{rows}");
+    let child = child_of(&unrelated, 1_000);
+    let rows = test(&[&unrelated, &child, &child_of(&child, 1_000)]);
+    assert!(rows.as_array().unwrap().iter().all(over_cap), "{rows}");
+    let rows = test(&[&spend(0), &spend(1), &unrelated]);
+    assert!(over_cap(&rows[0]) && over_cap(&rows[1]), "{rows}");
+    assert_eq!(rows[2]["allowed"], true, "{rows}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tx with the txid of a pool entry but another witness is
+/// `txn-same-nonwitness-data-in-mempool`, alone and as a package member. The
+/// pooled witness itself is `txn-already-in-mempool`. Core gives each the
+/// same `reject-details`. `sendrawtransaction` of
+/// the other witness returns the txid and keeps the pooled one (Core
+/// `mempool_accept_wtxid.py`).
+#[test]
+fn testmempoolaccept_tells_a_witness_swap_from_a_duplicate() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let value = 50_0000_0000 - 10_000;
+    let proto = p2wsh_with_lens(OutPoint::null(), value, 1_000, 1, &[1]);
+    let (_, funding) = spend_generated_coinbase(&ctx, 1, value, p2wsh_spk(&proto));
+    let prev = OutPoint::new(funding.compute_txid(), 0);
+    let pooled = p2wsh_with_lens(prev, value, 1_000, 1, &[1]);
+    let swapped = p2wsh_with_lens(prev, value, 1_000, 1, &[2]);
+    assert_eq!(pooled.compute_txid(), swapped.compute_txid());
+    assert_ne!(pooled.compute_wtxid(), swapped.compute_wtxid());
+    let child = Transaction {
+        version: TxVersion::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(pooled.compute_txid(), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value - 2_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    for tx in [&funding, &pooled] {
+        dispatch(&ctx, "sendrawtransaction", vec![json!(hex(tx))]).unwrap();
+    }
+    let test = |txs: &[&Transaction]| {
+        let hexes: Vec<String> = txs.iter().map(|tx| hex(tx)).collect();
+        dispatch(&ctx, "testmempoolaccept", vec![json!(hexes)]).unwrap()
+    };
+    let same_nonwitness = "txn-same-nonwitness-data-in-mempool";
+    let alone = test(&[&swapped]);
+    assert_eq!(alone[0]["reject-reason"], same_nonwitness, "{alone}");
+    assert_eq!(alone[0]["reject-details"], same_nonwitness, "{alone}");
+    let member = test(&[&swapped, &child]);
+    assert_eq!(member[0]["reject-reason"], same_nonwitness, "{member}");
+    assert_eq!(member[0]["reject-details"], same_nonwitness, "{member}");
+    let duplicate = test(&[&pooled, &child]);
+    for key in ["reject-reason", "reject-details"] {
+        assert_eq!(duplicate[0][key], "txn-already-in-mempool", "{duplicate}");
+    }
+    let sent = dispatch(&ctx, "sendrawtransaction", vec![json!(hex(&swapped))]).unwrap();
+    assert_eq!(sent, json!(pooled.compute_txid().to_string()));
+    let mp = ctx.mempool.as_ref().unwrap();
+    assert_eq!(
+        mp.wtxid_of(&pooled.compute_txid()),
+        Some(pooled.compute_wtxid())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core adds a member's inputs as a batch, so an input repeated inside one
+/// tx is that row's `bad-txns-inputs-duplicate`, not `conflict-in-package`
+/// (Core `IsConsistentPackage`). `submitpackage` reports it before the
+/// doubled input sum can trip `maxfeerate`.
+#[test]
+fn testmempoolaccept_package_reports_a_repeated_input_on_its_row() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let (_, mut dup) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk.clone());
+    dup.input.push(dup.input[0].clone());
+    let child = child_of(&dup, 1_000);
+    let hexes: Vec<String> = [&dup, &child]
+        .iter()
+        .map(|tx| rbitcoin_primitives::hex_encode(serialize(*tx)))
+        .collect();
+    let rows = dispatch(&ctx, "testmempoolaccept", vec![json!(hexes)]).unwrap();
+    assert!(rows[0].get("package-error").is_none(), "{rows}");
+    assert_eq!(
+        rows[0]["reject-reason"], "bad-txns-inputs-duplicate",
+        "{rows}"
+    );
+    let sub = dispatch(&ctx, "submitpackage", vec![json!(hexes)]).unwrap();
+    let dup_wtxid = dup.compute_wtxid().to_string();
+    assert_eq!(
+        sub["tx-results"][&dup_wtxid]["error"], "bad-txns-inputs-duplicate",
+        "{sub}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A package dry run may not replace a pool tx, and says so with Core's
+/// `reject-details`. The refusal comes after the checks that need only the tx
+/// and the tip, so a repeated input, a non-standard shape, or a locktime not
+/// yet final wins. It comes before any input resolves, so an input already
+/// spent on chain does not.
+#[test]
+fn testmempoolaccept_package_conflict_follows_check_transaction() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let keep = 50_0000_0000 - 1_000;
+    let (_, mined) = spend_generated_coinbase(&ctx, 1, keep, spk.clone());
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex(&mined))]).unwrap();
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let (_, pooled) = spend_generated_coinbase(&ctx, 2, keep, spk.clone());
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex(&pooled))]).unwrap();
+    let (_, other) = spend_generated_coinbase(&ctx, 3, keep, spk);
+    let mut clash = pooled.clone();
+    clash.output[0].value -= Amount::from_sat(1_000);
+    let mut repeated = clash.clone();
+    repeated.input.push(clash.input[0].clone());
+    let mut late = clash.clone();
+    late.input.insert(0, mined.input[0].clone());
+    let mut dusty = clash.clone();
+    let zero = bitcoin::TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    };
+    dusty.output.extend([zero.clone(), zero]);
+    let mut locked = clash.clone();
+    locked.input[0].sequence = bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME;
+    locked.lock_time = bitcoin::absolute::LockTime::from_height(10_000).unwrap();
+    let disallowed = "bip125-replacement-disallowed";
+    for (member, reason) in [
+        (&clash, disallowed),
+        (&repeated, "bad-txns-inputs-duplicate"),
+        (&dusty, "dust"),
+        (&locked, "non-final"),
+        (&late, disallowed),
+    ] {
+        let hexes = json!([hex(member), hex(&other)]);
+        let rows = dispatch(&ctx, "testmempoolaccept", vec![hexes]).unwrap();
+        assert_eq!(rows[0]["reject-reason"], reason, "{rows}");
+    }
+    let hexes = json!([hex(&clash), hex(&other)]);
+    let rows = dispatch(&ctx, "testmempoolaccept", vec![hexes]).unwrap();
+    assert_eq!(rows[0]["reject-details"], disallowed, "{rows}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5403,8 +5779,7 @@ fn pressure_admit_then_cluster(ctx: &RpcContext, spk: &ScriptBuf) {
     let arr = res.as_array().expect("package result");
     assert_eq!(arr.len(), 2);
     for row in arr {
-        let err = row["package-error"].as_str().expect("package-error");
-        assert!(err.contains("too-large-cluster"), "got {row}");
+        assert_eq!(row["reject-reason"], "too-large-cluster", "got {row}");
     }
 
     // Each fails alone only on fee or missing inputs, so the pair goes to
@@ -7004,6 +7379,26 @@ fn testmempoolaccept_missing_inputs_is_missing_inputs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn testmempoolaccept_takes_1_to_25_transactions() {
+    let (ctx, dir) = ctx_empty();
+    let hex = "00".repeat(60);
+    // Core checks the count before it parses `maxfeerate`.
+    for rawtxs in [json!([]), json!(vec![hex; 26])] {
+        for maxfeerate in [None, Some(json!(5))] {
+            let params: Vec<_> = std::iter::once(rawtxs.clone()).chain(maxfeerate).collect();
+            let err = dispatch(&ctx, "testmempoolaccept", params).unwrap_err();
+            assert_eq!(err["code"], json!(-8), "{err}");
+            assert_eq!(
+                err["message"],
+                json!("Array must contain between 1 and 25 transactions."),
+                "{err}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[allow(clippy::cognitive_complexity)] // table of RpcParams coercions
 #[test]
 fn rpc_params_type_coercion_and_unknown_named() {
@@ -8164,71 +8559,8 @@ fn sendraw_of_a_spender_of_a_held_parent_answers_after_the_package() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A multi-tx `testmempoolaccept` admits each member and removes it again.
-/// A `sendrawtransaction` of a member in that window admits it after the
-/// dry run, so its txid stays in the pool.
-#[test]
-fn sendraw_of_a_test_accept_member_stays_in_the_pool() {
-    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
-    let spk = ScriptBuf::from_bytes(vec![0x51]);
-    let (parent_hex, parent) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk);
-    let child_hex = rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(
-        &child_of(&parent, 1_000),
-    ));
-    let ctx = Arc::new(ctx);
-    let sent = sendraw_while_tentative(
-        &ctx,
-        "testmempoolaccept",
-        vec![json!([parent_hex.clone(), child_hex])],
-        parent.compute_txid(),
-        parent_hex,
-    );
-    assert_eq!(
-        sent.expect("the parent pays for itself"),
-        json!(parent.compute_txid().to_string())
-    );
-    assert!(ctx
-        .mempool
-        .as_ref()
-        .unwrap()
-        .contains(&parent.compute_txid()));
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// A multi-tx `testmempoolaccept` takes its members back with their
-/// spenders, as a failed package does. A `sendrawtransaction` of a spender
-/// of a member in that window answers after the dry run: the parent comes
-/// back from the extra pool as 1p1c, so both are in the pool.
-#[test]
-fn sendraw_of_a_spender_of_a_test_accept_member_keeps_its_parent() {
-    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
-    let spk = ScriptBuf::from_bytes(vec![0x51]);
-    let (parent_hex, parent) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk);
-    let hex = |tx: &Transaction| {
-        rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(tx))
-    };
-    let member = child_of(&parent, 1_000);
-    let spender = child_of(&parent, 2_000);
-    let ctx = Arc::new(ctx);
-    let sent = sendraw_while_tentative(
-        &ctx,
-        "testmempoolaccept",
-        vec![json!([parent_hex, hex(&member)])],
-        parent.compute_txid(),
-        hex(&spender),
-    );
-    assert_eq!(
-        sent.expect("the spender comes back with its parent"),
-        json!(spender.compute_txid().to_string())
-    );
-    let mp = ctx.mempool.as_ref().unwrap();
-    assert!(mp.contains(&parent.compute_txid()));
-    assert!(mp.contains(&spender.compute_txid()));
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// A multi-tx `testmempoolaccept` takes its members back but keeps a
-/// `prioritisetransaction` delta set before the dry run.
+/// A multi-tx `testmempoolaccept` keeps a `prioritisetransaction` delta
+/// set before the dry run.
 #[test]
 fn testmempoolaccept_package_keeps_a_fee_delta() {
     let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
@@ -9849,6 +10181,73 @@ mod decode;
 mod logging;
 mod mempool;
 mod submit_spent_race;
+
+/// A tx the active chain holds is `txn-already-known`, as a package member
+/// and alone. A spent output does not end it, nor do all of them. Every
+/// admit asks it, so `submitpackage` says so too.
+#[test]
+fn testmempoolaccept_package_member_already_known() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let (_, mut tx) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk.clone());
+    let half = tx.output[0].value / 2;
+    tx.output[0].value -= half;
+    tx.output.push(bitcoin::TxOut {
+        value: half,
+        script_pubkey: spk,
+    });
+    for sent in [&tx, &child_of(&tx, 1_000)] {
+        dispatch(&ctx, "sendrawtransaction", vec![json!(hex(sent))]).unwrap();
+    }
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let mut child = child_of(&tx, 1_000);
+    child.input[0].previous_output.vout = 1;
+    child.output[0].value = half - Amount::from_sat(1_000);
+    let params = vec![json!([hex(&tx), hex(&child)])];
+    let rows = dispatch(&ctx, "testmempoolaccept", params.clone()).unwrap();
+    assert_eq!(rows[0]["reject-reason"], "txn-already-known", "{rows}");
+    let sub = dispatch(&ctx, "submitpackage", params).unwrap();
+    let parent = &sub["tx-results"][tx.compute_wtxid().to_string()];
+    assert_eq!(parent["error"], "txn-already-known", "{sub}");
+    // Mined with every output spent, the chain still holds it.
+    assert!(
+        ctx.mempool
+            .as_ref()
+            .unwrap()
+            .contains(&child.compute_txid()),
+        "{sub}"
+    );
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let alone = dispatch(&ctx, "testmempoolaccept", vec![json!([hex(&tx)])]).unwrap();
+    assert_eq!(alone[0]["reject-reason"], "txn-already-known", "{alone}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A member over `maxfeerate` is rejected, so a later member may not spend
+/// it: the child is `missing-inputs`, not allowed beside a parent that is
+/// not.
+#[test]
+fn testmempoolaccept_parent_over_maxfeerate_is_not_a_parent() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    // 0.01 BTC on about 61 vB is over the default 0.10 BTC/kvB cap; the
+    // child's 1,000 sat is not.
+    let (_, parent) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000_000, spk);
+    let child = child_of(&parent, 1_000);
+    let rows = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([hex(&parent), hex(&child)])],
+    )
+    .unwrap();
+    assert_eq!(rows[0]["reject-reason"], "max-fee-exceeded", "{rows}");
+    assert_eq!(rows[1]["reject-reason"], "missing-inputs", "{rows}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
 /// Core's block count and decode text on the request task.
 #[test]

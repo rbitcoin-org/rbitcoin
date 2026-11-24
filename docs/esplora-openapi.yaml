@@ -904,9 +904,11 @@ paths:
       tags: [broadcast]
       summary: Test mempool acceptance without admitting
       description: |
-        One result per transaction. If the batch contains a duplicate txid, the
-        body is a single object with `allowed: false` and
-        `package-error: package-contains-duplicates` (no `reject-reason`).
+        One result per transaction, in request order. Two or more
+        transactions are tested as a package, as bitcoind
+        `testmempoolaccept` does for mempool/electrs, so a child may spend a
+        parent from the same request. Nothing is admitted. A package-wide
+        failure gives every row `package-error` and no `allowed`.
       parameters:
         - name: maxfeerate
           in: query
@@ -916,10 +918,10 @@ paths:
         required: true
         content:
           application/json:
-            schema: { type: array, maxItems: 25, items: { type: string, description: raw tx hex } }
+            schema: { type: array, minItems: 1, maxItems: 25, items: { type: string, description: raw tx hex } }
       responses:
         "200":
-          description: One result per transaction, or one object when the batch repeats a txid
+          description: One result per transaction
           headers: { X-Bitcoin-Chain-Tip: { $ref: "#/components/headers/ChainTip" }, X-Bitcoin-Chain-Tip-Height: { $ref: "#/components/headers/ChainTipHeight" }, X-Powered-By: { $ref: "#/components/headers/PoweredBy" } }
           content:
             application/json:
@@ -1461,11 +1463,13 @@ components:
           items: { type: array, prefixItems: [{ type: number }, { type: integer }], minItems: 2, maxItems: 2 }
     TestAcceptResult:
       type: object
-      required: [txid, wtxid, allowed]
+      required: [txid, wtxid]
       properties:
         txid: { $ref: "#/components/schemas/Hash" }
         wtxid: { $ref: "#/components/schemas/Hash" }
-        allowed: { type: boolean }
+        allowed:
+          type: boolean
+          description: Absent when `package-error` is set.
         vsize:
           type: integer
           description: Present when `allowed` is true. The sigop-adjusted admission weight divided by 4, rounded up, as `testmempoolaccept` reports it.
@@ -1474,11 +1478,13 @@ components:
           description: Present when `allowed` is true.
           properties:
             base: { type: number, description: BTC }
+            effective-feerate: { type: number, description: BTC/kvB }
+            effective-includes: { type: array, items: { $ref: "#/components/schemas/Hash" }, description: This transaction's wtxid }
         reject-reason:
           type: string
-          description: Policy or fee failure, including `max-fee-exceeded`. Absent when `package-error` is set.
+          description: Core reject reason, including `max-fee-exceeded`. Present when `allowed` is false.
         package-error:
           type: string
           description: |
-            Set to `package-contains-duplicates` when the batch repeats a txid.
-            That response is one object, not one per transaction, and has no `reject-reason`.
+            A failure of the whole package, such as `package-contains-duplicates`,
+            `conflict-in-package`, or `package-not-sorted`. Every row carries it.

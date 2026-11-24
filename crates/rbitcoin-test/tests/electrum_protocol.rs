@@ -1832,6 +1832,146 @@ async fn electrum_leftover_mempool_does_not_double_count() {
     handle.shutdown().await;
 }
 
+#[tokio::test]
+async fn electrum_testmempoolaccept_reports_without_admitting() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_net::MempoolHub;
+
+    let dir = TempDir::new().unwrap();
+    let params = ChainParams::regtest();
+    let (q, _tip, _tip_time, coinbase_txids) = open_electrum_maturity(&dir);
+    let q_arc = Arc::new(q);
+    let mp = MempoolHub::open(dir.path().join("mempool"), Arc::clone(&q_arc)).unwrap();
+    mp.set_relay_enabled(true);
+    let spend = |prev: OutPoint, value: u64| Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: prev,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let coin = OutPoint {
+        txid: coinbase_txids[0],
+        vout: 0,
+    };
+    let parent = spend(coin, 50_0000_0000 - 1_000);
+    let child = spend(
+        OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        50_0000_0000 - 2_000,
+    );
+    let rival = spend(coin, 50_0000_0000 - 3_000);
+    let miss = spend(
+        OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x11; 32]),
+            vout: 0,
+        },
+        1,
+    );
+    let hex = bitcoin::consensus::encode::serialize_hex::<Transaction>;
+    let ids = |tx: &Transaction| {
+        (
+            tx.compute_txid().to_string(),
+            tx.compute_wtxid().to_string(),
+        )
+    };
+
+    let (tip_tx, _) = broadcast::channel(4);
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let handle = run_electrum(
+        cfg,
+        Arc::clone(&q_arc),
+        params,
+        tip_tx,
+        Some(Arc::clone(&mp)),
+    )
+    .await
+    .expect("electrum listen");
+    let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+    let method = "blockchain.transaction.testmempoolaccept";
+
+    let (txid, wtxid) = ids(&parent);
+    let one = rpc(&mut stream, 1, method, json!([[hex(&parent)]])).await;
+    assert_eq!(
+        one["result"],
+        json!([{"txid": txid, "wtxid": wtxid, "allowed": true}]),
+        "{one}"
+    );
+
+    let (child_txid, child_wtxid) = ids(&child);
+    let pkg = rpc(&mut stream, 2, method, json!([[hex(&parent), hex(&child)]])).await;
+    assert_eq!(
+        pkg["result"],
+        json!([
+            {"txid": txid, "wtxid": wtxid, "allowed": true},
+            {"txid": child_txid, "wtxid": child_wtxid, "allowed": true},
+        ]),
+        "a child sees its parent from the same call: {pkg}"
+    );
+    assert!(
+        !mp.contains(&parent.compute_txid()) && !mp.contains(&child.compute_txid()),
+        "testmempoolaccept must not leave a tx in the pool"
+    );
+
+    let (miss_txid, miss_wtxid) = ids(&miss);
+    let missing = rpc(&mut stream, 3, method, json!([[hex(&miss)]])).await;
+    assert_eq!(
+        missing["result"],
+        json!([{
+            "txid": miss_txid,
+            "wtxid": miss_wtxid,
+            "allowed": false,
+            "reason": "missing-inputs",
+        }]),
+        "{missing}"
+    );
+
+    let (rival_txid, rival_wtxid) = ids(&rival);
+    let conflict = rpc(&mut stream, 4, method, json!([[hex(&parent), hex(&rival)]])).await;
+    assert_eq!(
+        conflict["result"],
+        json!([
+            {"txid": txid, "wtxid": wtxid, "reason": "conflict-in-package"},
+            {"txid": rival_txid, "wtxid": rival_wtxid, "reason": "conflict-in-package"},
+        ]),
+        "a package-wide failure has no allowed key: {conflict}"
+    );
+
+    let too_many = vec![hex(&parent); MempoolHub::max_package_count() + 1];
+    for (id, bad) in [
+        (5, json!([[]])),
+        (6, json!([["zz"]])),
+        (7, json!([hex(&parent)])),
+        (8, json!([too_many])),
+    ] {
+        let err = rpc(&mut stream, id, method, bad.clone()).await;
+        assert!(
+            err.get("error").is_some() && err.get("result").is_none(),
+            "{bad} must be an error: {err}"
+        );
+    }
+    assert!(
+        [&parent, &child, &rival]
+            .iter()
+            .all(|tx| !mp.contains(&tx.compute_txid())),
+        "no call may admit"
+    );
+
+    handle.shutdown().await;
+}
+
 /// Output-by-position and by outpoint at the create block hide the later spend.
 async fn assert_output_asof_hides_later_spend(
     addr: SocketAddr,

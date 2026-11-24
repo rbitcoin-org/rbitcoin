@@ -30,9 +30,6 @@ use rbitcoin_test::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const MINED: rbitcoin_net::Removal =
-    rbitcoin_net::Removal::Committed(rbitcoin_net::RemovalReason::Block);
-
 fn query_tip_hash(q: &Query) -> BlockHash {
     let h = q.tip_height().unwrap();
     let (_, rec) = q.header_at_height(h).unwrap().unwrap();
@@ -294,7 +291,7 @@ fn pin_restart_catchup_then_tip_purge(
         hub.set_relay_enabled(true);
         let mut strip = extra_ids;
         strip.push(child_id);
-        assert_eq!(hub.remove_for_block(&strip, MINED), strip.len());
+        assert_eq!(hub.remove_for_block(&strip), strip.len());
         hub.flush()
             .expect("restore singleton leftover for slots.tmp pin");
     }

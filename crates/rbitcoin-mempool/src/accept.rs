@@ -357,21 +357,55 @@ fn kept_trust_structural(
     }
 }
 
-/// Maturity, absolute finality (`is_final_tx`), and BIP68 at the next block.
+/// Core `CheckTransaction`: the shape and output values, then repeated
+/// inputs before any value sum (Finding 011: phantom fee), then null
+/// prevouts. A coinbase passes the last.
+pub fn check_transaction(tx: &Transaction, waive: bool) -> Result<(), AcceptError> {
+    let check_tx = |r: Result<(), rbitcoin_consensus::ConsensusError>| {
+        r.map_err(|e| AcceptError::CheckTransaction(rbitcoin_consensus::block_reject_reason(&e)))
+    };
+    check_tx(rbitcoin_consensus::block::check_tx_shape(
+        tx,
+        tx.base_size(),
+    ))?;
+    // One input cannot repeat an outpoint.
+    if tx.input.len() >= 2 {
+        let mut seen = BTreeSet::new();
+        if !tx.input.iter().all(|inp| seen.insert(inp.previous_output)) {
+            return Err(duplicate_inputs(waive, tx.compute_txid()));
+        }
+    }
+    check_tx(rbitcoin_consensus::block::reject_null_prevouts(tx))
+}
+
+/// Absolute finality (`is_final_tx`), BIP68, then coinbase maturity at the
+/// next block, in Core's order.
 pub fn check_mempool_structural(
     tx: &Transaction,
     chain_coins: &[Option<Coin>],
     tip: ChainTipCtx,
 ) -> Result<(), AcceptError> {
+    check_final_at_tip(tx, tip)?;
+    check_coin_locks(tx, chain_coins, tip)
+}
+
+/// Absolute finality at the next block. It needs only the tip, so admission
+/// asks it before the pool and the coins (Core `PreChecks`).
+fn check_final_at_tip(tx: &Transaction, tip: ChainTipCtx) -> Result<(), AcceptError> {
+    if rbitcoin_consensus::is_final_tx(tx, tip.height.saturating_add(1), tip.mtp) {
+        Ok(())
+    } else {
+        Err(AcceptError::NotFinal)
+    }
+}
+
+/// BIP68, then coinbase maturity, at the next block. Both need the coins.
+fn check_coin_locks(
+    tx: &Transaction,
+    chain_coins: &[Option<Coin>],
+    tip: ChainTipCtx,
+) -> Result<(), AcceptError> {
     let next_height = tip.height.saturating_add(1);
-    for c in chain_coins.iter().flatten() {
-        if c.is_coinbase && next_height < c.create_height.saturating_add(100) {
-            return Err(AcceptError::ImmatureCoinbase);
-        }
-    }
-    if !rbitcoin_consensus::is_final_tx(tx, next_height, tip.mtp) {
-        return Err(AcceptError::NotFinal);
-    }
     if rbitcoin_consensus::tx_has_relative_lock(tx) {
         let mut prev_heights = Vec::with_capacity(tx.input.len());
         let mut prev_mtps = Vec::with_capacity(tx.input.len());
@@ -396,6 +430,11 @@ pub fn check_mempool_structural(
             tip.mtp,
         ) {
             return Err(AcceptError::NonBip68Final);
+        }
+    }
+    for c in chain_coins.iter().flatten() {
+        if c.is_coinbase && next_height < c.create_height.saturating_add(100) {
+            return Err(AcceptError::ImmatureCoinbase);
         }
     }
     Ok(())
@@ -472,6 +511,17 @@ pub fn fee_and_adjusted_weight(
     ))
 }
 
+/// `txn-already-known`: the active chain holds this txid, its outputs spent
+/// or not. Only a tx the chain does not hold reads
+/// [`ChainPrevout::Unknown`], so output 0 answers for all of them. Asked
+/// only once an input is spent on chain, so an orphan costs no read.
+fn chain_holds_tx(txid: Txid, utxos: &impl UtxoProvider) -> bool {
+    !matches!(
+        utxos.chain_prevout(&OutPoint::new(txid, 0)),
+        ChainPrevout::Unknown
+    )
+}
+
 #[doc(hidden)]
 pub fn first_missing_outpoint(
     tx: &Transaction,
@@ -501,6 +551,9 @@ pub struct PrepareOpts {
     pub report_orphans: bool,
     pub min_relay: Option<u64>,
     pub waive: bool,
+    /// Earlier members of a package dry run, which also may not replace.
+    /// `None` for every real admit.
+    pub tested: Option<Arc<TestedMembers>>,
 }
 
 /// Result of accept prepare (resolve + policy + structural), before script verify.
@@ -532,6 +585,86 @@ pub struct PreparedAdmit {
     /// Whether a second child of a version-3 parent may evict the first
     /// (BIP 431 sibling eviction). Off unless the admit turns it on.
     pub sibling_eviction: SiblingEviction,
+    /// From [`PrepareOpts::tested`]. The plan after script sees them too.
+    pub tested: Option<Arc<TestedMembers>>,
+}
+
+/// The members of a multi-tx `testmempoolaccept` that have passed so far.
+/// A later member spends their outputs as unconfirmed parents, and none of
+/// them enters the pool, so the dry run publishes nothing and has nothing to
+/// remove.
+///
+/// The cluster limit counts only a member's pool parents. The package
+/// precheck already bounds each cluster the members make with the pool,
+/// which holds any one member's cluster.
+#[derive(Debug, Clone, Default)]
+pub struct TestedMembers {
+    members: BTreeMap<Txid, TestedMember>,
+}
+
+#[derive(Debug, Clone)]
+struct TestedMember {
+    tx: Arc<Transaction>,
+    parents: BTreeSet<Txid>,
+}
+
+static NO_TESTED: TestedMembers = TestedMembers {
+    members: BTreeMap::new(),
+};
+
+impl TestedMembers {
+    fn of(tested: &Option<Arc<TestedMembers>>) -> &TestedMembers {
+        tested.as_deref().unwrap_or(&NO_TESTED)
+    }
+
+    /// Add a member that passed, for the members after it.
+    pub fn push(&mut self, tx: Arc<Transaction>) {
+        let txid = tx.compute_txid();
+        let parents: BTreeSet<Txid> = tx
+            .input
+            .iter()
+            .map(|i| i.previous_output.txid)
+            .filter(|p| self.members.contains_key(p))
+            .collect();
+        self.members.insert(txid, TestedMember { tx, parents });
+    }
+
+    fn contains(&self, txid: &Txid) -> bool {
+        self.members.contains_key(txid)
+    }
+
+    /// Some member spends an output of `parent`, a pool tx or a member.
+    fn has_child(&self, parent: &Txid) -> bool {
+        self.members
+            .values()
+            .any(|m| m.tx.input.iter().any(|i| i.previous_output.txid == *parent))
+    }
+
+    /// Member `txid` spends another member or a pool tx.
+    fn spends_unconfirmed(&self, txid: &Txid, graph: &TxGraph) -> bool {
+        self.members.get(txid).is_some_and(|m| {
+            !m.parents.is_empty()
+                || m.tx
+                    .input
+                    .iter()
+                    .any(|i| graph.contains(&i.previous_output.txid))
+        })
+    }
+
+    fn body(&self, txid: &Txid) -> Option<&Transaction> {
+        self.members.get(txid).map(|m| m.tx.as_ref())
+    }
+
+    /// Output `op` of a tested member, or `None` when no member created it.
+    fn output(&self, op: &OutPoint) -> Result<Option<TxOut>, AcceptError> {
+        let Some(m) = self.members.get(&op.txid) else {
+            return Ok(None);
+        };
+        match m.tx.output.get(op.vout as usize) {
+            Some(out) => Ok(Some(out.clone())),
+            None => Err(AcceptError::MissingPrevout(*op)),
+        }
+    }
 }
 
 /// BIP 431 sibling eviction for one admit. Core allows it only for a tx
@@ -573,6 +706,8 @@ struct AdmitInputs {
 pub struct ConflictScan {
     pub direct_conflicts: BTreeSet<Txid>,
     pub parent_txids: BTreeSet<Txid>,
+    /// Parents that are [`TestedMembers`].
+    pub tested_parents: BTreeSet<Txid>,
 }
 
 #[doc(hidden)]
@@ -696,8 +831,8 @@ impl ActiveMempool {
         std::mem::take(&mut self.undone_replacements)
     }
 
-    /// `admit` committed `txid` and may still take it back: a package, a
-    /// 1p1c pair, or a multi-tx `testmempoolaccept`.
+    /// `admit` committed `txid` and may still take it back: a package or a
+    /// 1p1c pair.
     pub fn hold_tentative(&mut self, txid: Txid, admit: u64) {
         let held_by = self.tentative.entry(txid).or_default();
         if !held_by.contains(&admit) {
@@ -1157,6 +1292,7 @@ impl ActiveMempool {
                 report_orphans,
                 min_relay,
                 waive,
+                tested: None,
             },
         )?;
         prep.sibling_eviction = sibling_eviction;
@@ -1224,13 +1360,19 @@ impl ActiveMempool {
         txid: Txid,
         tx: &Transaction,
         chain_coins: &[Option<Coin>],
+        tested: &TestedMembers,
     ) -> Result<ConflictScan, AcceptError> {
         let mut scan = ConflictScan {
             direct_conflicts: BTreeSet::new(),
             parent_txids: BTreeSet::new(),
+            tested_parents: BTreeSet::new(),
         };
         for (i, inp) in tx.input.iter().enumerate() {
             let op = inp.previous_output;
+            if tested.contains(&op.txid) {
+                scan.tested_parents.insert(op.txid);
+                continue;
+            }
             if let Some(creator) = self.note_conflict_and_parent(txid, op, Some(&mut scan))? {
                 if !self.bodies.contains_key(&creator) {
                     return Err(AcceptError::Durable("parent body missing".into()));
@@ -1258,31 +1400,35 @@ impl ActiveMempool {
             report_orphans,
             min_relay,
             waive,
+            tested,
         } = opts;
+        check_transaction(tx, waive)?;
         let check_tx = |r: Result<(), rbitcoin_consensus::ConsensusError>| {
             r.map_err(|e| {
                 AcceptError::CheckTransaction(rbitcoin_consensus::block_reject_reason(&e))
             })
         };
-        let base_size = tx.base_size();
-        check_tx(rbitcoin_consensus::block::check_tx_shape(tx, base_size))?;
-        if self.enforce_bip54 && rbitcoin_consensus::block::reject_bip54_tx_size(base_size).is_err()
-        {
-            return Err(AcceptError::CheckTransaction("txn-size-64".into()));
-        }
-        let txid = tx.compute_txid();
-        // Core CheckTransaction: repeated inputs after the outputs and before
-        // null prevouts, and before any value sum (Finding 011: phantom fee).
-        if tx.input.len() >= 2 {
-            let mut seen = BTreeSet::new();
-            if !tx.input.iter().all(|inp| seen.insert(inp.previous_output)) {
-                return Err(duplicate_inputs(waive, txid));
-            }
-        }
         if tx.is_coinbase() {
             return Err(AcceptError::Coinbase);
         }
-        check_tx(rbitcoin_consensus::block::reject_null_prevouts(tx))?;
+        // A 64-byte tx has one input, so `check_transaction` cannot refuse it
+        // first. A coinbase is `coinbase` before its size (Core `PreChecks`).
+        if self.enforce_bip54
+            && rbitcoin_consensus::block::reject_bip54_tx_size(tx.base_size()).is_err()
+        {
+            return Err(AcceptError::CheckTransaction("txn-size-64".into()));
+        }
+        // What needs only the tx and the tip comes before the pool and the
+        // coins (Core `PreChecks`).
+        let weight = tx.weight().to_wu();
+        if let PolicyResult::NonStandard(s) = policy::check_libre_shape(tx, weight) {
+            return Err(AcceptError::Policy(s));
+        }
+        let trust_final = match check_final_at_tip(tx, tip) {
+            Ok(()) => None,
+            Err(err) => kept_trust_structural(waive, err)?,
+        };
+        let txid = tx.compute_txid();
         let wtxid = tx.compute_wtxid();
         if let Some(live) = self.graph.get(&txid) {
             if live.wtxid == wtxid {
@@ -1292,16 +1438,31 @@ impl ActiveMempool {
             // mempool_accept_wtxid.py).
             return Err(AcceptError::Policy("txn-same-nonwitness-data-in-mempool"));
         }
+        // A package dry run may not replace (Core `m_allow_replacement`). Every
+        // input is asked before any resolves, as Core asks before the coins.
+        if tested.is_some()
+            && tx
+                .input
+                .iter()
+                .any(|i| self.graph.conflict_txid(&i.previous_output).is_some())
+        {
+            return Err(AcceptError::Policy("bip125-replacement-disallowed"));
+        }
         let AdmitInputs {
             prevouts,
             chain_coins,
             input_value,
             utxo_us,
-        } = self.collect_admit_inputs(tx, txid, utxos, report_orphans)?;
+        } =
+            self.collect_admit_inputs(tx, txid, utxos, report_orphans, TestedMembers::of(&tested))?;
 
-        let trust_structural = match check_mempool_structural(tx, &chain_coins, tip) {
-            Ok(()) => None,
-            Err(err) => kept_trust_structural(waive, err)?,
+        // A trusted session keeps one structural fault, and the rest go unasked.
+        let trust_structural = match trust_final {
+            Some(err) => Some(err),
+            None => match check_coin_locks(tx, &chain_coins, tip) {
+                Ok(()) => None,
+                Err(err) => kept_trust_structural(waive, err)?,
+            },
         };
 
         if self.enforce_bip54 {
@@ -1314,14 +1475,13 @@ impl ActiveMempool {
         let sigop_cost = block_fit_sigop_cost(tx, &prevouts, self.graph.block_reserved_sigops())?;
 
         let fee_sat = checked_fee_sat(tx, input_value)?;
-        let weight = tx.weight().to_wu();
         let admit_fee = (i128::from(fee_sat).saturating_add(i128::from(fee_delta))).max(0) as u64;
 
         let floor = self.mempool_min_fee_sat_kvb();
         let min_relay = min_relay.unwrap_or(floor);
-        // Standardness on raw weight; the fee floor on sigop-adjusted vsize.
+        // The fee rules on raw weight; the fee floor on sigop-adjusted vsize.
         if let PolicyResult::NonStandard(s) =
-            policy::check_libre_admission_at(tx, fee_sat, fee_delta, weight, 0)
+            policy::check_libre_fees_at(tx, fee_sat, fee_delta, weight, 0)
         {
             return Err(AcceptError::Policy(s));
         }
@@ -1351,6 +1511,7 @@ impl ActiveMempool {
             trust_warn,
             keep_mark: false,
             sibling_eviction: SiblingEviction::Off,
+            tested,
         })
     }
 
@@ -1360,6 +1521,7 @@ impl ActiveMempool {
         txid: Txid,
         utxos: &impl UtxoProvider,
         report_orphans: bool,
+        tested: &TestedMembers,
     ) -> Result<AdmitInputs, AcceptError> {
         let t_utxo = Instant::now();
         let mut prevouts: Vec<TxOut> = Vec::with_capacity(tx.input.len());
@@ -1368,6 +1530,12 @@ impl ActiveMempool {
         let mut input_value = 0u64;
         for inp in &tx.input {
             let op = inp.previous_output;
+            if let Some(txout) = tested.output(&op)? {
+                input_value = input_value.saturating_add(txout.value.to_sat());
+                prevouts.push(txout);
+                chain_coins.push(None);
+                continue;
+            }
             let mempool_parent = self.note_conflict_and_parent(txid, op, None)?;
             let (txout, chain_coin) = if let Some(creator) = mempool_parent {
                 let parent_tx = self
@@ -1381,6 +1549,9 @@ impl ActiveMempool {
             } else {
                 match utxos.chain_prevout(&op) {
                     ChainPrevout::Unspent(coin) => (coin.txout.clone(), Some(coin)),
+                    ChainPrevout::KnownUnavailable if chain_holds_tx(txid, utxos) => {
+                        return Err(AcceptError::Policy("txn-already-known"));
+                    }
                     ChainPrevout::KnownUnavailable => {
                         return Err(AcceptError::MissingPrevout(op));
                     }
@@ -1419,10 +1590,6 @@ impl ActiveMempool {
             return AcceptError::MissingPrevout(op);
         }
         if report_orphans {
-            match policy::check_libre_shape(tx, tx.weight().to_wu()) {
-                policy::PolicyResult::Standard => {}
-                policy::PolicyResult::NonStandard(s) => return AcceptError::Policy(s),
-            }
             return AcceptError::Orphaned {
                 txid,
                 missing: missing_parents,
@@ -1798,6 +1965,18 @@ impl ActiveMempool {
         Ok(())
     }
 
+    fn parent_body<'a>(
+        &'a self,
+        id: &Txid,
+        tested: &'a TestedMembers,
+    ) -> Result<&'a Transaction, AcceptError> {
+        self.bodies
+            .get(id)
+            .map(|b| b.as_ref())
+            .or_else(|| tested.body(id))
+            .ok_or_else(|| AcceptError::Durable("parent body missing".into()))
+    }
+
     /// BIP 431 TRUC, as Core `SingleTRUCChecks`. `Ok(Some(sibling))` is a
     /// second child whose only violation is the one-child limit, and whose
     /// sibling can be evicted: the parent's only descendant, with no other
@@ -1810,14 +1989,12 @@ impl ActiveMempool {
         tx: &Transaction,
         vsize: u64,
         scan: &ConflictScan,
+        tested: &TestedMembers,
     ) -> Result<Option<Txid>, AcceptError> {
         const VIOLATION: AcceptError = AcceptError::Policy("TRUC-violation");
         let is_truc = tx.version.0 == policy::TRUC_VERSION;
-        for id in &scan.parent_txids {
-            let body = self
-                .bodies
-                .get(id)
-                .ok_or_else(|| AcceptError::Durable("parent body missing".into()))?;
+        for id in scan.parent_txids.iter().chain(&scan.tested_parents) {
+            let body = self.parent_body(id, tested)?;
             if (body.version.0 == policy::TRUC_VERSION) != is_truc {
                 return Err(VIOLATION);
             }
@@ -1825,17 +2002,29 @@ impl ActiveMempool {
         if !is_truc {
             return Ok(None);
         }
-        if vsize > policy::TRUC_MAX_VSIZE || scan.parent_txids.len() > 1 {
+        if vsize > policy::TRUC_MAX_VSIZE || scan.parent_txids.len() + scan.tested_parents.len() > 1
+        {
             return Err(VIOLATION);
         }
-        let Some(parent) = scan.parent_txids.first() else {
+        let Some(parent) = scan.parent_txids.first().or(scan.tested_parents.first()) else {
             return Ok(None);
         };
+        // A dry run evicts no tested member, so a tested sibling is one too many.
+        if vsize > policy::TRUC_CHILD_MAX_VSIZE || tested.has_child(parent) {
+            return Err(VIOLATION);
+        }
+        if scan.tested_parents.contains(parent) {
+            return if tested.spends_unconfirmed(parent, &self.graph) {
+                Err(VIOLATION)
+            } else {
+                Ok(None)
+            };
+        }
         let entry = self
             .graph
             .get(parent)
             .ok_or_else(|| AcceptError::Durable("parent entry missing".into()))?;
-        if !entry.parents.is_empty() || vsize > policy::TRUC_CHILD_MAX_VSIZE {
+        if !entry.parents.is_empty() {
             return Err(VIOLATION);
         }
         let child_replaced = entry
@@ -1869,12 +2058,10 @@ impl ActiveMempool {
         &self,
         tx: &Transaction,
         scan: &ConflictScan,
+        tested: &TestedMembers,
     ) -> Result<(), AcceptError> {
-        for id in &scan.parent_txids {
-            let body = self
-                .bodies
-                .get(id)
-                .ok_or_else(|| AcceptError::Durable("parent body missing".into()))?;
+        for id in scan.parent_txids.iter().chain(&scan.tested_parents) {
+            let body = self.parent_body(id, tested)?;
             let unspent = policy::dust_vouts(body).any(|vout| {
                 let dust = OutPoint { txid: *id, vout };
                 !tx.input.iter().any(|i| i.previous_output == dust)
@@ -1901,14 +2088,15 @@ impl ActiveMempool {
             return Err(AcceptError::Policy("txn-same-nonwitness-data-in-mempool"));
         }
 
-        let scan = self.scan_conflicts_and_parents(txid, tx, &prep.chain_coins)?;
+        let tested = TestedMembers::of(&prep.tested);
+        let scan = self.scan_conflicts_and_parents(txid, tx, &prep.chain_coins, tested)?;
 
         let fee_sat = prep.fee_sat;
         let weight =
             sigops_adjusted_weight(prep.weight, prep.sigop_cost, self.graph.bytes_per_sigop());
         let admit_fee =
             (i128::from(fee_sat).saturating_add(i128::from(prep.fee_delta))).max(0) as u64;
-        let sibling = match self.check_truc(tx, weight.div_ceil(4), &scan)? {
+        let sibling = match self.check_truc(tx, weight.div_ceil(4), &scan, tested)? {
             Some(s)
                 if match prep.sibling_eviction {
                     SiblingEviction::Off => false,
@@ -1925,7 +2113,7 @@ impl ActiveMempool {
             Some(_) => return Err(AcceptError::Policy("TRUC-violation")),
             None => None,
         };
-        self.check_ephemeral_spends(tx, &scan)?;
+        self.check_ephemeral_spends(tx, &scan, tested)?;
 
         // The sibling joins the replaced set and pays for it like any
         // conflict (Core adds it to `m_conflicts`).
@@ -2150,18 +2338,27 @@ impl ActiveMempool {
                 return Err(AcceptError::Duplicate(id));
             }
         }
-        // `seen` still holds this tx and every tx after it. An input that
-        // names one of those txids spends a parent that is not earlier in
-        // the package, including a tx that spends its own txid.
-        for tx in txs {
-            for inp in &tx.input {
-                if seen.contains(&inp.previous_output.txid) {
-                    return Err(AcceptError::PackageNotTopo);
-                }
-            }
-            seen.remove(&tx.compute_txid());
+        if !Self::package_is_sorted(txs) {
+            return Err(AcceptError::PackageNotTopo);
         }
         Ok(())
+    }
+
+    /// Core `IsTopoSortedPackage`: no member spends itself or a member
+    /// listed after it.
+    pub fn package_is_sorted(txs: &[Transaction]) -> bool {
+        let mut later: BTreeSet<_> = txs.iter().map(|tx| tx.compute_txid()).collect();
+        for tx in txs {
+            if tx
+                .input
+                .iter()
+                .any(|inp| later.contains(&inp.previous_output.txid))
+            {
+                return false;
+            }
+            later.remove(&tx.compute_txid());
+        }
+        true
     }
 
     /// Core `IsChildWithParentsTree`: the last tx spends every other package
@@ -2451,6 +2648,7 @@ impl ActiveMempool {
                 report_orphans: false,
                 min_relay: Some(0),
                 waive,
+                tested: None,
             },
         )?;
         prep.keep_mark = waive;

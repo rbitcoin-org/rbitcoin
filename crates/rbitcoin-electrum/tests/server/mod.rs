@@ -2475,6 +2475,14 @@ async fn broadcast_hex_cap_enforced() {
     .await
     .unwrap_err();
     assert!(pkg_err.contains("too large"), "{pkg_err}");
+    let test_err = electrum_tcp_call(
+        &mut stream,
+        "blockchain.transaction.testmempoolaccept",
+        json!([["aa".repeat(20)]]),
+    )
+    .await
+    .unwrap_err();
+    assert!(test_err.contains("too large"), "{test_err}");
     let exact_hex = electrum_tcp_call(
         &mut stream,
         "blockchain.transaction.broadcast",

@@ -22,9 +22,6 @@ use rbitcoin_test::{
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const MINED: rbitcoin_net::Removal =
-    rbitcoin_net::Removal::Committed(rbitcoin_net::RemovalReason::Block);
-
 /// This toolchain's `ExitCode` lacks `PartialEq`; compare via Debug.
 fn exit_success(c: ExitCode) -> bool {
     format!("{c:?}") == format!("{:?}", ExitCode::SUCCESS)
@@ -3127,7 +3124,7 @@ fn block_cache_and_mempool_hub_surface() {
     );
     hub.flush().unwrap();
     let _ = hub.compact();
-    assert_eq!(hub.remove_for_block(&[r.txid], MINED), 1);
+    assert_eq!(hub.remove_for_block(&[r.txid]), 1);
     assert_eq!(hub.live_count(), 0);
     assert!(hub.reorg_reaccept(std::slice::from_ref(&spend)) >= 1);
     let _ = hub.accept_package(std::slice::from_ref(&spend));

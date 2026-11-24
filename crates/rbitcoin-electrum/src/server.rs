@@ -5,9 +5,10 @@
 
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
+use rbitcoin_consensus::policy::DEFAULT_MAX_RAW_TX_FEE_SAT_KVB;
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_net::RequestMeter;
-use rbitcoin_net::{BlockingRegion, MempoolHub};
+use rbitcoin_net::{BlockingRegion, MempoolHub, TestAcceptRow, TestAcceptVerdict};
 use rbitcoin_primitives::{Fk, Height};
 
 use rbitcoin_query::{ChainView, ChainViewKind, HistoryFilter, Query, ShJoinSlot};
@@ -1259,6 +1260,9 @@ async fn answer_one(
             }
             "blockchain.transaction.broadcast_package" => {
                 broadcast_package_async(&asked.params, ctx.config, ctx.mempool.as_ref()).await
+            }
+            "blockchain.transaction.testmempoolaccept" => {
+                testmempoolaccept_async(&asked.params, ctx.config, ctx.mempool.as_ref()).await
             }
             _ => Err("unknown broadcast".into()),
         };
@@ -2587,11 +2591,14 @@ pub async fn write_rpc_result<W: AsyncWrite + Unpin>(
     write_raw_line(writer, &s, deadline).await
 }
 
-/// Broadcast runs scripts on `rbtc-scripts-*` and must not take a blocking thread.
+/// Broadcast and test-accept run scripts on `rbtc-scripts-*` and must not
+/// take a blocking thread.
 fn method_awaits_scripts(method: &str) -> bool {
     matches!(
         method,
-        "blockchain.transaction.broadcast" | "blockchain.transaction.broadcast_package"
+        "blockchain.transaction.broadcast"
+            | "blockchain.transaction.broadcast_package"
+            | "blockchain.transaction.testmempoolaccept"
     )
 }
 
@@ -2809,36 +2816,6 @@ fn broadcast_tx_from_params(
     decode_broadcast_tx(raw_hex)
 }
 
-/// Hex array plus the verbose flag, under the broadcast hex cap.
-fn decode_broadcast_package(
-    params: &Value,
-    config: &ElectrumConfig,
-) -> Result<(Vec<bitcoin::Transaction>, bool), String> {
-    let arr = params
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "broadcast_package expected array of hex txs".to_string())?;
-    let verbose = params
-        .as_array()
-        .and_then(|a| a.get(1))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let mut txs = Vec::with_capacity(arr.len());
-    let mut total_hex = 0usize;
-    for h in arr {
-        let raw_hex = h
-            .as_str()
-            .ok_or_else(|| "broadcast_package tx must be hex".to_string())?;
-        total_hex = total_hex.saturating_add(raw_hex.len());
-        if total_hex > config.max_broadcast_hex {
-            return Err("package hex too large".into());
-        }
-        txs.push(decode_broadcast_tx(raw_hex)?);
-    }
-    Ok((txs, verbose))
-}
-
 fn package_broadcast_value(verbose: bool, accepted: &[rbitcoin_net::AcceptResult]) -> Value {
     if !verbose {
         return json!("success");
@@ -2881,7 +2858,12 @@ pub async fn broadcast_package_async(
     config: &ElectrumConfig,
     mempool: Option<&Arc<MempoolHub>>,
 ) -> Result<Value, String> {
-    let (txs, verbose) = decode_broadcast_package(params, config)?;
+    let txs = param_hex_txs(params, config, "broadcast_package")?;
+    let verbose = params
+        .as_array()
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let mp = mempool
         .ok_or_else(|| "mempool not available".to_string())?
         .clone();
@@ -2890,6 +2872,77 @@ pub async fn broadcast_package_async(
         .await
         .map_err(|e| format!("broadcast_package reject: {e}"))?;
     Ok(package_broadcast_value(verbose, &accepted))
+}
+
+/// The first param as hex transactions, at most `max_broadcast_hex` chars in all.
+fn param_hex_txs(
+    params: &Value,
+    config: &ElectrumConfig,
+    method: &str,
+) -> Result<Vec<bitcoin::Transaction>, String> {
+    let arr = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("{method} expected array of hex txs"))?;
+    let mut txs = Vec::with_capacity(arr.len());
+    let mut total_hex = 0usize;
+    for h in arr {
+        let raw_hex = h
+            .as_str()
+            .ok_or_else(|| format!("{method} tx must be hex"))?;
+        total_hex = total_hex.saturating_add(raw_hex.len());
+        if total_hex > config.max_broadcast_hex {
+            return Err("package hex too large".into());
+        }
+        txs.push(decode_broadcast_tx(raw_hex)?);
+    }
+    Ok(txs)
+}
+
+/// Electrum 1.7 row. `allowed` is absent when the whole package failed.
+/// `reason` is present only when the tx is not allowed.
+fn test_accept_row_json(row: &TestAcceptRow) -> Value {
+    let mut out = json!({
+        "txid": row.txid.to_string(),
+        "wtxid": row.wtxid.to_string(),
+    });
+    match &row.verdict {
+        TestAcceptVerdict::Allowed { .. } => out["allowed"] = json!(true),
+        TestAcceptVerdict::Rejected { reason, .. } => {
+            out["allowed"] = json!(false);
+            out["reason"] = json!(reason);
+        }
+        TestAcceptVerdict::PackageError(msg) => out["reason"] = json!(msg),
+    }
+    out
+}
+
+/// `blockchain.transaction.testmempoolaccept`: Core `testmempoolaccept`
+/// with its default `maxfeerate`. Nothing stays in the pool.
+async fn testmempoolaccept_async(
+    params: &Value,
+    config: &ElectrumConfig,
+    mempool: Option<&Arc<MempoolHub>>,
+) -> Result<Value, String> {
+    let txs = param_hex_txs(params, config, "testmempoolaccept")?;
+    let max = MempoolHub::max_package_count();
+    if txs.is_empty() || txs.len() > max {
+        return Err(format!("testmempoolaccept takes 1 to {max} transactions"));
+    }
+    let mp = mempool
+        .ok_or_else(|| "mempool not available".to_string())?
+        .clone();
+    let budget = mp.query.api_read_budget();
+    let rows = rbitcoin_net::with_store_budget(
+        budget,
+        mp.test_accept_rows_async(txs, DEFAULT_MAX_RAW_TX_FEE_SAT_KVB),
+    )
+    .await;
+    Ok(json!(rows
+        .iter()
+        .map(test_accept_row_json)
+        .collect::<Vec<_>>()))
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled

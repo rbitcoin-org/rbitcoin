@@ -57,6 +57,8 @@ pub mod service;
 #[doc(hidden)]
 pub mod socks;
 #[doc(hidden)]
+pub mod test_accept;
+#[doc(hidden)]
 pub mod tip_accept;
 #[doc(hidden)]
 pub mod tx_relay;
@@ -109,8 +111,8 @@ pub use peers::{
 pub use perf_meter::RequestMeter;
 pub use rbitcoin_mempool::MempoolGraphStats;
 pub use rbitcoin_mempool::{
-    AcceptError, AcceptResult, CoreDatTx, CoreMempoolDat, Removal, RemovalReason, RemovedRow,
-    RemovedRows, SelectBudget, Selected, UtxoProvider,
+    check_transaction, AcceptError, AcceptResult, CoreDatTx, CoreMempoolDat, Removal,
+    RemovalReason, RemovedRow, RemovedRows, SelectBudget, Selected, UtxoProvider,
 };
 pub use reactor::{
     acquire_armed_store_budget, finish_join, hold_store_permit, is_join_error, off_pool,
@@ -128,6 +130,10 @@ pub use serve_perf::{
 };
 pub use service::{P2PNode, REDIAL_INTERVAL, REDIAL_INTERVAL_TEST};
 pub use socks::{Dialer, NetProxies};
+pub use test_accept::{
+    accept_reject_reason, package_has_conflicts, submit_tx_version_nonstandard, TestAcceptRow,
+    TestAcceptVerdict,
+};
 pub use tx_relay::{
     arm_template_prev_sample, sample_template_prev_for_build, CoreDatImport, ElectrumMempoolItem,
     FeeHistoryBackfillStats, LocalBroadcast, MempoolAnnounce, MempoolHub, MempoolPerfSample,

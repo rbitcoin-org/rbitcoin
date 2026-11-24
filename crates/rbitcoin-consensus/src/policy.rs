@@ -62,6 +62,9 @@ pub fn vbytes_ceil(weight: u64) -> u64 {
     Weight::from_wu(weight).to_vbytes_ceil()
 }
 
+/// Default submit cap: Core 0.10 BTC/kvB, in sat/kvB. `0` is unlimited.
+pub const DEFAULT_MAX_RAW_TX_FEE_SAT_KVB: u64 = 10_000_000;
+
 /// Core `CFeeRate::GetFee` cap (`sendrawtransaction`, `testmempoolaccept`).
 /// Zero `max_sat_kvb` is unlimited. Otherwise the fee is over
 /// `max_sat_kvb * vbytes_ceil(weight) / 1000`, rounded up to a whole sat.
@@ -175,14 +178,6 @@ pub fn spends_dust_of(parent: &Transaction, child: &Transaction) -> bool {
     })
 }
 
-/// Libre admission for a single tx given fee and weight (no dust limit, no template ban).
-///
-/// Callers still enforce consensus, cluster limits, and DoS caps separately.
-pub fn check_libre_admission(tx: &Transaction, fee_sat: u64, weight: u64) -> PolicyResult {
-    check_libre_admission_at(tx, fee_sat, 0, weight, MIN_RELAY_FEE_RATE_SAT_PER_KVB)
-}
-
-/// Libre admission with an explicit min-relay floor (Core `-minrelaytxfee`).
 /// Shape checks that do not need a fee or parent outputs.
 pub fn check_libre_shape(tx: &Transaction, weight: u64) -> PolicyResult {
     if tx.is_coinbase() {
@@ -204,22 +199,18 @@ pub fn check_libre_shape(tx: &Transaction, weight: u64) -> PolicyResult {
     check_libre_annex(tx)
 }
 
-/// Libre admission at an explicit min-relay floor (Core `-minrelaytxfee`).
+/// The Libre rules that need the fee, after [`check_libre_shape`].
 ///
 /// `fee_delta` is the `prioritisetransaction` delta. A tx with a dust output
 /// must pay nothing, base or modified (Core `PreCheckEphemeralTx`): it enters
 /// only beside a child that spends that output and pays for both.
-pub fn check_libre_admission_at(
+pub fn check_libre_fees_at(
     tx: &Transaction,
     fee_sat: u64,
     fee_delta: i64,
     weight: u64,
     min_relay_sat_kvb: u64,
 ) -> PolicyResult {
-    match check_libre_shape(tx, weight) {
-        PolicyResult::Standard => {}
-        other => return other,
-    }
     let modified = i128::from(fee_sat) + i128::from(fee_delta);
     if (fee_sat != 0 || modified != 0) && dust_vouts(tx).next().is_some() {
         return PolicyResult::NonStandard("dust");

@@ -19,15 +19,9 @@ fn nonstandard_version_is_version() {
     let mut tx = bare_tx(1);
     tx.version = Version::non_standard(0xffff_ffffu32 as i32);
     let weight = tx.weight().to_wu();
-    assert_eq!(
-        check_libre_admission_at(&tx, 50_000, 0, weight, 0),
-        PolicyResult::Standard
-    );
+    assert_eq!(check_libre_shape(&tx, weight), PolicyResult::Standard);
     tx.version = Version::ONE;
-    assert_eq!(
-        check_libre_admission_at(&tx, 50_000, 0, weight, 0),
-        PolicyResult::Standard
-    );
+    assert_eq!(check_libre_shape(&tx, weight), PolicyResult::Standard);
 }
 
 #[test]
@@ -36,22 +30,16 @@ fn oversized_spk_is_scriptpubkey() {
     tx.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 10_001]);
     let weight = tx.weight().to_wu();
     assert_eq!(
-        check_libre_admission_at(&tx, 50_000, 0, weight, 0),
+        check_libre_shape(&tx, weight),
         PolicyResult::NonStandard("scriptpubkey")
     );
     tx.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 10_000]);
-    assert_eq!(
-        check_libre_admission_at(&tx, 50_000, 0, weight, 0),
-        PolicyResult::Standard
-    );
+    assert_eq!(check_libre_shape(&tx, weight), PolicyResult::Standard);
     let mut opreturn = vec![0x6a];
     opreturn.extend(std::iter::repeat_n(0x01, 10_001));
     tx.output[0].script_pubkey = ScriptBuf::from_bytes(opreturn);
     let weight = tx.weight().to_wu();
-    assert_eq!(
-        check_libre_admission_at(&tx, 50_000, 0, weight, 0),
-        PolicyResult::Standard
-    );
+    assert_eq!(check_libre_shape(&tx, weight), PolicyResult::Standard);
 }
 
 #[test]
@@ -103,16 +91,23 @@ fn libre_allows_op_true_and_dust_outputs() {
     let tx = bare_tx(1);
     let weight = tx.weight().to_wu();
     let fee = 50_000u64.saturating_sub(1);
-    assert!(check_libre_admission(&tx, fee, weight).is_ok());
+    assert!(check_libre_shape(&tx, weight).is_ok());
+    assert!(check_libre_fees_at(&tx, fee, 0, weight, MIN_RELAY_FEE_RATE_SAT_PER_KVB).is_ok());
 
     let zero = bare_tx(0);
+    let weight = zero.weight().to_wu();
+    assert!(check_libre_shape(&zero, weight).is_ok());
     assert_eq!(
-        check_libre_admission(&zero, 50_000, zero.weight().to_wu()),
+        check_libre_fees_at(&zero, 50_000, 0, weight, MIN_RELAY_FEE_RATE_SAT_PER_KVB),
         PolicyResult::NonStandard("dust")
     );
     let mut opreturn = bare_tx(0);
     opreturn.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00]);
-    assert!(check_libre_admission(&opreturn, 50_000, opreturn.weight().to_wu()).is_ok());
+    let weight = opreturn.weight().to_wu();
+    assert!(check_libre_shape(&opreturn, weight).is_ok());
+    assert!(
+        check_libre_fees_at(&opreturn, 50_000, 0, weight, MIN_RELAY_FEE_RATE_SAT_PER_KVB).is_ok()
+    );
 }
 
 #[test]
@@ -120,7 +115,7 @@ fn libre_rejects_low_feerate() {
     let tx = bare_tx(50_000);
     let weight = tx.weight().to_wu();
     assert_eq!(
-        check_libre_admission(&tx, 0, weight),
+        check_libre_fees_at(&tx, 0, 0, weight, MIN_RELAY_FEE_RATE_SAT_PER_KVB),
         PolicyResult::NonStandard("min relay fee")
     );
 }
@@ -141,7 +136,7 @@ fn libre_dust_rejects_a_zero_fee_with_a_priority_delta() {
     let tx = bare_tx(0);
     let weight = tx.weight().to_wu();
     assert_eq!(
-        check_libre_admission_at(&tx, 0, 1_000, weight, 1),
+        check_libre_fees_at(&tx, 0, 1_000, weight, 1),
         PolicyResult::NonStandard("dust")
     );
 }
@@ -157,7 +152,7 @@ fn libre_negative_delta_can_miss_min_relay() {
     assert!(vsize.saturating_mul(rate) > 10 * 1_000);
     assert!(vsize.saturating_mul(rate) <= 190 * 1_000);
     assert_eq!(
-        check_libre_admission_at(&tx, 100, -90, weight, rate),
+        check_libre_fees_at(&tx, 100, -90, weight, rate),
         PolicyResult::NonStandard("min relay fee")
     );
 }
@@ -204,7 +199,7 @@ fn vsize_fee_zero_and_libre_gates() {
         }],
     };
     assert_eq!(
-        check_libre_admission(&cb, 0, 100),
+        check_libre_shape(&cb, 100),
         PolicyResult::NonStandard("coinbase")
     );
 
@@ -212,7 +207,7 @@ fn vsize_fee_zero_and_libre_gates() {
     let tx = bare_tx(1);
     assert!(check_libre_shape(&tx, MAX_STANDARD_TX_WEIGHT).is_standard());
     assert_eq!(
-        check_libre_admission(&tx, 1_000_000, MAX_STANDARD_TX_WEIGHT + 1),
+        check_libre_shape(&tx, MAX_STANDARD_TX_WEIGHT + 1),
         PolicyResult::NonStandard("tx weight")
     );
     // 10_000 bytes is spendable. One more byte, or equality, is not.
@@ -221,7 +216,7 @@ fn vsize_fee_zero_and_libre_gates() {
     let mut zero_exact = bare_tx(0);
     zero_exact.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 10_000]);
     assert_eq!(
-        check_libre_admission(&zero_exact, 50_000, 100),
+        check_libre_fees_at(&zero_exact, 50_000, 0, 100, MIN_RELAY_FEE_RATE_SAT_PER_KVB),
         PolicyResult::NonStandard("dust")
     );
 

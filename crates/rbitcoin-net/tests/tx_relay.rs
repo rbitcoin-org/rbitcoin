@@ -23,9 +23,6 @@ use bitcoin::{Sequence, TxIn, Witness};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MINED: rbitcoin_net::Removal =
-    rbitcoin_net::Removal::Committed(rbitcoin_net::RemovalReason::Block);
-
 fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -678,7 +675,7 @@ fn reorg_reaccept_then_unindex_drops_relay() {
     let w = tx.compute_wtxid();
     assert!(hub.is_reorg_servable(&w));
     assert!(hub.get_tx_by_wtxid(&w).is_some());
-    assert!(hub.remove_for_block(&[tx.compute_txid()], MINED) >= 1);
+    assert!(hub.remove_for_block(&[tx.compute_txid()]) >= 1);
     assert!(hub.get_tx_by_wtxid(&w).is_none());
     assert!(
         !hub.is_relay_servable(&w, u64::MAX),
@@ -867,12 +864,12 @@ async fn inv_floor_follows_the_oldest_live_accept() {
     admit(cbs[2], 5_000);
     let newest = admit(cbs[3], 5_005);
     hub.note_mock_now(5_010);
-    assert_eq!(hub.remove_for_block(&[newest], MINED), 1);
+    assert_eq!(hub.remove_for_block(&[newest]), 1);
     assert!(
         hub.any_tx_inv_due(),
         "the 1000 accept is still live and due"
     );
-    assert_eq!(hub.remove_for_block(&[oldest], MINED), 1);
+    assert_eq!(hub.remove_for_block(&[oldest]), 1);
     assert!(
         !hub.any_tx_inv_due(),
         "the 5000 accept is the floor, 10s old"
@@ -1027,7 +1024,7 @@ fn unbroadcast_survives_reopen_and_logs_confirm_before_broadcast() {
     let got = rx.try_recv().expect("mockscheduler rebroadcast");
     assert_eq!(got.txid, tx.compute_txid());
     rbitcoin_log::capture_logs(true);
-    assert_eq!(hub2.remove_for_block(&[tx.compute_txid()], MINED), 1);
+    assert_eq!(hub2.remove_for_block(&[tx.compute_txid()]), 1);
     let logs = rbitcoin_log::take_logs();
     rbitcoin_log::capture_logs(false);
     let needle = format!(
@@ -1160,9 +1157,9 @@ fn scripthash_reopen_drops_parent_then_child() {
     let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
     hub.set_relay_enabled(true);
     assert!(hub.scripthash_mempool(&sh).len() >= 2);
-    assert!(hub.remove_for_block(&[parent.compute_txid()], MINED) >= 1);
+    assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
     assert!(!hub.scripthash_mempool(&sh).is_empty());
-    assert!(hub.remove_for_block(&[child.compute_txid()], MINED) >= 1);
+    assert!(hub.remove_for_block(&[child.compute_txid()]) >= 1);
     assert!(hub.scripthash_mempool(&sh).is_empty());
     let _ = std::fs::remove_dir_all(&mp);
 }
@@ -1320,7 +1317,7 @@ fn live_pool_recent_accepts_and_1p1c_rollback() {
     let delta = hub.scripthash_unconfirmed_delta(&sh).unwrap();
     assert_eq!(delta, 50_0000_0000 - 2_000 - 50_0000_0000 - 50_0000_0000);
     assert!(hub.is_relay_servable(&wtxid, hub.next_relay_seq.load(Ordering::Relaxed)));
-    assert!(hub.remove_for_block(&[parent.compute_txid()], MINED) >= 1);
+    assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
     hub.mark_fee_dirty();
     let e1b = hub.estimate_fee_btc_per_kb(1);
     let e144b = hub.estimate_fee_btc_per_kb(144);
@@ -1587,7 +1584,7 @@ fn sigop_adjusted_weight_feeds_cluster_and_confirm_memory() {
     hub.set_bytes_per_sigop(20);
     // Confirmed feerate memory: 1_000 sat on 500 adjusted vB (raw 100).
     hub.set_relay_enabled(true);
-    assert_eq!(hub.remove_for_block(&[tid], MINED), 1);
+    assert_eq!(hub.remove_for_block(&[tid]), 1);
     assert_eq!(hub.confirm_memory_floor_sat_per_kvb(), Some(2_000));
     let _ = std::fs::remove_dir_all(&mp);
 }
@@ -1772,8 +1769,8 @@ fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
     );
     let err = hub.admit(&confirmed).unwrap_err();
     assert!(
-        matches!(err, AcceptError::MissingPrevout(_)),
-        "confirmed body must not park as orphan, got {err}"
+        matches!(err, AcceptError::Policy("txn-already-known")),
+        "a confirmed body is txn-already-known, not an orphan, got {err}"
     );
     assert_eq!(hub.orphan_count(), 0);
     assert!(
@@ -1821,7 +1818,7 @@ fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
     );
     assert_eq!(hub.orphan_count(), 0);
 
-    hub.remove_for_block(&[child.compute_txid()], MINED);
+    hub.remove_for_block(&[child.compute_txid()]);
     q.disconnect_tip().unwrap();
     let ghost = Transaction {
         version: Version::TWO,
@@ -2206,10 +2203,10 @@ fn eviction_keeps_priority_and_duplicate_does_not_replay_it() {
     assert!(matches!(err, AcceptError::Duplicate(_)), "{err}");
     assert_eq!(hub.template_updates(), updates);
     assert_eq!(hub.fee_delta(&low_id), 9);
-    assert!(hub.remove_for_block(&[high_id], MINED) >= 1);
+    assert!(hub.remove_for_block(&[high_id]) >= 1);
     assert_eq!(hub.fee_delta(&high_id), 0);
     assert_eq!(hub.fee_delta(&low_id), 9);
-    assert_eq!(hub.remove_for_block(&[low_id], MINED), 0);
+    assert_eq!(hub.remove_for_block(&[low_id]), 0);
     assert_eq!(
         hub.fee_delta(&low_id),
         0,
@@ -2301,7 +2298,7 @@ fn unindex_drops_relay_seq_and_accept_at() {
     let stay_w = stay.compute_wtxid();
     assert!(hub.relay_seq_of(&gone_w).is_some());
     assert!(hub.relay_seq_of(&stay_w).is_some());
-    assert!(hub.remove_for_block(&[gone.compute_txid()], MINED) >= 1);
+    assert!(hub.remove_for_block(&[gone.compute_txid()]) >= 1);
     assert!(hub.contains(&stay.compute_txid()));
     assert!(hub.relay_seq_of(&gone_w).is_none());
     assert!(hub.relay_seq_of(&stay_w).is_some());
@@ -2452,7 +2449,7 @@ fn purge_confirmed_drops_relay_maps() {
     assert!(hub.contains(&parent_id), "connect does not strip the pool");
     assert!(!hub.pool_maintained());
     assert_eq!(
-        hub.remove_for_block(&[parent_id], MINED),
+        hub.remove_for_block(&[parent_id]),
         0,
         "per-block strip waits for maintenance"
     );
@@ -2512,7 +2509,7 @@ fn purge_confirmed_drops_relay_maps() {
     assert!(reopened.contains(&child_id));
     reopened.set_relay_enabled(true);
     assert_eq!(
-        reopened.remove_for_block(&[child_id], MINED),
+        reopened.remove_for_block(&[child_id]),
         1,
         "once maintained, the strip removes a live tx"
     );
@@ -2705,8 +2702,11 @@ fn maintenance_keeps_a_child_whose_confirmed_parent_the_head_lost() {
         }
         // The parents' block strips them from the pool. The children stay.
         let mut g = hub.lock_write();
-        g.remove_live_txids(&[parent.compute_txid(), spent_parent.compute_txid()], MINED)
-            .expect("strip the confirmed parents");
+        g.remove_live_txids(
+            &[parent.compute_txid(), spent_parent.compute_txid()],
+            rbitcoin_net::Removal::Committed(rbitcoin_net::RemovalReason::Block),
+        )
+        .expect("strip the confirmed parents");
         g.flush().expect("persist the pool");
     }
     let connect = |q: &Query, txs: Vec<Transaction>| {
@@ -3083,7 +3083,7 @@ fn remove_for_block_skipped_until_relay_then_purge() {
     let dummy = Txid::from_byte_array([9u8; 32]);
     mp.prioritise_tx(dummy, 3);
     // Strip stays deferred until maintenance begins. The mined delta still drops.
-    assert_eq!(mp.remove_for_block(&[dummy], MINED), 0);
+    assert_eq!(mp.remove_for_block(&[dummy]), 0);
     assert_eq!(
         mp.fee_delta(&dummy),
         0,
@@ -3095,7 +3095,7 @@ fn remove_for_block_skipped_until_relay_then_purge() {
     assert!(mp.pool_maintained());
     assert_eq!(mp.purge_confirmed_on_chain(), 0);
     // Still no-op for unknown txid, but path is live.
-    assert_eq!(mp.remove_for_block(&[dummy], MINED), 0);
+    assert_eq!(mp.remove_for_block(&[dummy]), 0);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&store_dir);
 }
@@ -3155,7 +3155,7 @@ fn hub_accept_remove_with_map_utxo_path() {
     assert!(hub
         .get_tx_by_wtxid(&Wtxid::from_byte_array([0u8; 32]))
         .is_none());
-    assert_eq!(hub.remove_for_block(&[], MINED), 0);
+    assert_eq!(hub.remove_for_block(&[]), 0);
     assert_eq!(hub.reorg_reaccept(&[]), 0);
     hub.flush().unwrap();
     let _ = hub.compact();
@@ -3986,11 +3986,10 @@ fn broadcast_waits_for_settle_after_its_tx_left() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Core's `MempoolAcceptedTx` is peer relay only. A multi-tx
-/// `testmempoolaccept` member commits with no peer, so the parked copy of
-/// it stays parked under its peer.
+/// Core's `MempoolAcceptedTx` is peer relay only. A local submit commits
+/// with no peer, so the parked copy of it stays parked under its peer.
 #[test]
-fn test_package_member_leaves_its_parked_copy() {
+fn a_commit_with_no_peer_leaves_its_parked_copy() {
     let (_store, q, cbs) = pad_cbs(12);
     let dir = tmp();
     let hub = Arc::new(MempoolHub::open(&dir, Arc::clone(&q)).unwrap());
@@ -4004,16 +4003,15 @@ fn test_package_member_leaves_its_parked_copy() {
         BTreeSet::from([parent.compute_txid()]),
         Some(4),
     ));
-    let admit = hub.begin_tentative();
-    hub.accept_test_package_member(&child, admit)
+    hub.admit_from(&child, TxOrigin::Local)
         .expect("its parent is pooled");
-    hub.settle(admit);
+    assert!(hub.contains(&child.compute_txid()));
     assert_eq!(
         hub.lock_read()
             .orphanage
             .announcers_of(&child.compute_wtxid()),
         vec![4],
-        "a test member does not erase the parked copy"
+        "a commit with no peer does not erase the parked copy"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5665,7 +5663,7 @@ fn package_inside_promote_admits_parent_orphans() {
     accept_and_connect_block(&q, &params, Height(tip_h + 1), &block, Milestone::NONE)
         .expect("connect the chain parent");
     rbitcoin_net::tx_relay::reset_promote_depth();
-    hub.remove_for_block(&[conf.compute_txid()], MINED);
+    hub.remove_for_block(&[conf.compute_txid()]);
     assert!(
         hub.contains(&low_parent.compute_txid()),
         "1p1c inside the walk must admit the low parent"
@@ -6499,7 +6497,11 @@ fn script_admit_finishes_while_the_blocking_pool_is_parked() {
     });
     let hub_test = Arc::clone(&hub);
     let tested = rt.block_on(async {
-        tokio::time::timeout(Duration::from_secs(10), hub_test.test_accept_async(probed)).await
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            hub_test.test_accept_async(probed, None),
+        )
+        .await
     });
     let _ = release_tx.send(());
     let one = admitted
@@ -7089,7 +7091,8 @@ fn review_trust_flag_off_open_drops_marked_tree() {
 }
 
 /// A non-final or script-invalid orphan announced by the trusted session is
-/// admitted when its parent arrives. Any other announcer is dropped.
+/// admitted when its parent arrives. From any other announcer a non-final tx
+/// is refused before it can park, and a script-invalid one is dropped.
 #[test]
 fn review_trust_orphan_keeps_session_waiver() {
     use bitcoin::WPubkeyHash;
@@ -7127,12 +7130,12 @@ fn review_trust_orphan_keeps_session_waiver() {
         .admit_from(&trusted, TxOrigin::Relay(Some(session)))
         .unwrap_err();
     assert!(matches!(parked, AcceptError::Orphaned { .. }), "{parked}");
-    let parked_other = hub
+    let refused_other = hub
         .admit_from(&other, TxOrigin::Relay(Some(99)))
         .unwrap_err();
     assert!(
-        matches!(parked_other, AcceptError::Orphaned { .. }),
-        "{parked_other}"
+        matches!(refused_other, AcceptError::NotFinal),
+        "{refused_other}"
     );
     hub.admit(&parent).expect("parent");
     hub.admit(&other_parent).expect("other parent");
@@ -7950,7 +7953,7 @@ async fn released_inv_log_drops_a_tx_that_left_the_pool() {
     let before = hub.take_released_invs(InvDirection::Inbound, 0, usize::MAX);
     assert_eq!(before.1.len(), 2);
 
-    hub.remove_for_block(&[gone.compute_txid()], MINED);
+    hub.remove_for_block(&[gone.compute_txid()]);
     hub.drain_inv_backlog(1_000_000);
     assert_eq!(
         hub.inv_buckets.lock().unwrap().released_inbound.len(),
@@ -7998,7 +8001,7 @@ async fn released_inv_skips_a_dead_middle_row() {
         hub.accept_tx_async(tx.clone()).await.expect("accept");
     }
     hub.drain_inv_backlog(1_000_000);
-    hub.remove_for_block(&[txs[1].compute_txid()], MINED);
+    hub.remove_for_block(&[txs[1].compute_txid()]);
     let (last, rows) = hub.take_released_invs(InvDirection::Inbound, 0, usize::MAX);
     assert_eq!(
         rows.iter().map(|(_, _, w)| *w).collect::<Vec<_>>(),

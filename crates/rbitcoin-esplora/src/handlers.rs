@@ -2374,6 +2374,43 @@ pub fn parse_maxfeerate_btc_kvb(q: MaxFeeQuery) -> Result<u64, Response> {
     Ok(sat_vb.max(1).saturating_mul(1000))
 }
 
+/// mempool/electrs `MempoolAcceptResult`, as bitcoind `testmempoolaccept`
+/// returns it. A package-wide failure carries Core's `package-error`.
+fn test_accept_row_json(row: &rbitcoin_net::TestAcceptRow) -> Value {
+    let txid = row.txid.to_string();
+    let wtxid = row.wtxid.to_string();
+    match &row.verdict {
+        rbitcoin_net::TestAcceptVerdict::Allowed {
+            fee_sat, weight, ..
+        } => {
+            let vsize = rbitcoin_consensus::policy::vbytes_ceil(*weight).max(1);
+            let sat_kvb = fee_sat.saturating_mul(1000) / vsize;
+            json!({
+                "txid": txid,
+                "wtxid": wtxid,
+                "allowed": true,
+                "vsize": vsize,
+                "fees": {
+                    "base": *fee_sat as f64 / 100_000_000.0,
+                    "effective-feerate": sat_kvb as f64 / 100_000_000.0,
+                    "effective-includes": [wtxid],
+                },
+            })
+        }
+        rbitcoin_net::TestAcceptVerdict::Rejected { reason, .. } => json!({
+            "txid": txid,
+            "wtxid": wtxid,
+            "allowed": false,
+            "reject-reason": reason,
+        }),
+        rbitcoin_net::TestAcceptVerdict::PackageError(msg) => json!({
+            "txid": txid,
+            "wtxid": wtxid,
+            "package-error": msg,
+        }),
+    }
+}
+
 pub async fn post_txs_test(
     State(st): State<AppState>,
     AxumQuery(q): AxumQuery<MaxFeeQuery>,
@@ -2403,6 +2440,17 @@ pub async fn post_txs_test(
             )
                 .into_response();
         }
+        if hexes.is_empty() {
+            // mempool/electrs leaves this to bitcoind and relays its error.
+            let max = rbitcoin_net::MempoolHub::max_package_count();
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    r#"testmempoolaccept RPC error: {{"code":-8,"message":"Array must contain between 1 and {max} transactions."}}"#
+                ),
+            )
+                .into_response();
+        }
         for (i, hex) in hexes.iter().enumerate() {
             if !(120..800_000).contains(&hex.len()) {
                 return (
@@ -2425,56 +2473,12 @@ pub async fn post_txs_test(
                 }
             }
         }
-        let mut ids = HashSet::new();
-        if decoded.iter().any(|tx| !ids.insert(tx.compute_txid())) {
-            let tx = &decoded[0];
-            return json_reply_here(json!([{
-                "txid": format!("{}", tx.compute_txid()),
-                "wtxid": format!("{}", tx.compute_wtxid()),
-                "allowed": false,
-                "package-error": "package-contains-duplicates",
-            }]));
-        }
-        let mut out = Vec::new();
-        for tx in decoded {
-            let txid = format!("{}", tx.compute_txid());
-            let wtxid = format!("{}", tx.compute_wtxid());
-            match rbitcoin_net::with_store_budget(
-                st.query.api_read_budget(),
-                mp.test_accept_async(tx.clone()),
-            )
-            .await
-            {
-                Ok(r) => {
-                    if rbitcoin_consensus::policy::fee_exceeds_max(r.fee_sat, r.weight, max_sat_kvb)
-                    {
-                        out.push(json!({
-                            "txid": txid,
-                            "wtxid": wtxid,
-                            "allowed": false,
-                            "reject-reason": "max-fee-exceeded",
-                        }));
-                        continue;
-                    }
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": true,
-                        "vsize": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                        "fees": { "base": r.fee_sat as f64 / 100_000_000.0 },
-                    }));
-                }
-                Err(e) => {
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": false,
-                        "reject-reason": e.to_string(),
-                    }));
-                }
-            }
-        }
-        json_reply_here(out)
+        let rows = rbitcoin_net::with_store_budget(
+            st.query.api_read_budget(),
+            mp.test_accept_rows_async(decoded, max_sat_kvb),
+        )
+        .await;
+        json_reply_here(rows.iter().map(test_accept_row_json).collect::<Vec<_>>())
     }
 }
 
