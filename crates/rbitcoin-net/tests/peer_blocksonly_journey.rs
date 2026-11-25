@@ -154,9 +154,10 @@ async fn blocksonly_p2p_tx_disconnects(
     peers.unregister(sess.id);
 }
 
-/// Relay off: an RPC sendraw is announced only once it is unbroadcast.
-/// Then a peer with a writer gets the INV at once, an inbound peer on its
-/// next tick, a block-relay peer never, and the announced wtx serves.
+/// Relay off: an RPC sendraw is unbroadcast from its commit, so its accept
+/// announce reaches peers. A peer with a writer gets the INV at once, an
+/// inbound peer on its next tick, a block-relay peer never, and the announced
+/// wtx serves.
 async fn blocksonly_sendraw_invs_inbound(
     hub: &rbitcoin_net::chain::ChainHub,
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
@@ -164,16 +165,16 @@ async fn blocksonly_sendraw_invs_inbound(
 ) {
     let mp = hub.mempool().unwrap();
     let mut ann_rx = mp.subscribe_announces();
-    mp.admit(tx).expect("sendraw accept");
+    mp.admit_from(tx, rbitcoin_net::TxOrigin::Local)
+        .expect("sendraw accept");
     assert_eq!(
         ann_rx.try_recv().expect("accept publishes announce").txid,
         tx.compute_txid()
     );
     assert!(
-        !mp.is_unbroadcast(&tx.compute_txid()),
-        "unbroadcast is noted only after accept_tx returns (sendraw)"
+        mp.is_unbroadcast(&tx.compute_txid()),
+        "the commit marks a sendraw unbroadcast"
     );
-    mp.note_unbroadcast(tx.compute_txid());
 
     let first = relay_peer(peers, [127, 0, 0, 1], rbitcoin_net::peers::PeerConnType::Inbound);
     let mut first_rx = writer_of(&first);

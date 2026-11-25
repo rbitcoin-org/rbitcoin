@@ -1022,8 +1022,7 @@ fn unbroadcast_survives_reopen_and_logs_confirm_before_broadcast() {
     );
     let wire = spend_true(cbs[8], 1_000, spk.clone());
     hub.admit(&wire).expect("peer tx");
-    hub.note_unbroadcast(tx.compute_txid());
-    assert_eq!(hub.unbroadcast_count(), 1);
+    assert_eq!(hub.unbroadcast_count(), 1, "the local admit is unbroadcast");
     assert!(hub.is_local_origin(&tx.compute_txid()));
     assert!(!hub.is_local_origin(&wire.compute_txid()));
     assert!(
@@ -1059,7 +1058,11 @@ fn unbroadcast_survives_reopen_and_logs_confirm_before_broadcast() {
         "p2p: local tx {} left the unbroadcast set before a peer fetched it",
         tx.compute_txid()
     );
-    assert!(logs.iter().any(|(_, m)| *m == needle), "{logs:?}");
+    assert!(
+        logs.iter()
+            .any(|(l, m)| *m == needle && *l == rbitcoin_log::Level::Debug),
+        "one debug line per tx, not info: {logs:?}"
+    );
     assert_eq!(hub2.unbroadcast_count(), 0);
     let _ = std::fs::remove_dir_all(&mp);
 }
@@ -1074,7 +1077,7 @@ fn unbroadcast_set_is_published_through_a_synced_rename() {
     let mut set = std::collections::HashSet::new();
     set.insert(Txid::from_byte_array([1u8; 32]));
     rbitcoin_store::file::arm_fsync_dir_trace();
-    persist_unbroadcast_file(&dir, &set);
+    persist_unbroadcast_file(&dir, &set).unwrap();
     let synced = rbitcoin_store::file::take_fsynced_dirs();
     assert!(
         synced.iter().any(|d| d == &dir),
@@ -1082,6 +1085,85 @@ fn unbroadcast_set_is_published_through_a_synced_rename() {
     );
     assert_eq!(load_unbroadcast_file(&dir), set);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Noting, serving, and removing unbroadcast txs only mark the set dirty.
+/// The sidecar is written by `persist_due` and `flush`. Written per change, a
+/// node whose local txs no peer fetches rewrites and fsyncs the whole set
+/// once per tx, and a block confirming thousands of them stalls the node.
+#[test]
+fn unbroadcast_set_is_written_on_persist_not_per_change() {
+    let (_store, q, _cbs) = pad_cbs(3);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    let a = Txid::from_byte_array([0xa1; 32]);
+    let b = Txid::from_byte_array([0xb2; 32]);
+    hub.note_unbroadcast(a);
+    hub.note_unbroadcast(b);
+    assert!(
+        load_unbroadcast_file(&dir).is_empty(),
+        "a note does not write the sidecar"
+    );
+    hub.persist_due().unwrap();
+    assert_eq!(load_unbroadcast_file(&dir), [a, b].into_iter().collect());
+    hub.mark_broadcast(&a);
+    assert_eq!(
+        load_unbroadcast_file(&dir).len(),
+        2,
+        "a served getdata does not write the sidecar"
+    );
+    hub.flush().unwrap();
+    assert_eq!(load_unbroadcast_file(&dir), [b].into_iter().collect());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sidecar write that fails is an error from `persist_due` and `flush`, and
+/// the set stays due. Dropped, the next persist skips it and the sidecar keeps
+/// the old set until the next change.
+#[test]
+fn a_failed_unbroadcast_write_errors_and_stays_due() {
+    let (_store, q, _cbs) = pad_cbs(3);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    let a = Txid::from_byte_array([0xa1; 32]);
+    hub.note_unbroadcast(a);
+    // A directory at the sidecar name fails the rename.
+    std::fs::create_dir(dir.join("unbroadcast")).unwrap();
+    assert!(hub.persist_due().is_err(), "persist_due hides the failure");
+    assert!(hub.flush().is_err(), "flush hides the failure");
+    std::fs::remove_dir(dir.join("unbroadcast")).unwrap();
+    hub.persist_due().unwrap();
+    assert_eq!(
+        load_unbroadcast_file(&dir),
+        [a].into_iter().collect(),
+        "the failed write cleared the dirty set"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A local admit joins the unbroadcast set in its commit, under the mempool
+/// write lock that a persist takes to write the body. Joined after the commit
+/// released that lock, a persist in the gap writes the body without it, and a
+/// crash then reloads the tx with no rebroadcast. A relay admit stays out.
+#[test]
+fn a_local_admit_is_unbroadcast_in_its_commit() {
+    let (_store, q, cbs) = pad_cbs(3);
+    let mp = tmp();
+    let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let local = spend_true(cbs[1], 1_000, spk.clone());
+    let relay = spend_true(cbs[2], 1_000, spk);
+    hub.admit_from(&local, TxOrigin::Local).expect("local");
+    hub.admit(&relay).expect("relay");
+    assert!(hub.is_unbroadcast(&local.compute_txid()), "the commit left the local tx out");
+    assert!(!hub.is_unbroadcast(&relay.compute_txid()));
+    hub.persist_due().unwrap();
+    hub.flush().unwrap();
+    drop(hub);
+    let hub2 = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    assert!(hub2.contains(&local.compute_txid()));
+    assert!(hub2.is_unbroadcast(&local.compute_txid()));
+    let _ = std::fs::remove_dir_all(&mp);
 }
 
 /// `importmempool` logs each Core `LoadMempool` outcome: a fresh admit, a

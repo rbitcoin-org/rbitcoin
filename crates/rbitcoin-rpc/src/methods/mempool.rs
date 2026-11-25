@@ -1069,39 +1069,14 @@ pub async fn sendrawtransaction_async(
     let ctx_done = Arc::clone(ctx);
     let tx_done = tx;
     let mp_done = mp;
-    // The note and the blocksonly rebroadcast sit on the admit task. Dropping
-    // this request must not skip them after the tx is already published.
+    // The blocksonly rebroadcast sits on the admit task. Dropping this
+    // request must not skip it after the tx is already published.
     rbitcoin_net::spawn_with_store_budget(async move {
         let accepted = mp_done.broadcast_local_async(tx_done.clone()).await;
-        // After publish, before the note. A dropped request stays here only
-        // when a test armed the latch. The note still runs on this task.
-        park_before_unbroadcast_note(&mp_done).await;
         rbitcoin_net::off_pool(move || sendraw_after_accept(&ctx_done, &tx_done, accepted)).await
     })
     .await
     .expect("sendrawtransaction")
-}
-
-/// Test latch between publish and `note_unbroadcast`. Clear in production,
-/// so this returns without yielding. The wait is on the admit task: aborting
-/// the request does not cancel it.
-async fn park_before_unbroadcast_note(mp: &MempoolHub) {
-    if !mp
-        .pause_before_unbroadcast_note
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        return;
-    }
-    mp.unbroadcast_note_parked
-        .store(true, std::sync::atomic::Ordering::Release);
-    while mp
-        .pause_before_unbroadcast_note
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        tokio::task::yield_now().await;
-    }
-    mp.unbroadcast_note_parked
-        .store(false, std::sync::atomic::Ordering::Release);
 }
 
 fn sendraw_after_accept(
@@ -1117,10 +1092,9 @@ fn sendraw_after_accept(
     // (`p2p_blocksonly.py` sendrawtransaction).
     match accepted {
         Ok(rbitcoin_net::LocalBroadcast::Admitted) => {
-            mp.note_unbroadcast(tx.compute_txid());
-            // `-blocksonly`: accept-time announce is skipped (relay off + not
-            // yet unbroadcast). `note_unbroadcast` queues the tx again; wake
-            // sessions so inbound peers INV (`p2p_blocksonly.py:48`). When
+            // The commit put the tx in the unbroadcast set before publish, so
+            // `-blocksonly` peers take its accept-time INV. Wake sessions so
+            // inbound peers INV it now (`p2p_blocksonly.py:48`). When
             // relay is on, leave the 30s inbound age gate alone
             // (`mempool_reorg` / `mempool_unbroadcast`).
             if !mp.relay_enabled() {
@@ -2128,13 +2102,10 @@ pub async fn submitpackage_admit_async(
         rbitcoin_net::off_pool(move || submitpackage_plan(&ctx_p, &mp_p, &txs_p, max_feerate))
             .await;
     let mp_a = Arc::clone(mp);
-    // `note_unbroadcast` is inside `submitpackage_apply`. That call shares
-    // the admit task so a dropped request still records each published member.
     rbitcoin_net::spawn_with_store_budget(async move {
         let outcome = mp_a
             .submit_package_rpc_eval_async(plan.eval_txs.clone(), plan.package_eval)
             .await;
-        park_before_unbroadcast_note(&mp_a).await;
         let mp_b = Arc::clone(&mp_a);
         rbitcoin_net::off_pool(move || submitpackage_apply(&mp_b, plan, outcome)).await
     })
@@ -2229,7 +2200,6 @@ fn submitpackage_apply(
     for (tx, row) in eval_txs.iter().zip(outcome.rows) {
         match row.result {
             Ok(ok) => {
-                mp.note_unbroadcast(ok.txid);
                 for old in &ok.replaced {
                     replaced.push(hash_hex_display(&old.to_byte_array()));
                 }

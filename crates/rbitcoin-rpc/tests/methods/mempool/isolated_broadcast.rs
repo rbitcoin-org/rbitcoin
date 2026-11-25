@@ -76,11 +76,9 @@ fn drain_isolated(mp: &MempoolHub) -> Vec<Txid> {
 /// standing outbound sessions on each accept announce: one runs the
 /// announce arm, the other a forced heartbeat walk.
 ///
-/// The test holds `unbroadcast` across the submit. The RPC notes the tx
-/// unbroadcast right after accept returns, so the submitter parks there:
-/// the last point a mark taken after accept could still be pending. Each
-/// announce is therefore read while the submitter is provably stopped, and
-/// the result does not depend on scheduling.
+/// The commit marks the tx local origin and unbroadcast under the mempool
+/// write lock, before its announce. No later step of the submit changes
+/// either, so the result does not depend on where the submitter is.
 fn isolated_submit_reaches_no_standing_peer(
     mut ctx: RpcContext,
     method: &str,
@@ -101,7 +99,6 @@ fn isolated_submit_reaches_no_standing_peer(
 
     let ours: Vec<Txid> = txs.iter().map(Transaction::compute_txid).collect();
     let reply = std::thread::scope(|s| {
-        let held = mp.unbroadcast.lock().unwrap();
         let submit = s.spawn(|| dispatch(&ctx, method, params));
         for _ in txs {
             let ann = recv_announce(&mut ann_rx);
@@ -126,7 +123,6 @@ fn isolated_submit_reaches_no_standing_peer(
                 &walk_out,
             );
         }
-        drop(held);
         submit.join().unwrap()
     });
     reply.unwrap_or_else(|e| panic!("{method}: {e}"));

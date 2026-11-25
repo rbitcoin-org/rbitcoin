@@ -264,13 +264,14 @@ pub fn load_unbroadcast_file(dir: &Path) -> HashSet<Txid> {
 }
 
 #[doc(hidden)]
-pub fn persist_unbroadcast_file(dir: &Path, set: &HashSet<Txid>) {
+pub fn persist_unbroadcast_file(dir: &Path, set: &HashSet<Txid>) -> Result<(), String> {
     let mut buf = Vec::with_capacity(set.len() * 32);
     for t in set {
         buf.extend_from_slice(&t.to_byte_array());
     }
     // Replaced whole: a crash keeps the previous set, never a truncated one.
-    let _ = rbitcoin_store::file::write_synced_tmp_rename(&dir.join("unbroadcast"), &buf);
+    rbitcoin_store::file::write_synced_tmp_rename(&dir.join("unbroadcast"), &buf)
+        .map_err(|e| format!("unbroadcast persist: {e}"))
 }
 
 /// Depths the refresh evaluates. Every other confirm target is
@@ -1304,6 +1305,9 @@ pub struct Unbroadcast {
     pub live: HashSet<Txid>,
     /// Getdata arrived before [`MempoolHub::note_unbroadcast`].
     early: HashSet<Txid>,
+    /// Bumped on every change to `live`. The sidecar is due while this is
+    /// ahead of the count [`MempoolHub::unbroadcast_write`] last wrote.
+    changes: u64,
 }
 
 /// Shared mempool + relay gate used by peer sessions and tip confirm.
@@ -1371,16 +1375,13 @@ pub struct MempoolHub {
     pub dir: PathBuf,
     /// Local txs not yet requested by a peer, plus getdatas that beat the note.
     pub unbroadcast: Mutex<Unbroadcast>,
+    /// [`Unbroadcast::changes`] the sidecar holds. Taken under the mempool
+    /// write lock and held across the write, so an older snapshot cannot
+    /// replace a newer one.
+    unbroadcast_write: Mutex<u64>,
     /// Core `ReattemptInitialBroadcast`: node second of the next pass. `0`
     /// schedules the first one.
     unbroadcast_reattempt_at: AtomicU64,
-    /// Test latch. Async admits park before `note_unbroadcast` while this is set.
-    /// Production leaves it clear. Each hub has its own latch.
-    #[doc(hidden)]
-    pub pause_before_unbroadcast_note: AtomicBool,
-    /// Set while an async admit is parked on [`Self::pause_before_unbroadcast_note`].
-    #[doc(hidden)]
-    pub unbroadcast_note_parked: AtomicBool,
     /// Test latch. A package, 1p1c pair, or multi-tx `testmempoolaccept`
     /// parks right after it commits a member it may still take back.
     #[cfg(debug_assertions)]
@@ -1754,10 +1755,10 @@ impl MempoolHub {
             unbroadcast: Mutex::new(Unbroadcast {
                 live: unbroadcast,
                 early: HashSet::new(),
+                changes: 0,
             }),
+            unbroadcast_write: Mutex::new(0),
             unbroadcast_reattempt_at: AtomicU64::new(0),
-            pause_before_unbroadcast_note: AtomicBool::new(false),
-            unbroadcast_note_parked: AtomicBool::new(false),
             #[cfg(debug_assertions)]
             pause_after_tentative_commit: AtomicBool::new(false),
             #[cfg(debug_assertions)]
@@ -1968,8 +1969,11 @@ impl MempoolHub {
         self.local_origin.lock().unwrap().txs.remove(txid);
         let mut u = self.unbroadcast.lock().unwrap();
         if u.live.remove(txid) {
-            persist_unbroadcast_file(&self.dir, &u.live);
-            rbitcoin_log::info!("{}", Self::unbroadcast_removed_log(txid));
+            u.changes += 1;
+            rbitcoin_log::debug!(
+                P2p,
+                "local tx {txid} left the unbroadcast set before a peer fetched it"
+            );
         }
         u.early.remove(txid);
     }
@@ -2041,12 +2045,6 @@ impl MempoolHub {
             .accept_gen
             .get(wtxid)
             .copied()
-    }
-
-    /// A local tx left the unbroadcast set because it confirmed before a peer
-    /// fetched it. The functional debug-log map emits Core's sentence.
-    pub fn unbroadcast_removed_log(txid: &Txid) -> String {
-        format!("p2p: local tx {txid} left the unbroadcast set before a peer fetched it")
     }
 
     /// Count peer inv of txs we do not already hold (want → getdata path).
@@ -2950,16 +2948,45 @@ impl MempoolHub {
     }
 
     pub fn flush(&self) -> Result<(), String> {
-        self.lock_write()
-            .flush()
-            .map_err(|e| format!("mempool flush: {e}"))
+        let mut g = self.lock_write();
+        g.flush().map_err(|e| format!("mempool flush: {e}"))?;
+        self.persist_unbroadcast_after(g)
     }
 
     /// Time-based sidecar persist (5 s, no fsync). No-op when clean or too soon.
+    /// The unbroadcast set is written after it, whenever it changed since the
+    /// last write.
     pub fn persist_due(&self) -> Result<(), String> {
-        self.lock_write()
-            .persist_due()
-            .map_err(|e| format!("mempool persist: {e}"))
+        let mut g = self.lock_write();
+        g.persist_due()
+            .map_err(|e| format!("mempool persist: {e}"))?;
+        self.persist_unbroadcast_after(g)
+    }
+
+    /// Write the unbroadcast sidecar if `live` changed since the last write.
+    /// `g` is the write lock the body was just written under. A local tx joins
+    /// `live` in its commit, so the snapshot taken before `g` drops holds every
+    /// local tx in that body. Changes only bump a count: one write per change
+    /// rewrites and fsyncs the whole set, which a node with many unfetched
+    /// local txs cannot keep up with. A failed write leaves the set due.
+    fn persist_unbroadcast_after(
+        &self,
+        g: std::sync::RwLockWriteGuard<'_, ActiveMempool>,
+    ) -> Result<(), String> {
+        let mut written = self.unbroadcast_write.lock().unwrap();
+        let (changes, live) = {
+            let u = self.unbroadcast.lock().unwrap();
+            if u.changes == *written {
+                return Ok(());
+            }
+            (u.changes, u.live.clone())
+        };
+        // The fsync runs outside the mempool lock. `written` stays held, so a
+        // later snapshot cannot land first.
+        drop(g);
+        persist_unbroadcast_file(&self.dir, &live)?;
+        *written = changes;
+        Ok(())
     }
 
     pub fn contains(&self, txid: &Txid) -> bool {
@@ -3220,9 +3247,11 @@ impl MempoolHub {
 
     /// Runs under the write lock that commits `result`. A tx a peer relayed
     /// erases the parked copy of the same wtxid, as Core's `MempoolAcceptedTx`
-    /// on the peer path. A local admit is marked local. Neither it nor an
-    /// admit with no peer (a `testmempoolaccept` member, a `mempool.dat`
-    /// load) touches the orphanage, as in Core.
+    /// on the peer path. A local admit is marked local and joins the
+    /// unbroadcast set here, so a persist that takes this lock next writes it
+    /// in both the body and the sidecar. Neither it nor an admit with no peer
+    /// (a `testmempoolaccept` member, a `mempool.dat` load) touches the
+    /// orphanage, as in Core.
     fn note_committed(
         &self,
         g: &mut ActiveMempool,
@@ -3234,7 +3263,12 @@ impl MempoolHub {
             return;
         };
         match origin {
-            TxOrigin::Local => self.local_origin.lock().unwrap().mark(r.txid),
+            TxOrigin::Local => {
+                self.local_origin.lock().unwrap().mark(r.txid);
+                let mut u = self.unbroadcast.lock().unwrap();
+                u.live.insert(r.txid);
+                u.changes += 1;
+            }
             TxOrigin::Relay(Some(_)) => {
                 g.orphanage.remove_wtxid(&tx.compute_wtxid());
             }
@@ -7368,15 +7402,17 @@ impl MempoolHub {
         }
     }
 
-    /// `sendrawtransaction` origin: rebroadcast until a peer getdata's it.
-    /// A getdata that already won the publish-to-note race is not put back.
+    /// Rebroadcast a pooled tx until a peer getdata's it: a relayed tx while
+    /// relay is off, or an `importmempool` unbroadcast entry. A local admit
+    /// joins the set in its commit instead. A getdata that already won the
+    /// publish-to-note race is not put back.
     pub fn note_unbroadcast(&self, txid: Txid) {
         let mut u = self.unbroadcast.lock().unwrap();
         if u.early.remove(&txid) {
             return;
         }
         u.live.insert(txid);
-        persist_unbroadcast_file(&self.dir, &u.live);
+        u.changes += 1;
         drop(u);
         // A peer whose own relay flag is off may have read the accept-time
         // release before this note and skipped it. The note itself queues the
@@ -7605,7 +7641,7 @@ impl MempoolHub {
     pub fn mark_broadcast(&self, txid: &Txid) {
         let mut u = self.unbroadcast.lock().unwrap();
         if u.live.remove(txid) {
-            persist_unbroadcast_file(&self.dir, &u.live);
+            u.changes += 1;
             return;
         }
         u.early.insert(*txid);
