@@ -4,8 +4,13 @@
 //! `./scripts/overlay-functional/run.sh`.
 
 use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::p2p::address::Address;
+use bitcoin::p2p::message::NetworkMessage;
+use bitcoin::p2p::message_bloom::{BloomFlags, FilterLoad};
+use bitcoin::p2p::message_network::VersionMessage;
+use bitcoin::p2p::ServiceFlags;
 use bitcoin::Amount;
-use rbitcoin_net::{NetAddr, OnlyNet};
+use rbitcoin_net::{encode_v2_contents, NetAddr, OnlyNet, V2PlainSession};
 use rbitcoin_node::{NodeConfig, P2pListen};
 use rbitcoin_test::jsonrpc::write_rpc_token;
 use rbitcoin_test::mine::spend_anyone_can_spend;
@@ -17,10 +22,11 @@ use rbitcoin_test::overlay::{
 };
 use rbitcoin_test::TempDir;
 use serde_json::json;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpSocket, TcpStream};
 
 fn tor_b(env: &OverlayEnv, datadir: &std::path::Path, rpc: SocketAddr) -> NodeConfig {
     write_rpc_token(datadir);
@@ -319,8 +325,90 @@ async fn cjdns_tun_two_node() {
         "cjdns listen must be a local address: {ainfo}"
     );
 
+    let mut probe = cjdns_handshake(env.cjdns_a, b_p2p, "/filterload-probe/").await;
+    wait_jsonrpc(
+        b_rpc,
+        "getpeerinfo",
+        json!([]),
+        Duration::from_secs(20),
+        |v| has_subver(v, "/filterload-probe/"),
+    )
+    .await;
+    let bloom = FilterLoad {
+        filter: vec![],
+        hash_funcs: 1,
+        tweak: 0,
+        flags: BloomFlags::None,
+    };
+    probe
+        .write_contents(&encode_v2_contents(NetworkMessage::FilterLoad(bloom)).unwrap())
+        .await
+        .expect("write filterload");
+    wait_jsonrpc(
+        b_rpc,
+        "getpeerinfo",
+        json!([]),
+        Duration::from_secs(20),
+        |v| v["result"].is_array() && !has_subver(v, "/filterload-probe/"),
+    )
+    .await;
+    probe.close();
+
+    let redial = cjdns_connect(env.cjdns_a, b_p2p).await;
+    let refused = tokio::time::timeout(
+        Duration::from_secs(10),
+        V2PlainSession::outbound_bip324(redial),
+    )
+    .await
+    .expect("redial bip324 wall");
+    assert!(
+        refused.is_err(),
+        "B must refuse {} after filterload",
+        env.cjdns_a
+    );
+
     a.stop().await;
     b.stop().await;
+}
+
+fn has_subver(peers: &serde_json::Value, agent: &str) -> bool {
+    peers["result"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|p| p["subver"] == agent))
+}
+
+async fn cjdns_connect(bind: Ipv6Addr, to: SocketAddr) -> TcpStream {
+    let sock = TcpSocket::new_v6().expect("v6 socket");
+    sock.bind(SocketAddr::new(IpAddr::V6(bind), 0))
+        .unwrap_or_else(|e| panic!("bind {bind}: {e}"));
+    tokio::time::timeout(Duration::from_secs(10), sock.connect(to))
+        .await
+        .unwrap_or_else(|_| panic!("connect {bind} to {to} timed out"))
+        .unwrap_or_else(|e| panic!("connect {bind} to {to}: {e}"))
+}
+
+async fn cjdns_handshake(bind: Ipv6Addr, to: SocketAddr, agent: &str) -> V2PlainSession {
+    let stream = cjdns_connect(bind, to).await;
+    let mut raw = V2PlainSession::outbound_bip324(stream)
+        .await
+        .expect("bip324");
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&to, ServiceFlags::NONE),
+        sender: Address::new(&to, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: agent.into(),
+        start_height: 0,
+        relay: true,
+    };
+    for msg in [NetworkMessage::Version(ver), NetworkMessage::Verack] {
+        raw.write_contents(&encode_v2_contents(msg).expect("encode"))
+            .await
+            .expect("write handshake");
+    }
+    raw
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
