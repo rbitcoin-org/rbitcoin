@@ -1,14 +1,14 @@
 {
   "new_base": "8e62e4ce4d60c30abc851cb0893e4b80149ac9e4",
   "new_skip": 5148,
-  "old_index": 14711,
-  "old_name": "crates/rbitcoin-query/src/scripthash.rs:1597:9: replace Query::sh_matched_outs -> Result<HashMap<Fk, Vec<(u32, i64)>>, QueryError> with Ok(HashMap::from_iter([(Default::default(), vec![(1, -1)])]))",
+  "old_index": 15754,
+  "old_name": "crates/rbitcoin-query/src/milestone_gate.rs:9:5: replace skips_on_query -> bool with true",
   "new_cap_used": true,
   "run_id": "45583722624",
   "new_len": 12916,
   "new_remaining": 7768,
   "old_len": 26250,
-  "old_remaining": 25896,
-  "completed_new": 422,
-  "completed_old": 354
+  "old_remaining": 25207,
+  "completed_new": 0,
+  "completed_old": 1043
 }
