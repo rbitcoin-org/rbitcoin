@@ -1,5 +1,6 @@
 //! A synced Class A tail block torn to zeroes on the next append.
 use rbitcoin_primitives::Fk;
+use rbitcoin_store::error::StoreError;
 use rbitcoin_store::store::Store;
 use rbitcoin_store::tx_table::{InputRecord, OutputRecord, TxRecord, TxTable};
 use std::io::{Seek, SeekFrom, Write};
@@ -89,6 +90,30 @@ const TAIL_BYTES: usize = 17 * PAGE;
 const FIRST_BYTES: usize = 32 * PAGE;
 /// `txid.body` in the Class A sync order.
 const TXID_STEM: usize = 9;
+/// `spent.body` in the Class A sync order.
+const SPENT_STEM: usize = 2;
+
+fn plant_armed(dir: &Path, generation: u64) {
+    let mut buf = Vec::with_capacity(16);
+    buf.extend_from_slice(b"CARM");
+    buf.extend_from_slice(&rbitcoin_primitives::SCHEMA_VERSION.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&generation.to_le_bytes());
+    let path = dir.join("tear_guard/armed");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, buf).unwrap();
+}
+
+fn write_meta_ver(dir: &Path, ver: u16) {
+    let mut meta = std::fs::read(dir.join("meta")).unwrap();
+    meta[4..6].copy_from_slice(&ver.to_le_bytes());
+    std::fs::write(dir.join("meta"), meta).unwrap();
+}
+
+fn meta_ver(dir: &Path) -> u16 {
+    let meta = std::fs::read(dir.join("meta")).unwrap();
+    u16::from_le_bytes(meta[4..6].try_into().unwrap())
+}
 
 fn logical_of(path: &Path) -> u64 {
     let mut header = [0u8; 16];
@@ -938,5 +963,212 @@ fn page0_bytes_past_the_slot_image_stay() {
     assert_eq!(s.txs.txids.logical_len(), published);
     assert_eq!(s.txs.txids.get(Fk(1)).unwrap(), first);
     assert_eq!(s.txs.txids.get(Fk(2)).unwrap(), second);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A nonzero mix is the tear `armed` exists to undo. Open copies generation
+/// 4 back, including page 0, and does not take the newer slot's bytes.
+#[test]
+fn armed_nonzero_mix_restores_generation_n_and_ignores_a_newer_slot() {
+    let named = 128u64;
+    let (dir, txid) = synced_txid_past_page(named);
+    let body = dir.join("txid.body");
+    let published = logical_of(&body);
+    let off = published & !4095;
+    let n = (published - off) as usize;
+    let mut image = vec![0u8; n];
+    read_at(&body, off, &mut image);
+    let mut newer = image.clone();
+    if !newer.is_empty() {
+        newer[0] ^= 0xff;
+    }
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).open(&body).unwrap();
+        file.seek(SeekFrom::Start(off)).unwrap();
+        file.write_all(&vec![0x11u8; n]).unwrap();
+        file.seek(SeekFrom::Start(32)).unwrap();
+        file.write_all(&[0x11u8; 32]).unwrap();
+        file.sync_all().unwrap();
+    }
+    plant_tail(
+        &dir.join("tear_guard/tail.0"),
+        4,
+        named,
+        &[(TXID_STEM, published, off, &image)],
+    );
+    plant_tail(
+        &dir.join("tear_guard/tail.1"),
+        9,
+        named,
+        &[(TXID_STEM, published, off, &newer)],
+    );
+    plant_armed(&dir, 4);
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.txids.get(Fk(named)).unwrap(), txid);
+    assert_eq!(s.txs.txids.get(Fk(1)).unwrap(), [1u8; 32]);
+    assert!(!dir.join("tear_guard/armed").exists());
+    let mut magic = [0u8; 4];
+    read_at(&dir.join("tear_guard/tail.1"), 0, &mut magic);
+    assert_eq!(magic, [0, 0, 0, 0], "newer slot must not stay trusted");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// No `armed` file: a deliberate nonzero mix stays, and a zero tail still
+/// comes back from the slot.
+#[test]
+fn unmarked_nonzero_mix_stays_and_a_zero_tail_still_restores() {
+    let named = 128u64;
+    let (dir, txid) = synced_txid_past_page(named);
+    let body = dir.join("txid.body");
+    let published = logical_of(&body);
+    let off = published & !4095;
+    let n = (published - off) as usize;
+    assert!(!dir.join("tear_guard/armed").exists());
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).open(&body).unwrap();
+        file.seek(SeekFrom::Start(off)).unwrap();
+        file.write_all(&vec![0x11u8; n]).unwrap();
+        file.sync_all().unwrap();
+    }
+    let s = Store::open_tiny(&dir).unwrap();
+    let mut got = vec![0u8; n];
+    read_at(&body, off, &mut got);
+    assert_eq!(got, vec![0x11u8; n]);
+    drop(s);
+    zero_published_tail_block(&body);
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.txids.get(Fk(named)).unwrap(), txid);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The arm rename is refused while meta is 30. A plain open does not
+/// promote 30. The append path writes 31 before it renames the mark.
+#[test]
+fn arm_errors_while_meta_is_30_and_plain_open_does_not_promote() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    write_meta_ver(&dir, 30);
+    let err = s
+        .txs
+        .arm_class_a_generation_for_test(1)
+        .expect_err("arm while meta is 30");
+    assert!(matches!(err, StoreError::Rejected(_)));
+    assert!(!dir.join("tear_guard/armed").exists());
+    assert_eq!(meta_ver(&dir), 30);
+    drop(s);
+    let s = Store::open_tiny(&dir).unwrap();
+    drop(s);
+    assert_eq!(meta_ver(&dir), 30);
+    assert!(!dir.join("tear_guard/armed").exists());
+    let s = Store::open_tiny(&dir).unwrap();
+    s.put_tx_full_batch_indexed(&[coinbase([0x22u8; 32])], false)
+        .unwrap();
+    assert_eq!(meta_ver(&dir), 31);
+    assert!(dir.join("tear_guard/armed").is_file());
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `write_barrier` on the sync path leaves `armed` while an append is in
+/// flight. An idle sync clears it, after the seal.
+#[test]
+fn write_barrier_does_not_clear_armed_while_an_append_is_in_flight() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    s.put_tx_full_batch_indexed(&[coinbase([0x33u8; 32])], false)
+        .unwrap();
+    assert!(dir.join("tear_guard/armed").is_file());
+    s.txs.hold_class_a_append_for_test();
+    s.txs.sync_class_a_named(1).unwrap();
+    assert!(
+        dir.join("tear_guard/armed").is_file(),
+        "the barrier must not clear armed"
+    );
+    s.txs.release_class_a_append_for_test();
+    s.txs.sync_class_a_named(1).unwrap();
+    assert!(
+        !dir.join("tear_guard/armed").exists(),
+        "an idle sync clears after the seal"
+    );
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Class A restore does not write `spent.body`. A following fold replay,
+/// on the same open, puts the fold image on the mixed page.
+#[test]
+fn spent_body_is_unchanged_by_class_a_restore_and_fold_replay_wins() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let outs = vec![OutputRecord::unspent(50, vec![0x51]); 512];
+        s.put_tx_full_batch_indexed(
+            &[(
+                TxRecord {
+                    txid: [0x61u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 512,
+                },
+                vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+                outs,
+            )],
+            false,
+        )
+        .unwrap();
+        s.txs.sync_class_a_named(1).unwrap();
+    }
+    let body = dir.join("spent.body");
+    let published = logical_of(&body);
+    assert!(published > 4096, "spent.body published {published}");
+    let keep = (published - 4096) as usize;
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).open(&body).unwrap();
+        file.seek(SeekFrom::Start(4096)).unwrap();
+        file.write_all(&vec![0xabu8; keep]).unwrap();
+        file.sync_all().unwrap();
+    }
+    let junk = vec![0x11u8; keep];
+    plant_tail(
+        &dir.join("tear_guard/tail.0"),
+        3,
+        1,
+        &[(SPENT_STEM, published, 4096, &junk)],
+    );
+    plant_armed(&dir, 3);
+    let s = Store::open_tiny(&dir).unwrap();
+    drop(s);
+    let mut got = vec![0u8; keep];
+    read_at(&body, 4096, &mut got);
+    assert_eq!(got, vec![0xabu8; keep], "class A restore wrote spent.body");
+    assert!(!dir.join("tear_guard/armed").exists());
+    let delta = dir.join(rbitcoin_store::spend_delta::SPEND_DELTA_DIR);
+    let mut fold = Vec::new();
+    fold.extend_from_slice(&rbitcoin_primitives::STORE_MAGIC);
+    fold.extend_from_slice(&rbitcoin_primitives::SCHEMA_VERSION.to_le_bytes());
+    fold.extend_from_slice(&0u16.to_le_bytes());
+    fold.extend_from_slice(&1u32.to_le_bytes());
+    fold.extend_from_slice(&4096u64.to_le_bytes());
+    fold.extend_from_slice(&vec![0x5au8; PAGE]);
+    std::fs::write(
+        delta.join(rbitcoin_store::spend_delta::SPEND_DELTA_FOLD_NAME),
+        &fold,
+    )
+    .unwrap();
+    let mut commit =
+        std::fs::read(delta.join(rbitcoin_store::spend_delta::SPEND_DELTA_COMMIT_NAME)).unwrap();
+    commit[8..12].copy_from_slice(&1u32.to_le_bytes());
+    std::fs::write(
+        delta.join(rbitcoin_store::spend_delta::SPEND_DELTA_COMMIT_NAME),
+        &commit,
+    )
+    .unwrap();
+    let s = Store::open_tiny(&dir).unwrap();
+    drop(s);
+    read_at(&body, 4096, &mut got);
+    assert_eq!(got, vec![0x5au8; keep]);
     let _ = std::fs::remove_dir_all(&dir);
 }

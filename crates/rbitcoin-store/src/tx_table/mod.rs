@@ -720,6 +720,14 @@ pub struct TxTable {
     /// returns 0 because another took the writeback error cannot commit
     /// after that failure.
     class_a_sync: std::sync::Mutex<()>,
+    /// `tear_guard/armed` generation plus one. Zero means this process has
+    /// not armed. The barrier stores the slot it sealed the same way.
+    class_a_mark: std::sync::atomic::AtomicU64,
+    class_a_slot: std::sync::atomic::AtomicU64,
+    /// Appends inside the armed window. The barrier clears the mark only
+    /// when this is zero: it is not the writer, and a write is still in
+    /// flight.
+    class_a_writes: std::sync::atomic::AtomicUsize,
     /// Set once a Class A sync or append write failed. The kernel may have
     /// dropped those dirty pages, and RAM may name rows the device does not
     /// hold, so a retry that succeeds proves nothing: every later sync and
@@ -1391,8 +1399,9 @@ fn open_spend_delta(
         .map_err(|e| StoreError::io(path, e))?
         .len();
     let populated = body_end > crate::file::FILE_HEADER_LEN as u64;
-    let schema_30 = opened_schema.is_some_and(|v| v >= rbitcoin_primitives::SCHEMA_VERSION);
-    let filled_by_class_a = physical >= body_end && !schema_30;
+    // 30 and 31 both keep a sparse `spent.body`. Only an older meta filled it.
+    let spend_delta_meta = opened_schema.is_some_and(|v| v >= 30);
+    let filled_by_class_a = physical >= body_end && !spend_delta_meta;
     if populated && !filled_by_class_a && !dir.join(crate::spend_delta::SPEND_DELTA_DIR).exists() {
         return Err(StoreError::Corrupt(
             "spent.delta is missing beside a populated spent.body; wipe datadir and redo IBD",
@@ -1478,6 +1487,9 @@ impl TxTable {
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages: crate::spend_delta::SpendPageLog::create(dir)?,
             class_a_sync: std::sync::Mutex::new(()),
+            class_a_mark: std::sync::atomic::AtomicU64::new(0),
+            class_a_slot: std::sync::atomic::AtomicU64::new(0),
+            class_a_writes: std::sync::atomic::AtomicUsize::new(0),
             class_a_failed: std::sync::atomic::AtomicBool::new(false),
             class_a_on_fail: std::sync::OnceLock::new(),
             hot_dir: dir.to_path_buf(),
@@ -1766,6 +1778,9 @@ impl TxTable {
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages,
             class_a_sync: std::sync::Mutex::new(()),
+            class_a_mark: std::sync::atomic::AtomicU64::new(0),
+            class_a_slot: std::sync::atomic::AtomicU64::new(0),
+            class_a_writes: std::sync::atomic::AtomicUsize::new(0),
             class_a_failed: std::sync::atomic::AtomicBool::new(false),
             class_a_on_fail: std::sync::OnceLock::new(),
             hot_dir: dir.to_path_buf(),
@@ -4027,20 +4042,29 @@ impl TxTable {
     /// `named` is at most [`Self::settled_count`]: every row of those
     /// creates was written, and a failed write latched before this sync.
     pub fn sync_class_a_named(&self, named: u64) -> Result<(), StoreError> {
-        use std::sync::atomic::Ordering;
-        self.class_a_latched(|| {
-            self.sync_class_a_stems(named)?;
-            // Synced first, then named: the mark never passes a create the
-            // device may not hold. One writer at a time under the latch.
-            if named > self.synced_named.load(Ordering::Acquire) {
-                crate::file::write_synced_tmp_rename(
-                    &self.hot_dir.join(CLASS_A_SYNCED_NAME),
-                    &named.to_le_bytes(),
-                )?;
-                self.synced_named.store(named, Ordering::Release);
-            }
-            Ok(())
-        })
+        self.class_a_latched(|| self.sync_class_a_stems(named))
+    }
+
+    /// Keep `tear_guard/armed` across a Class A sync. The test holds an
+    /// append the way the confirm thread does while `rbtc-tip-flush` runs.
+    #[doc(hidden)]
+    pub fn hold_class_a_append_for_test(&self) {
+        self.class_a_writes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Drop [`Self::hold_class_a_append_for_test`].
+    #[doc(hidden)]
+    pub fn release_class_a_append_for_test(&self) {
+        self.class_a_writes
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Arm naming `generation` without promoting `meta`. Errors while meta
+    /// is 30.
+    #[doc(hidden)]
+    pub fn arm_class_a_generation_for_test(&self, generation: u64) -> Result<(), StoreError> {
+        crate::class_a_pages::arm_named_generation(&self.hot_dir, generation)
     }
 
     /// Run `sync` on Class A fds under the latch: refuse once one failed,
@@ -4089,14 +4113,35 @@ impl TxTable {
         &self,
         write: impl FnOnce() -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
+        self.enter_class_a_write()?;
         let written = write();
+        self.class_a_writes
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         if written.is_err() {
             self.latch_class_a_failure();
         }
         written
     }
 
+    /// Arm before the pwrite, and count the write before releasing the
+    /// barrier latch so a sync cannot clear the mark in between.
+    fn enter_class_a_write(&self) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
+        let _one = self.class_a_sync.lock().unwrap_or_else(|e| e.into_inner());
+        self.refuse_if_class_a_failed()?;
+        let armed = self.class_a_mark.load(Ordering::Acquire);
+        let slot = self.class_a_slot.load(Ordering::Acquire);
+        if armed == 0 || slot > armed {
+            let generation = crate::class_a_pages::arm_for_appender(&self.hot_dir)?;
+            self.class_a_mark
+                .store(generation.saturating_add(1), Ordering::Release);
+        }
+        self.class_a_writes.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
     fn sync_class_a_stems(&self, named: u64) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
         let files: [&crate::file::TableFile; 16] = [
             &self.body.body,
             &self.seqsigwit.body,
@@ -4115,7 +4160,24 @@ impl TxTable {
             &self.input.off,
             &self.input.body,
         ];
-        crate::class_a_pages::write_barrier(&self.hot_dir, &files, named)
+        let generation = crate::class_a_pages::write_barrier(&self.hot_dir, &files, named)?;
+        self.class_a_slot
+            .store(generation.saturating_add(1), Ordering::Release);
+        // `write_barrier` does not clear. This caller does, and only when
+        // the appender is not inside a write: that is the quiescent point
+        // after the seal. An overlapping append keeps the old generation.
+        if self.class_a_writes.load(Ordering::Acquire) == 0 {
+            crate::class_a_pages::clear_armed(&self.hot_dir)?;
+            self.class_a_mark.store(0, Ordering::Release);
+            if named > self.synced_named.load(Ordering::Acquire) {
+                crate::file::write_synced_tmp_rename(
+                    &self.hot_dir.join(CLASS_A_SYNCED_NAME),
+                    &named.to_le_bytes(),
+                )?;
+                self.synced_named.store(named, Ordering::Release);
+            }
+        }
+        Ok(())
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
