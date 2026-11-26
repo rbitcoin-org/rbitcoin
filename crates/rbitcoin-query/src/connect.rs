@@ -1481,22 +1481,6 @@ impl Query {
         Ok(outs)
     }
 
-    /// Disconnect the current tip (Class C + scripthash create unlink; archive remains).
-    ///
-    /// Durable point edges remain for archive history; strong bits cleared below.
-    ///
-    /// # Crash order (**tip first** — opposite of connect)
-    ///
-    /// 1. SH unlink (index only; filtered by strong+tip at query time).
-    /// 2. `confirmed` truncate in RAM → **`flush_confirmed_only`** (durable tip shrink).
-    /// 3. Then `set_unstrong` for disconnected txs → flush strong.
-    ///
-    /// Unstrong-before-tip would make tip txs fail `is_confirmed_strong` while
-    /// tip is still high (permanent if kill). Mid-kill after tip shrink leaves
-    /// strong **not on the new fence** → `repair_class_c_above_tip` heals.
-    ///
-    /// Logs [`format_disconnect_tip_line`] at **warn** once, after the tip
-    /// shrink commits (`clamp_spend_durable`).
     /// Drop `height` from `confirmed[]`, publish the new tip, and make the
     /// shrink durable.
     fn shrink_tip_for_disconnect(
@@ -1522,6 +1506,22 @@ impl Query {
         Ok(())
     }
 
+    /// Disconnect the current tip (Class C + scripthash create unlink; archive remains).
+    ///
+    /// Durable point edges remain for archive history; strong bits cleared below.
+    ///
+    /// # Crash order (**tip first** — opposite of connect)
+    ///
+    /// 1. SH unlink (index only; filtered by strong+tip at query time).
+    /// 2. `confirmed` truncate in RAM → **`flush_confirmed_only`** (durable tip shrink).
+    /// 3. Then `set_unstrong` for disconnected txs → flush strong.
+    ///
+    /// Unstrong-before-tip would make tip txs fail `is_confirmed_strong` while
+    /// tip is still high (permanent if kill). Mid-kill after tip shrink leaves
+    /// strong **not on the new fence** → `repair_class_c_above_tip` heals.
+    ///
+    /// Logs [`format_disconnect_tip_line`] at **warn** once, after the tip
+    /// shrink commits (`clamp_spend_durable`).
     pub fn disconnect_tip(&self) -> Result<(), QueryError> {
         let _commit = self.lock_tip_commit()?;
         self.disconnect_tip_body(true)
