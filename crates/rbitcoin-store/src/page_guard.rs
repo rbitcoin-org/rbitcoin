@@ -8,8 +8,10 @@
 //! [`append_past_end`] writes only when the range shares no 4 KiB block with a
 //! byte below `committed_end`.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
 
@@ -62,16 +64,27 @@ pub fn arm_page_guard(path: &Path, pages: &[(u64, &[u8])]) -> Result<(), StoreEr
     write_synced_tmp_rename(path, &buf)
 }
 
-/// One group mark for several files. A retry replaces the previous in-flight
-/// file by rename; leftover `(file, offset)` images the new set does not
-/// name stay, and new images win on overlap.
+/// One process-wide hold for every mark. Arm and clear of the same path must
+/// sit inside one hold, or a second flusher can rename the file between them.
+#[doc(hidden)]
+pub fn hold_marks() -> MutexGuard<'static, ()> {
+    static MARKS: OnceLock<Mutex<()>> = OnceLock::new();
+    MARKS
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// One group mark for several files. A retry replaces the image at the same
+/// file and offset. Other offsets stay, including other pages of a file this
+/// set names.
 #[doc(hidden)]
 pub fn arm_page_guard_group(path: &Path, pages: &[(&str, u64, &[u8])]) -> Result<(), StoreError> {
     mark_parent(path)?;
     if pages.is_empty() {
         return Err(StoreError::Corrupt("page guard arm is empty"));
     }
-    let mut seen: Vec<(&str, u64)> = Vec::with_capacity(pages.len());
+    let mut seen: HashSet<(&str, u64)> = HashSet::with_capacity(pages.len());
     for &(file, offset, image) in pages {
         if !valid_guard_name(file) {
             return Err(StoreError::Corrupt("page guard file name"));
@@ -79,13 +92,9 @@ pub fn arm_page_guard_group(path: &Path, pages: &[(&str, u64, &[u8])]) -> Result
         if !offset.is_multiple_of(PAGE) || image.len() != PAGE as usize {
             return Err(StoreError::Corrupt("page guard image is not one page"));
         }
-        if seen
-            .iter()
-            .any(|&(have, off)| have == file && off == offset)
-        {
+        if !seen.insert((file, offset)) {
             return Err(StoreError::Corrupt("page guard names one page twice"));
         }
-        seen.push((file, offset));
     }
     let leftover = load_group_leftover(path, &seen)?;
     let count = u32::try_from(pages.len().saturating_add(leftover.len()))
@@ -174,7 +183,10 @@ pub fn clear_page_guard(path: &Path, data: &File, data_path: &Path) -> Result<()
     clear_page_guard_files(path, &[(data, data_path)])
 }
 
-/// Syncs every live file, then removes `path` and syncs its directory.
+/// Syncs every live file, then drops those files' images.
+///
+/// Records for a file this call did not sync stay armed. The mark file goes
+/// away only when nothing remains.
 #[doc(hidden)]
 pub fn clear_page_guard_files(path: &Path, files: &[(&File, &Path)]) -> Result<(), StoreError> {
     mark_parent(path)?;
@@ -182,7 +194,46 @@ pub fn clear_page_guard_files(path: &Path, files: &[(&File, &Path)]) -> Result<(
         data.durable_sync_data()
             .map_err(|e| StoreError::io(*data_path, e))?;
     }
-    remove_mark(path)
+    let mut synced = HashSet::with_capacity(files.len());
+    for (_, data_path) in files {
+        synced.insert(guard_file_name(data_path)?.to_string());
+    }
+    retain_unsynced(path, &synced)
+}
+
+/// Rewrite `path` without records for `synced`. Delete it when none remain.
+fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreError> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(path, e)),
+    };
+    let pages = match mark_group_pages(&raw) {
+        Ok(pages) => pages,
+        Err(StoreError::Corrupt("page guard mark reserved")) => return remove_mark(path),
+        Err(e) => return Err(e),
+    };
+    let mut keep = Vec::new();
+    for (name, offset, at) in pages {
+        if synced.contains(&name) {
+            continue;
+        }
+        keep.push((name, offset, raw[at..at + PAGE as usize].to_vec()));
+    }
+    if keep.is_empty() {
+        return remove_mark(path);
+    }
+    let count = u32::try_from(keep.len())
+        .map_err(|_| StoreError::Corrupt("page guard arm is too large"))?;
+    let mut buf = Vec::with_capacity(HEAD + keep.len() * (2 + 16 + RECORD));
+    buf.extend_from_slice(&STORE_MAGIC);
+    buf.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    buf.extend_from_slice(&GROUP_KIND.to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
+    for (file, offset, image) in &keep {
+        encode_group_record(&mut buf, file, *offset, image)?;
+    }
+    write_synced_tmp_rename(path, &buf)
 }
 
 /// Restore `dir/<mark>` when it exists, then continue. Missing is `Ok`.
@@ -246,7 +297,7 @@ fn encode_group_record(
 
 fn load_group_leftover(
     path: &Path,
-    incoming: &[(&str, u64)],
+    replaced: &HashSet<(&str, u64)>,
 ) -> Result<Vec<(String, u64, Vec<u8>)>, StoreError> {
     let raw = match std::fs::read(path) {
         Ok(raw) => raw,
@@ -256,10 +307,7 @@ fn load_group_leftover(
     let pages = mark_group_pages(&raw)?;
     let mut leftover = Vec::new();
     for (name, offset, at) in pages {
-        if incoming
-            .iter()
-            .any(|&(have, off)| have == name && off == offset)
-        {
+        if replaced.contains(&(name.as_str(), offset)) {
             continue;
         }
         leftover.push((name, offset, raw[at..at + PAGE as usize].to_vec()));
@@ -389,6 +437,7 @@ fn mark_group_pages(raw: &[u8]) -> Result<Vec<(String, u64, usize)>, StoreError>
         return Err(StoreError::Corrupt("page guard mark length"));
     }
     let mut pages = Vec::with_capacity(count);
+    let mut seen: HashSet<(String, u64)> = HashSet::with_capacity(count);
     let mut at = HEAD;
     for _ in 0..count {
         if raw.len() < at + 2 {
@@ -409,11 +458,7 @@ fn mark_group_pages(raw: &[u8]) -> Result<Vec<(String, u64, usize)>, StoreError>
         off.copy_from_slice(&raw[at..at + 8]);
         let offset = u64::from_le_bytes(off);
         at += 8;
-        if !offset.is_multiple_of(PAGE)
-            || pages
-                .iter()
-                .any(|(have, have_off, _)| have == name && *have_off == offset)
-        {
+        if !offset.is_multiple_of(PAGE) || !seen.insert((name.to_string(), offset)) {
             return Err(StoreError::Corrupt("page guard names a torn page"));
         }
         pages.push((name.to_string(), offset, at));

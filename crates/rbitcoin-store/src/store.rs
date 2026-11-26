@@ -535,9 +535,7 @@ impl Store {
         }
         let meta_ver = check_meta(&path)?;
         open_layout_refuse_old(&path, meta_ver)?;
-        crate::page_guard::restore_store_group(&path, crate::page_guard::CLASS_C_MARK)?;
-        crate::page_guard::restore_store_group(&path, crate::page_guard::HEADER_BODY_MARK)?;
-        crate::page_guard::restore_store_group(&path, crate::page_guard::HEADER_HEAD_MARK)?;
+        restore_open_marks(&path)?;
         drop_unread_store_leftovers(&path);
         let scripthash = if path.join("scripthash.body").exists() {
             ScriptHashTable::open_with_scale(&path, layout.head_scale)?
@@ -2756,6 +2754,14 @@ pub fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
         std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
     }
     rbitcoin_log::warn!("store: dropping leftover spent.off (schema 22 uses create.loc)");
+    Ok(())
+}
+
+/// Copy armed page images back before trim or the tip walk.
+fn restore_open_marks(path: &Path) -> Result<(), StoreError> {
+    crate::page_guard::restore_store_group(path, crate::page_guard::CLASS_C_MARK)?;
+    crate::page_guard::restore_store_group(path, crate::page_guard::HEADER_BODY_MARK)?;
+    crate::page_guard::restore_store_group(path, crate::page_guard::HEADER_HEAD_MARK)?;
     Ok(())
 }
 
