@@ -3206,3 +3206,55 @@ MISSED   crates/rbitcoin-query/src/index_writebehind.rs:290:20: replace > with =
 MISSED   crates/rbitcoin-query/src/index_writebehind.rs:290:20: replace > with >= in plan_window in 2s build + 10s test
 MISSED   crates/rbitcoin-query/src/index_writebehind.rs:290:16: replace + with * in plan_window in 2s build + 10s test
 MISSED   crates/rbitcoin-query/src/index_writebehind.rs:293:13: replace += with *= in plan_window in 2s build + 10s test
+# 45787411316 1 31bd5933d025df57b10cef52acf517d384bf129a
+MISSED   crates/rbitcoin-net/src/peers.rs:741:9: replace LivePeer::raw_sent -> u64 with 0 in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:756:9: replace LivePeer::held_front_queued -> bool with true in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:1037:42: replace && with || in LivePeer::self_announce_link in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:1625:22: replace > with == in LivePeer::claim_hb_body_fanout in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:1625:22: replace > with < in LivePeer::claim_hb_body_fanout in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:1625:22: replace > with >= in LivePeer::claim_hb_body_fanout in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:1665:9: replace LivePeer::inv_released_seen -> u64 with 0 in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:1764:27: replace && with || in LivePeer::block_download_owns in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:2034:32: replace && with || in insert_rolling in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:2035:30: replace > with >= in insert_rolling in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:2486:15: replace == with != in <impl Drop for IncompleteInbound>::drop in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:2718:22: replace < with <= in PeerHub::set_external_endpoints in 82s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:3035:9: replace PeerHub::addrfetch_learned -> &Notify with Box::leak(Box::new(Default::default())) in 6s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:3363:46: replace || with && in PeerHub::try_start_headers_sync in 7s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:4742:29: replace == with != in PeerHub::full_outbound_count in 6s build + 42s test
+MISSED   crates/rbitcoin-query/src/confirm_run/bq_resolve.rs:584:17: delete ! in confirm_bq_resolve_wave_capped in 91s build + 58s test
+MISSED   crates/rbitcoin-query/src/confirm_run/index.rs:123:12: delete ! in prepare_index_jobs in 94s build + 56s test
+MISSED   crates/rbitcoin-query/src/confirm_run/index.rs:135:33: replace || with && in prepare_index_jobs in 7s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/lookup.rs:325:41: replace && with || in spend_needs_external_parent in 11s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/lookup.rs:325:44: delete ! in spend_needs_external_parent in 8s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/lookup.rs:399:13: replace || with && in stamp_parent_pin_archived in 7s build + 56s test
+MISSED   crates/rbitcoin-query/src/confirm_run/phases.rs:304:10: replace < with <= in bip34_header_in_write in 7s build + 56s test
+MISSED   crates/rbitcoin-query/src/confirm_run/phases.rs:304:32: replace > with >= in bip34_header_in_write in 7s build + 56s test
+MISSED   crates/rbitcoin-query/src/confirm_run/phases.rs:328:36: replace || with && in bip34_ancestor_for_write in 8s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/phases.rs:368:41: replace - with + in structural_run in 7s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/phases.rs:368:41: replace - with / in structural_run in 8s build + 58s test
+MISSED   crates/rbitcoin-query/src/confirm_run/pin.rs:327:20: replace == with != in denserels_by_stamped_range in 90s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/pin.rs:506:30: replace || with && in ensure_spend_abs_layouts in 8s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/scripts.rs:48:15: replace > with == in take_script_jobs in 90s build + 58s test
+MISSED   crates/rbitcoin-query/src/confirm_run/scripts.rs:68:19: replace > with == in outcome_from in 9s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/scripts.rs:241:9: replace Inflight::note_clocks with () in 8s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/scripts.rs:252:9: replace Inflight::stamp_index with () in 9s build + 58s test
+MISSED   crates/rbitcoin-query/src/confirm_run/scripts.rs:266:9: replace Inflight::is_complete -> bool with true in 8s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/scripts.rs:269:22: replace && with || in Inflight::is_complete in 8s build + 56s test
+MISSED   crates/rbitcoin-query/src/confirm_run/scripts.rs:321:38: replace && with || in Inflight::finish_scripts in 8s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/scripts.rs:342:34: replace && with || in Inflight::finish_scripts in 7s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/scripts.rs:450:30: replace == with != in log_batch_fault in 8s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/scripts.rs:488:13: replace drive_script_waves_with::<impl Drop for ClearPublisher>::drop with () in 7s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/scripts.rs:568:27: replace || with && in drive_try_start in 8s build + 56s test
+MISSED   crates/rbitcoin-query/src/confirm_run/scripts.rs:568:45: replace >= with < in drive_try_start in 8s build + 57s test
+MISSED   crates/rbitcoin-query/src/confirm_run/write.rs:91:20: replace > with == in submit_queued in 1s build + 7s test
+MISSED   crates/rbitcoin-query/src/confirm_run/write.rs:337:23: replace && with || in write_phase in 1s build + 7s test
+MISSED   crates/rbitcoin-query/src/confirm_run/write.rs:383:19: replace > with == in write_phase_inner in 1s build + 7s test
+MISSED   crates/rbitcoin-query/src/confirm_run/write.rs:386:18: replace > with == in write_phase_inner in 1s build + 7s test
+MISSED   crates/rbitcoin-query/src/confirm_run/write.rs:389:21: replace > with == in write_phase_inner in 1s build + 7s test
+MISSED   crates/rbitcoin-query/src/confirm_run/write.rs:392:22: replace > with == in write_phase_inner in 1s build + 7s test
+MISSED   crates/rbitcoin-query/src/confirm_run/write.rs:454:28: replace > with == in write_phase_inner in 1s build + 6s test
+MISSED   crates/rbitcoin-query/src/confirm_run/write.rs:466:23: replace > with == in write_phase_inner in 1s build + 7s test
+MISSED   crates/rbitcoin-query/src/confirm_run/write.rs:645:36: replace > with == in replay_spend_annotations in 1s build + 7s test
+MISSED   crates/rbitcoin-query/src/confirm_run/write.rs:645:36: replace > with < in replay_spend_annotations in 1s build + 7s test
+MISSED   crates/rbitcoin-query/src/confirm_run/write.rs:645:36: replace > with >= in replay_spend_annotations in 1s build + 7s test
