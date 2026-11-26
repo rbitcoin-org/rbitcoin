@@ -679,6 +679,9 @@ pub struct ArrayTable {
     pub(crate) seq: AtomicU64,
     /// Lowest index not yet persisted. `u64::MAX` means none.
     pub unstored_from: AtomicU64,
+    /// Bumps on every dirty note. A flush publishes clean only when this is
+    /// still the value captured under `flushing`.
+    unstored_gen: AtomicU64,
     /// True from the moment a flush records its range until it returns.
     pub flushing: AtomicBool,
     /// Length last flushed. Elements, or body bytes when `byte_body` is set.
@@ -744,6 +747,7 @@ impl ArrayTable {
             slots: data.map_or_else(RamSlots::empty, RamSlots::from_values),
             seq: AtomicU64::new(0),
             unstored_from: AtomicU64::new(CLEAN),
+            unstored_gen: AtomicU64::new(0),
             flushing: AtomicBool::new(false),
             disk_len: AtomicU64::new(n),
             flush_lock: Mutex::new(()),
@@ -773,6 +777,13 @@ impl ArrayTable {
     }
 
     fn mark_unstored(&self, index: u64) {
+        self.note_unstored(index);
+    }
+
+    /// The generation moves first, then the index. A flush that already sampled
+    /// the old generation cannot publish clean over this note.
+    pub(crate) fn note_unstored(&self, index: u64) {
+        self.unstored_gen.fetch_add(1, Ordering::Release);
         let _ = self.unstored_from.fetch_min(index, Ordering::AcqRel);
     }
 
@@ -952,6 +963,7 @@ impl ArrayTable {
         max_idx: u64,
         zero_gap: bool,
     ) -> Result<(), StoreError> {
+        let _hold = page_guard::hold_marks();
         let pages = self.fd_guard_pages(pairs, max_idx, zero_gap)?;
         let mark = self.arm_class_c(&pages)?;
         let len = self.len.load(Ordering::Acquire);
@@ -1133,9 +1145,9 @@ impl ArrayTable {
         let start = if self.byte_body { from / 8 } else { from }.min(disk);
         let logical = FILE_HEADER_LEN as u64 + n * stride;
         let mut pages = BTreeSet::new();
-        if n != disk {
-            pages.insert(0u64);
-        }
+        // A dirty table always images page 0. A retry that skips it would keep
+        // a longer length from the previous attempt.
+        pages.insert(0u64);
         if start < n {
             let lo = FILE_HEADER_LEN as u64 + start * stride;
             let hi = logical;
@@ -1265,17 +1277,29 @@ impl ArrayTable {
         Ok(Some(dir.join(page_guard::CLASS_C_MARK)))
     }
 
-    /// Write dirty slots without clearing `unstored_from`. A group mark covers
-    /// every table until [`Self::publish_clean`].
-    pub(crate) fn persist_dirty(&self) -> Result<(), StoreError> {
+    /// Write dirty slots without clearing `unstored_from`.
+    ///
+    /// `Some((len, gen))` is the length written and the dirty generation
+    /// sampled while stores were excluded. [`Self::publish_clean`] consumes it
+    /// after the mark is cleared.
+    pub(crate) fn persist_dirty(&self) -> Result<Option<(u64, u64)>, StoreError> {
         self.flush_dirty_inner(|_, _| {}, false)
     }
 
-    /// Length and unstored mark after a group mark is gone.
-    pub(crate) fn publish_clean(&self) {
-        let n = self.len.load(Ordering::Acquire);
+    /// Publish `disk_len = n` and a clean mark when `gen` is still current.
+    ///
+    /// A note that landed during the sync keeps the table dirty. The re-check
+    /// covers a note that passed the first load and stored its index after
+    /// the clean write.
+    pub(crate) fn publish_clean(&self, n: u64, gen: u64) {
+        if self.unstored_gen.load(Ordering::Acquire) != gen {
+            return;
+        }
         self.disk_len.store(n, Ordering::Release);
         self.unstored_from.store(CLEAN, Ordering::Release);
+        if self.unstored_gen.load(Ordering::Acquire) != gen {
+            self.unstored_from.store(0, Ordering::Release);
+        }
     }
 
     pub(crate) fn store_dir(&self) -> Result<&Path, StoreError> {
@@ -1298,22 +1322,22 @@ impl ArrayTable {
         &self,
         between: impl FnMut(&Self, FlushStep),
     ) -> Result<(), StoreError> {
-        self.flush_dirty_inner(between, true)
+        self.flush_dirty_inner(between, true).map(|_| ())
     }
 
     fn flush_dirty_inner(
         &self,
         mut between: impl FnMut(&Self, FlushStep),
         publish: bool,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Option<(u64, u64)>, StoreError> {
         // One flusher, including the strong-bit image.
         let _one = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
         if !self.in_ram {
-            return Ok(());
+            return Ok(None);
         }
         let from = self.unstored_from.load(Ordering::Acquire);
         if from == CLEAN {
-            return Ok(());
+            return Ok(None);
         }
         between(self, FlushStep::Admit);
         seq_arm(&self.seq, &self.flushing);
@@ -1357,10 +1381,11 @@ impl ArrayTable {
         let logical = FILE_HEADER_LEN as u64 + n * stride;
         self.file.set_logical_len(logical)?;
         between(self, FlushStep::Clean);
+        let gen = self.unstored_gen.load(Ordering::Acquire);
         if publish {
             end.3 = Some(n);
         }
-        Ok(())
+        Ok(Some((n, gen)))
     }
 
     pub(crate) fn has_unstored(&self) -> bool {

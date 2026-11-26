@@ -386,6 +386,7 @@ impl HeaderTable {
         }
         let new_len = FILE_HEADER_LEN as u64 + n * HEADER_RECORD_LEN as u64;
         let pages = compose_body_pages(&dst, FILE_HEADER_LEN as u64, &blob, new_len)?;
+        let _hold = page_guard::hold_marks();
         let name = page_guard::guard_file_name(&grow)?;
         let refs: Vec<(&str, u64, &[u8])> = pages
             .iter()
@@ -474,21 +475,25 @@ impl HeaderTable {
         let Some(dir) = self.body.path().parent() else {
             return Err(StoreError::Rejected("page guard mark has no directory"));
         };
-        let name = page_guard::guard_file_name(self.body.path())?;
-        let refs: Vec<(&str, u64, &[u8])> = pages
-            .iter()
-            .map(|(off, image)| (name, *off, image.as_slice()))
-            .collect();
-        page_guard::arm_store_group(dir, page_guard::HEADER_BODY_MARK, &refs)?;
-        self.body.write_at(offset, &blob)?;
-        // Head insert fdatasyncs. The body must be durable first so a crash
-        // cannot leave header.head naming an fk above the durable row count.
-        self.body.sync_data_only()?;
-        page_guard::clear_page_guard(
-            &dir.join(page_guard::HEADER_BODY_MARK),
-            &self.body.read_file,
-            self.body.path(),
-        )?;
+        {
+            // Drop before `insert_many`. That flush takes the same hold.
+            let _hold = page_guard::hold_marks();
+            let name = page_guard::guard_file_name(self.body.path())?;
+            let refs: Vec<(&str, u64, &[u8])> = pages
+                .iter()
+                .map(|(off, image)| (name, *off, image.as_slice()))
+                .collect();
+            page_guard::arm_store_group(dir, page_guard::HEADER_BODY_MARK, &refs)?;
+            self.body.write_at(offset, &blob)?;
+            // Head insert fdatasyncs. The body must be durable first so a crash
+            // cannot leave header.head naming an fk above the durable row count.
+            self.body.sync_data_only()?;
+            page_guard::clear_page_guard(
+                &dir.join(page_guard::HEADER_BODY_MARK),
+                &self.body.read_file,
+                self.body.path(),
+            )?;
+        }
         self.count
             .store(base.saturating_add(fresh.len() as u64), Ordering::Release);
         self.head.insert_many(&head_entries)?;
