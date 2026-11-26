@@ -332,6 +332,172 @@ fn ingest_syncs_the_alloc_header_before_the_head() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn slab_at(v: &ShHeadValue) -> u64 {
+    match v {
+        ShHeadValue::Slab { off, .. } => *off,
+        other => panic!("expected a slab, got {other:?}"),
+    }
+}
+
+fn create_fks(t: &ScriptHashTable, sh: &[u8; 32]) -> Vec<u64> {
+    t.entries(sh).unwrap().iter().map(|(fk, _)| fk.0).collect()
+}
+
+fn word_at(body: &TableFile, off: u64) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    body.read_at(off, &mut buf).unwrap();
+    buf
+}
+
+/// A class change frees the old slab only after the head that named it moved.
+#[test]
+fn ingest_keeps_a_replaced_slab_until_its_head_moves() {
+    for skip in 0..2 {
+        let dir = tmp();
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        let sh = script_hash(&[0xc5]);
+        assert_eq!(put_create_batch(&t, [rec(sh, 1, 0), rec(sh, 2, 0)]), 2);
+        t.flush().unwrap();
+        let old = t.head_value(&sh).unwrap().unwrap();
+        let handle = t.ovf_file().io_handle();
+        rbitcoin_store::io_handle::arm_fail_sync_after(handle, skip, 1);
+        let err = t
+            .put_create_batch_append(&[rec(sh, 3, 0), rec(sh, 4, 0)])
+            .unwrap_err();
+        rbitcoin_store::io_handle::disarm_sync(handle);
+        assert!(matches!(err, StoreError::Io { .. }), "{err}");
+        drop(t);
+        let t = ScriptHashTable::open_tiny(&dir).unwrap();
+        assert_eq!(t.head_value(&sh).unwrap(), Some(old));
+        match t.entries(&sh) {
+            Ok(_) => assert_eq!(create_fks(&t, &sh), vec![1, 2], "sync {skip}"),
+            Err(e) => panic!("sync {skip}: the head names a slab the free list overwrote: {e}"),
+        }
+    }
+}
+
+/// The replaced slab is not linked into the free list until the ingest head
+/// that stops naming it is synced.
+#[test]
+fn ingest_frees_a_replaced_slab_after_the_ingest_head_sync() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0xc6]);
+    assert_eq!(put_create_batch(&t, [rec(sh, 1, 0), rec(sh, 2, 0)]), 2);
+    t.flush().unwrap();
+    let off = slab_at(&t.head_value(&sh).unwrap().unwrap());
+    let before = word_at(t.ovf_file(), off);
+    let handle = t.ingest.lock().unwrap().as_ref().unwrap().file.io_handle();
+    rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
+    let err = t
+        .put_create_batch_append(&[rec(sh, 3, 0), rec(sh, 4, 0)])
+        .unwrap_err();
+    rbitcoin_store::io_handle::disarm_sync(handle);
+    assert!(matches!(err, StoreError::Io { .. }), "{err}");
+    assert_eq!(
+        word_at(t.ovf_file(), off),
+        before,
+        "old slab linked before its head moved"
+    );
+    let state = read_alloc_header(t.ovf_file()).unwrap().0;
+    assert!(!state.free_head.contains(&off), "header names the old slab");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The free-list link is synced before the header that names it.
+#[test]
+fn ingest_syncs_a_freed_link_before_the_header_names_it() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0xca]);
+    assert_eq!(put_create_batch(&t, [rec(sh, 1, 0), rec(sh, 2, 0)]), 2);
+    t.flush().unwrap();
+    let off = slab_at(&t.head_value(&sh).unwrap().unwrap());
+    let handle = t.ovf_file().io_handle();
+    // Payload and header barriers pass; the third body sync follows the link.
+    rbitcoin_store::io_handle::arm_fail_sync_after(handle, 2, 1);
+    let out = t.put_create_batch_append(&[rec(sh, 3, 0), rec(sh, 4, 0)]);
+    rbitcoin_store::io_handle::disarm_sync(handle);
+    let state = read_alloc_header(t.ovf_file()).unwrap().0;
+    assert!(
+        !state.free_head.contains(&off),
+        "header names a link before its sync: {out:?}"
+    );
+    assert!(matches!(out, Err(StoreError::Io { .. })), "{out:?}");
+    assert_eq!(create_fks(&t, &sh), vec![1, 2, 3, 4]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Same on a packed main key: the main head is a bare pwrite, so the free
+/// waits for that file's sync.
+#[test]
+fn ingest_frees_a_main_slab_after_the_main_head_sync() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0xc9]);
+    let si = t.shard_index(&sh);
+    let mut session = t.pack_shard_session(si).unwrap();
+    push_chain(&mut session, sh, &[Fk(1), Fk(2)]);
+    seal_session(&t, si, session);
+    t.flush().unwrap();
+    let off = slab_at(&t.head_value(&sh).unwrap().unwrap());
+    let body = t.shard_body(si);
+    let before = word_at(body, off);
+    let handle = {
+        let g = t.sorted_main[si].read().unwrap();
+        rbitcoin_store::io_handle::IoHandle::from_file(&g.as_ref().unwrap().val_file)
+    };
+    rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
+    let out = t.put_create_batch_append(&[rec(sh, 3, 0), rec(sh, 4, 0), rec(sh, 5, 0)]);
+    rbitcoin_store::io_handle::disarm_sync(handle);
+    assert_eq!(
+        word_at(body, off),
+        before,
+        "old slab linked before main synced: {out:?}"
+    );
+    assert!(matches!(out, Err(StoreError::Io { .. })), "{out:?}");
+    let state = read_alloc_header(body).unwrap().0;
+    assert!(!state.free_head.contains(&off), "header names the old slab");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A popped free slab is written only after a durable header stops naming it.
+#[test]
+fn ingest_never_leaves_a_free_head_on_a_written_slab() {
+    for skip in 0..3 {
+        let dir = tmp();
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        let a = script_hash(&[0xc7]);
+        let b = script_hash(&[0xc8]);
+        assert_eq!(put_create_batch(&t, [rec(a, 1, 0), rec(a, 2, 0)]), 2);
+        let freed = slab_at(&t.head_value(&a).unwrap().unwrap());
+        assert_eq!(put_create_batch(&t, [rec(a, 3, 0), rec(a, 4, 0)]), 2);
+        t.flush().unwrap();
+        let free = read_alloc_header(t.ovf_file()).unwrap().0.free_head;
+        assert_eq!(free[0], freed, "class change did not free the old slab");
+        let link = word_at(t.ovf_file(), freed);
+        let handle = t.ovf_file().io_handle();
+        rbitcoin_store::io_handle::arm_fail_sync_after(handle, skip, 1);
+        let err = t
+            .put_create_batch_append(&[rec(b, 10, 0), rec(b, 11, 0)])
+            .unwrap_err();
+        rbitcoin_store::io_handle::disarm_sync(handle);
+        assert!(matches!(err, StoreError::Io { .. }), "{err}");
+        drop(t);
+        let t = ScriptHashTable::open_tiny(&dir).unwrap();
+        let free = read_alloc_header(t.ovf_file()).unwrap().0.free_head;
+        if free[0] == freed {
+            assert_eq!(
+                word_at(t.ovf_file(), freed)[..8],
+                link[..8],
+                "sync {skip}: the free head names a slab that holds a payload"
+            );
+        }
+        assert!(t.head_value(&b).unwrap().is_none());
+        assert_eq!(create_fks(&t, &a), vec![1, 2, 3, 4]);
+    }
+}
+
 #[test]
 fn last_create_fk_on_rejects_a_slab_whose_used_lies() {
     let dir = tmp();
