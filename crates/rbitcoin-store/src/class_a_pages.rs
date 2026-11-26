@@ -384,6 +384,15 @@ fn replace_armed(path: &Path, generation: u64) -> Result<(), StoreError> {
     publish_armed(path, generation)
 }
 
+/// Point an existing mark at `generation`. A missing mark stays missing.
+pub(crate) fn retarget_armed(hot: &Path, generation: u64) -> Result<(), StoreError> {
+    let path = guard_dir(hot).join("armed");
+    if !path.try_exists().map_err(|e| StoreError::io(&path, e))? {
+        return Ok(());
+    }
+    replace_armed(&path, generation)
+}
+
 /// The appender's arm. Promotes `meta` to 31 and syncs it before the rename
 /// when the datadir is still 30. A newer sealed slot replaces the mark with
 /// that generation; otherwise the current mark stays.

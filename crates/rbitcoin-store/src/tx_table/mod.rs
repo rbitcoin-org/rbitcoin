@@ -1256,6 +1256,43 @@ fn run_after_bodies_hook() {
     }
 }
 
+// Which table this thread is inside `class_a_append` for, and how deep.
+// A sync on that thread must not wait out its own pwrite.
+thread_local! {
+    static CLASS_A_WRITER: std::cell::Cell<(*const (), usize)> =
+        const { std::cell::Cell::new((std::ptr::null(), 0)) };
+}
+
+fn class_a_writer_depth(table: *const ()) -> usize {
+    CLASS_A_WRITER.with(|slot| {
+        let (ptr, depth) = slot.get();
+        if ptr == table {
+            depth
+        } else {
+            0
+        }
+    })
+}
+
+struct ClassAWriterDepth {
+    prev: (*const (), usize),
+}
+
+impl Drop for ClassAWriterDepth {
+    fn drop(&mut self) {
+        CLASS_A_WRITER.with(|slot| slot.set(self.prev));
+    }
+}
+
+fn enter_class_a_writer_depth(table: *const ()) -> ClassAWriterDepth {
+    CLASS_A_WRITER.with(|slot| {
+        let prev = slot.get();
+        let depth = if prev.0 == table { prev.1 } else { 0 };
+        slot.set((table, depth + 1));
+        ClassAWriterDepth { prev }
+    })
+}
+
 fn publish_prepared_body(
     table: &VarTable,
     prep: crate::var_table::PreparedAppend,
@@ -4043,19 +4080,27 @@ impl TxTable {
         self.sync_class_a_quiescent(Some(named))
     }
 
-    /// Seal and clear only when no append is in a pwrite. `Ok` means a crash
-    /// keeps this generation: the mark is gone and the slot matches the bytes.
+    /// Seal, then clear only when no append is in a pwrite.
+    ///
+    /// The append thread is already inside the pwrite, so it waits out every
+    /// other append and then seals without clearing. Waiting for its own
+    /// count would never finish. The synced sidecar still advances: open
+    /// keeps the creates this call named, and the mark still rolls the
+    /// half-written tail back. Any other thread waits until the count is
+    /// zero, then seals and clears before `Ok`.
     fn sync_class_a_quiescent(&self, named: Option<u64>) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
         loop {
             self.refuse_if_class_a_failed()?;
-            if self.class_a_writes.load(Ordering::Acquire) != 0 {
+            let mine = class_a_writer_depth(self as *const Self as *const ());
+            if self.class_a_writes.load(Ordering::Acquire) != mine {
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
             let mut sealed = false;
             self.class_a_latched(|| {
-                if self.class_a_writes.load(Ordering::Acquire) != 0 {
+                let mine = class_a_writer_depth(self as *const Self as *const ());
+                if self.class_a_writes.load(Ordering::Acquire) != mine {
                     return Ok(());
                 }
                 let named = named.unwrap_or_else(|| self.synced_named.load(Ordering::Acquire));
@@ -4138,9 +4183,11 @@ impl TxTable {
         write: impl FnOnce() -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         self.enter_class_a_write()?;
+        let depth = enter_class_a_writer_depth(self as *const Self as *const ());
         let written = write();
         self.class_a_writes
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        drop(depth);
         if written.is_err() {
             self.latch_class_a_failure();
         }
@@ -4196,17 +4243,25 @@ impl TxTable {
         // `write_barrier` does not clear. This caller does, after the seal,
         // and only when no append is in a pwrite. The sync holds
         // `class_a_sync` across that clear, so the next append cannot start
-        // until the mark is gone.
+        // until the mark is gone. The sidecar moves even when the mark stays:
+        // a spend commit or scripthash mark on this thread names `named`,
+        // and open keeps those creates.
         if self.class_a_writes.load(Ordering::Acquire) == 0 {
             crate::class_a_pages::clear_armed(&self.hot_dir)?;
             self.class_a_mark.store(0, Ordering::Release);
-            if named > self.synced_named.load(Ordering::Acquire) {
-                crate::file::write_synced_tmp_rename(
-                    &self.hot_dir.join(CLASS_A_SYNCED_NAME),
-                    &named.to_le_bytes(),
-                )?;
-                self.synced_named.store(named, Ordering::Release);
-            }
+        } else {
+            // The append is still writing. Name the seal just taken so open
+            // restores these bytes, not an older slot that drops `named`.
+            crate::class_a_pages::retarget_armed(&self.hot_dir, generation)?;
+            self.class_a_mark
+                .store(generation.saturating_add(1), Ordering::Release);
+        }
+        if named > self.synced_named.load(Ordering::Acquire) {
+            crate::file::write_synced_tmp_rename(
+                &self.hot_dir.join(CLASS_A_SYNCED_NAME),
+                &named.to_le_bytes(),
+            )?;
+            self.synced_named.store(named, Ordering::Release);
         }
         Ok(())
     }
