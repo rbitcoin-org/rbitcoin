@@ -85,21 +85,20 @@ async fn read_self_announcement(stream: TcpStream) -> (V2PlainSession, Vec<NetAd
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tor_automatic_listener_reports_an_occupied_backend() {
+    let env = require_env();
     let dir = TempDir::new().unwrap();
+    let rpc = ephemeral_addr();
     let ordinary_port = Network::Regtest.default_p2p_port();
+    let ordinary = SocketAddr::from(([127, 0, 0, 1], ordinary_port));
     let backend = SocketAddr::from(([127, 0, 0, 1], ordinary_port + 1));
     let _occupied = tokio::net::TcpListener::bind(backend)
         .await
         .expect("reserve the regtest Tor backend");
-    let control = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut cfg = base_node(dir.path());
-    cfg.listen.listen_onion = true;
-    cfg.tor.control = Some(control.local_addr().unwrap());
-    cfg.tor.io_timeout = Some(Duration::from_secs(1));
-    cfg.max_run_secs = Some(0);
+    let mut cfg = tor_b(&env, dir.path(), rpc);
+    cfg.listen.p2p = P2pListen::Auto;
 
     let Err(NodeError::Init(message)) =
-        tokio::time::timeout(Duration::from_secs(30), rbitcoin_node::run_p2p(cfg))
+        tokio::time::timeout(Duration::from_secs(30), rbitcoin_node::run_p2p(cfg.clone()))
             .await
             .expect("node startup deadline")
     else {
@@ -110,10 +109,61 @@ async fn tor_automatic_listener_reports_an_occupied_backend() {
         "{message}"
     );
     assert!(
-        message.contains(&format!("--listen 127.0.0.1:{ordinary_port}"))
+        message.contains(&format!("--listen {ordinary}"))
             && message.contains("--listen ADDR:PORT=onion"),
         "{message}"
     );
+
+    cfg.apply_kv("listen", &ordinary.to_string()).unwrap();
+    let node = spawn_node(cfg, rpc).await;
+    let checks = tokio::spawn(async move {
+        let direct = TcpStream::connect(ordinary).await.unwrap();
+        let _direct =
+            V2PlainSession::outbound_regtest(direct, "/tor-port-recovery/", Duration::from_secs(5))
+                .await
+                .expect("ordinary P2P after recovery");
+        let (onion, port) = wait_p2p_onion(rpc, Duration::from_secs(90)).await;
+        assert_eq!(port, ordinary_port);
+        wait_socks_onion(env.tor_socks, &onion, port, Duration::from_secs(90)).await;
+        let forwarded = tokio::time::timeout(
+            Duration::from_secs(15),
+            socks5_connect_domain(env.tor_socks, &onion, port, None),
+        )
+        .await
+        .expect("Tor SOCKS deadline")
+        .unwrap();
+        let _forwarded = V2PlainSession::outbound_regtest(
+            forwarded,
+            "/tor-port-recovery/",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Tor P2P while the default backend is still occupied");
+        wait_jsonrpc(
+            rpc,
+            "getpeerinfo",
+            json!([]),
+            Duration::from_secs(5),
+            |reply| {
+                let Some(rows) = reply["result"].as_array() else {
+                    return false;
+                };
+                let binds: Vec<_> = rows
+                    .iter()
+                    .filter(|row| row["inbound"] == true)
+                    .filter_map(|row| row["addrbind"].as_str()?.parse::<SocketAddr>().ok())
+                    .collect();
+                binds.contains(&ordinary)
+                    && binds
+                        .iter()
+                        .any(|addr| *addr != ordinary && *addr != backend)
+            },
+        )
+        .await;
+    })
+    .await;
+    node.stop().await;
+    checks.expect("ordinary and Tor P2P recovery");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
