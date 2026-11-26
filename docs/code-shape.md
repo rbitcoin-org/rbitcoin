@@ -124,6 +124,21 @@ A new opcode byte belongs in `script_opcode.rs`; that file's line moves
 with the constant. Any other new literal is a baseline edit in the
 same commit.
 
+Raw store and mempool page writes are frozen per file and per token in
+[`lint/page-write-baseline.txt`](../lint/page-write-baseline.txt).
+`./scripts/page-write-ratchet.sh` fails when a token grows, when a file
+gains one, and when a cleanup leaves the old count in place. The tokens
+are `pwrite`, `pwrite_batch`, `pwrite_exact`, `handle_pwrite_all`,
+`write_at`, `write_at_pwrite`, `persist_hwm`, `zero_range`, `set_len`,
+`set_file_len`, `truncate`, `fs::write`, and `WriteOp`. `write_all`
+counts only under `rbitcoin-mempool`. `write_at` does not match
+`write_at_pwrite`. The scan is `crates/rbitcoin-store/src` and
+`crates/rbitcoin-mempool/src`, with the same `#[cfg(test)]` skip as the
+unwrap ratchet. A new write of a live page that already holds
+committed bytes goes through `page_guard`. The calls that exist today
+are the baseline. A baseline edit belongs in the commit that adds or
+removes the call.
+
 **Goal:** no `[workspace.lints.clippy]` `= "allow"`. A lint that is wrong
 for one item is `#[allow(clippy::lint)]` on **that item**, with a one-line
 reason (Core-faithful opcode loop, wire layout, dispatch bag,
