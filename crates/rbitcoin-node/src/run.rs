@@ -352,15 +352,31 @@ pub fn spawn_fee_history_backfill(mempool: &Arc<MempoolHub>) {
 
 #[cfg(debug_assertions)]
 thread_local! {
-    static FAIL_MEMPOOL_TASKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// `(calls to let through, then calls to fail)`.
+    static FAIL_MEMPOOL_TASKS: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
 }
 
-/// Fail the next `n` [`mempool_blocking`] calls made on this thread, as a
-/// panicked task does.
+/// Let `skip` [`mempool_blocking`] calls on this thread through, then fail
+/// the next one, as a panicked task does.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
-pub fn arm_fail_mempool_tasks(n: u32) {
-    FAIL_MEMPOOL_TASKS.with(|c| c.set(n));
+pub fn arm_fail_mempool_task(skip: u32) {
+    FAIL_MEMPOOL_TASKS.with(|c| c.set((skip, 1)));
+}
+
+#[cfg(debug_assertions)]
+fn take_armed_mempool_failure() -> bool {
+    FAIL_MEMPOOL_TASKS.with(|c| match c.get() {
+        (_, 0) => false,
+        (0, fail) => {
+            c.set((0, fail - 1));
+            true
+        }
+        (skip, fail) => {
+            c.set((skip - 1, fail));
+            false
+        }
+    })
 }
 
 pub async fn mempool_blocking<T: Send + 'static>(
@@ -368,7 +384,7 @@ pub async fn mempool_blocking<T: Send + 'static>(
     f: impl FnOnce(&MempoolHub) -> T + Send + 'static,
 ) -> Result<T, NodeError> {
     #[cfg(debug_assertions)]
-    if FAIL_MEMPOOL_TASKS.with(|c| c.replace(c.get().saturating_sub(1)) > 0) {
+    if take_armed_mempool_failure() {
         return Err(NodeError::Config("mempool task: armed failure".into()));
     }
     let mp = Arc::clone(mp);
@@ -1475,7 +1491,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         rpc_handle =
             shutdown.or_fail(start_rpc_listener(&config, &node, &mempool, &shared_peers).await);
     }
-    let sv2_tp = shutdown.or_fail(start_sv2_tp(&config, &node.hub).await);
+    let sv2_tp = if shutdown.requested() {
+        None
+    } else {
+        shutdown.or_fail(start_sv2_tp(&config, &node.hub).await)
+    };
     let sv2_stats = sv2_tp.as_ref().map(Sv2TpHandle::stats);
     if let Some(s) = &sv2_stats {
         status.attach_sv2(Arc::clone(s));
@@ -1891,8 +1911,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
 
-    // Shutdown tail. Every step runs: a failed one is kept as the exit
-    // error, logged, and skipped past. First the writers stop. Then the saves
+    // Shutdown tail. Every step runs: a failed one is logged and skipped
+    // past, and a failed task or store flush is kept as the exit error.
+    // First the writers stop. Then the saves
     // run in order of what each costs to rebuild: the store (a dirty
     // scripthash index is a full rebuild), the mempool (relay refills it),
     // then the address book.
@@ -1949,11 +1970,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let spend_checkpoint = lap();
     // Host-friendly: fsync tip tables; MS_ASYNC Class A.
     // Full multi‑GiB fdatasync froze the desktop for 1–2+ minutes on exit.
-    if let Err(e) = node.hub.query.flush_for_shutdown() {
-        warn!("node: flush warning: {e}");
-    } else {
-        info!("node: store flushed (shutdown-friendly)");
-    }
+    flush_store_for_exit(&node.hub.query, &shutdown);
     let store_flush = lap();
     let flushed = mempool_blocking(&mempool, |mp| {
         mp.flush().map(|()| (mp.generation(), mp.live_count()))
@@ -2011,6 +2028,19 @@ fn log_settle_waits() {
         us / 1000,
         max_us / 1000
     );
+}
+
+/// The store flush of the shutdown tail. A store that did not reach the
+/// disk fails the stop, so the process exits non-zero.
+#[doc(hidden)]
+pub fn flush_store_for_exit(query: &Query, shutdown: &Shutdown) {
+    match query.flush_for_shutdown() {
+        Ok(()) => info!("node: store flushed (shutdown-friendly)"),
+        Err(e) => {
+            warn!("node: flush warning: {e}");
+            shutdown.fail(NodeError::Store(e));
+        }
+    }
 }
 
 #[doc(hidden)]
