@@ -34,6 +34,10 @@ assert_ok "store write_all is not a raw page write" \
   python3 "$PY" --root "$FIX/store-write-all"
 assert_fail "mempool write_all fails an empty baseline" \
   python3 "$PY" --root "$FIX/mempool-write-all"
+assert_fail "pwrite_all fails an empty baseline" \
+  python3 "$PY" --root "$FIX/pwrite-all"
+assert_ok "handle_pwrite_all is not counted as pwrite_all" \
+  python3 "$PY" --root "$FIX/match"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "page-write-ratchet.test.sh: $PASS passed, $FAIL failed"

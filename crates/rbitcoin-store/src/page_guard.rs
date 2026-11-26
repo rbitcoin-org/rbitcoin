@@ -21,6 +21,10 @@ const RECORD: usize = 8 + PAGE as usize;
 
 #[doc(hidden)]
 pub fn arm_page_guard(path: &Path, pages: &[(u64, &[u8])]) -> Result<(), StoreError> {
+    mark_parent(path)?;
+    if path.try_exists().map_err(|e| StoreError::io(path, e))? {
+        return Err(StoreError::Rejected("page guard mark is already armed"));
+    }
     if pages.is_empty() {
         return Err(StoreError::Corrupt("page guard arm is empty"));
     }
@@ -54,6 +58,7 @@ pub fn arm_page_guard(path: &Path, pages: &[(u64, &[u8])]) -> Result<(), StoreEr
 /// parse is an error, and the live file is left alone.
 #[doc(hidden)]
 pub fn restore_page_guard(mark: &Path, data: &File, data_path: &Path) -> Result<bool, StoreError> {
+    mark_parent(mark)?;
     let raw = match std::fs::read(mark) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -65,23 +70,37 @@ pub fn restore_page_guard(mark: &Path, data: &File, data_path: &Path) -> Result<
     }
     data.durable_sync_data()
         .map_err(|e| StoreError::io(data_path, e))?;
-    clear_page_guard(mark)?;
+    remove_mark(mark)?;
     Ok(true)
 }
 
-/// Removes `path` and syncs its directory. A path that is already gone is `Ok`.
+/// Syncs `data`, then removes `path` and syncs its directory.
+///
+/// A path that is already gone is `Ok` after the sync. A mark with no
+/// directory is an error, so a relative name cannot skip that sync.
 #[doc(hidden)]
-pub fn clear_page_guard(path: &Path) -> Result<(), StoreError> {
+pub fn clear_page_guard(path: &Path, data: &File, data_path: &Path) -> Result<(), StoreError> {
+    mark_parent(path)?;
+    data.durable_sync_data()
+        .map_err(|e| StoreError::io(data_path, e))?;
+    remove_mark(path)
+}
+
+fn mark_parent(path: &Path) -> Result<&Path, StoreError> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => Ok(parent),
+        _ => Err(StoreError::Rejected("page guard mark has no directory")),
+    }
+}
+
+fn remove_mark(path: &Path) -> Result<(), StoreError> {
+    let parent = mark_parent(path)?;
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(StoreError::io(path, e)),
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-        }
-    }
+    fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
     Ok(())
 }
 
@@ -122,6 +141,9 @@ fn mark_pages(raw: &[u8]) -> Result<Vec<(u64, usize)>, StoreError> {
     let schema = u16::from_le_bytes([raw[4], raw[5]]);
     if !schema_file_openable(schema) {
         return Err(StoreError::Corrupt("page guard mark schema"));
+    }
+    if raw[6] != 0 || raw[7] != 0 {
+        return Err(StoreError::Corrupt("page guard mark reserved"));
     }
     let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
     if count == 0 || raw.len() != HEAD + count * RECORD {
