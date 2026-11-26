@@ -30,7 +30,7 @@ use crate::scripthash_slabs::{
 use crate::scripthash_sorted_head::SortedHead;
 use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{le_u64, uleb128_len, Fk, TableKind};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -296,6 +296,51 @@ pub struct AppendTiming {
     pub seed_ns: u64,
     pub body_ns: u64,
     pub head_ns: u64,
+}
+
+/// Body bytes and frees one key change holds back from the body.
+///
+/// An ingest batch packs every key first. The payloads land only after the
+/// allocator header that stops naming a popped offset is durable, and a
+/// replaced slab joins the free list only after the head that named it is
+/// durable. The trade is RAM for that order: the batch keeps every new slab
+/// and page image until its body barrier, one contiguous buffer per body.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct StagedSlabs {
+    bytes: Vec<u8>,
+    writes: Vec<(u64, usize)>,
+    frees: Vec<(u8, u64)>,
+}
+
+impl StagedSlabs {
+    #[doc(hidden)]
+    pub fn write(&mut self, off: u64, bytes: &[u8]) {
+        self.writes.push((off, bytes.len()));
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    #[doc(hidden)]
+    pub fn free(&mut self, class: u8, off: u64) {
+        self.frees.push((class, off));
+    }
+
+    #[doc(hidden)]
+    pub fn write_to(&self, body: &TableFile) -> Result<(), StoreError> {
+        let mut at = 0usize;
+        for &(off, len) in &self.writes {
+            body.write_at(off, &self.bytes[at..at + len])?;
+            at += len;
+        }
+        Ok(())
+    }
+}
+
+/// One body's share of an ingest batch.
+struct BodyStage<'a> {
+    body: &'a TableFile,
+    alloc: &'a Mutex<AllocState>,
+    slabs: StagedSlabs,
 }
 
 /// Body slab allocator state (persisted in alloc header).
@@ -1034,6 +1079,27 @@ impl From<LocatedHome> for KeyHome {
             LocatedHome::SealedOvf => Self::SealedOvf,
             LocatedHome::Ingest => Self::Ingest,
         }
+    }
+}
+
+/// Remember the head file `apply_head_upserts` writes for `key`, once per
+/// main shard or home, so it can be synced before the key's old slab is freed.
+fn note_free_home(
+    table: &ScriptHashTable,
+    homes: &mut Vec<(LocatedHome, [u8; 32])>,
+    key: &[u8; 32],
+    kh: KeyHome,
+) {
+    let home = match kh {
+        KeyHome::Main => LocatedHome::Main,
+        KeyHome::SealedOvf => LocatedHome::SealedOvf,
+        KeyHome::Ingest | KeyHome::Absent => LocatedHome::Ingest,
+    };
+    let seen = homes.iter().any(|(h, k)| {
+        *h == home && (home != LocatedHome::Main || table.shard_index(k) == table.shard_index(key))
+    });
+    if !seen {
+        homes.push((home, *key));
     }
 }
 
@@ -1854,6 +1920,9 @@ impl ScriptHashTable {
         let t_body = std::time::Instant::now();
         let mut head_final: Vec<([u8; 32], ShHeadValue, KeyHome)> = Vec::new();
         let mut written = 0usize;
+        let mut stages: BTreeMap<usize, BodyStage<'_>> = BTreeMap::new();
+        let mut popped = false;
+        let mut free_homes: Vec<(LocatedHome, [u8; 32])> = Vec::new();
 
         let mut i = 0usize;
         while i < order.len() {
@@ -1896,9 +1965,22 @@ impl ScriptHashTable {
             let kh = home.get(&key).copied().unwrap_or(KeyHome::Absent);
             let body = self.body_for(&key, kh);
             let alloc_mu = self.alloc_for(&key, kh);
+            let stage = stages
+                .entry(std::ptr::from_ref(body) as usize)
+                .or_insert_with(|| BodyStage {
+                    body,
+                    alloc: alloc_mu,
+                    slabs: StagedSlabs::default(),
+                });
+            let frees_before = stage.slabs.frees.len();
             let mut alloc = alloc_mu.lock().unwrap();
-            let new_val = self.append_sorted_creates(body, &mut alloc, &cur, &add)?;
+            let free_before = alloc.free_head;
+            let new_val = self.append_sorted_creates(body, &mut alloc, &cur, &add, &mut stage.slabs)?;
+            popped |= alloc.free_head != free_before;
             drop(alloc);
+            if stage.slabs.frees.len() > frees_before {
+                note_free_home(self, &mut free_homes, &key, kh);
+            }
             head_final.push((key, new_val, kh));
         }
 
@@ -1907,15 +1989,51 @@ impl ScriptHashTable {
         if !head_final.is_empty() {
             let t_head = std::time::Instant::now();
             let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
-            // Slabs and free-list links durable, then alloc headers, then the
-            // ingest head that names those slabs.
+            // A payload on a popped offset waits for a durable header that no
+            // longer names it. Otherwise the payloads share the first barrier.
+            if !popped {
+                self.write_staged(&stages)?;
+            }
             self.sync_bodies_for(&head_final)?;
             self.write_alloc_headers_for(&head_final)?;
             self.sync_bodies_for(&head_final)?;
+            if popped {
+                self.write_staged(&stages)?;
+                self.sync_bodies_for(&head_final)?;
+            }
             self.apply_head_upserts(&head_final, flush_each)?;
+            self.free_replaced_slabs(&stages, &free_homes)?;
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }
         Ok((written, timing))
+    }
+
+    fn write_staged(&self, stages: &BTreeMap<usize, BodyStage<'_>>) -> Result<(), StoreError> {
+        for stage in stages.values() {
+            stage.slabs.write_to(stage.body)?;
+        }
+        Ok(())
+    }
+
+    /// Link the slabs a class change replaced once the heads that named them
+    /// are durable: the links, a body barrier, then the header that names them.
+    fn free_replaced_slabs(
+        &self,
+        stages: &BTreeMap<usize, BodyStage<'_>>,
+        free_homes: &[(LocatedHome, [u8; 32])],
+    ) -> Result<(), StoreError> {
+        for (home, key) in free_homes {
+            self.sync_home(*home, key)?;
+        }
+        for stage in stages.values().filter(|s| !s.slabs.frees.is_empty()) {
+            let mut alloc = stage.alloc.lock().unwrap();
+            for &(class, off) in &stage.slabs.frees {
+                self.free_slab(stage.body, &mut alloc, class, off)?;
+            }
+            stage.body.sync_data_only()?;
+            write_alloc_header(stage.body, &alloc)?;
+        }
+        Ok(())
     }
 
     /// Route head upserts without get-then-insert:
@@ -2282,7 +2400,10 @@ impl ScriptHashTable {
                 ));
             }
         }
-        self.pack_entries(body, alloc, live, false)
+        let mut staged = StagedSlabs::default();
+        let val = self.pack_entries(body, alloc, live, false, &mut staged)?;
+        staged.write_to(body)?;
+        Ok(val)
     }
 
     /// Append strictly increasing `new_ents` (all already `> durable max`) without
@@ -2294,6 +2415,7 @@ impl ScriptHashTable {
         alloc: &mut AllocState,
         old: &ShHeadValue,
         new_ents: &[Fk],
+        staged: &mut StagedSlabs,
     ) -> Result<ShHeadValue, StoreError> {
         if new_ents.is_empty() {
             return Ok(old.clone());
@@ -2308,11 +2430,11 @@ impl ScriptHashTable {
         alloc.live_count = alloc.live_count.saturating_add(new_ents.len() as u64);
 
         match old {
-            ShHeadValue::Empty => self.pack_entries(body, alloc, new_ents, true),
+            ShHeadValue::Empty => self.pack_entries(body, alloc, new_ents, true, staged),
             ShHeadValue::Inline { .. } => {
                 let mut live = old.inline_entries().to_vec();
                 live.extend_from_slice(new_ents);
-                self.pack_entries(body, alloc, &live, true)
+                self.pack_entries(body, alloc, &live, true, staged)
             }
             ShHeadValue::Slab { class, off, .. } => {
                 let mut live = self.read_slab(body, *class, *off)?;
@@ -2324,8 +2446,14 @@ impl ScriptHashTable {
                     }
                 }
                 live.extend_from_slice(new_ents);
-                let new_val =
-                    self.pack_entries_reuse(body, alloc, &live, true, Some((*class, *off)))?;
+                let new_val = self.pack_entries_reuse(
+                    body,
+                    alloc,
+                    &live,
+                    true,
+                    Some((*class, *off)),
+                    staged,
+                )?;
                 if !matches!(
                     &new_val,
                     ShHeadValue::Slab {
@@ -2334,12 +2462,12 @@ impl ScriptHashTable {
                         ..
                     } if *nc == *class && *no == *off
                 ) {
-                    self.free_slab(body, alloc, *class, *off)?;
+                    staged.free(*class, *off);
                 }
                 Ok(new_val)
             }
             ShHeadValue::Extent { last_page } => {
-                let last = self.append_fks_to_pages(body, alloc, *last_page, new_ents)?;
+                let last = self.append_fks_to_pages(body, alloc, *last_page, new_ents, staged)?;
                 Ok(ShHeadValue::extent(last))
             }
         }
@@ -2354,8 +2482,9 @@ impl ScriptHashTable {
         alloc: &mut AllocState,
         live: &[Fk],
         slack: bool,
+        staged: &mut StagedSlabs,
     ) -> Result<ShHeadValue, StoreError> {
-        self.pack_entries_reuse(body, alloc, live, slack, None)
+        self.pack_entries_reuse(body, alloc, live, slack, None, staged)
     }
 
     #[doc(hidden)]
@@ -2366,6 +2495,7 @@ impl ScriptHashTable {
         live: &[Fk],
         slack: bool,
         reuse: Option<(u8, u64)>,
+        staged: &mut StagedSlabs,
     ) -> Result<ShHeadValue, StoreError> {
         let n = live.len() as u32;
         if n == 0 {
@@ -2375,7 +2505,7 @@ impl ScriptHashTable {
             return Ok(ShHeadValue::inline_one(live[0]));
         }
         if n >= SH_MEGAKEY_MIN_FKS {
-            let last = self.write_new_page_chain(body, alloc, live)?;
+            let last = self.write_new_page_chain(body, alloc, live, staged)?;
             return Ok(ShHeadValue::extent(last));
         }
         let mut raw = [0u64; SH_MEGAKEY_MIN_FKS as usize - 1];
@@ -2387,7 +2517,7 @@ impl ScriptHashTable {
         let class = match Self::slab_class_fitting(n, packed_len, slack) {
             Some(c) => c,
             None => {
-                let last = self.write_new_page_chain(body, alloc, live)?;
+                let last = self.write_new_page_chain(body, alloc, live, staged)?;
                 return Ok(ShHeadValue::extent(last));
             }
         };
@@ -2408,7 +2538,7 @@ impl ScriptHashTable {
         };
         let mut buf = [0u8; 2048];
         buf[..packed_len].copy_from_slice(&payload[..packed_len]);
-        body.write_at(off, &buf[..cap])?;
+        staged.write(off, &buf[..cap]);
         Ok(ShHeadValue::slab(class, n as u16, off))
     }
 
@@ -2444,6 +2574,7 @@ impl ScriptHashTable {
         body: &TableFile,
         alloc: &mut AllocState,
         live: &[Fk],
+        staged: &mut StagedSlabs,
     ) -> Result<u64, StoreError> {
         if live.is_empty() {
             return Err(StoreError::Corrupt("scripthash empty page chain"));
@@ -2462,7 +2593,7 @@ impl ScriptHashTable {
                 let next = off.saturating_add(SH_PAGE_SIZE as u64);
                 sh_page_pack_fks(&mut page, &raw, next)?;
             }
-            body.write_at(off, &page)?;
+            staged.write(off, &page);
         }
         Ok(base.saturating_add(((n_pages - 1) as u64).saturating_mul(SH_PAGE_SIZE as u64)))
     }
@@ -2479,6 +2610,7 @@ impl ScriptHashTable {
         alloc: &mut AllocState,
         last_page: u64,
         tail: &[Fk],
+        staged: &mut StagedSlabs,
     ) -> Result<u64, StoreError> {
         if tail.is_empty() {
             return Ok(last_page);
@@ -2505,7 +2637,7 @@ impl ScriptHashTable {
             if !sh_page_try_append(&mut page, *fk)? {
                 let new_off = self.alloc_page(body, alloc)?;
                 sh_page_set_next(&mut page, new_off)?;
-                body.write_at(last, &page)?;
+                staged.write(last, &page);
                 let glued = new_off == base.saturating_add(u64::from(n) * SH_PAGE_SIZE as u64);
                 n = if glued { n.saturating_add(1) } else { n };
                 sh_page_pack_extent_last_fks(&mut page, &[fk.0], base, n, 0)?;
@@ -2521,7 +2653,7 @@ impl ScriptHashTable {
         if creates > 0 {
             crate::scripthash_pages::sh_page_set_extent_creates(&mut page, creates);
         }
-        body.write_at(last, &page)?;
+        staged.write(last, &page);
         Ok(last)
     }
 

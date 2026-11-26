@@ -65,6 +65,13 @@ impl MphfHead {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
+        #[cfg(debug_assertions)]
+        if crate::io_handle::take_fail_sync(crate::io_handle::IoHandle::from_file(&self.val_file)) {
+            return Err(StoreError::io(
+                val_path(&self.base),
+                std::io::Error::from_raw_os_error(5),
+            ));
+        }
         self.val_file
             .durable_sync_data()
             .map_err(|e| StoreError::io(val_path(&self.base), e))
