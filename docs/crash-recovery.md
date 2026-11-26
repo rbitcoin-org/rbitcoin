@@ -175,6 +175,13 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   append skips each `fk ≤` the last fk its head or last page already holds.
   Hot path only appends + maintains heads in RAM.
 - Creates for unstrong / above-tip txs are **invisible** via `is_confirmed_strong`.
+- Append: one batch packs every key before it writes a slab. A batch that
+  reuses a free offset first syncs an alloc header that no longer names it,
+  so a crash leaks that offset instead of leaving a free head on a written
+  slab. Otherwise the payloads are synced before the header. The heads move
+  last. A slab a class change replaced joins the free list only after the
+  head file that stopped naming it is synced (main, sealed overflow or
+  ingest); its link is synced before the header names it.
 - Disconnect tip: **one unlink per scripthash**. A megakey drops that block's
   creates from the tail pages. The saved page image is synced before the undo
   record is published. The page the head names is updated before any earlier

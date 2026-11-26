@@ -1975,7 +1975,8 @@ impl ScriptHashTable {
             let frees_before = stage.slabs.frees.len();
             let mut alloc = alloc_mu.lock().unwrap();
             let free_before = alloc.free_head;
-            let new_val = self.append_sorted_creates(body, &mut alloc, &cur, &add, &mut stage.slabs)?;
+            let new_val =
+                self.append_sorted_creates(body, &mut alloc, &cur, &add, &mut stage.slabs)?;
             popped |= alloc.free_head != free_before;
             drop(alloc);
             if stage.slabs.frees.len() > frees_before {
