@@ -345,6 +345,15 @@ struct BodyStage<'a> {
     popped: bool,
 }
 
+/// One ingest batch between packing and its barriers.
+#[derive(Default)]
+struct IngestBatch<'a> {
+    head_final: Vec<([u8; 32], ShHeadValue, KeyHome)>,
+    stages: BTreeMap<usize, BodyStage<'a>>,
+    moved_heads: Vec<MovedHead>,
+    written: usize,
+}
+
 /// A head file whose bare in-place update must be synced before a slab its
 /// key replaced is freed. An ingest head needs none: `insert_many` syncs it,
 /// and a seal writes a synced sorted file.
@@ -1896,126 +1905,139 @@ impl ScriptHashTable {
         order.sort_by(|&a, &b| recs[a].scripthash.cmp(&recs[b].scripthash));
         timing.sort_ns = t_sort.elapsed().as_nanos() as u64;
 
-        let mut heads: HashMap<[u8; 32], ShHeadValue> = HashMap::new();
-        let mut home: HashMap<[u8; 32], KeyHome> = HashMap::new();
-
         let t_seed = std::time::Instant::now();
-        // Cold body (no prior creates): skip N head gets — empty table probes.
-        if self.entry_count() > 0 || !self.head_is_empty() {
-            let mut keys: Vec<[u8; 32]> = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for &i in &order {
-                let rec = &recs[i];
-                if rec.create_tx_fk.is_null() {
-                    continue;
-                }
-                if seen.insert(rec.scripthash) {
-                    keys.push(rec.scripthash);
-                }
-            }
-            keys.sort_unstable();
-            for key in keys {
-                if let Some((v, kh)) = self.locate_head(&key)? {
-                    heads.insert(key, v);
-                    home.insert(key, KeyHome::from(kh));
-                } else {
-                    home.insert(key, KeyHome::Absent);
-                }
-            }
-        }
+        let heads = self.seed_batch_heads(recs, &order)?;
         timing.seed_ns = t_seed.elapsed().as_nanos() as u64;
 
         let t_body = std::time::Instant::now();
-        let mut head_final: Vec<([u8; 32], ShHeadValue, KeyHome)> = Vec::new();
-        let mut written = 0usize;
-        let mut stages: BTreeMap<usize, BodyStage<'_>> = BTreeMap::new();
-        let mut moved_heads: Vec<MovedHead> = Vec::new();
-
+        let mut batch = IngestBatch::default();
         let mut i = 0usize;
         while i < order.len() {
-            let rec0 = &recs[order[i]];
-            if rec0.create_tx_fk.is_null() {
-                i += 1;
-                continue;
-            }
-            let key = rec0.scripthash;
+            let key = recs[order[i]].scripthash;
             let mut fk_vals: Vec<u64> = Vec::new();
-            while i < order.len() {
-                let rec = &recs[order[i]];
-                if rec.scripthash != key {
-                    break;
-                }
-                if !rec.create_tx_fk.is_null() {
-                    fk_vals.push(rec.create_tx_fk.0);
+            while i < order.len() && recs[order[i]].scripthash == key {
+                let fk = recs[order[i]].create_tx_fk;
+                if !fk.is_null() {
+                    fk_vals.push(fk.0);
                 }
                 i += 1;
             }
             if fk_vals.is_empty() {
                 continue;
             }
-            fk_vals.sort_unstable();
-            fk_vals.dedup();
-
-            let cur = heads.get(&key).cloned().unwrap_or(ShHeadValue::Empty);
-            let kh_early = home.get(&key).copied().unwrap_or(KeyHome::Absent);
-            let max = self.last_create_fk_on(self.body_for(&key, kh_early), &cur)?;
-            let max_u = max.map(|f| f.0).unwrap_or(0);
-            let add: Vec<Fk> = fk_vals
-                .into_iter()
-                .filter(|&fk| max.is_none() || fk > max_u)
-                .map(Fk)
-                .collect();
-            if add.is_empty() {
-                continue;
-            }
-            written += add.len();
-            let kh = home.get(&key).copied().unwrap_or(KeyHome::Absent);
-            let body = self.body_for(&key, kh);
-            let alloc_mu = self.alloc_for(&key, kh);
-            let stage = stages
-                .entry(std::ptr::from_ref(body) as usize)
-                .or_insert_with(|| BodyStage {
-                    body,
-                    alloc: alloc_mu,
-                    slabs: StagedSlabs::default(),
-                    popped: false,
-                });
-            let frees_before = stage.slabs.frees.len();
-            let mut alloc = alloc_mu.lock().unwrap();
-            let free_before = alloc.free_head;
-            let new_val =
-                self.append_sorted_creates(body, &mut alloc, &cur, &add, &mut stage.slabs)?;
-            stage.popped |= alloc.free_head != free_before;
-            drop(alloc);
-            if stage.slabs.frees.len() > frees_before {
-                note_moved_head(self, &mut moved_heads, &key, kh);
-            }
-            head_final.push((key, new_val, kh));
+            let (cur, kh) = heads
+                .get(&key)
+                .cloned()
+                .unwrap_or((ShHeadValue::Empty, KeyHome::Absent));
+            self.stage_key_creates(&mut batch, key, fk_vals, &cur, kh)?;
         }
-
         timing.body_ns = t_body.elapsed().as_nanos() as u64;
 
-        if !head_final.is_empty() {
+        if !batch.head_final.is_empty() {
             let t_head = std::time::Instant::now();
             let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
-            // A payload on a popped offset waits for a durable header that no
-            // longer names it. A body that popped nothing writes its payloads
-            // before the first barrier.
-            for stage in stages.values().filter(|s| !s.popped) {
-                stage.slabs.write_to(stage.body)?;
-            }
-            self.sync_bodies_for(&head_final)?;
-            self.write_alloc_headers_for(&head_final)?;
-            self.sync_bodies_for(&head_final)?;
-            for stage in stages.values().filter(|s| s.popped) {
-                stage.slabs.write_to(stage.body)?;
-                stage.body.sync_data_only()?;
-            }
-            self.apply_head_upserts(&head_final, flush_each)?;
-            self.free_replaced_slabs(&stages, &moved_heads)?;
+            self.commit_staged_batch(&batch, flush_each)?;
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }
-        Ok((written, timing))
+        Ok((batch.written, timing))
+    }
+
+    /// Locate the durable head and home of every key the batch names. A key
+    /// not in the map is absent; a cold body (no prior creates) skips the gets.
+    fn seed_batch_heads(
+        &self,
+        recs: &[ScriptHashRecord],
+        order: &[usize],
+    ) -> Result<HashMap<[u8; 32], (ShHeadValue, KeyHome)>, StoreError> {
+        let mut heads = HashMap::new();
+        if self.entry_count() == 0 && self.head_is_empty() {
+            return Ok(heads);
+        }
+        let mut keys: Vec<[u8; 32]> = order
+            .iter()
+            .map(|&i| &recs[i])
+            .filter(|rec| !rec.create_tx_fk.is_null())
+            .map(|rec| rec.scripthash)
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        for key in keys {
+            if let Some((v, kh)) = self.locate_head(&key)? {
+                heads.insert(key, (v, KeyHome::from(kh)));
+            }
+        }
+        Ok(heads)
+    }
+
+    /// Pack one key's creates past its durable max into its body's stage.
+    /// Nothing is written to the body here.
+    fn stage_key_creates<'a>(
+        &'a self,
+        batch: &mut IngestBatch<'a>,
+        key: [u8; 32],
+        mut fk_vals: Vec<u64>,
+        cur: &ShHeadValue,
+        kh: KeyHome,
+    ) -> Result<(), StoreError> {
+        fk_vals.sort_unstable();
+        fk_vals.dedup();
+        let body = self.body_for(&key, kh);
+        let max = self.last_create_fk_on(body, cur)?;
+        let max_u = max.map(|f| f.0).unwrap_or(0);
+        let add: Vec<Fk> = fk_vals
+            .into_iter()
+            .filter(|&fk| max.is_none() || fk > max_u)
+            .map(Fk)
+            .collect();
+        if add.is_empty() {
+            return Ok(());
+        }
+        batch.written += add.len();
+        let alloc_mu = self.alloc_for(&key, kh);
+        let stage = batch
+            .stages
+            .entry(std::ptr::from_ref(body) as usize)
+            .or_insert_with(|| BodyStage {
+                body,
+                alloc: alloc_mu,
+                slabs: StagedSlabs::default(),
+                popped: false,
+            });
+        let frees_before = stage.slabs.frees.len();
+        let mut alloc = alloc_mu.lock().unwrap();
+        let free_before = alloc.free_head;
+        let new_val = self.append_sorted_creates(body, &mut alloc, cur, &add, &mut stage.slabs)?;
+        stage.popped |= alloc.free_head != free_before;
+        drop(alloc);
+        if stage.slabs.frees.len() > frees_before {
+            note_moved_head(self, &mut batch.moved_heads, &key, kh);
+        }
+        batch.head_final.push((key, new_val, kh));
+        Ok(())
+    }
+
+    /// Land a packed batch: payloads, alloc headers, heads, then the frees.
+    ///
+    /// A payload on a popped offset waits for a durable header that no longer
+    /// names it. A body that popped nothing writes its payloads before the
+    /// first barrier.
+    fn commit_staged_batch(
+        &self,
+        batch: &IngestBatch<'_>,
+        flush_each: bool,
+    ) -> Result<(), StoreError> {
+        for stage in batch.stages.values().filter(|s| !s.popped) {
+            stage.slabs.write_to(stage.body)?;
+        }
+        self.sync_bodies_for(&batch.head_final)?;
+        self.write_alloc_headers_for(&batch.head_final)?;
+        self.sync_bodies_for(&batch.head_final)?;
+        for stage in batch.stages.values().filter(|s| s.popped) {
+            stage.slabs.write_to(stage.body)?;
+            stage.body.sync_data_only()?;
+        }
+        self.apply_head_upserts(&batch.head_final, flush_each)?;
+        self.free_replaced_slabs(&batch.stages, &batch.moved_heads)
     }
 
     /// Link the slabs a class change replaced once the heads that named them
