@@ -358,6 +358,37 @@ async fn onion_seednode_reaches_socks_from_operator_config() {
     );
 }
 
+/// A task that fails once the node is running stops it through the shutdown
+/// tail, so the store flush still syncs a dirty scripthash index. Returning
+/// early skipped it and the next start was refused (#2138).
+#[tokio::test]
+async fn a_failed_task_mid_run_still_runs_the_shutdown_tail() {
+    let dir = rbitcoin_store::testutil::TempDir::new().unwrap();
+    let mut cfg = tiny_regtest(dir.path());
+    cfg.apply_kv("milestone", "0").unwrap();
+    cfg.apply_kv("listen", "0").unwrap();
+    cfg.apply_kv("max_inbound", "0").unwrap();
+    cfg.listen.use_seeds = false;
+    cfg.max_run_secs = Some(30);
+    cfg.validate().unwrap();
+    arm_fail_mempool_tasks(1);
+    rbitcoin_log::capture_logs(true);
+    let ran = tokio::time::timeout(Duration::from_secs(45), run_p2p(cfg))
+        .await
+        .expect("the failed task stops the run");
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let err = ran.expect_err("the failed task is the exit error");
+    assert!(err.to_string().contains("armed"), "{err}");
+    let flushed = lines
+        .iter()
+        .position(|(_, l)| l.contains("node: store flushed") || l.contains("node: flush warning"));
+    let tail = lines
+        .iter()
+        .position(|(_, l)| l.contains("node: shutdown steps"));
+    assert!(flushed.is_some() && tail.is_some(), "no tail in {lines:?}");
+}
+
 #[test]
 fn follow_dial_targets_keeps_i2p_connect() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};

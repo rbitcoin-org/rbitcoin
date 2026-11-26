@@ -1157,3 +1157,27 @@ fn unsynced_sh_writes_refuse_the_next_start_until_a_rebuild() {
     q.mark_sh_degraded("test");
     assert_eq!(q.sh_dirty_refusal(true), None, "degraded wipes at open");
 }
+
+/// A tip the shutdown flush must not seal (here a missing keep-window file)
+/// still lets it sync a dirty scripthash index, so the next start is not
+/// refused (#2138).
+#[test]
+fn a_refused_tip_seal_still_syncs_the_scripthash_index_at_shutdown() {
+    use rbitcoin_store::scripthash::sh_dirty_marked;
+    let (dir, q, _c, _key) = heavy_chain("sh-dirty-keep-miss");
+    q.set_prune_seqsigwit(true).unwrap();
+    let tip = q.tip_height().unwrap().0;
+    std::fs::remove_file(q.seqsigwit_spill_file(tip).unwrap()).unwrap();
+    drop(q.store().scripthash.begin_dirty_write().unwrap());
+    assert!(
+        q.flush_for_shutdown().is_err(),
+        "a missing keep file refuses the seal"
+    );
+    assert!(
+        !sh_dirty_marked(dir.path()),
+        "the scripthash sync was skipped"
+    );
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.sh_dirty_refusal(true), None);
+}

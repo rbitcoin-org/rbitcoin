@@ -350,10 +350,27 @@ pub fn spawn_fee_history_backfill(mempool: &Arc<MempoolHub>) {
     });
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static FAIL_MEMPOOL_TASKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Fail the next `n` [`mempool_blocking`] calls made on this thread, as a
+/// panicked task does.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fail_mempool_tasks(n: u32) {
+    FAIL_MEMPOOL_TASKS.with(|c| c.set(n));
+}
+
 pub async fn mempool_blocking<T: Send + 'static>(
     mp: &Arc<MempoolHub>,
     f: impl FnOnce(&MempoolHub) -> T + Send + 'static,
 ) -> Result<T, NodeError> {
+    #[cfg(debug_assertions)]
+    if FAIL_MEMPOOL_TASKS.with(|c| c.replace(c.get().saturating_sub(1)) > 0) {
+        return Err(NodeError::Config("mempool task: armed failure".into()));
+    }
     let mp = Arc::clone(mp);
     tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
@@ -1180,7 +1197,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             enter_tip_mode(&query, Some(cancel), shindex)
         })
         .await
-        .map_err(|e| NodeError::Config(format!("tip entry: {e}")))?;
+        .map_err(|e| NodeError::Config(format!("tip entry: {e}")));
+        // Closed gates: the shutdown tail still joins the write-behind and
+        // flushes the store.
+        let gates = shutdown.or_fail(gates);
         ensure_sh_writebehind(
             &mut sh_writebehind,
             Arc::clone(&node.hub.query),
@@ -1225,16 +1245,21 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     },
                 ));
             }
-            sync_tx_relay(&node, &config, &mempool).await?;
-            let mp_live = mempool_blocking(&mempool, MempoolHub::live_count).await?;
-            info!(
-                "node: catch-up complete tip={:?} — tip tracking + block/tx relay \
-                 (mempool live={}, shindex={}, sh_tip_ready={})",
-                node.tip_height(),
-                mp_live,
-                config.shindex,
-                sh_tip_ready
-            );
+            let live = match sync_tx_relay(&node, &config, &mempool).await {
+                Ok(()) => mempool_blocking(&mempool, MempoolHub::live_count).await,
+                Err(e) => Err(e),
+            };
+            match live {
+                Ok(mp_live) => info!(
+                    "node: catch-up complete tip={:?} — tip tracking + block/tx relay \
+                     (mempool live={}, shindex={}, sh_tip_ready={})",
+                    node.tip_height(),
+                    mp_live,
+                    config.shindex,
+                    sh_tip_ready
+                ),
+                Err(e) => shutdown.fail(e),
+            }
         } else if shutdown.requested() {
             warn!("node: tip entry interrupted — restart to resume");
         }
@@ -1379,7 +1404,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         node.peers.set_connect_addrs(config.listen.connect.clone());
         // Dial can leave IBD before the tip-follow loop. Relay has to match
         // that edge before Electrum binds.
-        sync_tx_relay(&node, &config, &mempool).await?;
+        shutdown.or_fail(sync_tx_relay(&node, &config, &mempool).await);
     }
 
     let (mut electrum_handles, mut electrum_bridge, electrum_onion) = shutdown.or_fail(
@@ -1669,7 +1694,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 deadline,
             )
             .await;
-            if finish_tip_follow_wake(
+            match finish_tip_follow_wake(
                 &node,
                 &config,
                 &mempool,
@@ -1677,20 +1702,30 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 &wake,
                 &shutdown,
             )
-            .await?
+            .await
             {
-                break;
+                Ok(false) => {}
+                Ok(true) => break,
+                Err(e) => {
+                    shutdown.fail(e);
+                    break;
+                }
             }
 
             if matches!(wake, TipFollowWake::Perf) {
-                if let Err(e) = mempool_blocking(&mempool, |mp| {
+                match mempool_blocking(&mempool, |mp| {
                     mp.publish_fee_floor();
                     mp.reattempt_unbroadcast_due();
                     mp.persist_due()
                 })
-                .await?
+                .await
                 {
-                    warn!("mempool persist_due: {e}");
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => warn!("mempool persist_due: {e}"),
+                    Err(e) => {
+                        shutdown.fail(e);
+                        break;
+                    }
                 }
                 log_settle_waits();
                 let mp = mempool.sample_reset_perf();
@@ -1702,7 +1737,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     .map(|s| (s.fee_checks.take_window().0, s.builds.take_window()));
                 let blks = std::mem::take(&mut window_blocks);
                 if log_enabled(Level::Debug, Category::Tip) {
-                    let live = mempool_blocking(&mempool, MempoolHub::live_count).await?;
+                    let live = match mempool_blocking(&mempool, MempoolHub::live_count).await {
+                        Ok(live) => live,
+                        Err(e) => {
+                            shutdown.fail(e);
+                            break;
+                        }
+                    };
                     let follow_live = node.follow_live_count();
                     let acc_avg = mp
                         .accept_us
@@ -1850,20 +1891,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
 
+    // Shutdown tail. Every step runs: a failed one is kept as the exit
+    // error, logged, and skipped past. First the writers stop. Then the saves
+    // run in order of what each costs to rebuild: the store (a dirty
+    // scripthash index is a full rebuild), the mempool (relay refills it),
+    // then the address book.
     let tail_start = Instant::now();
-    if let Ok(g) = shared_peers.lock() {
-        addrman.merge_from(&g);
-    }
-    if let Err(e) = addrman.save(&peers_path) {
-        warn!("peers: final save {}: {e}", peers_path.display());
-    } else {
-        info!(
-            "peers: saved {} address(es) to {}",
-            addrman.len(),
-            peers_path.display()
-        );
-    }
-
     for e in electrum_handles {
         e.shutdown().await;
     }
@@ -1903,12 +1936,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let writebehind = lap();
     // In-flight tip accepts hold the hub. Drain them before the store flush.
     let hub = std::sync::Arc::clone(&node.hub);
-    tokio::task::spawn_blocking(move || {
+    let idle = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
         hub.wait_tip_accept_idle();
     })
-    .await
-    .map_err(|e| NodeError::Config(format!("tip-accept idle: {e}")))?;
+    .await;
+    // The flush still takes the tip commit lock.
+    shutdown.or_fail(idle.map_err(|e| NodeError::Config(format!("tip-accept idle: {e}"))));
     let tip_accept = lap();
     // One spend checkpoint at the snapshot, then Class C. Not `Store::flush`.
     spend_sync.shutdown();
@@ -1921,14 +1955,31 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         info!("node: store flushed (shutdown-friendly)");
     }
     let store_flush = lap();
-    if let Err(e) = mempool_blocking(&mempool, |mp| mp.flush()).await? {
-        warn!("node: mempool flush warning: {e}");
-    } else {
-        let (gen, live) =
-            mempool_blocking(&mempool, |mp| (mp.generation(), mp.live_count())).await?;
-        info!("node: mempool flushed gen={gen} live={live}");
+    let flushed = mempool_blocking(&mempool, |mp| {
+        mp.flush().map(|()| (mp.generation(), mp.live_count()))
+    })
+    .await;
+    match flushed {
+        Ok(Ok((gen, live))) => info!("node: mempool flushed gen={gen} live={live}"),
+        Ok(Err(e)) => warn!("node: mempool flush warning: {e}"),
+        Err(e) => {
+            warn!("node: mempool flush warning: {e}");
+            shutdown.fail(e);
+        }
     }
     let mempool_flush = lap();
+    if let Ok(g) = shared_peers.lock() {
+        addrman.merge_from(&g);
+    }
+    if let Err(e) = addrman.save(&peers_path) {
+        warn!("peers: final save {}: {e}", peers_path.display());
+    } else {
+        info!(
+            "peers: saved {} address(es) to {}",
+            addrman.len(),
+            peers_path.display()
+        );
+    }
     node.shutdown().await;
     let peers = lap();
     info!(
@@ -3225,7 +3276,7 @@ pub async fn start_sv2_tp(
 }
 
 /// Result of post-IBD tip entry: follow/mempool gates vs Electrum SH gate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TipModeGates {
     /// Class A + spends ready: follow peers, tip loop, mempool tip-relay.
     pub tip_follow_ready: bool,
