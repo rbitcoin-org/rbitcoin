@@ -1,5 +1,5 @@
 //! A mark of whole 4 KiB images, and an append that stays off those pages.
-use rbitcoin_primitives::STORE_MAGIC;
+use rbitcoin_primitives::{SCHEMA_VERSION, STORE_MAGIC};
 use rbitcoin_store::page_guard::{
     append_past_end, arm_page_guard, clear_page_guard, restore_page_guard,
 };
@@ -110,7 +110,7 @@ fn missing_mark_leaves_the_mixed_page() {
     write_bytes(&live, 0, &mixed);
     let file = open_rw(&live);
     assert!(!restore_page_guard(&mark, &file, &live).unwrap());
-    clear_page_guard(&mark).unwrap();
+    clear_page_guard(&mark, &file, &live).unwrap();
     drop(file);
     assert_eq!(read_bytes(&live, 0, PAGE), mixed);
     assert!(!mark.exists());
@@ -144,6 +144,16 @@ fn a_mark_that_does_not_parse_is_not_absence() {
     assert!(matches!(err, StoreError::Corrupt(_)));
     drop(file);
     assert_eq!(read_bytes(&live, 0, PAGE), mixed);
+
+    raw[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    raw[6] = 1;
+    std::fs::write(&mark, &raw).unwrap();
+    let file = open_rw(&live);
+    let err = restore_page_guard(&mark, &file, &live).unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt(_)));
+    drop(file);
+    assert_eq!(read_bytes(&live, 0, PAGE), mixed);
+    assert!(mark.exists());
 }
 
 #[test]
@@ -160,6 +170,31 @@ fn arm_refuses_a_page_that_is_not_one_image() {
     let err = arm_page_guard(&mark, &[(0, &page), (0, &page)]).unwrap_err();
     assert!(matches!(err, StoreError::Corrupt(_)));
     assert!(!mark.exists());
+}
+
+#[test]
+fn arm_refuses_a_second_mark_and_a_bare_name() {
+    let dir = TempDir::labeled("page-guard-twice").unwrap();
+    let mark = dir.path().join("guard");
+    let live = dir.path().join("live");
+    let page = fill(0x01);
+    arm_page_guard(&mark, &[(0, &page)]).unwrap();
+    let before = std::fs::read(&mark).unwrap();
+    let err = arm_page_guard(&mark, &[(0, &page)]).unwrap_err();
+    assert!(matches!(err, StoreError::Rejected(_)));
+    assert_eq!(std::fs::read(&mark).unwrap(), before);
+
+    let bare = Path::new("page-guard-bare-name");
+    let _ = std::fs::remove_file(bare);
+    let err = arm_page_guard(bare, &[(0, &page)]).unwrap_err();
+    assert!(matches!(err, StoreError::Rejected(_)));
+    assert!(!bare.exists());
+    let file = open_rw(&live);
+    let err = clear_page_guard(bare, &file, &live).unwrap_err();
+    assert!(matches!(err, StoreError::Rejected(_)));
+    let err = restore_page_guard(bare, &file, &live).unwrap_err();
+    assert!(matches!(err, StoreError::Rejected(_)));
+    assert!(!bare.exists());
 }
 
 #[test]
