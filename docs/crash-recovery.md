@@ -87,12 +87,12 @@ pack mark, and its keys stay in ingest or overflow until then. A start with
 `--sh-index` that finds the file refuses and names the fix:
 `RBITCOIN_SH_FORCE_REBUILD=1` (or the `scripthash.rebuild` and degraded
 markers) wipes the index at open and removes the file, or start without
-`--sh-index`. A same-class scripthash slab rewritten in place can still tear
-([#2074](https://github.com/rbitcoin-org/rbitcoin/issues/2074)). An undo
-restore of one head word can tear the neighbor slots on that page
-([#2132](https://github.com/rbitcoin-org/rbitcoin/issues/2132)). Until
-those are closed, the whole-store guarantee is the guarded state above, not
-every row. There is also no clean-close gate and no whole-store snapshot, so a
+`--sh-index`. An unlink undo restore of one scripthash head word writes a
+synced `*.ahead` image of that head page first, so a torn page comes back
+with its neighbor slots. A same-class scripthash slab rewritten in place can
+still tear ([#2074](https://github.com/rbitcoin-org/rbitcoin/issues/2074)).
+Until that is closed, the whole-store guarantee is the guarded state above,
+not every row. There is also no clean-close gate and no whole-store snapshot, so a
 Class B/C decode error after a crash can be crash damage rather than a
 hardware fault: the scripthash path marks the index degraded and rebuilds,
 while a Class A read error stops open. A design that needs one auditable
@@ -181,6 +181,10 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   page is rewritten, then the head moves. Old pages are freed only after that.
   If clearing the undo fails, the saved page and the old head word are written
   back. A crash does the same restore, so the same disconnect can run again.
+  The head word goes back behind a synced image of its head page (main
+  `.val`, ingest, sealed overflow, or L1), which open restores before the
+  undo replays. Each free-list link is synced before the alloc header that
+  names it.
   A non-suffix unlink writes the replacement, syncs those bytes and the new
   heads once for the whole disconnect, then frees the old pages.
   A full-list unlink does not sync the empty head until the tip shrink is durable.

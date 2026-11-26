@@ -236,7 +236,7 @@ itself changed.
     tear_guard/first                 # one sealed 4 KiB image per Class A stem, written once after that page is full. No SCHEMA_VERSION bump
     tear_guard/tail.0                # alternating partial-tail image and published lengths (generation 0 = unused). No SCHEMA_VERSION bump
     tear_guard/tail.1                # the other tail slot. No SCHEMA_VERSION bump
-    *.ahead                          # transient write-ahead page image for confirmed, header_txs_*, header.head, txstat.body, scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. No SCHEMA_VERSION bump
+    *.ahead                          # transient write-ahead page image for confirmed, header_txs_*, header.head, txstat.body, scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. An unlink undo restore of one scripthash head word leaves the same image beside the main `.val`, sealed overflow, or L1 `.val` file it writes until that write is synced; open restores it, never past the file's length, and writing a new head file at that path removes it. No SCHEMA_VERSION bump
     scripthash.rebuild               # optional: one byte. The next start wipes and rebuilds the scripthash index; removed when that rebuild finishes. No SCHEMA_VERSION bump
     scripthash.dirty                 # optional: one byte while scripthash writes may be unsynced. A --sh-index start that finds it refuses; a wipe removes it. No SCHEMA_VERSION bump
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
