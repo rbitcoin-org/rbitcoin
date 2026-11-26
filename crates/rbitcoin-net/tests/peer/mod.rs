@@ -11215,13 +11215,26 @@ fn getcfilters_parks_the_rest_after_the_filter_that_crosses_the_send_budget() {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(on_compact_filters(
-            NetworkMessage::GetCFilters(req),
-            &hub,
-            &tx,
-            &mut follow,
-            Some(peer.as_ref()),
-        ))
+        .block_on(async {
+            on_compact_filters(
+                NetworkMessage::GetCFilters(req.clone()),
+                &hub,
+                &tx,
+                &mut follow,
+                Some(peer.as_ref()),
+            )
+            .await?;
+            // A second request already decoded behind the first waits
+            // unbuilt, so the session holds one request's replies.
+            on_compact_filters(
+                NetworkMessage::GetCFilters(req),
+                &hub,
+                &tx,
+                &mut follow,
+                Some(peer.as_ref()),
+            )
+            .await
+        })
         .unwrap();
     assert!(peer.send_over_budget());
     let mut n = 0usize;
@@ -11235,7 +11248,7 @@ fn getcfilters_parks_the_rest_after_the_filter_that_crosses_the_send_budget() {
     assert_eq!(
         follow.cfilter_tail.len(),
         tip_h as usize,
-        "the rest of the range is parked"
+        "the rest of the first range is parked, and nothing of the second"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
