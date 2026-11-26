@@ -2235,7 +2235,7 @@ impl Store {
             |log| {
                 {
                     use std::sync::atomic::Ordering;
-                    let _g = hold_view(publish, view);
+                    let g = hold_view(publish, view);
                     let tip = confirmed.tip_height().map(|h| h.0).unwrap_or(height);
                     let seen = reorgs.load(Ordering::Acquire);
                     let disconnected = filtered.load(Ordering::Acquire) != seen;
@@ -2243,7 +2243,7 @@ impl Store {
                     filtered.store(seen, Ordering::Release);
                     // The appender is held off until this sync and the
                     // spent.ovf clear both finish. A later append arms again.
-                    spenders.sync_data_only()?;
+                    spenders.sync_data_only(&crate::spender_table::SpenderFreeze::new(&g))?;
                 }
                 let named = txs.settled_count();
                 txs.sync_class_a_named(named)?;
@@ -2367,10 +2367,6 @@ impl Store {
         after_first_read(self);
         let Some(height) = self.spend_snapshot_height() else {
             let tip = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
-            {
-                let _g = self.hold_utxo_view();
-                self.spenders.sync_data_only()?;
-            }
             self.publish_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
             return Ok(());
         };
@@ -2532,8 +2528,9 @@ impl Store {
         self.headers.flush()?;
         self.txs.flush()?;
         {
-            let _g = self.hold_utxo_view();
-            self.spenders.flush()?;
+            let g = self.hold_utxo_view();
+            self.spenders
+                .flush(&crate::spender_table::SpenderFreeze::new(&g))?;
         }
         self.scripthash.flush()?;
         self.flush_class_c_tip()?;

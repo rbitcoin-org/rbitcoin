@@ -33,7 +33,10 @@ fn append_get_chain() {
     ));
     assert!(matches!(t.get(Fk::NULL), Err(StoreError::InvalidFk)));
     assert!(matches!(t.get(Fk(99)), Err(StoreError::NotFound)));
-    t.flush().unwrap();
+    let freeze_dir = rbitcoin_store::testutil::TempDir::labeled("spender-freeze").unwrap();
+    let freeze = Store::create_tiny(freeze_dir.path()).unwrap();
+    let g = freeze.hold_utxo_view();
+    t.flush(&SpenderFreeze::new(&g)).unwrap();
     t.flush_async().unwrap();
     drop(t);
     let t = SpenderTable::open(&dir).unwrap();
@@ -91,7 +94,11 @@ fn open_renames_leftover_spenders_body_to_spent_ovf() {
     {
         let t = SpenderTable::create(&dir).unwrap();
         t.append(Fk(7), 9, Fk::NULL).unwrap();
-        t.flush().unwrap();
+        let freeze_dir =
+            rbitcoin_store::testutil::TempDir::labeled("spender-legacy-freeze").unwrap();
+        let freeze = Store::create_tiny(freeze_dir.path()).unwrap();
+        let g = freeze.hold_utxo_view();
+        t.flush(&SpenderFreeze::new(&g)).unwrap();
     }
     std::fs::rename(dir.join("spent.ovf"), dir.join("spenders.body")).unwrap();
     assert!(!dir.join("spent.ovf").exists());
@@ -200,7 +207,10 @@ fn torn_spent_ovf_reopens_as_the_pre_append_pages() {
         for i in 1..=committed {
             s.spenders.append(Fk(i), i as u32, Fk::NULL).unwrap();
         }
-        s.spenders.sync_data_only().unwrap();
+        {
+            let g = s.hold_utxo_view();
+            s.spenders.sync_data_only(&SpenderFreeze::new(&g)).unwrap();
+        }
         assert!(!mark.exists(), "sync clears the spent.ovf mark");
         assert_eq!(s.spenders.count(), committed);
         kept = s.spenders.get(Fk(committed)).unwrap();
@@ -234,4 +244,33 @@ fn torn_spent_ovf_reopens_as_the_pre_append_pages() {
     assert_eq!(page_at(&ovf, 0), pre_page0);
     assert_eq!(page_at(&ovf, tail_off), pre_tail);
     assert_ne!(page_at(&ovf, 0), vec![0xffu8; PAGE]);
+}
+
+/// A sync that returns an error leaves the mark. A later sync that would
+/// otherwise succeed still leaves it: a retried fsync can return 0 after
+/// the kernel dropped the dirty pages.
+#[test]
+fn failed_spent_ovf_sync_leaves_the_mark_armed() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-latch").unwrap();
+    let path = dir.path().to_path_buf();
+    let mark = path.join("guard/spent.ovf");
+    let s = Store::create_tiny(&path).unwrap();
+    s.spenders.append(Fk(1), 1, Fk::NULL).unwrap();
+    assert!(mark.is_file(), "the first append arms");
+    let handle = s.spenders.body.io_handle();
+    rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
+    let g = s.hold_utxo_view();
+    let freeze = SpenderFreeze::new(&g);
+    let err = s.spenders.sync_data_only(&freeze).unwrap_err();
+    assert!(mark.is_file(), "a failed sync leaves the mark: {err}");
+    let err = s.spenders.sync_data_only(&freeze).unwrap_err();
+    assert!(
+        mark.is_file(),
+        "a retry must not clear the mark after a failed sync: {err}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("earlier spent.ovf sync failed"),
+        "the retry must be the latch, got {msg}"
+    );
 }
