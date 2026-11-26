@@ -1872,7 +1872,10 @@ impl LivePeer {
         {
             crate::OnlyNet::Onion.label()
         } else {
-            self.net.network_label()
+            let cjdns_reachable = hub
+                .as_ref()
+                .is_some_and(|h| h.cjdns_reachable.load(Ordering::Relaxed));
+            self.net.peer_network_label(cjdns_reachable)
         };
         PeerInfo {
             id: self.id,

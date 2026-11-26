@@ -7322,6 +7322,50 @@ fn getpeerinfo_and_disconnectnode_support_onion_addr() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn getpeerinfo_uses_the_network_class_of_the_socket_address() {
+    use rbitcoin_net::{PeerConnType, PeerHub};
+
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    let bind = "127.0.0.1:18445".parse().unwrap();
+    let not_public = "not_publicly_routable";
+    let cjdns = "[fc00::1]:18444";
+    let cases = [
+        ("127.0.0.1:18444", not_public),
+        ("192.168.1.5:18444", not_public),
+        ("[::1]:18444", not_public),
+        ("[fd42::1]:18444", not_public),
+        ("[fe80::1]:18444", not_public),
+        ("[::ffff:192.168.1.6]:18444", not_public),
+        ("1.2.3.4:18444", "ipv4"),
+        ("[2606:4700::1]:18444", "ipv6"),
+        ("[64:ff9b::102:304]:18444", "ipv4"),
+        ("[::ffff:0:102:304]:18444", "ipv4"),
+        ("[2002:102:304::1]:18444", "ipv4"),
+        ("[2001:0:1:2:3:4:fefd:fcfb]:18444", "ipv4"),
+        (cjdns, not_public),
+    ];
+    for (addr, _) in cases {
+        hub.register_connecting(addr.parse().unwrap(), bind, true, PeerConnType::Inbound);
+    }
+    ctx.peers = Some(Arc::clone(&hub));
+
+    let info = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+    let rows = info.as_array().unwrap();
+    assert_eq!(rows.len(), cases.len());
+    for (row, (addr, class)) in rows.iter().zip(cases) {
+        assert_eq!(row["network"], class, "{addr}: {row}");
+    }
+
+    hub.set_cjdns_reachable(true);
+    let info = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+    let row = info.as_array().unwrap().last().unwrap();
+    assert_eq!(row["addr"], cjdns);
+    assert_eq!(row["network"], "cjdns");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A `--proxy` name session lists its name as `addr`, and `disconnectnode`
 /// takes that `addr` back, as Core matches the name a peer was added by.
 #[test]
@@ -7345,6 +7389,7 @@ fn disconnectnode_takes_the_addr_of_a_proxied_name() {
 
     let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
     assert_eq!(r[0]["addr"], json!("peer.example:8333"));
+    assert_eq!(r[0]["network"], "not_publicly_routable");
     dispatch(&ctx, "disconnectnode", vec![json!("peer.example:8333")]).unwrap();
     assert_eq!(dispatch(&ctx, "getpeerinfo", vec![]).unwrap(), json!([]));
     let _ = std::fs::remove_dir_all(&dir);

@@ -236,6 +236,7 @@ async fn tor_onion_two_node_v2() {
             .iter()
             .find(|p| p["addrbind"] == direct.to_string())
             .expect("ordinary inbound peer");
+        assert_eq!(direct_peer["network"], "not_publicly_routable", "{live}");
         assert_eq!(direct_peer["permissions"], json!(["relay"]), "{live}");
     })
     .await;

@@ -686,7 +686,7 @@ lock on the progress registry. NixOS:
 | `rbitcoin_tip_age_seconds` | gauge | Seconds since `getblockchaininfo.time` |
 | `rbitcoin_difficulty` | gauge | `getblockchaininfo.difficulty` |
 | `rbitcoin_connections{direction="in"\|"out"}` | gauge | `getnetworkinfo.connections_in` / `connections_out` |
-| `rbitcoin_peers{network}` | gauge | Count of `getpeerinfo` rows for `ipv4`, `ipv6`, `onion`, `i2p`, `cjdns` |
+| `rbitcoin_peers{network}` | gauge | Count of `getpeerinfo` rows for `ipv4`, `ipv6`, `onion`, `i2p`, `cjdns`, `not_publicly_routable` |
 | `rbitcoin_peer_time_offset_seconds` | gauge | `getnetworkinfo.timeoffset` |
 | `rbitcoin_network_receive_bytes_total` / `_transmit_bytes_total` | counter | `getnettotals.totalbytesrecv` / `totalbytessent` |
 | `rbitcoin_mempool_transactions` | gauge | `getmempoolinfo.size` |

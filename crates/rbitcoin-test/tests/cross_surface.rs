@@ -357,7 +357,14 @@ async fn pin_metrics_equal_rpc(
         m["rbitcoin_tip_age_seconds"]
     );
     let peer_rows = peers.as_array().expect("getpeerinfo array");
-    for network in ["ipv4", "ipv6", "onion", "i2p", "cjdns"] {
+    for network in [
+        "ipv4",
+        "ipv6",
+        "onion",
+        "i2p",
+        "cjdns",
+        "not_publicly_routable",
+    ] {
         let want = peer_rows.iter().filter(|p| p["network"] == network).count() as f64;
         let series = format!("rbitcoin_peers{{network=\"{network}\"}}");
         assert_eq!(m.get(&series), Some(&want), "{series}: {m:?}");
@@ -3891,7 +3898,7 @@ async fn onion_listener_separates_source_ip_grants() {
         for ((bind, socket), network) in [direct, onion]
             .into_iter()
             .zip(sockets)
-            .zip(["ipv4", "onion"])
+            .zip(["not_publicly_routable", "onion"])
         {
             let row = rows
                 .iter()
@@ -3909,6 +3916,7 @@ async fn onion_listener_separates_source_ip_grants() {
                 1.0
             );
         }
+        assert_eq!(samples["rbitcoin_peers{network=\"ipv4\"}"], 0.0);
     }
     let rows = info["result"].as_array().unwrap();
     for (bind, expected) in [(direct, json!(["relay"])), (onion, json!(["addr"]))] {

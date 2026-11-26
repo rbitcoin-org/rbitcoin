@@ -49,6 +49,18 @@ client refuses to start below a newer floor. Bark's captaind requires
 `310000` because Core 31 added the `getmempoolentry` chunk fields, which
 this node already returns.
 
+## `getpeerinfo.network`
+
+A connection accepted on an implicit native Tor listener or an explicit
+`=onion` listener reports `onion` as soon as it appears in `getpeerinfo`,
+including before VERSION.
+`addr` and `addrbind` still report the TCP source and listening endpoint.
+
+Ordinary non-public IP peers and SOCKS-resolved names with no known IP
+report `not_publicly_routable`. Routable IPv6 addresses with a linked IPv4
+address, such as well-known NAT64 addresses, report `ipv4`. TCP peers from
+`fc00::/8` report `cjdns` when CJDNS is enabled.
+
 ## Operator knobs
 
 | Knob | Default | Meaning |

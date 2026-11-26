@@ -88,7 +88,11 @@ pub fn render(status: &NodeStatus) -> String {
             "gauge",
             "Peer connections by network (getpeerinfo.network).",
         );
-        for network in ["ipv4", "ipv6", "onion", "i2p", "cjdns"] {
+        for network in rbitcoin_net::OnlyNet::ALL
+            .into_iter()
+            .map(rbitcoin_net::OnlyNet::label)
+            .chain([rbitcoin_net::netaddr::NOT_PUBLICLY_ROUTABLE])
+        {
             let n = rows.iter().filter(|p| p.network == network).count();
             out.sample("rbitcoin_peers", &format!("{{network=\"{network}\"}}"), n);
         }
