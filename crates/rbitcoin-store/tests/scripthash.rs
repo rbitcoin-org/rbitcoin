@@ -2178,6 +2178,117 @@ fn extent_ingest_torn_tail_restores_on_open() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn slab_off_of(t: &ScriptHashTable, sh: &[u8; 32]) -> u64 {
+    match t.head_value(sh).unwrap() {
+        Some(ShHeadValue::Slab { off, .. }) => off,
+        other => panic!("expected a slab, got {other:?}"),
+    }
+}
+
+fn fks_of(t: &ScriptHashTable, sh: &[u8; 32]) -> Vec<u64> {
+    t.entries(sh).unwrap().iter().map(|(fk, _)| fk.0).collect()
+}
+
+/// The free-list link after a non-suffix unlink is synced before the header
+/// names it. The batch's second body sync follows the frees.
+#[test]
+fn unlink_batch_syncs_freed_links_before_the_header() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0xd1]);
+    assert_eq!(put_create_batch(&t, [rec(sh, 1, 0), rec(sh, 2, 0), rec(sh, 3, 0)]), 3);
+    let old = slab_off_of(&t, &sh);
+    let handle = t.ovf_file().io_handle();
+    rbitcoin_store::io_handle::arm_fail_sync_after(handle, 1, 1);
+    let out = t.unlink_creates_batch(&[(sh, vec![Fk(2)])]);
+    rbitcoin_store::io_handle::disarm_sync(handle);
+    let free = read_alloc_header(t.ovf_file()).unwrap().0.free_head;
+    assert!(!free.contains(&old), "header names a link before its sync: {out:?}");
+    assert!(matches!(out, Err(StoreError::Io { .. })), "{out:?}");
+    assert_eq!(fks_of(&t, &sh), vec![1, 3], "the failure must follow the head");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A deferred empty head frees its slab, syncs the link, then the header names it.
+#[test]
+fn deferred_empty_syncs_the_freed_link_before_the_header() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0xd2]);
+    assert_eq!(put_create_batch(&t, [rec(sh, 1, 0), rec(sh, 2, 0)]), 2);
+    let old = slab_off_of(&t, &sh);
+    t.unlink_creates_batch(&[(sh, vec![Fk(1), Fk(2)])])
+        .unwrap();
+    let handle = t.ovf_file().io_handle();
+    rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
+    let out = t.commit_deferred_empty_heads();
+    rbitcoin_store::io_handle::disarm_sync(handle);
+    let free = read_alloc_header(t.ovf_file()).unwrap().0.free_head;
+    assert!(!free.contains(&old), "header names a link before its sync: {out:?}");
+    assert!(matches!(out, Err(StoreError::Io { .. })), "{out:?}");
+    assert!(t.entries(&sh).unwrap().is_empty(), "the failure must follow the head");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A suffix unlink that drops a whole tail page syncs that page's link before
+/// the header names it. The two tail commits take the first eight body syncs.
+#[test]
+fn suffix_unlink_syncs_dropped_page_links_before_the_header() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let n = (SH_PAGE_STREAM_MAX as u64).saturating_mul(2) + 100;
+    let mut sh = [0u8; 32];
+    sh[0] = 0xd3;
+    let ents: Vec<_> = (1..=n).map(Fk).collect();
+    let mut session = t.pack_shard_session(0).unwrap();
+    push_chain(&mut session, sh, &ents);
+    seal_session(&t, 0, session);
+    let last = match t.head_value(&sh).unwrap() {
+        Some(ShHeadValue::Extent { last_page }) => last_page,
+        other => panic!("expected an extent, got {other:?}"),
+    };
+    let fks: Vec<_> = ((n - 149)..=n).map(Fk).collect();
+    let handle = t.body().io_handle();
+    rbitcoin_store::io_handle::arm_fail_sync_after(handle, 8, 1);
+    let out = t.unlink_creates_batch(&[(sh, fks)]);
+    rbitcoin_store::io_handle::disarm_sync(handle);
+    let free = read_alloc_header(t.body()).unwrap().0.free_head;
+    assert_ne!(
+        free[SH_PAGE_SLAB_CLASS as usize], last,
+        "header names a dropped page before its link sync: {out:?}"
+    );
+    assert!(matches!(out, Err(StoreError::Io { .. })), "{out:?}");
+    assert_eq!(fks_of(&t, &sh).len() as u64, n - 150, "the failure must follow the head");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Undo recovery frees the saved image page, syncs that link, then the header
+/// names it. Restoring the page and clearing the undo take the first two syncs.
+#[test]
+fn undo_recovery_syncs_the_image_link_before_the_header() {
+    use rbitcoin_store::scripthash::unlink::read_undo;
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0xd4]);
+    let many: Vec<_> = (1..=300u64).map(|i| rec(sh, i, 0)).collect();
+    t.put_create_batch_append(&many).unwrap();
+    t.test_tear_extent_tail(&sh).unwrap();
+    let image = read_undo(t.ovf_file()).unwrap().unwrap().image;
+    let handle = t.ovf_file().io_handle();
+    rbitcoin_store::io_handle::arm_fail_sync_after(handle, 2, 1);
+    let out = t.recover_unlink_undos();
+    rbitcoin_store::io_handle::disarm_sync(handle);
+    let free = read_alloc_header(t.ovf_file()).unwrap().0.free_head;
+    assert_ne!(
+        free[SH_PAGE_SLAB_CLASS as usize], image,
+        "header names the image before its link sync: {out:?}"
+    );
+    assert!(matches!(out, Err(StoreError::Io { .. })), "{out:?}");
+    assert!(read_undo(t.ovf_file()).unwrap().is_none());
+    assert_eq!(t.entries(&sh).unwrap().len(), 300);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn page_freelist_is_acyclic(t: &ScriptHashTable, sh: &[u8; 32]) -> bool {
     let home = t.key_home(sh).unwrap();
     let body = t.body_for(sh, home);
