@@ -3,7 +3,7 @@ crates/rbitcoin-mempool/src/store.rs	write_all	10
 crates/rbitcoin-store/src/address_head.rs	set_len	1
 crates/rbitcoin-store/src/address_head.rs	write_at	1
 crates/rbitcoin-store/src/array_table.rs	pwrite_all	2
-crates/rbitcoin-store/src/array_table.rs	truncate	3
+crates/rbitcoin-store/src/array_table.rs	truncate	1
 crates/rbitcoin-store/src/array_table.rs	write_at	2
 crates/rbitcoin-store/src/block_filter.rs	write_at_pwrite	4
 crates/rbitcoin-store/src/bulk_io.rs	pwrite	1
@@ -38,7 +38,8 @@ crates/rbitcoin-store/src/integrity.rs	truncate	1
 crates/rbitcoin-store/src/io_handle.rs	pwrite	2
 crates/rbitcoin-store/src/io_session_pool.rs	pwrite	1
 crates/rbitcoin-store/src/loc_table.rs	write_uncommitted	3
-crates/rbitcoin-store/src/page_guard.rs	handle_pwrite_all	2
+crates/rbitcoin-store/src/page_guard.rs	handle_pwrite_all	3
+crates/rbitcoin-store/src/page_guard.rs	truncate	1
 crates/rbitcoin-store/src/scripthash.rs	write_at	7
 crates/rbitcoin-store/src/scripthash_head.rs	write_at	3
 crates/rbitcoin-store/src/scripthash_head.rs	zero_range	1

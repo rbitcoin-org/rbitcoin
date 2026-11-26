@@ -237,8 +237,11 @@ itself changed.
     tear_guard/tail.0                # alternating partial-tail image and published lengths (generation 0 = unused). No SCHEMA_VERSION bump
     tear_guard/tail.1                # the other tail slot. No SCHEMA_VERSION bump
     tear_guard/armed                 # schema 31: the Class A slot generation open restores. Absent means no Class A tear is in flight. Published by the first arm, after meta 31 is synced
+    guard/class_c                    # schema 31 sidecar: forward 4 KiB images for confirmed[], header_txs first+count, and strong_tx. One mark per flush group. Open copies every named image before any Class C read. Published after meta 31. No SCHEMA_VERSION bump
+    guard/header.body                # schema 31 sidecar: forward 4 KiB images for header.body (including header.body.grow). Open copies them before any header body read. Published after meta 31. No SCHEMA_VERSION bump
+    guard/header.head                # schema 31 sidecar: forward 4 KiB images for one header.head generation and its .mlt. Open copies both before any head read. Published after meta 31. No SCHEMA_VERSION bump
 
-    *.ahead                          # transient write-ahead page image for confirmed, header_txs_*, header.head, txstat.body, scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. No SCHEMA_VERSION bump
+    *.ahead                          # transient write-ahead page image for txstat.body and scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. No SCHEMA_VERSION bump
     scripthash.rebuild               # optional: one byte. The next start wipes and rebuilds the scripthash index; removed when that rebuild finishes. No SCHEMA_VERSION bump
     scripthash.dirty                 # optional: one byte while scripthash writes may be unsynced. A --sh-index start that finds it refuses; a wipe removes it. No SCHEMA_VERSION bump
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked

@@ -1,10 +1,43 @@
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::file::{self, TableFile, FILE_HEADER_LEN};
 use crate::hashhead::{initial_slots_for, HashHead, HeadScale};
+use crate::page_guard::{self, PAGE};
 use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rbitcoin_primitives::{bytes, le_i32, le_u32, le_u64, Fk, TableKind};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
+
+#[cfg(debug_assertions)]
+mod flush_hold {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    use crate::array_table::TipFlushHold;
+
+    thread_local! {
+        static HOLD: RefCell<Option<Arc<TipFlushHold>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn bind(hold: Option<Arc<TipFlushHold>>) {
+        HOLD.with(|slot| *slot.borrow_mut() = hold);
+    }
+
+    pub(super) fn wait() {
+        let Some(hold) = HOLD.with(|slot| slot.borrow().clone()) else {
+            return;
+        };
+        hold.wait_while_set();
+    }
+}
+
+/// Pause [`HeaderTable::flush`] while `put_lock` is still held, after the
+/// live write and before the mark is gone.
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn bind_header_flush_hold(hold: Option<std::sync::Arc<crate::array_table::TipFlushHold>>) {
+    flush_hold::bind(hold);
+}
 
 pub const HEADER_HEAD_DIR_REFUSE: &str =
     "header.head is a shard directory; wipe header.head and header.body and reindex";
@@ -282,6 +315,8 @@ impl HeaderTable {
     }
 
     pub fn open_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
+        page_guard::restore_store_group(dir, page_guard::HEADER_BODY_MARK)?;
+        page_guard::restore_store_group(dir, page_guard::HEADER_HEAD_MARK)?;
         let body = TableFile::open(dir.join("header.body"), TableKind::Header)?;
         let body_len = body.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         if body_len % HEADER_RECORD_LEN as u64 != 0 {
@@ -350,9 +385,21 @@ impl HeaderTable {
             blob.extend_from_slice(&raw[..HEADER_RECORD_LEN]);
         }
         let new_len = FILE_HEADER_LEN as u64 + n * HEADER_RECORD_LEN as u64;
+        let pages = compose_body_pages(&dst, FILE_HEADER_LEN as u64, &blob, new_len)?;
+        let name = page_guard::guard_file_name(&grow)?;
+        let refs: Vec<(&str, u64, &[u8])> = pages
+            .iter()
+            .map(|(off, image)| (name, *off, image.as_slice()))
+            .collect();
+        page_guard::arm_store_group(dir, page_guard::HEADER_BODY_MARK, &refs)?;
         dst.write_at(FILE_HEADER_LEN as u64, &blob)?;
         dst.set_logical_len(new_len)?;
         dst.flush()?;
+        page_guard::clear_page_guard(
+            &dir.join(page_guard::HEADER_BODY_MARK),
+            &dst.read_file,
+            dst.path(),
+        )?;
         drop(dst);
         drop(src);
         std::fs::rename(&grow, &path).map_err(|e| StoreError::io(&path, e))?;
@@ -422,10 +469,26 @@ impl HeaderTable {
             blob.extend_from_slice(&rec.encode());
             head_entries.push((rec.hash, *fk));
         }
+        let new_len = offset.saturating_add(blob.len() as u64);
+        let pages = compose_body_pages(&self.body, offset, &blob, new_len)?;
+        let Some(dir) = self.body.path().parent() else {
+            return Err(StoreError::Rejected("page guard mark has no directory"));
+        };
+        let name = page_guard::guard_file_name(self.body.path())?;
+        let refs: Vec<(&str, u64, &[u8])> = pages
+            .iter()
+            .map(|(off, image)| (name, *off, image.as_slice()))
+            .collect();
+        page_guard::arm_store_group(dir, page_guard::HEADER_BODY_MARK, &refs)?;
         self.body.write_at(offset, &blob)?;
         // Head insert fdatasyncs. The body must be durable first so a crash
         // cannot leave header.head naming an fk above the durable row count.
         self.body.sync_data_only()?;
+        page_guard::clear_page_guard(
+            &dir.join(page_guard::HEADER_BODY_MARK),
+            &self.body.read_file,
+            self.body.path(),
+        )?;
         self.count
             .store(base.saturating_add(fresh.len() as u64), Ordering::Release);
         self.head.insert_many(&head_entries)?;
@@ -539,14 +602,68 @@ impl HeaderTable {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
+        let _g = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.body.flush()?;
         self.head.flush()?;
+        #[cfg(debug_assertions)]
+        flush_hold::wait();
         Ok(())
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
+        let _g = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.body.flush_async()?;
         self.head.flush_async()?;
         Ok(())
     }
+}
+
+fn compose_body_pages(
+    body: &TableFile,
+    offset: u64,
+    blob: &[u8],
+    new_logical: u64,
+) -> Result<Vec<(u64, [u8; PAGE as usize])>, StoreError> {
+    let old_logical = body.logical_len();
+    let mut pages = BTreeSet::new();
+    if new_logical != old_logical {
+        pages.insert(0u64);
+    }
+    if !blob.is_empty() {
+        let first = (offset / PAGE) * PAGE;
+        let last = ((offset + blob.len() as u64 - 1) / PAGE) * PAGE;
+        let mut page = first;
+        while page <= last {
+            pages.insert(page);
+            page += PAGE;
+        }
+    }
+    let mut images = Vec::with_capacity(pages.len());
+    for page in pages {
+        let mut image = [0u8; PAGE as usize];
+        if page < old_logical {
+            let n = ((old_logical - page) as usize).min(PAGE as usize);
+            body.pread_all(page, &mut image[..n])?;
+        }
+        if page == 0 {
+            image[..FILE_HEADER_LEN]
+                .copy_from_slice(&file::encode_leading_header(TableKind::Header, new_logical));
+        }
+        overlay_bytes(&mut image, page, offset, blob);
+        images.push((page, image));
+    }
+    Ok(images)
+}
+
+fn overlay_bytes(image: &mut [u8; PAGE as usize], page: u64, off: u64, bytes: &[u8]) {
+    let end = off.saturating_add(bytes.len() as u64);
+    let lo = off.max(page);
+    let hi = end.min(page + PAGE);
+    if lo >= hi {
+        return;
+    }
+    let src = (lo - off) as usize;
+    let dst = (lo - page) as usize;
+    let n = (hi - lo) as usize;
+    image[dst..dst + n].copy_from_slice(&bytes[src..src + n]);
 }
