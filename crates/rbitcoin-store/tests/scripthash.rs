@@ -2289,6 +2289,146 @@ fn undo_recovery_syncs_the_image_link_before_the_header() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Zero the 4 KiB page of `path` that holds `off`, as a torn in-place write
+/// can leave it.
+fn tear_head_page(path: &std::path::Path, off: u64) {
+    use std::io::{Seek, SeekFrom, Write};
+    let block = off & !4095;
+    let len = std::fs::metadata(path).unwrap().len();
+    let n = len.saturating_sub(block).min(4096) as usize;
+    let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.seek(SeekFrom::Start(block)).unwrap();
+    f.write_all(&vec![0u8; n]).unwrap();
+}
+
+/// Arm the undo for `sh`, fail the head sync inside the head-word restore,
+/// tear that head page, and reopen.
+fn reopen_after_torn_head_word_restore(
+    dir: &std::path::Path,
+    t: ScriptHashTable,
+    sh: &[u8; 32],
+    head_file: impl Fn(&ScriptHashTable, u16) -> (PathBuf, rbitcoin_store::io_handle::IoHandle),
+) -> (ScriptHashTable, Result<(), StoreError>) {
+    use rbitcoin_store::scripthash::unlink::read_undo;
+    t.test_tear_extent_tail(sh).unwrap();
+    let home = t.key_home(sh).unwrap();
+    let word = read_undo(t.body_for(sh, home)).unwrap().unwrap().word.unwrap();
+    let (path, handle) = head_file(&t, word.index);
+    rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
+    let out = t.recover_unlink_undos();
+    rbitcoin_store::io_handle::disarm_sync(handle);
+    drop(t);
+    tear_head_page(&path, word.off);
+    match ScriptHashTable::open_tiny(dir) {
+        Ok(t) => (t, out),
+        Err(e) => panic!("open after a torn head page failed: {e}"),
+    }
+}
+
+fn assert_neighbors_kept(t: &ScriptHashTable, sh: &[u8; 32], n: u64, kept: &[([u8; 32], u64)]) {
+    assert_eq!(t.entries(sh).unwrap().len() as u64, n);
+    for (key, fk) in kept {
+        assert_eq!(fks_of(t, key), vec![*fk], "a neighbor slot on the torn page was lost");
+    }
+}
+
+/// An undo restore of an ingest head word keeps a synced page image, so a
+/// torn page comes back with its neighbor slots.
+#[test]
+fn undo_ingest_head_word_restore_survives_a_torn_page() {
+    let dir = tmp();
+    let sh = script_hash(&[0xd5]);
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let many: Vec<_> = (1..=300u64).map(|i| rec(sh, i, 0)).collect();
+    t.put_create_batch_append(&many).unwrap();
+    let kept: Vec<_> = (0..40u8)
+        .map(|i| (script_hash(&[0xd6, i]), 1000 + u64::from(i)))
+        .collect();
+    for (key, fk) in &kept {
+        put_create(&t, rec(*key, *fk, 0));
+    }
+    assert!(matches!(t.key_home(&sh).unwrap(), KeyHome::Ingest));
+    let (t, out) = reopen_after_torn_head_word_restore(&dir, t, &sh, |t, _| {
+        let g = t.ingest.lock().unwrap();
+        let head = g.as_ref().unwrap();
+        (head.file.path.clone(), head.file.io_handle())
+    });
+    assert_neighbors_kept(&t, &sh, 300, &kept);
+    assert!(out.is_err(), "the restore never reached its head sync");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same on a packed main shard's `.val` file.
+#[test]
+fn undo_main_head_word_restore_survives_a_torn_page() {
+    let dir = tmp();
+    let sh = script_hash(&[0xd7]);
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let mut kept: Vec<_> = (0..40u8)
+        .map(|i| (script_hash(&[0xd8, i]), 1000 + u64::from(i)))
+        .collect();
+    let mut chains: Vec<([u8; 32], Vec<Fk>)> =
+        kept.iter().map(|(key, fk)| (*key, vec![Fk(*fk)])).collect();
+    let n = SH_PAGE_STREAM_MAX as u64 + 10;
+    chains.push((sh, (1..=n).map(Fk).collect()));
+    chains.sort_by_key(|(key, _)| *key);
+    let mut session = t.pack_shard_session(0).unwrap();
+    for (key, fks) in &chains {
+        push_chain(&mut session, *key, fks);
+    }
+    seal_session(&t, 0, session);
+    assert!(matches!(t.key_home(&sh).unwrap(), KeyHome::Main));
+    let (t, out) = reopen_after_torn_head_word_restore(&dir, t, &sh, |t, si| {
+        let g = t.sorted_main[usize::from(si)].read().unwrap();
+        let head = g.as_ref().unwrap();
+        (
+            rbitcoin_store::scripthash_mphf::val_path(&head.base),
+            rbitcoin_store::io_handle::IoHandle::from_file(&head.val_file),
+        )
+    });
+    kept.sort_unstable();
+    assert_neighbors_kept(&t, &sh, n, &kept);
+    assert!(out.is_err(), "the restore never reached its head sync");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same on a sealed overflow file.
+#[test]
+fn undo_sealed_ovf_head_word_restore_survives_a_torn_page() {
+    let dir = tmp();
+    let mut sh = [0u8; 32];
+    sh[0] = 0xd9;
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let mut session = t.pack_shard_session(0).unwrap();
+    push_chain(&mut session, script_hash(&[0x10]), &[Fk(1)]);
+    seal_session(&t, 0, session);
+    let many: Vec<_> = (1..=300u64).map(|i| rec(sh, i, 0)).collect();
+    t.put_create_batch_append(&many).unwrap();
+    let fillers: Vec<_> = (0..210u32)
+        .map(|i| (script_hash(&[0xda, (i & 0xff) as u8, (i >> 8) as u8]), 5000 + u64::from(i)))
+        .collect();
+    for (key, fk) in &fillers {
+        put_create(&t, rec(*key, *fk, 0));
+    }
+    assert!(matches!(t.key_home(&sh).unwrap(), KeyHome::SealedOvf));
+    let kept: Vec<_> = fillers
+        .into_iter()
+        .filter(|(key, _)| matches!(t.key_home(key).unwrap(), KeyHome::SealedOvf))
+        .collect();
+    assert!(!kept.is_empty());
+    let (t, out) = reopen_after_torn_head_word_restore(&dir, t, &sh, |t, i| {
+        let g = t.sealed_ovf.lock().unwrap();
+        let head = &g[usize::from(i)];
+        (
+            head.path.clone(),
+            rbitcoin_store::io_handle::IoHandle::from_file(&head.file),
+        )
+    });
+    assert_neighbors_kept(&t, &sh, 300, &kept);
+    assert!(out.is_err(), "the restore never reached its head sync");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn page_freelist_is_acyclic(t: &ScriptHashTable, sh: &[u8; 32]) -> bool {
     let home = t.key_home(sh).unwrap();
     let body = t.body_for(sh, home);

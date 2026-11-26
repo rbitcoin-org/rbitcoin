@@ -112,6 +112,7 @@ impl MphfHead {
         }
         std::fs::rename(&staging, &mp).map_err(|e| StoreError::io(&mp, e))?;
         let vp = val_path(base);
+        crate::scripthash_head::drop_ahead_of(&vp)?;
         crate::file::write_synced_tmp_rename(&vp, &val)?;
         Self::open(base)
     }
@@ -162,6 +163,7 @@ impl MphfHead {
         let base = base.as_ref().to_path_buf();
         let mp = mphf_path(&base);
         let vp = val_path(&base);
+        crate::scripthash_head::restore_ahead(&vp)?;
         let mphf = BdzMphf::read_compact_from(&mp)?;
         let tags_off = mphf.trailer_off();
         let mphf_file = File::open(&mp).map_err(|e| StoreError::io(&mp, e))?;
@@ -223,8 +225,14 @@ impl MphfHead {
         Ok(buf)
     }
 
-    pub fn write_value_word(&self, off: u64, bytes: &[u8; 8]) -> Result<(), StoreError> {
-        pwrite_file(&self.val_file, off, bytes).map_err(|e| StoreError::io(val_path(&self.base), e))
+    /// Write one value word in place behind a synced image of its `.val` page.
+    pub fn write_value_word_imaged(&self, off: u64, bytes: &[u8; 8]) -> Result<(), StoreError> {
+        crate::scripthash_head::write_word_behind_image(
+            &val_path(&self.base),
+            &self.val_file,
+            off,
+            bytes,
+        )
     }
 
     pub fn for_each_occupied(

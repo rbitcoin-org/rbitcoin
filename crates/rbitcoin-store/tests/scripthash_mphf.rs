@@ -263,3 +263,27 @@ fn sh_mphf_duplicate_key16_does_not_clone_sort_mix64() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A head-word image a failed restore left behind does not replay onto a
+/// `.val` written later at the same path.
+#[test]
+fn a_rewritten_val_drops_a_stale_word_image() {
+    let dir = tmp();
+    let base = dir.join("00");
+    let word = |fk: u64| pack8(&ShHeadValue::inline_one(Fk(fk))).unwrap();
+    let h = MphfHead::write_pack8(&base, &[(key(1), word(11)), (key(2), word(22))]).unwrap();
+    let off = h.value_word_offset(&key(1)).unwrap().unwrap();
+    let handle = rbitcoin_store::io_handle::IoHandle::from_file(&h.val_file);
+    rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
+    let out = h.write_value_word_imaged(off, &word(33).to_le_bytes());
+    rbitcoin_store::io_handle::disarm_sync(handle);
+    assert!(out.is_err());
+    drop(h);
+    let h = MphfHead::write_pack8(&base, &[(key(1), word(44)), (key(2), word(55))]).unwrap();
+    assert_eq!(h.get(&key(1)).unwrap(), Some(ShHeadValue::inline_one(Fk(44))));
+    assert_eq!(h.get(&key(2)).unwrap(), Some(ShHeadValue::inline_one(Fk(55))));
+    drop(h);
+    let h = MphfHead::open(&base).unwrap();
+    assert_eq!(h.get(&key(1)).unwrap(), Some(ShHeadValue::inline_one(Fk(44))));
+    let _ = std::fs::remove_dir_all(&dir);
+}

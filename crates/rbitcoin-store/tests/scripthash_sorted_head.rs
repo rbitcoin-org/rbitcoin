@@ -174,3 +174,26 @@ fn sorted_idx_roundtrip_and_short_file() {
         Ok(_) => panic!("a truncated idx entry opened"),
     }
 }
+
+/// A head-word image a failed restore left behind does not replay onto a
+/// sorted head written later at the same path.
+#[test]
+fn a_rewritten_sorted_head_drops_a_stale_word_image() {
+    let path = tmp();
+    let h = SortedHead::write(&path, &recs(4)).unwrap();
+    let off = h.value_word_offset(&key_of(1)).unwrap().unwrap();
+    let stale = pack8_bytes(&ShHeadValue::inline_one(Fk(99))).unwrap();
+    let handle = rbitcoin_store::io_handle::IoHandle::from_file(&h.file);
+    rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
+    let out = h.write_value_word_imaged(off, &stale);
+    rbitcoin_store::io_handle::disarm_sync(handle);
+    assert!(out.is_err());
+    drop(h);
+    let fresh: Vec<_> = recs(4)
+        .into_iter()
+        .map(|(k, _)| (k, pack8_bytes(&ShHeadValue::inline_one(Fk(7))).unwrap()))
+        .collect();
+    let h = SortedHead::write(&path, &fresh).unwrap();
+    assert_eq!(h.get(&key_of(1)).unwrap(), Some(ShHeadValue::inline_one(Fk(7))));
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}

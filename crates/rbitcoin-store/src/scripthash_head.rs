@@ -298,8 +298,10 @@ fn encode_ahead_pages(blocks: &BTreeMap<u64, [u8; 4096]>) -> Vec<u8> {
     buf
 }
 
-/// Apply full 4 KiB page images left by an interrupted `SlotPageCache::flush`.
-fn restore_ahead(path: &Path) -> Result<(), StoreError> {
+/// Apply full 4 KiB page images left by an interrupted `SlotPageCache::flush`
+/// or head-word write. An image never grows the file: bytes past its end are
+/// the zero fill of a short last page.
+pub(crate) fn restore_ahead(path: &Path) -> Result<(), StoreError> {
     let side = ahead_path(path);
     let raw = match std::fs::read(&side) {
         Ok(raw) => raw,
@@ -312,20 +314,77 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         .write(true)
         .open(path)
         .map_err(|e| StoreError::io(path, e))?;
-    for (off, image) in images {
-        file.seek(SeekFrom::Start(off))
+    let len = file.metadata().map_err(|e| StoreError::io(path, e))?.len();
+    for (off, image) in images.range(..len) {
+        let n = (len - off).min(4096) as usize;
+        file.seek(SeekFrom::Start(*off))
             .map_err(|e| StoreError::io(path, e))?;
-        file.write_all(&image)
+        file.write_all(&image[..n])
             .map_err(|e| StoreError::io(path, e))?;
     }
     file.durable_sync_all()
         .map_err(|e| StoreError::io(path, e))?;
     drop(file);
-    std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
+    drop_ahead_of(path)
+}
+
+/// Remove the sidecar of `path` once the file sync covered it, or before a
+/// new file replaces `path`.
+pub(crate) fn drop_ahead_of(path: &Path) -> Result<(), StoreError> {
+    let side = ahead_path(path);
+    match std::fs::remove_file(&side) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(&side, e)),
+    }
     if let Some(parent) = side.parent() {
         file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
     }
     Ok(())
+}
+
+/// Write a synced `*.ahead` image of the page holding `off`, with `word` in
+/// place. Images already in the sidecar for other pages stay.
+fn stage_word_image(
+    path: &Path,
+    mut page: [u8; 4096],
+    off: u64,
+    word: &[u8; 8],
+) -> Result<(), StoreError> {
+    let block = off & !4095;
+    let at = (off - block) as usize;
+    if at + word.len() > page.len() {
+        return Err(StoreError::Corrupt("scripthash head word crosses a page"));
+    }
+    page[at..at + word.len()].copy_from_slice(word);
+    let mut merged = load_ahead_pages(path)?;
+    merged.insert(block, page);
+    file::write_synced_tmp_rename(&ahead_path(path), &encode_ahead_pages(&merged))
+}
+
+/// Write one 8-byte head word in place behind a synced image of its page,
+/// sync, then drop the image. A torn page comes back whole on the next open
+/// ([`restore_ahead`]), neighbor slots included.
+pub(crate) fn write_word_behind_image(
+    path: &Path,
+    file: &std::fs::File,
+    off: u64,
+    word: &[u8; 8],
+) -> Result<(), StoreError> {
+    let block = off & !4095;
+    let len = file.metadata().map_err(|e| StoreError::io(path, e))?.len();
+    let mut page = [0u8; 4096];
+    let n = len.saturating_sub(block).min(4096) as usize;
+    file::handle_pread_all(file, path, block, &mut page[..n])?;
+    stage_word_image(path, page, off, word)?;
+    file::handle_pwrite_all(file, path, off, word)?;
+    #[cfg(debug_assertions)]
+    if crate::io_handle::take_fail_sync(crate::io_handle::IoHandle::from_file(file)) {
+        return Err(StoreError::io(path, std::io::Error::from_raw_os_error(5)));
+    }
+    file.durable_sync_data()
+        .map_err(|e| StoreError::io(path, e))?;
+    drop_ahead_of(path)
 }
 
 impl ScriptHashHead {
@@ -521,8 +580,12 @@ impl ScriptHashHead {
         Ok(buf)
     }
 
-    pub fn write_value_word(&self, off: u64, bytes: &[u8; 8]) -> Result<(), StoreError> {
-        self.file.write_at(off, bytes)
+    /// Write one value word in place behind a synced image of its page.
+    pub fn write_value_word_imaged(&self, off: u64, bytes: &[u8; 8]) -> Result<(), StoreError> {
+        let page = read_page(self.file.path(), &self.file, off & !4095)?;
+        stage_word_image(self.file.path(), page, off, bytes)?;
+        self.file.write_at(off, bytes)?;
+        self.sync_and_drop_ahead()
     }
 
     /// Soft-clear value; keeps probe chain.
@@ -650,16 +713,7 @@ impl ScriptHashHead {
     /// Remove a sidecar the file sync already covered.
     #[doc(hidden)]
     pub fn drop_ahead(&self) -> Result<(), StoreError> {
-        let side = ahead_path(self.file.path());
-        match std::fs::remove_file(&side) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(StoreError::io(&side, e)),
-        }
-        if let Some(parent) = side.parent() {
-            file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-        }
-        Ok(())
+        drop_ahead_of(self.file.path())
     }
 
     /// occupied/slots when occupancy is known (`None` if unknown).

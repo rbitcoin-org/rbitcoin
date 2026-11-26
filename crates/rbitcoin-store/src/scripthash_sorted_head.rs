@@ -81,6 +81,7 @@ impl SortedHead {
         header[6..14].copy_from_slice(&count.to_le_bytes());
         header[14..16].copy_from_slice(&(SH_SORTED_RECS_PER_PAGE as u16).to_le_bytes());
 
+        crate::scripthash_head::drop_ahead_of(path)?;
         {
             let mut f = File::create(path).map_err(|e| StoreError::io(path, e))?;
             f.write_all(&header).map_err(|e| StoreError::io(path, e))?;
@@ -111,6 +112,7 @@ impl SortedHead {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
+        crate::scripthash_head::restore_ahead(&path)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -171,8 +173,9 @@ impl SortedHead {
         Ok(buf)
     }
 
-    pub fn write_value_word(&self, off: u64, bytes: &[u8; 8]) -> Result<(), StoreError> {
-        pwrite_file(&self.file, off, bytes).map_err(|e| StoreError::io(&self.path, e))
+    /// Write one value word in place behind a synced image of its page.
+    pub fn write_value_word_imaged(&self, off: u64, bytes: &[u8; 8]) -> Result<(), StoreError> {
+        crate::scripthash_head::write_word_behind_image(&self.path, &self.file, off, bytes)
     }
 
     /// In-place `value16` update. `Ok(false)` if the key is not on this file.

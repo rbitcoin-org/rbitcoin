@@ -920,32 +920,28 @@ impl ScriptHashTable {
                 let Some(h) = g.as_ref() else {
                     return Err(StoreError::Corrupt("scripthash undo: main head missing"));
                 };
-                h.write_value_word(word.off, &word.old)?;
-                h.flush()
+                h.write_value_word_imaged(word.off, &word.old)
             }
             HEAD_INGEST => {
                 let ingest = self.ingest.lock().unwrap();
                 let Some(ingest) = ingest.as_ref() else {
                     return Err(StoreError::Corrupt("scripthash undo: ingest missing"));
                 };
-                ingest.write_value_word(word.off, &word.old)?;
-                ingest.flush()
+                ingest.write_value_word_imaged(word.off, &word.old)
             }
             HEAD_SORTED_OVF => {
                 let g = self.sealed_ovf.lock().unwrap();
                 let Some(h) = g.get(usize::from(word.index)) else {
                     return Err(StoreError::Corrupt("scripthash undo: ovf head missing"));
                 };
-                h.write_value_word(word.off, &word.old)?;
-                h.flush()
+                h.write_value_word_imaged(word.off, &word.old)
             }
             HEAD_OVF_L1 => {
                 let g = self.ovf_l1.lock().unwrap();
                 let Some(l1) = g.as_ref() else {
                     return Err(StoreError::Corrupt("scripthash undo: ovf l1 missing"));
                 };
-                l1.head.write_value_word(word.off, &word.old)?;
-                l1.head.flush()
+                l1.head.write_value_word_imaged(word.off, &word.old)
             }
             _ => Err(StoreError::Corrupt("scripthash undo: bad head tag")),
         }
