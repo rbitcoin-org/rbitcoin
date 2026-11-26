@@ -1,14 +1,14 @@
 {
   "schemaVersion": 1,
   "label": "coverage",
-  "message": "92.92%",
+  "message": "92.91%",
   "color": "brightgreen",
-  "pct": 92.92,
-  "lh": 127239,
-  "lf": 136929,
+  "pct": 92.91,
+  "lh": 127418,
+  "lf": 137137,
   "gate": 92,
   "scope": "production",
-  "sha": "f0b66382fbea",
+  "sha": "a219613df7a2",
   "date": "2026-11-26",
   "crates": [
     {
@@ -19,27 +19,27 @@
     },
     {
       "name": "rbitcoin-consensus",
-      "lh": 6862,
+      "lh": 6861,
       "lf": 7015,
-      "pct": 97.82
+      "pct": 97.8
     },
     {
       "name": "rbitcoin-electrum",
-      "lh": 3747,
+      "lh": 3746,
       "lf": 4029,
-      "pct": 93.0
+      "pct": 92.98
     },
     {
       "name": "rbitcoin-esplora",
-      "lh": 4559,
+      "lh": 4560,
       "lf": 5000,
-      "pct": 91.18
+      "pct": 91.2
     },
     {
       "name": "rbitcoin-ibd",
-      "lh": 14517,
-      "lf": 15474,
-      "pct": 93.82
+      "lh": 14558,
+      "lf": 15497,
+      "pct": 93.94
     },
     {
       "name": "rbitcoin-log",
@@ -55,15 +55,15 @@
     },
     {
       "name": "rbitcoin-net",
-      "lh": 27884,
-      "lf": 29645,
-      "pct": 94.06
+      "lh": 28033,
+      "lf": 29811,
+      "pct": 94.04
     },
     {
       "name": "rbitcoin-node",
-      "lh": 5349,
+      "lh": 5316,
       "lf": 6245,
-      "pct": 85.65
+      "pct": 85.12
     },
     {
       "name": "rbitcoin-primitives",
@@ -73,27 +73,27 @@
     },
     {
       "name": "rbitcoin-query",
-      "lh": 17849,
+      "lh": 17848,
       "lf": 19369,
       "pct": 92.15
     },
     {
       "name": "rbitcoin-rpc",
-      "lh": 8191,
-      "lf": 8726,
-      "pct": 93.87
+      "lh": 8210,
+      "lf": 8745,
+      "pct": 93.88
     },
     {
       "name": "rbitcoin-store",
-      "lh": 30013,
+      "lh": 30019,
       "lf": 32765,
-      "pct": 91.6
+      "pct": 91.62
     },
     {
       "name": "rbitcoin-sv2",
-      "lh": 1006,
+      "lh": 1005,
       "lf": 1092,
-      "pct": 92.12
+      "pct": 92.03
     }
   ]
 }
