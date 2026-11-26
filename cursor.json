@@ -1,14 +1,14 @@
 {
   "new_base": "8e62e4ce4d60c30abc851cb0893e4b80149ac9e4",
   "new_skip": 5545,
-  "old_index": 16095,
-  "old_name": "crates/rbitcoin-query/src/confirm_run/write.rs:717:70: replace >= with < in annotate_pending_spends",
+  "old_index": 17321,
+  "old_name": "crates/rbitcoin-store/src/bdz.rs:68:9: replace <impl std::fmt::Debug for OccBits>::fmt -> std::fmt::Result with Ok(Default::default())",
   "new_cap_used": true,
   "run_id": "45787411316",
   "new_len": 13880,
   "new_remaining": 8335,
   "old_len": 26058,
-  "old_remaining": 25588,
-  "completed_new": 397,
-  "completed_old": 470
+  "old_remaining": 24832,
+  "completed_new": 0,
+  "completed_old": 1226
 }
