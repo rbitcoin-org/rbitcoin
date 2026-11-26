@@ -103,57 +103,63 @@ async fn tor_onion_two_node_v2() {
     wait_socks_onion(env.tor_socks, &onion, port, Duration::from_secs(90)).await;
 
     let a = spawn_node(tor_a(&env, a_dir.path(), a_rpc, &onion, port), a_rpc).await;
-    wait_jsonrpc(
-        a_rpc,
-        "getblockcount",
-        json!([]),
-        Duration::from_secs(90),
-        |v| v["result"] == 3,
-    )
+    // Keep both nodes outside the task so an assertion cannot skip shutdown.
+    let checks = tokio::spawn(async move {
+        wait_jsonrpc(
+            a_rpc,
+            "getblockcount",
+            json!([]),
+            Duration::from_secs(90),
+            |v| v["result"] == 3,
+        )
+        .await;
+        let peers = wait_peer_network(a_rpc, "onion", false, Duration::from_secs(30)).await;
+        let row = &peers["result"].as_array().unwrap()[0];
+        assert_eq!(row["network"], "onion", "{peers}");
+        assert_eq!(row["inbound"], false, "{peers}");
+        assert_eq!(row["transport_protocol_type"], "v2", "{peers}");
+        assert!(row["addr"].as_str().unwrap().contains(".onion"), "{peers}");
+        assert_ne!(row["addr"], "0.0.0.0", "{peers}");
+
+        let bin = wait_peer_network(b_rpc, "ipv4", true, Duration::from_secs(30)).await;
+        let brow = bin["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["inbound"] == true)
+            .expect("B inbound");
+        assert_eq!(brow["transport_protocol_type"], "v2", "{bin}");
+        let tor_bind: SocketAddr = brow["addrbind"].as_str().unwrap().parse().unwrap();
+        assert!(tor_bind.ip().is_loopback() && tor_bind.is_ipv4());
+        assert_ne!(tor_bind, direct, "{bin}");
+        assert_eq!(brow["permissions"], json!([]), "{bin}");
+
+        let tor_stream = socks5_connect_domain(env.tor_socks, &onion, port, None)
+            .await
+            .unwrap();
+        let (_tor_peer, tor_announce) = read_self_announcement(tor_stream).await;
+        assert_eq!(
+            tor_announce,
+            [format!("{onion}:{port}").parse::<NetAddr>().unwrap()]
+        );
+        let direct_stream = TcpStream::connect(direct).await.unwrap();
+        let (_direct_peer, direct_announce) = read_self_announcement(direct_stream).await;
+        assert_eq!(direct_announce, [public_ip.parse::<NetAddr>().unwrap()]);
+        let live = jsonrpc(b_rpc, "getpeerinfo", json!([])).await;
+        let direct_peer = live["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["addrbind"] == direct.to_string())
+            .expect("ordinary inbound peer");
+        assert_eq!(direct_peer["permissions"], json!(["relay"]), "{live}");
+    })
     .await;
-    let peers = wait_peer_network(a_rpc, "onion", false, Duration::from_secs(30)).await;
-    let row = &peers["result"].as_array().unwrap()[0];
-    assert_eq!(row["network"], "onion", "{peers}");
-    assert_eq!(row["inbound"], false, "{peers}");
-    assert_eq!(row["transport_protocol_type"], "v2", "{peers}");
-    assert!(row["addr"].as_str().unwrap().contains(".onion"), "{peers}");
-    assert_ne!(row["addr"], "0.0.0.0", "{peers}");
 
-    let bin = wait_peer_network(b_rpc, "ipv4", true, Duration::from_secs(30)).await;
-    let brow = bin["result"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["inbound"] == true)
-        .expect("B inbound");
-    assert_eq!(brow["transport_protocol_type"], "v2", "{bin}");
-    let tor_bind: SocketAddr = brow["addrbind"].as_str().unwrap().parse().unwrap();
-    assert!(tor_bind.ip().is_loopback() && tor_bind.is_ipv4());
-    assert_ne!(tor_bind, direct, "{bin}");
-    assert_eq!(brow["permissions"], json!([]), "{bin}");
-
-    let tor_stream = socks5_connect_domain(env.tor_socks, &onion, port, None)
-        .await
-        .unwrap();
-    let (_tor_peer, tor_announce) = read_self_announcement(tor_stream).await;
-    assert_eq!(
-        tor_announce,
-        [format!("{onion}:{port}").parse::<NetAddr>().unwrap()]
-    );
-    let direct_stream = TcpStream::connect(direct).await.unwrap();
-    let (_direct_peer, direct_announce) = read_self_announcement(direct_stream).await;
-    assert_eq!(direct_announce, [public_ip.parse::<NetAddr>().unwrap()]);
-    let live = jsonrpc(b_rpc, "getpeerinfo", json!([])).await;
-    let direct_peer = live["result"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["addrbind"] == direct.to_string())
-        .expect("ordinary inbound peer");
-    assert_eq!(direct_peer["permissions"], json!(["relay"]), "{live}");
-
-    a.stop().await;
-    b.stop().await;
+    let (a_stopped, b_stopped) = tokio::join!(tokio::spawn(a.stop()), tokio::spawn(b.stop()));
+    checks.expect("Tor and direct P2P checks");
+    a_stopped.expect("stop node A");
+    b_stopped.expect("stop node B");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

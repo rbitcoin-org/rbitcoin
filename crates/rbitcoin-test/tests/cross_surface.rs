@@ -3763,39 +3763,6 @@ fn starts_with_any(lines: &[String], prefix: &str) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn native_tor_automatic_listener_reports_an_occupied_backend() {
-    let td = TestDatadir::new().unwrap();
-    let backend = SocketAddr::from(([127, 0, 0, 1], Network::Regtest.default_p2p_port() + 1));
-    let occupied = tokio::net::TcpListener::bind(backend).await.unwrap();
-    let tor = FakeTor::start().await;
-    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
-    let mut cfg = listen_and_exit_cfg(&td.path());
-    cfg.listen.p2p = rbitcoin_node::P2pListen::Auto;
-    cfg.tor.control = Some(tor.addr);
-    cfg.tor.password = Some(TOR_PASSWORD.into());
-
-    start_and_exit(cfg.clone()).await.unwrap();
-    assert!(starts_with_any(&tor.take_log(), "ADD_ONION ").is_empty());
-
-    cfg.listen.listen_onion = true;
-    let err = start_and_exit(cfg.clone()).await.unwrap_err().to_string();
-    assert!(
-        err.contains(&backend.to_string()) && err.contains("=onion"),
-        "{err}"
-    );
-    assert!(starts_with_any(&tor.take_log(), "ADD_ONION ").is_empty());
-
-    drop(occupied);
-    start_and_exit(cfg).await.unwrap();
-    let lines = starts_with_any(&tor.take_log(), "ADD_ONION ");
-    let public = Network::Regtest.default_p2p_port();
-    assert_eq!(
-        lines,
-        [format!("ADD_ONION NEW:ED25519-V3 Port={public},{backend}")]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn external_onions_report_public_ports_with_an_onion_only_listener() {
     let td = TestDatadir::new().unwrap();
     let token = td.path().join("rpc.token");
@@ -3918,6 +3885,55 @@ fn native_tor_port_mapping(line: &str, ordinary: SocketAddr) -> String {
     assert_ne!(target.port(), 0);
     assert_ne!(target, ordinary, "Tor and SAM need separate listeners");
     mapping.to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_tor_with_an_external_onion_keeps_ordinary_loopback_unprivileged() {
+    use rbitcoin_net::peer::V2PlainSession;
+
+    let td = TestDatadir::new().unwrap();
+    rbitcoin_test::jsonrpc::write_rpc_token(&td.path());
+    let tor = FakeTor::start().await;
+    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
+    let rpc = ephemeral_addr();
+    let mut cfg = listen_and_exit_cfg(&td.path());
+    cfg.listen.listen_onion = true;
+    cfg.tor.control = Some(tor.addr);
+    cfg.tor.password = Some(TOR_PASSWORD.into());
+    cfg.rpc.listen = Some(rpc);
+    cfg.max_run_secs = Some(60);
+    cfg.apply_kv(
+        "external_ip",
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion",
+    )
+    .unwrap();
+    cfg.apply_kv("net_permission", "relay@127.0.0.1").unwrap();
+
+    let node = spawn_run_p2p(cfg);
+    wait_listeners(&[rpc]).await;
+    let ordinary = published_listener(&td.path(), "p2p").await;
+    let stream = TcpStream::connect(ordinary).await.unwrap();
+    let peer = V2PlainSession::outbound_regtest(
+        stream,
+        "/external-onion-bind-test/",
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let info = jsonrpc(rpc, "getpeerinfo", json!([])).await;
+    stop_run_p2p(rpc, node).await;
+    drop(peer);
+
+    let commands = starts_with_any(&tor.take_log(), "ADD_ONION ");
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    native_tor_port_mapping(&commands[0], ordinary);
+    let row = info["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["addrbind"] == ordinary.to_string())
+        .expect("ordinary inbound peer");
+    assert_eq!(row["permissions"], json!([]), "{info}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

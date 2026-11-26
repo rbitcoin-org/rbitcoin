@@ -230,16 +230,14 @@ Tor's `ADD_ONION` exposes the network default P2P port (8333 / signet 38333 / â€
 The key is saved at `{datadir}/onion/p2p.priv` (0600). This needs `--tor-control`
 and `--max-inbound` > 0. `--no-discover` still gossips that onion via
 `addrv2` and lists it in `getnetworkinfo.localaddresses`; it does not
-gossip `--external-ip`. `--max-inbound 0` refuses `--listen-onion`.
-`--max-inbound 0` refuses inbound slots. `--no-discover` does not
-self-announce even when `--external-ip` is set. A later onion inbound bind
-does not require a public clearnet listen.
+gossip `--external-ip`. `--max-inbound 0` refuses inbound slots and cannot
+be combined with `--listen-onion`.
 
 A self-announce carries only the address of the link's own network. The
 onion goes to `.onion` peers and to outbound dials through `--proxy`.
 The native onion also goes to peers on the marked Tor listener. The I2P
 destination goes to I2P peers and to forwarded loopback inbound on the
-ordinary listener. A clearnet `--external-ip` goes
+ordinary listener once SAM has published it. A clearnet `--external-ip` goes
 to direct clearnet peers, and an `fc00::/8` address (`--external-ip` or the
 CJDNS listen) only to CJDNS peers. An explicit port overrides the default
 for the same host. With `--discover-from-peers` and no
@@ -264,9 +262,9 @@ source IP `10.0.3.1` could connect to a node using `listen=10.0.3.2:8334=onion`.
 Restrict access to the marked listener to the Tor forwarder. For a
 non-loopback bind, enforce this restriction with a firewall or network policy.
 Inbound I2P uses a separate primary P2P listener reachable at `127.0.0.1`.
-With native Tor and `--no-listen`, SAM keeps its own ephemeral loopback listener.
-Source-IP permission rules skip the marked listener. Ordinary listeners
-keep their normal source-IP rules. Inbound peers on the marked listener do
+With an implicit native Tor listener and `--no-listen`, SAM gets a separate
+ephemeral loopback listener.
+Source-IP permission rules skip the marked listener. Inbound peers there do
 not trigger IP discouragement or eviction group cooldowns. Every listener
 enforces existing refusals for the exact TCP source IP. Only ordinary
 listeners enforce eviction group cooldowns at admission.
@@ -334,8 +332,10 @@ that wallet listener its own destination and forward (`i2p/electrum.priv`,
 the same `127.0.0.1` reach as the onion switches. The P2P destination is published as
 `{52}.b32.i2p:0` (SAM 3.1 has no ports; Core refuses any other I2P port)
 on `getnetworkinfo.localaddresses` and in addrv2, including with
-`--no-discover`. With `--listen=0` that is a start error
-unless `--listen-onion` provides a loopback accept. NixOS:
+`--no-discover`. SAM needs an ordinary P2P listener. With `--listen=0`
+and an implicit native Tor listener, rbitcoin opens a separate loopback
+listener for SAM. An explicit `=onion` bind reserves that socket for Tor
+and requires a separate `--listen` address for SAM. NixOS:
 `services.rbitcoin.i2p.sam` / `i2p.acceptIncoming`; the unit `After`/`Wants`
 `i2pd.service` when SAM is set. Do not start i2pd from this module.
 If i2pd closes a SAM session (for example it restarts), or a dial gets a reply

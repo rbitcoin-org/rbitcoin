@@ -2235,6 +2235,7 @@ fn self_announce_stays_on_the_link_network() {
             peers.set_p2p_onion(onion.host_str(), onion.port());
         }
         if with_i2p {
+            peers.set_overlay_loopback_forward(true);
             peers.set_p2p_i2p(i2p);
         }
         peers
@@ -2242,6 +2243,17 @@ fn self_announce_stays_on_the_link_network() {
 
     let out = rbitcoin_net::peers::PeerConnType::OutboundFullRelay;
     let inbound = rbitcoin_net::peers::PeerConnType::Inbound;
+    let starting = hub_with(true, false);
+    starting.set_overlay_loopback_forward(true);
+    let starting_peer = overlay_peer(&starting, loopback_inbound, inbound);
+    assert!(
+        starting_peer.take_local_addr_due(1_000).is_none(),
+        "SAM ingress cannot announce a clearnet address while starting"
+    );
+    assert!(self_announce_nets(&starting_peer).is_empty());
+    starting.set_p2p_i2p(i2p);
+    assert_eq!(self_announce_nets(&starting_peer), ["i2p"]);
+
     let peers = hub_with(true, true);
     assert_eq!(
         self_announce_nets(&overlay_peer(&peers, clearnet_peer, out)),
@@ -2443,6 +2455,7 @@ fn external_onion_withholds_self_announcements_on_shared_loopback() {
     let socket = loopback.socket_addr().unwrap();
     assert!(peers.permission_strings(socket, true, socket).is_empty());
 
+    peers.set_overlay_loopback_forward(true);
     peers.set_p2p_i2p(rbitcoin_net::NetAddr::I2p {
         dest: [0x11; 32],
         port: 0,
@@ -2534,6 +2547,7 @@ fn marked_tor_listener_announces_the_public_onion() {
         dest: [0x11; 32],
         port: 0,
     };
+    peers.set_overlay_loopback_forward(true);
     peers.set_p2p_i2p(i2p);
     assert_eq!(announce(tor_bind), public.parse().unwrap());
     assert_eq!(announce(normal_bind), i2p);
@@ -2602,6 +2616,7 @@ fn a_down_onion_is_not_advertised_but_stays_our_own() {
     let external_onion = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion";
     let peers = rbitcoin_net::peers::PeerHub::new();
     peers.set_p2p_onion(onion.host_str(), onion.port());
+    peers.set_overlay_loopback_forward(true);
     peers.set_p2p_i2p(i2p);
     peers.set_tor_wallet_onion(tor_wallet.host_str(), tor_wallet.port());
     peers.set_listen_port(50002);

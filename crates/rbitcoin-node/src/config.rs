@@ -212,7 +212,8 @@ impl ListenOpts {
             .or_else(|| self.implicit_onion_bind(network))
     }
 
-    pub(crate) fn implicit_onion_bind(&self, network: Network) -> Option<SocketAddr> {
+    #[doc(hidden)]
+    pub fn implicit_onion_bind(&self, network: Network) -> Option<SocketAddr> {
         if !self.listen_onion || self.onion_bind.is_some() {
             return None;
         }

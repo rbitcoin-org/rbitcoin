@@ -1053,7 +1053,7 @@ impl LivePeer {
                 SelfAnnounceLink::Clearnet
             };
         }
-        if sock.ip().is_loopback() && hub.p2p_i2p().is_some() {
+        if sock.ip().is_loopback() && hub.overlay_loopback_forward.load(Ordering::Relaxed) {
             SelfAnnounceLink::I2p
         } else {
             SelfAnnounceLink::Clearnet
@@ -2628,7 +2628,7 @@ impl PeerHub {
         let _ = open.wait_for(|o| *o).await;
     }
 
-    /// Treat inbound loopback as potentially forwarded.
+    /// Treat ordinary inbound loopback as possible SAM ingress, even before the destination is ready.
     pub fn set_overlay_loopback_forward(&self, on: bool) {
         self.overlay_loopback_forward.store(on, Ordering::Relaxed);
     }

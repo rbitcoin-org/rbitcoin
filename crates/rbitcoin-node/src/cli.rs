@@ -423,7 +423,8 @@ Trust-peer: --trust-peer ADDR (conf trustpeer=) dials only that address, the sam
   failed AUTH is a start error. Unset: no control connection.\n\
   --tor-control-cookie PATH (default /run/tor/control.authcookie). --tor-control-password PASS.\n\
   --i2p-sam [HOST:PORT] SAM v3 to system i2pd (default 127.0.0.1:7656). --only-net=i2p requires it.\n\
-  --i2p-accept-incoming persist {{datadir}}/i2p/p2p.priv and STREAM FORWARD to the P2P bind. Needs --listen. P2P only.\n\
+  --i2p-accept-incoming persist {{datadir}}/i2p/p2p.priv and STREAM FORWARD to the ordinary P2P listener. P2P only.\n\
+  With --no-listen and an implicit native Tor listener, SAM uses a separate loopback listener.\n\
   --listen ADDR:PORT=onion marks one Tor forwarding listener. Source-IP grants skip this listener.\n\
   --listen-onion ADD_ONION to the marked listener. Without an explicit =onion bind, opens a dedicated loopback listener.\n\
   With automatic P2P listening, its port is the network P2P default plus one. Otherwise the OS picks a free port.\n\
