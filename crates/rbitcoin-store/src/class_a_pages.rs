@@ -2,7 +2,10 @@
 //!
 //! `first` keeps one sealed copy of each stem's first 4 KiB. `tail.0` and
 //! `tail.1` alternate the partial last block and every stem's published
-//! length. Readers stay on the main file. Open writes a zeroed page back.
+//! length. `armed` names the slot generation that holds the before-image.
+//! Open copies that generation back without reading the live bytes, and
+//! ignores a newer slot. With no `armed` file, open still writes a zeroed
+//! page back and leaves a nonzero page alone.
 
 use crate::bulk_io::{self, ReadOp, WriteOp};
 use crate::durability::Durable;
@@ -331,6 +334,245 @@ fn write_vacant_tail(path: &Path) -> Result<(), StoreError> {
     sync_files(&[(path, &file)])
 }
 
+const ARMED_MAGIC: &[u8; 4] = b"CARM";
+const ARMED_LEN: usize = 16;
+
+/// Store `meta` when this directory is a datadir. A table fixture has no
+/// `meta`; the arm still publishes, and open of that fixture never served a
+/// schema check.
+fn meta_version(hot: &Path) -> Result<Option<u16>, StoreError> {
+    match crate::store::check_meta(hot) {
+        Ok(ver) => Ok(Some(ver)),
+        Err(StoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Publish `tear_guard/armed` naming `generation`.
+///
+/// Errors while `meta` is still 30 and does not create the file. An existing
+/// mark is left in place: the appender calls this again inside one window.
+#[doc(hidden)]
+pub fn arm_named_generation(hot: &Path, generation: u64) -> Result<(), StoreError> {
+    if meta_version(hot)?.is_some_and(|ver| ver < 31) {
+        return Err(StoreError::Rejected("class A arm while meta is 30"));
+    }
+    let path = guard_dir(hot).join("armed");
+    if path.try_exists().map_err(|e| StoreError::io(&path, e))? {
+        return Ok(());
+    }
+    let mut buf = Vec::with_capacity(ARMED_LEN);
+    buf.extend_from_slice(ARMED_MAGIC);
+    buf.extend_from_slice(&rbitcoin_primitives::SCHEMA_VERSION.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&generation.to_le_bytes());
+    file::write_synced_tmp_rename(&path, &buf)
+}
+
+/// The appender's arm. Promotes `meta` to 31 and syncs it before the rename
+/// when the datadir is still 30. A newer sealed slot replaces the mark with
+/// that generation; otherwise the current mark stays.
+pub(crate) fn arm_for_appender(hot: &Path) -> Result<u64, StoreError> {
+    let dir = guard_dir(hot);
+    let armed = read_armed(&dir)?;
+    let newest = newest_generation(&dir)?;
+    if let Some(generation) = armed {
+        if newest <= generation {
+            return Ok(generation);
+        }
+        // The sealed slot is the committed image. Publish its count before
+        // dropping the mark that still names the older generation.
+        if let Some(slot) = slot_by_generation(&dir, newest)? {
+            let settled = le_u64(&slot.raw[16..24]);
+            let current = crate::tx_table::read_class_a_synced(hot)?;
+            if settled > current {
+                file::write_synced_tmp_rename(
+                    &hot.join(crate::tx_table::CLASS_A_SYNCED_NAME),
+                    &settled.to_le_bytes(),
+                )?;
+            }
+        }
+        clear_armed_file(&dir.join("armed"))?;
+    }
+    if meta_version(hot)?.is_some_and(|ver| ver < 31) {
+        crate::store::write_meta_at(hot, 31)?;
+    }
+    arm_named_generation(hot, newest)?;
+    Ok(newest)
+}
+
+/// Remove `tear_guard/armed` and sync its directory. Already gone is fine.
+pub(crate) fn clear_armed(hot: &Path) -> Result<(), StoreError> {
+    clear_armed_file(&guard_dir(hot).join("armed"))
+}
+
+fn clear_armed_file(path: &Path) -> Result<(), StoreError> {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Err(StoreError::Rejected("class A armed mark has no directory"));
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(path, e)),
+    }
+    file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+    Ok(())
+}
+
+fn read_armed(dir: &Path) -> Result<Option<u64>, StoreError> {
+    let path = dir.join("armed");
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(StoreError::io(&path, e)),
+    };
+    if raw.len() != ARMED_LEN || raw[0..4] != *ARMED_MAGIC {
+        return Err(StoreError::Corrupt("class A armed mark"));
+    }
+    let schema = le_u16(&raw[4..6]);
+    if !rbitcoin_primitives::schema_file_openable(schema) || raw[6] != 0 || raw[7] != 0 {
+        return Err(StoreError::Corrupt("class A armed mark"));
+    }
+    Ok(Some(le_u64(&raw[8..16])))
+}
+
+fn newest_generation(dir: &Path) -> Result<u64, StoreError> {
+    let (slot0, slot1) = load_tails(dir)?;
+    Ok(match (slot0, slot1) {
+        (Some(a), Some(b)) => a.generation.max(b.generation),
+        (Some(a), None) => a.generation,
+        (None, Some(b)) => b.generation,
+        (None, None) => 0,
+    })
+}
+
+fn slot_by_generation(dir: &Path, generation: u64) -> Result<Option<TailSlot>, StoreError> {
+    let (slot0, slot1) = load_tails(dir)?;
+    Ok(match (slot0, slot1) {
+        (Some(slot), _) if slot.generation == generation => Some(slot),
+        (_, Some(slot)) if slot.generation == generation => Some(slot),
+        _ => None,
+    })
+}
+
+fn named_slot<'a>(
+    generation: u64,
+    slot0: &'a Option<TailSlot>,
+    slot1: &'a Option<TailSlot>,
+) -> Result<Option<&'a TailSlot>, StoreError> {
+    match (slot0, slot1) {
+        (Some(slot), _) if slot.generation == generation => Ok(Some(slot)),
+        (_, Some(slot)) if slot.generation == generation => Ok(Some(slot)),
+        _ if generation == 0 => Ok(None),
+        _ => Err(StoreError::Corrupt("class A armed generation missing")),
+    }
+}
+
+/// Copy the named generation onto every stem except `spent.body`, drop any
+/// newer slot, and remove `armed`. Live bytes are not consulted.
+fn restore_named_generation(
+    hot: &Path,
+    seq: &Path,
+    dir: &Path,
+    generation: u64,
+    first_raw: &[u8],
+    slot0: &Option<TailSlot>,
+    slot1: &Option<TailSlot>,
+) -> Result<(), StoreError> {
+    let slot = named_slot(generation, slot0, slot1)?;
+    for (i, name) in STEMS.iter().enumerate() {
+        if *name == "spent.body" {
+            continue;
+        }
+        restore_armed_stem(hot, seq, name, i, first_raw, slot)?;
+    }
+    if let Some(slot) = slot {
+        let settled = le_u64(&slot.raw[16..24]);
+        let current = crate::tx_table::read_class_a_synced(hot)?;
+        if current != settled {
+            file::write_synced_tmp_rename(
+                &hot.join(crate::tx_table::CLASS_A_SYNCED_NAME),
+                &settled.to_le_bytes(),
+            )?;
+        }
+    }
+    retire_other_slots(dir, generation)?;
+    clear_armed_file(&dir.join("armed"))
+}
+
+fn restore_armed_stem(
+    hot: &Path,
+    seq: &Path,
+    name: &str,
+    stem: usize,
+    first_raw: &[u8],
+    slot: Option<&TailSlot>,
+) -> Result<(), StoreError> {
+    let path = stem_path(hot, seq, name);
+    if !path.try_exists().map_err(|e| StoreError::io(&path, e))? {
+        return Ok(());
+    }
+    let file = open_rw(&path)?;
+    let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
+    if file_len == 0 {
+        return Ok(());
+    }
+    let mut wrote = false;
+    let page0_from_slot =
+        slot.is_some_and(|slot| slot.tail_off[stem] == 0 && slot.tail_len[stem] > 0);
+    if let Some(slot) = slot.filter(|_| page0_from_slot) {
+        let mut image = image_of(slot, stem).to_vec();
+        stamp_loaded_len(&mut image, slot.published[stem]);
+        pwrite_exact(&file, &path, 0, &image)?;
+        wrote = true;
+    } else if let Some(commit) = parse_commit(first_raw, stem) {
+        let mut image = commit.image;
+        let published = slot.map(|slot| slot.published[stem]).unwrap_or(0);
+        let len = recorded_len(slot, stem, published, le_u64(&image[8..16]));
+        image[8..16].copy_from_slice(&len.to_le_bytes());
+        pwrite_exact(&file, &path, 0, &image)?;
+        wrote = true;
+    }
+    if let Some(slot) = slot {
+        let off = slot.tail_off[stem];
+        let n = slot.tail_len[stem];
+        if n > 0 && off >= PAGE as u64 {
+            let image = image_of(slot, stem);
+            let take = (n as usize).min(image.len());
+            pwrite_exact(&file, &path, off, &image[..take])?;
+            wrote = true;
+        }
+    }
+    if wrote {
+        sync_files(&[(&path, &file)])?;
+    }
+    Ok(())
+}
+
+fn retire_other_slots(dir: &Path, keep: u64) -> Result<(), StoreError> {
+    for name in ["tail.0", "tail.1"] {
+        let path = dir.join(name);
+        let Some(raw) = read_fixed(&path, TAIL_BYTES)? else {
+            continue;
+        };
+        let Some(slot) = parse_tail(raw) else {
+            continue;
+        };
+        if keep != 0 && slot.generation == keep {
+            continue;
+        }
+        let file = open_rw(&path)?;
+        pwrite_exact(&file, &path, 0, &[0, 0, 0, 0])?;
+        sync_files(&[(&path, &file)])?;
+    }
+    Ok(())
+}
+
 const CATK: &[u8; 4] = b"CATK";
 const CATK_HEAD: usize = 16;
 
@@ -457,6 +699,11 @@ pub(crate) fn prepare_and_restore(hot: &Path, seq: &Path) -> Result<(), StoreErr
     let first_path = dir.join("first");
     let first_raw = read_fixed(&first_path, FIRST_BYTES)?.unwrap_or_default();
     let (slot0, slot1) = load_tails(&dir)?;
+    if let Some(generation) = read_armed(&dir)? {
+        restore_named_generation(hot, seq, &dir, generation, &first_raw, &slot0, &slot1)?;
+        seal_vacant_from_disk(hot, seq, &first_path, &first_raw)?;
+        return Ok(());
+    }
     let best = match (&slot0, &slot1) {
         (Some(a), b) => Some(newer(a, b)),
         (None, Some(b)) => Some(b),
@@ -904,7 +1151,7 @@ pub(crate) fn write_barrier(
     hot: &Path,
     files: &[&TableFile; STEM_N],
     settled: u64,
-) -> Result<(), StoreError> {
+) -> Result<u64, StoreError> {
     for (file, name) in files.iter().zip(STEMS) {
         debug_assert!(
             file.path().ends_with(name),
@@ -958,5 +1205,6 @@ pub(crate) fn write_barrier(
     }
     pwrite_exact(&tail, &tail_path, 0, &tail_buf)?;
     crate::file::TableFile::sync_data_all_with(files, &[(&tail_path, &tail)])?;
-    write_seals(&first_path, &images)
+    write_seals(&first_path, &images)?;
+    Ok(generation)
 }

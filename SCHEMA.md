@@ -1,6 +1,6 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 30` (`rbitcoin_primitives`).
+**Version:** `SCHEMA_VERSION = 31` (`rbitcoin_primitives`).
 **Status:** 30 replaces the `spend.pages` image log with a schema-30 spend delta that records every spend slot. `spent.body` keeps its layout but is sparse: Class A writes none of its bytes, and only a fold writes its pages. `store/spent.delta/` holds page records in capped segments, a page directory written as a base plus a log of one batch per generation, and the commit that names the snapshot. Old segments fold into `spent.body`. A 29 binary would read stale `spent.body` and miss the delta, so it refuses 30 `meta`. Opening any 22–29 datadir here rewrites `meta` to 30, publishes a committed schema-29 page log as the delta's first generation, and removes the 29 files. A 29 binary then refuses the directory. 29 records which generation file held each `spend.pages` image; it is read once, at that open. 28 rewrites `meta` only. `--prune-seqsigwit` can leave `seqsigwit` at a header while creates remain. A 26 binary treats that empty locator as damage and truncates the chain. A 27 binary refuses 28 `meta`. A 0.9.0 binary refuses it too. 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
 rewrites each 96 B row down to 88 B (`header.body.grow` then rename), dropping
 the trailing `size:u32` + `weight:u32`. Block size and weight are summed from
@@ -103,7 +103,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 ## Schema 17 freeze
 
 Class A shape settled here at schema 17 and is still the live layout under
-the `SCHEMA_VERSION` at the top of this file (30). Schemas 18–30 already
+the `SCHEMA_VERSION` at the top of this file (31). Schemas 18–31 already
 shipped. Meta 22–30 is what this binary opens (rules above). Earlier
 layouts are history in
 [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md). A byte-incompatible change bumps
@@ -236,6 +236,8 @@ itself changed.
     tear_guard/first                 # one sealed 4 KiB image per Class A stem, written once after that page is full. No SCHEMA_VERSION bump
     tear_guard/tail.0                # alternating partial-tail image and published lengths (generation 0 = unused). No SCHEMA_VERSION bump
     tear_guard/tail.1                # the other tail slot. No SCHEMA_VERSION bump
+    tear_guard/armed                 # schema 31: the Class A slot generation open restores. Absent means no Class A tear is in flight. Published by the first arm, after meta 31 is synced
+
     *.ahead                          # transient write-ahead page image for confirmed, header_txs_*, header.head, txstat.body, scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. No SCHEMA_VERSION bump
     scripthash.rebuild               # optional: one byte. The next start wipes and rebuilds the scripthash index; removed when that rebuild finishes. No SCHEMA_VERSION bump
     scripthash.dirty                 # optional: one byte while scripthash writes may be unsynced. A --sh-index start that finds it refuses; a wipe removes it. No SCHEMA_VERSION bump
@@ -302,7 +304,7 @@ and cuts it). `txout`, `txstat`, `input`, block filters, and tweaks are not prun
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — live **30** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **22–30** remain `schema_file_openable` |
+| 4 | 2 | Schema version (u16) — live **31** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **22–31** remain `schema_file_openable`. Meta **30** is not rewritten on open |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 

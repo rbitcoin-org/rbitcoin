@@ -701,7 +701,7 @@ fn open_schema24_occupied_creates_zero_txstat() {
     assert_eq!(s.txs.txstat.count(), 1);
     assert_eq!(s.txs.txstat.get_cell(Fk(1)).unwrap(), [0u8; 8]);
     drop(s);
-    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+    assert_eq!(read_store_meta_ver(&dir), 30);
     assert!(dir.join("txstat.body").is_file());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -726,7 +726,7 @@ fn schema_27_rewrites_meta_so_an_older_build_refuses() {
     let s = Store::open_tiny(&dir).unwrap();
     drop(s);
     assert_eq!(read_store_meta_ver(&dir), 30);
-    assert_eq!(SCHEMA_VERSION, 30);
+    assert_eq!(SCHEMA_VERSION, 31);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -759,7 +759,7 @@ fn pruned_schema_26_rewrites_meta_before_the_creates_are_read() {
     assert_eq!(s.txs.count(), 1, "schema 26 prune open must keep creates");
     drop(s);
     assert_eq!(read_store_meta_ver(&dir), 30);
-    assert_eq!(SCHEMA_VERSION, 30);
+    assert_eq!(SCHEMA_VERSION, 31);
     let synced = rbitcoin_store::file::take_fsynced_dirs();
     assert!(
         synced.iter().any(|p| p == dir.path()),
