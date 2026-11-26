@@ -3820,12 +3820,7 @@ async fn onion_listener_separates_source_ip_grants() {
     }
     let tor = FakeTor::start().await;
     *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
-    let (direct, onion, rpc, health) = (
-        ephemeral_addr(),
-        ephemeral_addr(),
-        ephemeral_addr(),
-        ephemeral_addr(),
-    );
+    let (direct, onion, rpc) = (ephemeral_addr(), ephemeral_addr(), ephemeral_addr());
     let mut cfg = listen_and_exit_cfg(&td.path()).with_p2p_listen(direct);
     cfg.apply_kv("listen", &format!("{onion}=onion")).unwrap();
     cfg.apply_kv(
@@ -3840,12 +3835,13 @@ async fn onion_listener_separates_source_ip_grants() {
     cfg.tor.control = Some(tor.addr);
     cfg.tor.password = Some(TOR_PASSWORD.into());
     cfg.rpc.listen = Some(rpc);
-    cfg.listen.health = Some(health);
+    cfg.listen.health = Some("127.0.0.1:0".parse().unwrap());
     cfg.metrics = true;
     cfg.max_run_secs = Some(60);
 
     let node = spawn_run_p2p(cfg);
-    wait_listeners(&[rpc, health]).await;
+    wait_listeners(&[rpc]).await;
+    let health = published_listener(&td.path(), "health").await;
     let streams = [
         TcpStream::connect(direct).await.unwrap(),
         TcpStream::connect(onion).await.unwrap(),
@@ -3853,20 +3849,30 @@ async fn onion_listener_separates_source_ip_grants() {
     let sockets = streams
         .each_ref()
         .map(|stream| stream.local_addr().unwrap());
-    let connecting = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let info = jsonrpc(rpc, "getpeerinfo", json!([])).await;
-            if info["result"]
-                .as_array()
-                .is_some_and(|rows| rows.len() == 2)
-            {
-                break info;
+    let wait_for_peers = |established| async move {
+        let sources = sockets.map(|socket| socket.to_string());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let info = jsonrpc(rpc, "getpeerinfo", json!([])).await;
+                if info["result"].as_array().is_some_and(|rows| {
+                    sources.iter().all(|source| {
+                        rows.iter().any(|row| {
+                            row["addr"] == source.as_str()
+                                && row["version"]
+                                    .as_u64()
+                                    .is_some_and(|version| (version > 0) == established)
+                        })
+                    })
+                }) {
+                    break info;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("both connecting peers");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("both fixture peers with established={established}"))
+    };
+    let connecting = wait_for_peers(false).await;
     let connecting_metrics = scrape_metrics(health).await;
     let mut connections = Vec::new();
     for ((stream, addr), local) in streams.into_iter().zip([direct, onion]).zip(sockets) {
@@ -3887,7 +3893,7 @@ async fn onion_listener_separates_source_ip_grants() {
                 .unwrap(),
         );
     }
-    let info = jsonrpc(rpc, "getpeerinfo", json!([])).await;
+    let info = wait_for_peers(true).await;
     let metrics = scrape_metrics(health).await;
     stop_run_p2p(rpc, node).await;
     for (established, snapshot, samples) in [

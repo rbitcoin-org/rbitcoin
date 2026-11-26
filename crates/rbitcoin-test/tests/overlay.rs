@@ -14,10 +14,10 @@ use rbitcoin_primitives::Network;
 use rbitcoin_test::jsonrpc::write_rpc_token;
 use rbitcoin_test::mine::spend_anyone_can_spend;
 use rbitcoin_test::overlay::{
-    base_node, control_gate, ephemeral_addr, i2p_b32_from_dest, jsonrpc, jsonrpc_try,
-    localaddresses, require_env, restart_daemon, socks_electrum_rpc, socks_http_get, spawn_node,
-    wait_file, wait_hs_desc_uploaded, wait_i2p_stream, wait_jsonrpc, wait_onion_port,
-    wait_p2p_onion, wait_peer_network, wait_socks_onion, OverlayEnv,
+    base_node, control_gate, ephemeral_addr, handshaken_peer_on_network, i2p_b32_from_dest,
+    jsonrpc, jsonrpc_try, localaddresses, require_env, restart_daemon, socks_electrum_rpc,
+    socks_http_get, spawn_node, wait_file, wait_hs_desc_uploaded, wait_i2p_stream, wait_jsonrpc,
+    wait_onion_port, wait_p2p_onion, wait_peer_network, wait_socks_onion, OverlayEnv,
 };
 use rbitcoin_test::TempDir;
 use serde_json::json;
@@ -206,12 +206,7 @@ async fn tor_onion_two_node_v2() {
         assert_ne!(row["addr"], "0.0.0.0", "{peers}");
 
         let bin = wait_peer_network(b_rpc, "onion", true, Duration::from_secs(30)).await;
-        let brow = bin["result"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["inbound"] == true)
-            .expect("B inbound");
+        let brow = handshaken_peer_on_network(&bin, "onion", true).expect("B inbound");
         assert_eq!(brow["transport_protocol_type"], "v2", "{bin}");
         let tor_bind: SocketAddr = brow["addrbind"].as_str().unwrap().parse().unwrap();
         assert!(tor_bind.ip().is_loopback() && tor_bind.is_ipv4());

@@ -1872,10 +1872,10 @@ impl LivePeer {
         {
             crate::OnlyNet::Onion.label()
         } else {
-            let cjdns_reachable = hub
+            let cjdns_reportable = hub
                 .as_ref()
-                .is_some_and(|h| h.cjdns_reachable.load(Ordering::Relaxed));
-            self.net.peer_network_label(cjdns_reachable)
+                .is_some_and(|h| h.cjdns_reportable.load(Ordering::Relaxed));
+            self.net.peer_network_label(cjdns_reportable)
         };
         PeerInfo {
             id: self.id,
@@ -2268,6 +2268,7 @@ pub struct PeerHub {
     /// Clearnet P2P bind (not onion-only loopback). Needed to gossip `--external-ip`.
     pub clearnet_listen: AtomicBool,
     pub cjdns_reachable: AtomicBool,
+    cjdns_reportable: AtomicBool,
     proxies: Mutex<crate::socks::NetProxies>,
     /// Core `-i2psam`: I2P rows may enter addrman. Off, they are still relayed.
     i2p_reachable: AtomicBool,
@@ -2536,6 +2537,7 @@ impl PeerHub {
             discovered: Mutex::new(VecDeque::new()),
             clearnet_listen: AtomicBool::new(true),
             cjdns_reachable: AtomicBool::new(false),
+            cjdns_reportable: AtomicBool::new(false),
             proxies: Mutex::new(crate::socks::NetProxies::default()),
             i2p_reachable: AtomicBool::new(false),
             pruned: AtomicBool::new(false),
@@ -2806,8 +2808,12 @@ impl PeerHub {
         self.clearnet_listen.store(on, Ordering::Relaxed);
     }
 
-    pub fn set_cjdns_reachable(&self, on: bool) {
+    pub fn set_cjdns_reachable(&self, on: bool, only_net: &[crate::OnlyNet]) {
         self.cjdns_reachable.store(on, Ordering::Relaxed);
+        self.cjdns_reportable.store(
+            on && crate::OnlyNet::Cjdns.allowed_by(only_net),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn set_proxies(&self, proxies: crate::socks::NetProxies) {

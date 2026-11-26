@@ -806,7 +806,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     node.peers.set_pruned(config.prune_seqsigwit);
     node.peers.set_asmap(asmap.clone());
     node.peers
-        .set_cjdns_reachable(config.listen.cjdns_reachable);
+        .set_cjdns_reachable(config.listen.cjdns_reachable, &config.listen.only_net);
     node.peers
         .publish_local_endpoints(node.local_addr.port(), external, table.clone());
     if p2p_inbound && node.peers.forwarded_loopback_drops_grants() {

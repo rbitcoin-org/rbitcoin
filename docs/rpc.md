@@ -57,9 +57,10 @@ including before VERSION.
 `addr` and `addrbind` still report the TCP source and listening endpoint.
 
 Ordinary non-public IP peers and SOCKS-resolved names with no known IP
-report `not_publicly_routable`. Routable IPv6 addresses with a linked IPv4
-address, such as well-known NAT64 addresses, report `ipv4`. TCP peers from
-`fc00::/8` report `cjdns` when CJDNS is enabled.
+report `not_publicly_routable`. A routable IPv6 address with a linked IPv4
+address reports `ipv4` even if its embedded IPv4 is private. TCP peers from
+`fc00::/8` report `cjdns` if `--cjdns-reachable` enables it and `--only-net`
+allows it. Otherwise they report `not_publicly_routable`.
 
 ## Operator knobs
 

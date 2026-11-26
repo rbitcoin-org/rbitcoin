@@ -474,13 +474,21 @@ pub async fn wait_onion_port(rpc: SocketAddr, port: u16, wall: Duration) -> Stri
 
 pub async fn wait_peer_network(rpc: SocketAddr, net: &str, inbound: bool, wall: Duration) -> Value {
     wait_jsonrpc(rpc, "getpeerinfo", serde_json::json!([]), wall, |v| {
-        v["result"].as_array().is_some_and(|rows| {
-            rows.iter().any(|p| {
-                p["network"] == net && p["inbound"] == inbound && p["startingheight"] != -1
-            })
-        })
+        handshaken_peer_on_network(v, net, inbound).is_some()
     })
     .await
+}
+
+pub fn handshaken_peer_on_network<'a>(
+    info: &'a Value,
+    net: &str,
+    inbound: bool,
+) -> Option<&'a Value> {
+    info["result"].as_array()?.iter().find(|row| {
+        row["network"] == net
+            && row["inbound"] == inbound
+            && row["version"].as_u64().is_some_and(|version| version > 0)
+    })
 }
 
 pub use crate::i2p_dest::i2p_b32_from_dest;

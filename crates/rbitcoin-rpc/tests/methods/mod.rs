@@ -7324,7 +7324,7 @@ fn getpeerinfo_and_disconnectnode_support_onion_addr() {
 
 #[test]
 fn getpeerinfo_uses_the_network_class_of_the_socket_address() {
-    use rbitcoin_net::{PeerConnType, PeerHub};
+    use rbitcoin_net::{OnlyNet, PeerConnType, PeerHub};
 
     let (mut ctx, dir) = ctx_empty();
     let hub = PeerHub::new();
@@ -7341,6 +7341,7 @@ fn getpeerinfo_uses_the_network_class_of_the_socket_address() {
         ("1.2.3.4:18444", "ipv4"),
         ("[2606:4700::1]:18444", "ipv6"),
         ("[64:ff9b::102:304]:18444", "ipv4"),
+        ("[64:ff9b::c0a8:106]:18444", "ipv4"),
         ("[::ffff:0:102:304]:18444", "ipv4"),
         ("[2002:102:304::1]:18444", "ipv4"),
         ("[2001:0:1:2:3:4:fefd:fcfb]:18444", "ipv4"),
@@ -7358,11 +7359,17 @@ fn getpeerinfo_uses_the_network_class_of_the_socket_address() {
         assert_eq!(row["network"], class, "{addr}: {row}");
     }
 
-    hub.set_cjdns_reachable(true);
-    let info = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
-    let row = info.as_array().unwrap().last().unwrap();
-    assert_eq!(row["addr"], cjdns);
-    assert_eq!(row["network"], "cjdns");
+    for (only_net, class) in [
+        (&[][..], "cjdns"),
+        (&[OnlyNet::Cjdns][..], "cjdns"),
+        (&[OnlyNet::Ipv4][..], not_public),
+    ] {
+        hub.set_cjdns_reachable(true, only_net);
+        let info = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+        let row = info.as_array().unwrap().last().unwrap();
+        assert_eq!(row["addr"], cjdns);
+        assert_eq!(row["network"], class);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

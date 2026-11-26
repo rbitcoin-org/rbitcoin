@@ -45,6 +45,10 @@ impl OnlyNet {
 
     pub const ALL: [Self; 5] = [Self::Ipv4, Self::Ipv6, Self::Onion, Self::I2p, Self::Cjdns];
 
+    pub(crate) fn allowed_by(self, only_net: &[Self]) -> bool {
+        only_net.is_empty() || only_net.contains(&self)
+    }
+
     pub fn of(addr: NetAddr) -> Self {
         match addr {
             NetAddr::Ip(s) if s.is_ipv4() => Self::Ipv4,
