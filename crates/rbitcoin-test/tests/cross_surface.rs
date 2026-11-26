@@ -3763,6 +3763,39 @@ fn starts_with_any(lines: &[String], prefix: &str) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn native_tor_automatic_listener_reports_an_occupied_backend() {
+    let td = TestDatadir::new().unwrap();
+    let backend = SocketAddr::from(([127, 0, 0, 1], Network::Regtest.default_p2p_port() + 1));
+    let occupied = tokio::net::TcpListener::bind(backend).await.unwrap();
+    let tor = FakeTor::start().await;
+    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
+    let mut cfg = listen_and_exit_cfg(&td.path());
+    cfg.listen.p2p = rbitcoin_node::P2pListen::Auto;
+    cfg.tor.control = Some(tor.addr);
+    cfg.tor.password = Some(TOR_PASSWORD.into());
+
+    start_and_exit(cfg.clone()).await.unwrap();
+    assert!(starts_with_any(&tor.take_log(), "ADD_ONION ").is_empty());
+
+    cfg.listen.listen_onion = true;
+    let err = start_and_exit(cfg.clone()).await.unwrap_err().to_string();
+    assert!(
+        err.contains(&backend.to_string()) && err.contains("=onion"),
+        "{err}"
+    );
+    assert!(starts_with_any(&tor.take_log(), "ADD_ONION ").is_empty());
+
+    drop(occupied);
+    start_and_exit(cfg).await.unwrap();
+    let lines = starts_with_any(&tor.take_log(), "ADD_ONION ");
+    let public = Network::Regtest.default_p2p_port();
+    assert_eq!(
+        lines,
+        [format!("ADD_ONION NEW:ED25519-V3 Port={public},{backend}")]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn external_onions_report_public_ports_with_an_onion_only_listener() {
     let td = TestDatadir::new().unwrap();
     let token = td.path().join("rpc.token");
@@ -3871,6 +3904,44 @@ async fn onion_listener_separates_source_ip_grants() {
                 && cmd.ends_with(&format!("Port=18444,{onion}"))),
         "{commands:?}"
     );
+}
+
+fn native_tor_port_mapping(line: &str, ordinary: SocketAddr) -> String {
+    let mapping = line.split_whitespace().last().unwrap();
+    let (public, target) = mapping.split_once(',').unwrap();
+    assert_eq!(
+        public,
+        format!("Port={}", Network::Regtest.default_p2p_port())
+    );
+    let target: SocketAddr = target.parse().unwrap();
+    assert_eq!(target.ip().to_string(), "127.0.0.1");
+    assert_ne!(target.port(), 0);
+    assert_ne!(target, ordinary, "Tor and SAM need separate listeners");
+    mapping.to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_tor_and_sam_keep_separate_targets_without_an_ordinary_bind() {
+    let td = TestDatadir::new().unwrap();
+    let tor = FakeTor::start().await;
+    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
+    let sam = FakeSam::start().await;
+    let mut cfg = listen_and_exit_cfg(&td.path());
+    cfg.apply_kv("listen", "0").unwrap();
+    cfg.listen.listen_onion = true;
+    cfg.tor.control = Some(tor.addr);
+    cfg.tor.password = Some(TOR_PASSWORD.into());
+    cfg.listen.i2p_sam = Some(sam.addr);
+    cfg.listen.i2p_accept_incoming = true;
+    start_and_exit(cfg).await.unwrap();
+
+    let primary = published_listener(&td.path(), "p2p").await;
+    let forwards = starts_with_any(&sam.take_log(), "STREAM FORWARD");
+    assert_eq!(forwards.len(), 1, "{forwards:?}");
+    assert!(forwards[0].contains(&format!("PORT={} ", primary.port())));
+    let onions = starts_with_any(&tor.take_log(), "ADD_ONION ");
+    assert_eq!(onions.len(), 1, "{onions:?}");
+    native_tor_port_mapping(&onions[0], primary);
 }
 
 /// An operator publishes P2P, Electrum, and Esplora as onion and I2P
@@ -4112,12 +4183,12 @@ async fn tor_control_onion_lifecycle() {
     let first = tor.take_log();
     assert!(first.contains(&format!("AUTHENTICATE \"{TOR_PASSWORD}\"")));
     let onions = starts_with_any(&first, "ADD_ONION ");
+    assert_eq!(onions.len(), 3, "{onions:?}");
     let targets = [
-        format!("Port={regtest_port},127.0.0.1:{}", p2p.port()),
+        native_tor_port_mapping(&onions[0], p2p),
         format!("Port={0},127.0.0.1:{0}", electrum.port()),
         format!("Port={0},127.0.0.1:{0}", esplora.port()),
     ];
-    assert_eq!(onions.len(), 3, "{onions:?}");
     for (line, target) in onions.iter().zip(&targets) {
         assert_eq!(*line, format!("ADD_ONION NEW:ED25519-V3 {target}"));
     }
@@ -4160,7 +4231,15 @@ async fn tor_control_onion_lifecycle() {
     );
     let onions = starts_with_any(&second, "ADD_ONION ");
     assert_eq!(onions.len(), 3, "{onions:?}");
-    for (key, (line, target)) in private_keys.iter().zip(onions.iter().zip(&targets)) {
+    let restarted_targets = [
+        native_tor_port_mapping(&onions[0], p2p),
+        targets[1].clone(),
+        targets[2].clone(),
+    ];
+    for (key, (line, target)) in private_keys
+        .iter()
+        .zip(onions.iter().zip(&restarted_targets))
+    {
         assert_eq!(*line, format!("ADD_ONION {key} {target}"));
     }
     let creates = starts_with_any(&sam.take_log(), "SESSION CREATE");
@@ -4186,6 +4265,8 @@ async fn tor_control_onion_lifecycle() {
             .iter()
             .map(|l| l.rsplit(' ').next().unwrap())
             .collect();
+        let native = native_tor_port_mapping(&onion_lines[0], p2p);
+        let targets = [native, targets[1].clone(), targets[2].clone()];
         let want: Vec<&str> = [true, electrum_on, esplora_on]
             .into_iter()
             .zip(&targets)

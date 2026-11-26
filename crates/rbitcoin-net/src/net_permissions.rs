@@ -345,6 +345,8 @@ pub struct NetPermTable {
     pub whitelist: Vec<WhitelistGrant>,
     pub whitebind: Vec<WhitebindGrant>,
     pub onion_bind: Option<SocketAddr>,
+    /// Native Tor's automatic bind does not tell us where an external service forwards.
+    pub onion_bind_is_implicit: bool,
 }
 
 impl NetPermTable {

@@ -2275,19 +2275,23 @@ fn self_announce_stays_on_the_link_network() {
         self_announce_nets(&overlay_peer(&peers, other_i2p, out)),
         ["i2p"]
     );
-    assert!(
-        self_announce_nets(&overlay_peer(&peers, loopback_inbound, inbound)).is_empty(),
-        "loopback inbound could be Tor or I2P, so it gets nothing"
+    assert_eq!(
+        self_announce_nets(&overlay_peer(&peers, loopback_inbound, inbound)),
+        ["i2p"]
     );
 
     let tor_only = hub_with(true, false);
+    tor_only.set_net_perms(rbitcoin_net::net_permissions::NetPermTable {
+        onion_bind: loopback_inbound.socket_addr(),
+        ..Default::default()
+    });
     let tor_inbound = overlay_peer(&tor_only, loopback_inbound, inbound);
     assert_eq!(
         self_announce_nets(&tor_inbound),
         ["onion"],
         "inbound on the onion listener gets the onion and not the clearnet IP"
     );
-    let v1_tor_inbound = live_peer(&tor_only, 51001, 41, true);
+    let v1_tor_inbound = live_peer(&tor_only, 51000, 41, true);
     assert!(
         v1_tor_inbound.take_self_announce_msg().is_none(),
         "v1 ADDR on the onion listener must not carry the clearnet IP"
@@ -2411,6 +2415,7 @@ fn external_onion_announcement_uses_the_configured_or_listen_port_on_tor() {
 
 #[test]
 fn external_onion_withholds_self_announcements_on_shared_loopback() {
+    use rbitcoin_net::net_permissions::{parse_whitelist, NetPermTable};
     use rbitcoin_net::peers::PeerConnType::Inbound;
 
     let peers = rbitcoin_net::PeerHub::new();
@@ -2426,6 +2431,17 @@ fn external_onion_withholds_self_announcements_on_shared_loopback() {
 
     assert!(inbound().take_local_addr_due(1_000).is_none());
     assert!(inbound().take_self_announce_msg().is_none());
+
+    peers.set_net_perms(NetPermTable {
+        onion_bind: Some("127.0.0.1:18446".parse().unwrap()),
+        onion_bind_is_implicit: true,
+        whitelist: vec![parse_whitelist("relay@127.0.0.1").unwrap()],
+        ..Default::default()
+    });
+    assert!(inbound().take_local_addr_due(1_000).is_none());
+    assert!(inbound().take_self_announce_msg().is_none());
+    let socket = loopback.socket_addr().unwrap();
+    assert!(peers.permission_strings(socket, true, socket).is_empty());
 
     peers.set_p2p_i2p(rbitcoin_net::NetAddr::I2p {
         dest: [0x11; 32],
@@ -2612,9 +2628,10 @@ fn a_down_onion_is_not_advertised_but_stays_our_own() {
         peers.is_own_address(tor_wallet),
         "a down wallet onion is still filtered from address replies"
     );
-    assert!(
-        self_announce_nets(&overlay_peer(&peers, loopback_inbound, inbound)).is_empty(),
-        "a loopback inbound still cannot tell Tor from I2P, so it gets neither"
+    assert_eq!(
+        self_announce_nets(&overlay_peer(&peers, loopback_inbound, inbound)),
+        ["i2p"],
+        "the I2P announcement continues while native Tor is down"
     );
 
     peers.set_external_endpoints(vec![external_onion.parse().unwrap()]);
