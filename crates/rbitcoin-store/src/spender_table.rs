@@ -14,7 +14,7 @@ use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::tx_table::{pack_spent_field, unpack_spent_field};
 use rbitcoin_primitives::{le_u64, Fk, TableKind};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const SPENDER_RECORD_LEN: usize = 16;
 /// Multi-spender overflow next to `spent.body` (schema 17).
@@ -22,9 +22,27 @@ pub const SPENT_OVF_NAME: &str = "spent.ovf";
 #[doc(hidden)]
 pub const LEGACY_SPENDERS_BODY: &str = "spenders.body";
 
+/// The annotate freeze. [`Self::new`] borrows [`crate::store::UtxoViewGuard`]
+/// for the sync and the clear.
+pub struct SpenderFreeze<'a> {
+    _view: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> SpenderFreeze<'a> {
+    pub fn new(guard: &'a crate::store::UtxoViewGuard<'_>) -> Self {
+        let _ = guard.view;
+        Self {
+            _view: std::marker::PhantomData,
+        }
+    }
+}
+
 pub struct SpenderTable {
     pub body: TableFile,
     pub count: AtomicU64,
+    /// A body sync failed. A retry can return 0 after the kernel dropped
+    /// the dirty pages, so the mark stays until restart.
+    sync_failed: AtomicBool,
 }
 
 #[doc(hidden)]
@@ -53,6 +71,7 @@ impl SpenderTable {
         Ok(Self {
             body,
             count: AtomicU64::new(0),
+            sync_failed: AtomicBool::new(false),
         })
     }
 
@@ -70,6 +89,7 @@ impl SpenderTable {
         Ok(Self {
             body,
             count: AtomicU64::new(count),
+            sync_failed: AtomicBool::new(false),
         })
     }
 
@@ -112,13 +132,32 @@ impl SpenderTable {
         Ok((spend_tx, vin, Fk(le_u64!(buf, 8))))
     }
 
-    pub fn flush(&self) -> Result<(), StoreError> {
-        self.body.flush()?;
-        self.clear_mark()
+    pub fn flush(&self, _freeze: &SpenderFreeze<'_>) -> Result<(), StoreError> {
+        self.refuse_if_sync_failed()?;
+        self.finish_sync(self.body.flush())
     }
 
-    pub fn sync_data_only(&self) -> Result<(), StoreError> {
-        self.body.sync_data_only()?;
+    pub fn sync_data_only(&self, _freeze: &SpenderFreeze<'_>) -> Result<(), StoreError> {
+        self.refuse_if_sync_failed()?;
+        self.finish_sync(self.body.sync_data_only())
+    }
+
+    fn refuse_if_sync_failed(&self) -> Result<(), StoreError> {
+        if self.sync_failed.load(Ordering::Acquire) {
+            return Err(StoreError::io(
+                self.body.path(),
+                std::io::Error::other("an earlier spent.ovf sync failed; restart the node"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Latch the first body sync error and leave the mark in place.
+    fn finish_sync(&self, synced: Result<(), StoreError>) -> Result<(), StoreError> {
+        if let Err(e) = synced {
+            self.sync_failed.store(true, Ordering::Release);
+            return Err(e);
+        }
         self.clear_mark()
     }
 
