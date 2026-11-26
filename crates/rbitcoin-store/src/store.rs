@@ -534,7 +534,7 @@ impl Store {
             return Err(StoreError::NotDirectory(path));
         }
         let meta_ver = check_meta(&path)?;
-        crate::page_guard::restore_store_group(&path, crate::page_guard::CLASS_C_MARK)?;
+        restore_open_marks(&path)?;
         open_layout_refuse_old(&path, meta_ver)?;
         drop_unread_store_leftovers(&path);
         let scripthash = if path.join("scripthash.body").exists() {
@@ -2235,11 +2235,11 @@ impl Store {
                     let disconnected = filtered.load(Ordering::Acquire) != seen;
                     log.freeze_open(tip, disconnected.then_some(keep))?;
                     filtered.store(seen, Ordering::Release);
+                    // The appender is held off until this sync and the
+                    // spent.ovf clear both finish. A later append arms again.
+                    spenders.sync_data_only()?;
                 }
-                // Every spender a frozen note names was appended before the
-                // freeze. Sync it before the commit can name its number.
                 let named = txs.settled_count();
-                spenders.sync_data_only()?;
                 txs.sync_class_a_named(named)?;
                 Ok(())
             },
@@ -2361,7 +2361,10 @@ impl Store {
         after_first_read(self);
         let Some(height) = self.spend_snapshot_height() else {
             let tip = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
-            self.spenders.sync_data_only()?;
+            {
+                let _g = self.hold_utxo_view();
+                self.spenders.sync_data_only()?;
+            }
             self.publish_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
             return Ok(());
         };
@@ -2522,7 +2525,10 @@ impl Store {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.headers.flush()?;
         self.txs.flush()?;
-        self.spenders.flush()?;
+        {
+            let _g = self.hold_utxo_view();
+            self.spenders.flush()?;
+        }
         self.scripthash.flush()?;
         self.flush_class_c_tip()?;
         Ok(())
@@ -2773,6 +2779,18 @@ pub fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
         std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
     }
     rbitcoin_log::warn!("store: dropping leftover spent.off (schema 22 uses create.loc)");
+    Ok(())
+}
+
+/// Copy armed page images back before trim or the tip walk. The header
+/// marks are replayed by the header table open.
+fn restore_open_marks(path: &Path) -> Result<(), StoreError> {
+    crate::page_guard::restore_store_group(path, crate::page_guard::CLASS_C_MARK)?;
+    crate::page_guard::restore_store_file(
+        path,
+        crate::page_guard::SPENT_OVF_MARK,
+        crate::spender_table::SPENT_OVF_NAME,
+    )?;
     Ok(())
 }
 

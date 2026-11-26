@@ -1284,3 +1284,78 @@ fn lower_named_sync_seals_the_higher_synced_value() {
     drop(s);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// One open: the live page is mixed, Class A is armed with a different
+/// image, and `spent.delta/fold` is already present. The fold image is
+/// what the page comes back as. Class A does not restore `spent.body`.
+#[test]
+fn mixed_spent_body_page_under_fold_reopens_as_the_fold_image() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let outs = vec![OutputRecord::unspent(50, vec![0x51]); 512];
+        s.put_tx_full_batch_indexed(
+            &[(
+                TxRecord {
+                    txid: [0x62u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 512,
+                },
+                vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+                outs,
+            )],
+            false,
+        )
+        .unwrap();
+        s.txs.sync_class_a_named(1).unwrap();
+    }
+    let body = dir.join("spent.body");
+    let published = logical_of(&body);
+    assert!(published > 4096, "spent.body published {published}");
+    let keep = (published - 4096) as usize;
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).open(&body).unwrap();
+        file.seek(SeekFrom::Start(4096)).unwrap();
+        file.write_all(&vec![0xabu8; keep]).unwrap();
+        file.sync_all().unwrap();
+    }
+    let junk = vec![0x11u8; keep];
+    plant_tail(
+        &dir.join("tear_guard/tail.0"),
+        3,
+        1,
+        &[(SPENT_STEM, published, 4096, &junk)],
+    );
+    plant_armed(&dir, 3);
+    let delta = dir.join(rbitcoin_store::spend_delta::SPEND_DELTA_DIR);
+    let mut fold = Vec::new();
+    fold.extend_from_slice(&rbitcoin_primitives::STORE_MAGIC);
+    fold.extend_from_slice(&rbitcoin_primitives::SCHEMA_VERSION.to_le_bytes());
+    fold.extend_from_slice(&0u16.to_le_bytes());
+    fold.extend_from_slice(&1u32.to_le_bytes());
+    fold.extend_from_slice(&4096u64.to_le_bytes());
+    fold.extend_from_slice(&vec![0x5au8; PAGE]);
+    std::fs::write(
+        delta.join(rbitcoin_store::spend_delta::SPEND_DELTA_FOLD_NAME),
+        &fold,
+    )
+    .unwrap();
+    let mut commit =
+        std::fs::read(delta.join(rbitcoin_store::spend_delta::SPEND_DELTA_COMMIT_NAME)).unwrap();
+    commit[8..12].copy_from_slice(&1u32.to_le_bytes());
+    std::fs::write(
+        delta.join(rbitcoin_store::spend_delta::SPEND_DELTA_COMMIT_NAME),
+        &commit,
+    )
+    .unwrap();
+    let s = Store::open_tiny(&dir).unwrap();
+    drop(s);
+    let mut got = vec![0u8; keep];
+    read_at(&body, 4096, &mut got);
+    assert_eq!(got, vec![0x5au8; keep], "fold image lost");
+    assert_ne!(got, vec![0x11u8; keep], "class A restored spent.body");
+    assert_ne!(got, vec![0xabu8; keep], "the mixed page survived");
+    let _ = std::fs::remove_dir_all(&dir);
+}

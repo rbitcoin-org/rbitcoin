@@ -30,6 +30,8 @@ pub const CLASS_C_MARK: &str = "guard/class_c";
 pub const HEADER_BODY_MARK: &str = "guard/header.body";
 /// Forward images for one `header.head` generation and its `.mlt`.
 pub const HEADER_HEAD_MARK: &str = "guard/header.head";
+/// Backward image of `spent.ovf` page 0 and its tail block.
+pub const SPENT_OVF_MARK: &str = "guard/spent.ovf";
 
 #[doc(hidden)]
 pub fn arm_page_guard(path: &Path, pages: &[(u64, &[u8])]) -> Result<(), StoreError> {
@@ -267,6 +269,31 @@ pub fn restore_store_group(dir: &Path, mark: &str) -> Result<bool, StoreError> {
 /// Copy `dir/<mark>` onto its files and keep the mark. Missing is `Ok(false)`.
 pub(crate) fn replay_store_group(dir: &Path, mark: &str) -> Result<bool, StoreError> {
     replay_page_guard_group(&dir.join(mark), dir)
+}
+
+/// Copy `dir/<mark>` onto `dir/<data_name>` when the mark exists.
+///
+/// `Ok(false)` is a missing mark. A present mark is copied without reading
+/// the live bytes. The data file is created when the mark names one that
+/// is not there yet.
+#[doc(hidden)]
+pub fn restore_store_file(dir: &Path, mark: &str, data_name: &str) -> Result<bool, StoreError> {
+    let mark_path = dir.join(mark);
+    match mark_path.try_exists() {
+        Ok(false) => return Ok(false),
+        Ok(true) => {}
+        Err(e) => return Err(StoreError::io(&mark_path, e)),
+    }
+    let data_path = dir.join(data_name);
+    // Default is truncate-false. Naming it adds a ratchet-counted truncate(.
+    #[allow(clippy::suspicious_open_options)]
+    let data = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&data_path)
+        .map_err(|e| StoreError::io(&data_path, e))?;
+    restore_page_guard(&mark_path, &data, &data_path)
 }
 
 /// Promote `meta` to 31 when this directory is a datadir still on 30.
