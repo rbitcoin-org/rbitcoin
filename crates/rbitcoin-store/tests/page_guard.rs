@@ -318,27 +318,57 @@ fn group_restore_names_each_file() {
 }
 
 #[test]
-fn group_arm_keeps_leftover_pages_the_new_set_does_not_cover() {
+fn group_arm_replaces_one_file_and_keeps_another() {
     let dir = TempDir::labeled("page-guard-merge").unwrap();
-    let live = dir.path().join("header.head");
+    let head = dir.path().join("header.head");
+    let mlt = dir.path().join("header.head.mlt");
     let mark = dir.path().join("guard/header.head");
-    let first = fill(0x31);
-    let second = fill(0x32);
-    let third = fill(0x33);
+    let old_head = fill(0x31);
+    let kept_page = fill(0x34);
+    let kept_mlt = fill(0x32);
+    let new_head = fill(0x33);
     arm_page_guard_group(
         &mark,
         &[
-            ("header.head", 0, first.as_slice()),
-            ("header.head", PAGE as u64, second.as_slice()),
+            ("header.head", 0, old_head.as_slice()),
+            ("header.head", PAGE as u64, kept_page.as_slice()),
+            ("header.head.mlt", 0, kept_mlt.as_slice()),
         ],
     )
     .unwrap();
-    arm_page_guard_group(&mark, &[("header.head", PAGE as u64 * 2, third.as_slice())]).unwrap();
-    write_bytes(&live, 0, &fill(0x00));
-    write_bytes(&live, PAGE as u64, &fill(0x00));
-    write_bytes(&live, PAGE as u64 * 2, &fill(0x00));
+    arm_page_guard_group(&mark, &[("header.head", 0, new_head.as_slice())]).unwrap();
+    write_bytes(&head, 0, &fill(0x00));
+    write_bytes(&head, PAGE as u64, &fill(0x00));
+    write_bytes(&mlt, 0, &fill(0x00));
     assert!(restore_page_guard_group(&mark, dir.path()).unwrap());
-    assert_eq!(read_bytes(&live, 0, PAGE), first);
-    assert_eq!(read_bytes(&live, PAGE as u64, PAGE), second);
-    assert_eq!(read_bytes(&live, PAGE as u64 * 2, PAGE), third);
+    assert_eq!(read_bytes(&head, 0, PAGE), new_head);
+    assert_eq!(read_bytes(&head, PAGE as u64, PAGE), kept_page);
+    assert_eq!(read_bytes(&mlt, 0, PAGE), kept_mlt);
+}
+
+#[test]
+fn clear_drops_only_the_synced_file() {
+    let dir = TempDir::labeled("page-guard-clear-one").unwrap();
+    let head = dir.path().join("header.head");
+    let mlt = dir.path().join("header.head.mlt");
+    let mark = dir.path().join("guard/header.head");
+    let head_image = fill(0x41);
+    let mlt_image = fill(0x42);
+    arm_page_guard_group(
+        &mark,
+        &[
+            ("header.head", 0, head_image.as_slice()),
+            ("header.head.mlt", 0, mlt_image.as_slice()),
+        ],
+    )
+    .unwrap();
+    write_bytes(&head, 0, &head_image);
+    write_bytes(&mlt, 0, &fill(0x00));
+    let head_file = open_rw(&head);
+    clear_page_guard(&mark, &head_file, &head).unwrap();
+    drop(head_file);
+    write_bytes(&mlt, 0, &fill(0x00));
+    assert!(restore_page_guard_group(&mark, dir.path()).unwrap());
+    assert_eq!(read_bytes(&mlt, 0, PAGE), mlt_image);
+    assert!(!mark.exists());
 }
