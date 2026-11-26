@@ -9,7 +9,8 @@ use bitcoin::p2p::Magic;
 use bitcoin::Amount;
 use rbitcoin_net::{peer::V2PlainSession, socks::socks5_connect_domain, v2::read_v2_frame};
 use rbitcoin_net::{NetAddr, OnlyNet};
-use rbitcoin_node::{NodeConfig, P2pListen};
+use rbitcoin_node::{NodeConfig, NodeError, P2pListen};
+use rbitcoin_primitives::Network;
 use rbitcoin_test::jsonrpc::write_rpc_token;
 use rbitcoin_test::mine::spend_anyone_can_spend;
 use rbitcoin_test::overlay::{
@@ -80,6 +81,39 @@ async fn read_self_announcement(stream: TcpStream) -> (V2PlainSession, Vec<NetAd
     .await
     .expect("P2P self-announcement");
     (peer, addresses)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tor_automatic_listener_reports_an_occupied_backend() {
+    let dir = TempDir::new().unwrap();
+    let ordinary_port = Network::Regtest.default_p2p_port();
+    let backend = SocketAddr::from(([127, 0, 0, 1], ordinary_port + 1));
+    let _occupied = tokio::net::TcpListener::bind(backend)
+        .await
+        .expect("reserve the regtest Tor backend");
+    let control = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = base_node(dir.path());
+    cfg.listen.listen_onion = true;
+    cfg.tor.control = Some(control.local_addr().unwrap());
+    cfg.tor.io_timeout = Some(Duration::from_secs(1));
+    cfg.max_run_secs = Some(0);
+
+    let Err(NodeError::Init(message)) =
+        tokio::time::timeout(Duration::from_secs(30), rbitcoin_node::run_p2p(cfg))
+            .await
+            .expect("node startup deadline")
+    else {
+        panic!("startup must fail on the occupied implicit Tor listener");
+    };
+    assert!(
+        message.contains(&format!("Unable to open implicit Tor listener {backend}")),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("--listen 127.0.0.1:{ordinary_port}"))
+            && message.contains("--listen ADDR:PORT=onion"),
+        "{message}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

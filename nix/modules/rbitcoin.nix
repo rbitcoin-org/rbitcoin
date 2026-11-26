@@ -1143,15 +1143,16 @@ in
         type = types.bool;
         default = false;
         description = ''
-          ADD_ONION for the P2P port. Binds 127.0.0.1 even with p2p.listen = false.
+          Publish a native Tor P2P service with ADD_ONION at the network's
+          default public P2P port. Uses the marked `onionListen` socket when set.
+          Otherwise the OS assigns a dedicated 127.0.0.1 port, including with
+          p2p.listen = false. Source-IP grants skip either Tor listener.
           Requires tor.control (implied 127.0.0.1:9051) and maxInbound > 0.
           The module refuses a 0 cap. An implied port enables services.tor, opens
           127.0.0.1:9051, and writes a group-readable cookie at the control cookie path.
           The unit joins group tor, and creates that group with the NixOS tor gid
           when it is missing, so it can read the cookie.
           Gossip the onion, not a home IPv4, when discover is off.
-          Set `onionListen` to give Tor its own listener, so source-IP grants on
-          the P2P listener do not reach Tor-forwarded peers.
         '';
       };
 
@@ -1161,9 +1162,10 @@ in
         example = "127.0.0.1:8334";
         description = ''
           Pass `--listen ADDR:PORT=onion`: a separate P2P listener for Tor forwarding.
-          `listenOnion` publishes this listener instead of the P2P bind, and an operator's
-          own onion service (an onion `externalIp`) forwards to it. Source-IP permission
-          grants skip it and keep applying on the P2P listener.
+          `listenOnion` publishes this listener. An operator's own onion service
+          (an onion `externalIp`) can also forward to it. Source-IP permission
+          grants skip it. Ordinary inbound loopback keeps source-IP grants
+          unless `i2p.acceptIncoming` is enabled.
           Needs a specific IP and a nonzero port (`[ADDR]:PORT` for IPv6), its own port,
           and `maxInbound` > 0. Works with `listen = false` for Tor-only inbound.
           The firewall never opens it. On a non-loopback address, restrict it to the

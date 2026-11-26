@@ -223,8 +223,10 @@ file. Copy `peers` before rolling back.
 uses an explicit `=onion` bind when supplied. Otherwise it opens a dedicated
 marked listener on `127.0.0.1`. With automatic P2P listening this uses the
 network's default P2P port plus one (8334 on mainnet). If that port is occupied,
-startup fails and names the address. Set `--listen ADDR:PORT=onion` to choose
-the Tor listener explicitly. With an explicit ordinary bind or `--no-listen`,
+startup fails and names the address. Set an ordinary `--listen ADDR:PORT`
+to keep ordinary P2P listening. The OS then picks a free Tor port. To choose
+both ports, supply both the ordinary bind and `--listen ADDR:PORT=onion`.
+An explicit `=onion` bind by itself serves Tor only. With `--no-listen`,
 the OS picks a free port for the implicit Tor listener.
 Tor's `ADD_ONION` exposes the network default P2P port (8333 / signet 38333 / …).
 The key is saved at `{datadir}/onion/p2p.priv` (0600). This needs `--tor-control`

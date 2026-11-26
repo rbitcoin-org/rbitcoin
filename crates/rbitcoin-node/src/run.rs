@@ -673,7 +673,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let bound = node.add_listen(addr).await.map_err(|e| {
             if implicit_onion_bind.is_some() {
                 NodeError::Init(format!(
-                    "Unable to open implicit Tor listener {addr}: {e}. Use --listen ADDR:PORT=onion to choose a different Tor listener."
+                    "Unable to open implicit Tor listener {addr}: {e}. Set --listen {} to keep ordinary P2P listening there and let the OS pick a free Tor port. To choose the Tor port as well, add --listen ADDR:PORT=onion.",
+                    node.local_addr,
                 ))
             } else {
                 p2p_start_err("p2p onion listen", e)

@@ -3873,7 +3873,7 @@ async fn onion_listener_separates_source_ip_grants() {
     );
 }
 
-fn native_tor_port_mapping(line: &str, ordinary: SocketAddr) -> String {
+fn native_tor_port_mapping(line: &str, ordinary: SocketAddr) -> (&str, SocketAddr) {
     let mapping = line.split_whitespace().last().unwrap();
     let (public, target) = mapping.split_once(',').unwrap();
     assert_eq!(
@@ -3883,12 +3883,28 @@ fn native_tor_port_mapping(line: &str, ordinary: SocketAddr) -> String {
     let target: SocketAddr = target.parse().unwrap();
     assert_eq!(target.ip().to_string(), "127.0.0.1");
     assert_ne!(target.port(), 0);
-    assert_ne!(target, ordinary, "Tor and SAM need separate listeners");
-    mapping.to_string()
+    assert_ne!(target, ordinary, "Tor needs a dedicated listener");
+    (mapping, target)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn native_tor_with_an_external_onion_keeps_ordinary_loopback_unprivileged() {
+    check_native_tor_listener_permissions(
+        Some("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"),
+        &[],
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_tor_keeps_ordinary_loopback_grants_off_its_listener() {
+    check_native_tor_listener_permissions(None, &["relay"]).await;
+}
+
+async fn check_native_tor_listener_permissions(
+    external_onion: Option<&str>,
+    ordinary_permissions: &[&str],
+) {
     use rbitcoin_net::peer::V2PlainSession;
 
     let td = TestDatadir::new().unwrap();
@@ -3902,38 +3918,54 @@ async fn native_tor_with_an_external_onion_keeps_ordinary_loopback_unprivileged(
     cfg.tor.password = Some(TOR_PASSWORD.into());
     cfg.rpc.listen = Some(rpc);
     cfg.max_run_secs = Some(60);
-    cfg.apply_kv(
-        "external_ip",
-        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion",
-    )
-    .unwrap();
+    if let Some(onion) = external_onion {
+        cfg.apply_kv("external_ip", onion).unwrap();
+    }
     cfg.apply_kv("net_permission", "relay@127.0.0.1").unwrap();
 
     let node = spawn_run_p2p(cfg);
     wait_listeners(&[rpc]).await;
     let ordinary = published_listener(&td.path(), "p2p").await;
-    let stream = TcpStream::connect(ordinary).await.unwrap();
-    let peer = V2PlainSession::outbound_regtest(
-        stream,
-        "/external-onion-bind-test/",
-        Duration::from_secs(5),
-    )
-    .await
-    .unwrap();
-    let info = jsonrpc(rpc, "getpeerinfo", json!([])).await;
-    stop_run_p2p(rpc, node).await;
-    drop(peer);
-
     let commands = starts_with_any(&tor.take_log(), "ADD_ONION ");
     assert_eq!(commands.len(), 1, "{commands:?}");
-    native_tor_port_mapping(&commands[0], ordinary);
-    let row = info["result"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["addrbind"] == ordinary.to_string())
-        .expect("ordinary inbound peer");
-    assert_eq!(row["permissions"], json!([]), "{info}");
+    let (_, marked) = native_tor_port_mapping(&commands[0], ordinary);
+    let mut peers = Vec::new();
+    for addr in [ordinary, marked] {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        peers.push(
+            V2PlainSession::outbound_regtest(
+                stream,
+                "/native-tor-bind-test/",
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let binds = [ordinary.to_string(), marked.to_string()];
+    let registered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let info = jsonrpc(rpc, "getpeerinfo", json!([])).await;
+            let rows = info["result"].as_array().unwrap();
+            if binds.iter().all(|bind| {
+                rows.iter()
+                    .any(|row| row["inbound"] == true && row["addrbind"] == *bind)
+            }) {
+                return info;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    stop_run_p2p(rpc, node).await;
+    drop(peers);
+
+    let info = registered.expect("both inbound peers registered");
+    let rows = info["result"].as_array().unwrap();
+    for (bind, permissions) in binds.iter().zip([ordinary_permissions, &[]]) {
+        let row = rows.iter().find(|row| row["addrbind"] == *bind).unwrap();
+        assert_eq!(row["permissions"], json!(permissions), "{info}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4201,7 +4233,7 @@ async fn tor_control_onion_lifecycle() {
     let onions = starts_with_any(&first, "ADD_ONION ");
     assert_eq!(onions.len(), 3, "{onions:?}");
     let targets = [
-        native_tor_port_mapping(&onions[0], p2p),
+        native_tor_port_mapping(&onions[0], p2p).0.to_owned(),
         format!("Port={0},127.0.0.1:{0}", electrum.port()),
         format!("Port={0},127.0.0.1:{0}", esplora.port()),
     ];
@@ -4248,7 +4280,7 @@ async fn tor_control_onion_lifecycle() {
     let onions = starts_with_any(&second, "ADD_ONION ");
     assert_eq!(onions.len(), 3, "{onions:?}");
     let restarted_targets = [
-        native_tor_port_mapping(&onions[0], p2p),
+        native_tor_port_mapping(&onions[0], p2p).0.to_owned(),
         targets[1].clone(),
         targets[2].clone(),
     ];
@@ -4281,7 +4313,7 @@ async fn tor_control_onion_lifecycle() {
             .iter()
             .map(|l| l.rsplit(' ').next().unwrap())
             .collect();
-        let native = native_tor_port_mapping(&onion_lines[0], p2p);
+        let native = native_tor_port_mapping(&onion_lines[0], p2p).0.to_owned();
         let targets = [native, targets[1].clone(), targets[2].clone()];
         let want: Vec<&str> = [true, electrum_on, esplora_on]
             .into_iter()
