@@ -299,7 +299,7 @@ impl StrongTxTable {
 
     #[doc(hidden)]
     pub fn mark_dirty_bit(&self, bit: u64) {
-        let _ = self.table.unstored_from.fetch_min(bit, Ordering::AcqRel);
+        self.table.note_unstored(bit);
     }
 
     #[doc(hidden)]
@@ -844,6 +844,7 @@ impl HeaderTxsTable {
 /// writes, then the clear. Unstored stays set until the mark is gone so a
 /// retry re-images every column.
 pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreError> {
+    let _hold = page_guard::hold_marks();
     let mut owned: Vec<(String, u64, [u8; PAGE as usize])> = Vec::new();
     let mut dirty: Vec<&ArrayTable> = Vec::new();
     for t in tables {
@@ -877,8 +878,11 @@ pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreEr
             }
         }
     }
+    let mut spans = Vec::with_capacity(dirty.len());
     for t in &dirty {
-        t.persist_dirty()?;
+        if let Some(span) = t.persist_dirty()? {
+            spans.push((*t, span));
+        }
         #[cfg(debug_assertions)]
         if take_fail_after_first(t.file.path()) {
             return Err(StoreError::io(
@@ -900,8 +904,8 @@ pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreEr
         .map(|t| (&t.file.read_file, t.file.path() as &Path))
         .collect();
     page_guard::clear_page_guard_files(&dir.join(page_guard::CLASS_C_MARK), &files)?;
-    for t in dirty {
-        t.publish_clean();
+    for (t, (n, gen)) in spans {
+        t.publish_clean(n, gen);
     }
     Ok(())
 }

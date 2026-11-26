@@ -819,9 +819,13 @@ impl HashHead {
             overlay_bytes(&mut image, page, offset, bytes);
             images.push((page, image));
         }
-        self.arm_head_pages(&images, &[])?;
+        let mlt_pages = self.multi.pending_pages()?;
+        let _hold = page_guard::hold_marks();
+        self.arm_head_pages(&images, &mlt_pages)?;
+        self.multi.write_pending()?;
         self.file.write_at(offset, bytes)?;
         self.clear_head_mark()?;
+        self.multi.clear_pending();
         Ok(())
     }
 
@@ -1121,6 +1125,7 @@ impl<'a> SlotPageCache<'a> {
         let mlt_pages = self.head.multi.pending_pages()?;
         let head_pages: Vec<(u64, [u8; PAGE as usize])> = blocks.into_iter().collect();
         if !head_pages.is_empty() || !mlt_pages.is_empty() {
+            let _hold = page_guard::hold_marks();
             self.head.arm_head_pages(&head_pages, &mlt_pages)?;
             #[cfg(debug_assertions)]
             if take_fail_ahead(self.head.file.path()) {
