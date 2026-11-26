@@ -2734,6 +2734,15 @@ impl ScriptHashTable {
         self.dirty.clear_after_wipe(&self.store_dir)
     }
 
+    /// Mark [`SH_DIRTY_NAME`] and keep it until a wipe. For a write that
+    /// returned but whose meaning depends on a later step that failed: a
+    /// disconnect's unlinks when the tip shrink did not reach the disk.
+    pub fn hold_dirty(&self) -> Result<(), StoreError> {
+        drop(self.dirty.begin(&self.store_dir)?);
+        self.dirty.hold();
+        Ok(())
+    }
+
     /// Run a write that can land in place with [`SH_DIRTY_NAME`] set for its
     /// whole span. An error keeps the mark until a wipe.
     pub(crate) fn dirty_write<T>(
