@@ -183,8 +183,10 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   back. A crash does the same restore, so the same disconnect can run again.
   The head word goes back behind a synced image of its head page (main
   `.val`, ingest, sealed overflow, or L1), which open restores before the
-  undo replays. Each free-list link is synced before the alloc header that
-  names it.
+  undo replays. A sealed overflow image is restored before open checks that
+  file's `SHSR` magic or discards it, so a torn page 0 keeps the file; an
+  image whose file is gone is removed. Each free-list link is synced before
+  the alloc header that names it.
   A non-suffix unlink writes the replacement, syncs those bytes and the new
   heads once for the whole disconnect, then frees the old pages.
   A full-list unlink does not sync the empty head until the tip shrink is durable.

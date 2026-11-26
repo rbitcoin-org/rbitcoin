@@ -2419,45 +2419,65 @@ fn undo_main_head_word_restore_survives_a_torn_page() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The same on a sealed overflow file.
+/// The same on a sealed overflow file, with the word on page 0 (the file
+/// magic tears too) and on a later page.
 #[test]
 fn undo_sealed_ovf_head_word_restore_survives_a_torn_page() {
-    let dir = tmp();
-    let mut sh = [0u8; 32];
-    sh[0] = 0xd9;
-    let t = ScriptHashTable::create_tiny(&dir).unwrap();
-    let mut session = t.pack_shard_session(0).unwrap();
-    push_chain(&mut session, script_hash(&[0x10]), &[Fk(1)]);
-    seal_session(&t, 0, session);
-    let many: Vec<_> = (1..=300u64).map(|i| rec(sh, i, 0)).collect();
-    t.put_create_batch_append(&many).unwrap();
-    let fillers: Vec<_> = (0..210u32)
-        .map(|i| {
+    for first in [0x01u8, 0xd9] {
+        let dir = tmp();
+        let mut sh = [0u8; 32];
+        sh[0] = first;
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        let mut session = t.pack_shard_session(0).unwrap();
+        push_chain(&mut session, script_hash(&[0x10]), &[Fk(1)]);
+        seal_session(&t, 0, session);
+        let many: Vec<_> = (1..=300u64).map(|i| rec(sh, i, 0)).collect();
+        t.put_create_batch_append(&many).unwrap();
+        let fillers: Vec<_> = (0..210u32)
+            .map(|i| {
+                (
+                    script_hash(&[0xda, (i & 0xff) as u8, (i >> 8) as u8]),
+                    5000 + u64::from(i),
+                )
+            })
+            .collect();
+        for (key, fk) in &fillers {
+            put_create(&t, rec(*key, *fk, 0));
+        }
+        assert!(matches!(t.key_home(&sh).unwrap(), KeyHome::SealedOvf));
+        let kept: Vec<_> = fillers
+            .into_iter()
+            .filter(|(key, _)| matches!(t.key_home(key).unwrap(), KeyHome::SealedOvf))
+            .collect();
+        assert!(!kept.is_empty());
+        let (t, out) = reopen_after_torn_head_word_restore(&dir, t, &sh, |t, i| {
+            let g = t.sealed_ovf.lock().unwrap();
+            let head = &g[usize::from(i)];
             (
-                script_hash(&[0xda, (i & 0xff) as u8, (i >> 8) as u8]),
-                5000 + u64::from(i),
+                head.path.clone(),
+                rbitcoin_store::io_handle::IoHandle::from_file(&head.file),
             )
-        })
-        .collect();
-    for (key, fk) in &fillers {
-        put_create(&t, rec(*key, *fk, 0));
+        });
+        assert_neighbors_kept(&t, &sh, 300, &kept);
+        assert!(out.is_err(), "the restore never reached its head sync");
+        let _ = std::fs::remove_dir_all(&dir);
     }
-    assert!(matches!(t.key_home(&sh).unwrap(), KeyHome::SealedOvf));
-    let kept: Vec<_> = fillers
-        .into_iter()
-        .filter(|(key, _)| matches!(t.key_home(key).unwrap(), KeyHome::SealedOvf))
-        .collect();
-    assert!(!kept.is_empty());
-    let (t, out) = reopen_after_torn_head_word_restore(&dir, t, &sh, |t, i| {
-        let g = t.sealed_ovf.lock().unwrap();
-        let head = &g[usize::from(i)];
-        (
-            head.path.clone(),
-            rbitcoin_store::io_handle::IoHandle::from_file(&head.file),
-        )
-    });
-    assert_neighbors_kept(&t, &sh, 300, &kept);
-    assert!(out.is_err(), "the restore never reached its head sync");
+}
+
+/// A sealed overflow image whose file is gone is removed at open.
+#[test]
+fn open_removes_a_sealed_ovf_image_without_its_file() {
+    let dir = tmp();
+    drop(ScriptHashTable::create_tiny(&dir).unwrap());
+    let orphan = dir.join("scripthash.ovf").join("000042.ahead");
+    std::fs::write(&orphan, b"not an image").unwrap();
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert!(
+        !orphan.exists(),
+        "orphaned image left beside no sealed file"
+    );
+    assert!(t.sealed_ovf.lock().unwrap().is_empty());
+    drop(t);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

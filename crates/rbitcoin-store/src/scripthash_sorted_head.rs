@@ -112,7 +112,6 @@ impl SortedHead {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
-        crate::scripthash_head::restore_ahead(&path)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)

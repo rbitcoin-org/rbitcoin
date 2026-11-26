@@ -727,19 +727,40 @@ pub fn discard_incomplete_scripthash_head(dir: &Path, n_shards: usize) -> Result
     remove_store_path(&dir.join("scripthash.head"))
 }
 
+/// Put back each sealed overflow file's head-word image, drop an image whose
+/// file is gone, then remove a six-digit file that is not `SHSR`. The image
+/// comes first: a torn page 0 has no magic until it is restored.
 #[doc(hidden)]
 pub fn discard_leftover_oa_overflow(dir: &Path) -> Result<(), StoreError> {
     let ovf = dir.join("scripthash.ovf");
     let Ok(rd) = std::fs::read_dir(&ovf) else {
         return Ok(());
     };
+    let mut paths = Vec::new();
     for ent in rd {
-        let ent = ent.map_err(|e| StoreError::io(&ovf, e))?;
-        let name = ent.file_name();
-        let name = name.to_string_lossy();
-        let path = ent.path();
-        if six_digit_name(&name).is_some() && path.is_file() && !read_shsr_magic(&path)? {
-            std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
+        paths.push(ent.map_err(|e| StoreError::io(&ovf, e))?.path());
+    }
+    for path in &paths {
+        let Some(base) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".ahead"))
+            .filter(|n| six_digit_name(n).is_some())
+        else {
+            continue;
+        };
+        let file = ovf.join(base);
+        if file.is_file() {
+            crate::scripthash_head::restore_ahead(&file)?;
+        } else {
+            crate::scripthash_head::drop_ahead_of(&file)?;
+        }
+    }
+    for path in &paths {
+        let name = path.file_name().map(|n| n.to_string_lossy());
+        let six = name.as_deref().and_then(six_digit_name).is_some();
+        if six && path.is_file() && !read_shsr_magic(path)? {
+            std::fs::remove_file(path).map_err(|e| StoreError::io(path, e))?;
         }
     }
     Ok(())
