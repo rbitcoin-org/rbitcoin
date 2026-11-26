@@ -5690,6 +5690,16 @@ struct PausedServe {
 }
 
 async fn paused_serve(label: &str, blocks: u32, agents: &[&str]) -> PausedServe {
+    paused_serve_with(label, blocks, agents, false).await
+}
+
+/// [`paused_serve`] with the basic block filter index on when `filters`.
+async fn paused_serve_with(
+    label: &str,
+    blocks: u32,
+    agents: &[&str],
+    filters: bool,
+) -> PausedServe {
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -5697,6 +5707,7 @@ async fn paused_serve(label: &str, blocks: u32, agents: &[&str]) -> PausedServe 
     let dir = std::env::temp_dir().join(format!("rbitcoin-{label}-{n}"));
     std::fs::create_dir_all(&dir).unwrap();
     let query = Query::open_or_create_tiny(dir.join("store")).unwrap();
+    query.set_block_filter_index(filters).unwrap();
     let node = rbitcoin_net::P2PNode::start_with_agent(
         "127.0.0.1:0".parse().unwrap(),
         query,
@@ -6738,6 +6749,38 @@ async fn paused_getdata_tail_is_served_before_the_next_getdata() {
     .await
     .expect("the paused tail and the next getdata are served");
     assert_eq!(served, t.hashes, "tail first, then the next getdata");
+    t.node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&t.dir);
+}
+
+/// A `getcfilters` whose replies pass the send budget is not cut short: the
+/// session parks the rest, reads nothing meanwhile, and sends every filter
+/// in order once the writer drains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn getcfilters_past_the_send_budget_is_answered_in_full() {
+    let mut t = paused_serve_with("serve-cfilters", 22, &["/rbitcoin:test(cf)/"], true).await;
+    let (raw, sess) = &mut t.clients[0];
+    let held = hold_send_bytes(sess, rbitcoin_net::peers::PEER_SEND_BUDGET);
+    let req = bitcoin::p2p::message_filter::GetCFilters {
+        filter_type: 0,
+        start_height: 0,
+        stop_hash: *t.hashes.last().unwrap(),
+    };
+    write_peer_msg(raw, NetworkMessage::GetCFilters(req)).await;
+    wait_session_read(&t.node, sess, "getcfilters").await;
+    drop(held);
+    let got = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut got = Vec::new();
+        while got.len() < t.hashes.len() + 1 {
+            if let NetworkMessage::CFilter(f) = next_peer_msg(raw).await.unwrap() {
+                got.push(f.block_hash);
+            }
+        }
+        got
+    })
+    .await
+    .expect("every filter of the range is sent");
+    assert_eq!(&got[1..], &t.hashes[..], "in height order after genesis");
     t.node.shutdown().await;
     let _ = std::fs::remove_dir_all(&t.dir);
 }
@@ -11044,11 +11087,12 @@ fn serve_filters(
     session: Option<&rbitcoin_net::peers::LivePeer>,
     msg: NetworkMessage,
 ) -> Result<(), NetError> {
+    let mut follow = PeerFollowState::new();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(on_compact_filters(msg, hub, tx, session))
+        .block_on(on_compact_filters(msg, hub, tx, &mut follow, session))
 }
 
 #[test]
@@ -11108,77 +11152,6 @@ fn compact_filter_ranges_past_core_limits_disconnect() {
     };
     serve_filters(&hub, &tx, None, NetworkMessage::GetCFilters(basic.clone())).unwrap();
     assert!(rx.try_recv().is_err(), "filters off is silence");
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-fn outbound_peer() -> Arc<rbitcoin_net::peers::LivePeer> {
-    let peers = rbitcoin_net::peers::PeerHub::new();
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18444));
-    let ver = VersionMessage {
-        version: bitcoin::p2p::PROTOCOL_VERSION,
-        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-        timestamp: 0,
-        receiver: Address::new(&addr, ServiceFlags::NONE),
-        sender: Address::new(&addr, ServiceFlags::NONE),
-        nonce: 1,
-        user_agent: "/rbitcoin:test/".into(),
-        start_height: 0,
-        relay: true,
-    };
-    peers.register(
-        addr,
-        addr,
-        &ver,
-        false,
-        rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
-    )
-}
-
-/// One `getcfilters` queues the filter that crosses the 4 MiB budget and
-/// none after it. The peer starts on the cap, so the first filter is the
-/// one that crosses.
-#[test]
-fn getcfilters_stops_after_the_filter_that_crosses_the_send_budget() {
-    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cf-budget");
-    let hub = std::sync::Arc::new(hub);
-    hub.query.set_block_filter_index(true).unwrap();
-    hub.ensure_genesis().unwrap();
-    hub.mine(2, ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .unwrap();
-    let tip_h = hub.tip_height().unwrap();
-    assert_eq!(
-        hub.query.basic_filter_hwm().unwrap(),
-        Some(tip_h),
-        "generate seals a basic filter through the tip"
-    );
-    let peer = outbound_peer();
-    let _at_cap = hold_send_bytes(&peer, rbitcoin_net::peers::PEER_SEND_BUDGET);
-    assert!(
-        !peer.send_over_budget(),
-        "the cap itself is still inside the budget"
-    );
-    let (tx, mut rx) = peer.open_out();
-    let req = bitcoin::p2p::message_filter::GetCFilters {
-        filter_type: 0,
-        start_height: 0,
-        stop_hash: hub.tip_hash().unwrap(),
-    };
-    serve_filters(
-        &hub,
-        &tx,
-        Some(peer.as_ref()),
-        NetworkMessage::GetCFilters(req.clone()),
-    )
-    .unwrap();
-    assert!(peer.send_over_budget());
-    let mut n = 0usize;
-    while let Ok(msg) = rx.try_recv().map(Queued::into_out) {
-        match msg {
-            PeerOut::Msg(NetworkMessage::CFilter(_)) => n += 1,
-            other => panic!("expected cfilter, got {other:?}"),
-        }
-    }
-    assert_eq!(n, 1, "only the filter that crosses the budget is queued");
     let _ = std::fs::remove_dir_all(dir);
 }
 

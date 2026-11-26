@@ -2640,8 +2640,7 @@ pub async fn peer_session_with(
                     s.note_held_front_queued();
                 }
             }
-            let tail_pending =
-                !follow.getdata_tail.is_empty() || !follow.getblocktxn_tail.is_empty();
+            let tail_pending = serve_tail_pending(follow);
             let reading = !over_budget && !tail_pending;
             let hb_wait = SESSION_HEARTBEAT.saturating_sub(last_hb.elapsed());
             decoy_score.store(follow.ban_score, Ordering::Relaxed);
@@ -3117,6 +3116,23 @@ pub async fn peer_session_with(
                             session.as_deref(),
                         )
                         .await
+                        {
+                            let _ = apply_queued_decodes(
+                                &mut decode_q,
+                                hub.as_ref(),
+                                &out_tx,
+                                follow,
+                                session.as_deref(),
+                                &mut requested_since,
+                                &peer_s,
+                            )
+                            .await;
+                            return Err(e);
+                        }
+                    }
+                    if !follow.cfilter_tail.is_empty() {
+                        if let Err(e) =
+                            serve_cfilter_tail(&out_tx, follow, session.as_deref()).await
                         {
                             let _ = apply_queued_decodes(
                                 &mut decode_q,
@@ -3755,6 +3771,11 @@ pub struct PeerFollowState {
     /// One parked `getblocktxn`. The session reads no frame while this is
     /// non-empty, so a peer that never reads cannot stack reconstructs.
     pub getblocktxn_tail: VecDeque<BlockTransactionsRequest>,
+    /// Built compact-filter replies not yet queued, once the writer went
+    /// past the send budget (Core keeps them in its send buffer). The
+    /// session reads no frame while this is non-empty, so it holds the rest
+    /// of one request: at most 1,000 `cfilter` messages.
+    pub cfilter_tail: VecDeque<NetworkMessage>,
     /// Ping nonce held until both serve tails are empty. Queuing the pong
     /// earlier lets it leave before the rest of that reply. A later ping
     /// replaces this nonce.
@@ -3792,6 +3813,7 @@ impl PeerFollowState {
             ban_score: 0,
             getdata_tail: VecDeque::new(),
             getblocktxn_tail: VecDeque::new(),
+            cfilter_tail: VecDeque::new(),
             parked_pong: None,
             continuation_block: None,
         }
@@ -4081,7 +4103,9 @@ pub async fn handle_decoded_peer_msg(
         NetworkMessage::Tx(tx) => on_tx(hub, out_tx, follow, session, &tx).await?,
         msg @ (NetworkMessage::GetCFilters(_)
         | NetworkMessage::GetCFHeaders(_)
-        | NetworkMessage::GetCFCheckpt(_)) => on_compact_filters(msg, hub, out_tx, session).await?,
+        | NetworkMessage::GetCFCheckpt(_)) => {
+            on_compact_filters(msg, hub, out_tx, follow, session).await?
+        }
         NetworkMessage::GetBlockTxn(GetBlockTxn { txs_request }) => {
             serve_getblocktxn(hub, out_tx, follow, session, txs_request).await?
         }
@@ -4173,22 +4197,31 @@ pub async fn on_compact_filters(
     payload: NetworkMessage,
     hub: &ChainHub,
     out_tx: &PeerOutTx,
+    follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
-    // The reply that crossed the budget is already queued.
-    if session.is_some_and(|s| s.send_over_budget()) {
-        return Ok(());
-    }
     // Up to 1,000 filters or 2,000 filter headers are read on the blocking
     // pool under a header permit, not on the session's worker.
     let replies = run_header_job(hub, move |hub| compact_filter_replies(hub, &payload)).await??;
-    for reply in replies {
-        if session.is_some_and(|s| s.send_over_budget()) {
-            return Ok(());
-        }
+    follow.cfilter_tail.extend(replies);
+    serve_cfilter_tail(out_tx, follow, session).await
+}
+
+/// Queue parked compact-filter replies in order until the writer is past
+/// the send budget. The reply that crosses it is queued; the rest stays in
+/// `follow.cfilter_tail` for the session loop to resume.
+async fn serve_cfilter_tail(
+    out_tx: &PeerOutTx,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) -> Result<(), NetError> {
+    while session.is_none_or(|s| !s.send_over_budget()) {
+        let Some(reply) = follow.cfilter_tail.pop_front() else {
+            break;
+        };
         out_tx.send(reply)?;
     }
-    Ok(())
+    flush_parked_pong(out_tx, follow, session)
 }
 
 /// The replies to a compact-filter request, read from the store. Runs off
@@ -4428,7 +4461,9 @@ pub fn on_ping(
 }
 
 fn serve_tail_pending(follow: &PeerFollowState) -> bool {
-    !follow.getdata_tail.is_empty() || !follow.getblocktxn_tail.is_empty()
+    !follow.getdata_tail.is_empty()
+        || !follow.getblocktxn_tail.is_empty()
+        || !follow.cfilter_tail.is_empty()
 }
 
 /// Queue a pong parked by [`on_ping`] once both serve tails are empty.
