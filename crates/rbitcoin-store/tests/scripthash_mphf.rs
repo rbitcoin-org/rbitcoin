@@ -280,10 +280,19 @@ fn a_rewritten_val_drops_a_stale_word_image() {
     assert!(out.is_err());
     drop(h);
     let h = MphfHead::write_pack8(&base, &[(key(1), word(44)), (key(2), word(55))]).unwrap();
-    assert_eq!(h.get(&key(1)).unwrap(), Some(ShHeadValue::inline_one(Fk(44))));
-    assert_eq!(h.get(&key(2)).unwrap(), Some(ShHeadValue::inline_one(Fk(55))));
+    assert_eq!(
+        h.get(&key(1)).unwrap(),
+        Some(ShHeadValue::inline_one(Fk(44)))
+    );
+    assert_eq!(
+        h.get(&key(2)).unwrap(),
+        Some(ShHeadValue::inline_one(Fk(55)))
+    );
     drop(h);
     let h = MphfHead::open(&base).unwrap();
-    assert_eq!(h.get(&key(1)).unwrap(), Some(ShHeadValue::inline_one(Fk(44))));
+    assert_eq!(
+        h.get(&key(1)).unwrap(),
+        Some(ShHeadValue::inline_one(Fk(44)))
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

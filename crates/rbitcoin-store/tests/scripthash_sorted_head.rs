@@ -194,6 +194,9 @@ fn a_rewritten_sorted_head_drops_a_stale_word_image() {
         .map(|(k, _)| (k, pack8_bytes(&ShHeadValue::inline_one(Fk(7))).unwrap()))
         .collect();
     let h = SortedHead::write(&path, &fresh).unwrap();
-    assert_eq!(h.get(&key_of(1)).unwrap(), Some(ShHeadValue::inline_one(Fk(7))));
+    assert_eq!(
+        h.get(&key_of(1)).unwrap(),
+        Some(ShHeadValue::inline_one(Fk(7)))
+    );
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }

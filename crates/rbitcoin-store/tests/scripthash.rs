@@ -2196,16 +2196,26 @@ fn unlink_batch_syncs_freed_links_before_the_header() {
     let dir = tmp();
     let t = ScriptHashTable::create_tiny(&dir).unwrap();
     let sh = script_hash(&[0xd1]);
-    assert_eq!(put_create_batch(&t, [rec(sh, 1, 0), rec(sh, 2, 0), rec(sh, 3, 0)]), 3);
+    assert_eq!(
+        put_create_batch(&t, [rec(sh, 1, 0), rec(sh, 2, 0), rec(sh, 3, 0)]),
+        3
+    );
     let old = slab_off_of(&t, &sh);
     let handle = t.ovf_file().io_handle();
     rbitcoin_store::io_handle::arm_fail_sync_after(handle, 1, 1);
     let out = t.unlink_creates_batch(&[(sh, vec![Fk(2)])]);
     rbitcoin_store::io_handle::disarm_sync(handle);
     let free = read_alloc_header(t.ovf_file()).unwrap().0.free_head;
-    assert!(!free.contains(&old), "header names a link before its sync: {out:?}");
+    assert!(
+        !free.contains(&old),
+        "header names a link before its sync: {out:?}"
+    );
     assert!(matches!(out, Err(StoreError::Io { .. })), "{out:?}");
-    assert_eq!(fks_of(&t, &sh), vec![1, 3], "the failure must follow the head");
+    assert_eq!(
+        fks_of(&t, &sh),
+        vec![1, 3],
+        "the failure must follow the head"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2217,16 +2227,21 @@ fn deferred_empty_syncs_the_freed_link_before_the_header() {
     let sh = script_hash(&[0xd2]);
     assert_eq!(put_create_batch(&t, [rec(sh, 1, 0), rec(sh, 2, 0)]), 2);
     let old = slab_off_of(&t, &sh);
-    t.unlink_creates_batch(&[(sh, vec![Fk(1), Fk(2)])])
-        .unwrap();
+    t.unlink_creates_batch(&[(sh, vec![Fk(1), Fk(2)])]).unwrap();
     let handle = t.ovf_file().io_handle();
     rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
     let out = t.commit_deferred_empty_heads();
     rbitcoin_store::io_handle::disarm_sync(handle);
     let free = read_alloc_header(t.ovf_file()).unwrap().0.free_head;
-    assert!(!free.contains(&old), "header names a link before its sync: {out:?}");
+    assert!(
+        !free.contains(&old),
+        "header names a link before its sync: {out:?}"
+    );
     assert!(matches!(out, Err(StoreError::Io { .. })), "{out:?}");
-    assert!(t.entries(&sh).unwrap().is_empty(), "the failure must follow the head");
+    assert!(
+        t.entries(&sh).unwrap().is_empty(),
+        "the failure must follow the head"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2258,7 +2273,11 @@ fn suffix_unlink_syncs_dropped_page_links_before_the_header() {
         "header names a dropped page before its link sync: {out:?}"
     );
     assert!(matches!(out, Err(StoreError::Io { .. })), "{out:?}");
-    assert_eq!(fks_of(&t, &sh).len() as u64, n - 150, "the failure must follow the head");
+    assert_eq!(
+        fks_of(&t, &sh).len() as u64,
+        n - 150,
+        "the failure must follow the head"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2312,7 +2331,11 @@ fn reopen_after_torn_head_word_restore(
     use rbitcoin_store::scripthash::unlink::read_undo;
     t.test_tear_extent_tail(sh).unwrap();
     let home = t.key_home(sh).unwrap();
-    let word = read_undo(t.body_for(sh, home)).unwrap().unwrap().word.unwrap();
+    let word = read_undo(t.body_for(sh, home))
+        .unwrap()
+        .unwrap()
+        .word
+        .unwrap();
     let (path, handle) = head_file(&t, word.index);
     rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
     let out = t.recover_unlink_undos();
@@ -2328,7 +2351,11 @@ fn reopen_after_torn_head_word_restore(
 fn assert_neighbors_kept(t: &ScriptHashTable, sh: &[u8; 32], n: u64, kept: &[([u8; 32], u64)]) {
     assert_eq!(t.entries(sh).unwrap().len() as u64, n);
     for (key, fk) in kept {
-        assert_eq!(fks_of(t, key), vec![*fk], "a neighbor slot on the torn page was lost");
+        assert_eq!(
+            fks_of(t, key),
+            vec![*fk],
+            "a neighbor slot on the torn page was lost"
+        );
     }
 }
 
@@ -2405,7 +2432,12 @@ fn undo_sealed_ovf_head_word_restore_survives_a_torn_page() {
     let many: Vec<_> = (1..=300u64).map(|i| rec(sh, i, 0)).collect();
     t.put_create_batch_append(&many).unwrap();
     let fillers: Vec<_> = (0..210u32)
-        .map(|i| (script_hash(&[0xda, (i & 0xff) as u8, (i >> 8) as u8]), 5000 + u64::from(i)))
+        .map(|i| {
+            (
+                script_hash(&[0xda, (i & 0xff) as u8, (i >> 8) as u8]),
+                5000 + u64::from(i),
+            )
+        })
         .collect();
     for (key, fk) in &fillers {
         put_create(&t, rec(*key, *fk, 0));
