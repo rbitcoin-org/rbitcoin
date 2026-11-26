@@ -2336,7 +2336,7 @@ fn self_announce_stays_on_the_link_network() {
         port: 8333,
     };
     let with_cjdns = hub_with(false, false);
-    with_cjdns.set_cjdns_reachable(true, &[]);
+    with_cjdns.set_cjdns_reachable(true);
     with_cjdns.set_external_endpoints(vec![ExternalEndpoint::BareIp(external), ExternalEndpoint::BareIp(IpAddr::V6(cjdns_bind))]);
     assert_eq!(
         self_announce_nets(&overlay_peer(&with_cjdns, cjdns_peer, inbound)),
@@ -2354,7 +2354,7 @@ fn self_announce_stays_on_the_link_network() {
         ["ipv4"]
     );
     let cjdns_only = hub_with(false, false);
-    cjdns_only.set_cjdns_reachable(true, &[]);
+    cjdns_only.set_cjdns_reachable(true);
     cjdns_only.set_external_endpoints(vec![ExternalEndpoint::BareIp(IpAddr::V6(cjdns_bind))]);
     assert!(
         self_announce_nets(&overlay_peer(&cjdns_only, clearnet_peer, out)).is_empty(),
@@ -2793,7 +2793,7 @@ fn discover_from_peers_announces_the_reported_address() {
         "a clearnet --external-ip wins over the report"
     );
     let cjdns_bind = hub(true);
-    cjdns_bind.set_cjdns_reachable(true, &[]);
+    cjdns_bind.set_cjdns_reachable(true);
     cjdns_bind.set_external_endpoints(vec!["fc00::9".parse().unwrap()]);
     assert_eq!(
         announced_ips(&reporting_peer(&cjdns_bind, clearnet, Out, seen)),

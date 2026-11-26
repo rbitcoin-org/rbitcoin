@@ -541,19 +541,22 @@ impl NetAddr {
 
     /// Core's IP network classes for connection reporting. The gossip filter
     /// applies additional rules to addresses considered for the address book.
-    pub(crate) fn peer_network_label(self, cjdns_reachable: bool) -> &'static str {
-        match self {
+    pub(crate) fn peer_network_label(self, cjdns_reportable: bool) -> &'static str {
+        let address = match self {
+            Self::Ip(socket) => Self::from_socket(socket),
+            address => address,
+        };
+        match address {
             Self::Name { .. } => NOT_PUBLICLY_ROUTABLE,
-            Self::Cjdns { .. } if !cjdns_reachable => NOT_PUBLICLY_ROUTABLE,
+            Self::Cjdns { .. } if !cjdns_reportable => NOT_PUBLICLY_ROUTABLE,
             Self::Ip(socket) => match socket.ip().to_canonical() {
                 IpAddr::V4(ip) if ipv4_peer_unroutable(ip) => NOT_PUBLICLY_ROUTABLE,
                 IpAddr::V4(_) => OnlyNet::Ipv4.label(),
-                IpAddr::V6(ip) if is_cjdns_ip(ip) && cjdns_reachable => OnlyNet::Cjdns.label(),
                 IpAddr::V6(ip) if ipv6_peer_unroutable(ip) => NOT_PUBLICLY_ROUTABLE,
                 IpAddr::V6(ip) if linked_ipv4(ip).is_some() => OnlyNet::Ipv4.label(),
                 IpAddr::V6(_) => OnlyNet::Ipv6.label(),
             },
-            _ => self.network_label(),
+            _ => address.network_label(),
         }
     }
 }

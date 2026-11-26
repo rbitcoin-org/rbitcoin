@@ -806,7 +806,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     node.peers.set_pruned(config.prune_seqsigwit);
     node.peers.set_asmap(asmap.clone());
     node.peers
-        .set_cjdns_reachable(config.listen.cjdns_reachable, &config.listen.only_net);
+        .set_cjdns_reporting(config.listen.cjdns_reachable, &config.listen.only_net);
     node.peers
         .publish_local_endpoints(node.local_addr.port(), external, table.clone());
     if p2p_inbound && node.peers.forwarded_loopback_drops_grants() {
@@ -984,6 +984,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     addrman.set_cjdns_reachable(config.listen.cjdns_reachable);
     addrman.set_only_net(config.listen.only_net.clone());
     let reachability_removed_rows = addrman.len() < len_before_reach;
+    node.peers
+        .set_cjdns_reachable(config.listen.cjdns_reachable);
     node.peers.set_proxies(rbitcoin_net::NetProxies {
         dialer: config.listen.dialer(),
         i2p_sam: config.listen.i2p_sam,

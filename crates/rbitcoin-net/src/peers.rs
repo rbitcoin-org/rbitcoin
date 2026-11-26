@@ -1010,13 +1010,17 @@ impl LivePeer {
         }
     }
 
+    fn is_inbound_onion(&self, onion_bind: impl FnOnce() -> Option<SocketAddr>) -> bool {
+        self.inbound && self.net.socket_addr().is_some() && onion_bind() == Some(self.addrbind)
+    }
+
     /// Choose the network for self-announcements. An external onion that may
     /// share ordinary loopback makes the network of those peers ambiguous.
     fn self_announce_link(&self, hub: &PeerHub) -> SelfAnnounceLink {
         if self.inbound {
             if let Some(source) = self.net.socket_addr() {
                 let table = hub.net_perms.lock().unwrap_or_else(|e| e.into_inner());
-                if table.onion_bind == Some(self.addrbind) {
+                if self.is_inbound_onion(|| table.onion_bind) {
                     return SelfAnnounceLink::Tor;
                 }
                 if source.ip().is_loopback() && hub.external_onion_may_share_loopback(&table) {
@@ -1866,10 +1870,7 @@ impl LivePeer {
             (g.last_inv_sequence, g.inv_to_send)
         };
         let hub = self.owner.upgrade();
-        let network = if self.inbound
-            && self.net.socket_addr().is_some()
-            && hub.as_deref().and_then(PeerHub::onion_bind) == Some(self.addrbind)
-        {
+        let network = if self.is_inbound_onion(|| hub.as_deref().and_then(PeerHub::onion_bind)) {
             crate::OnlyNet::Onion.label()
         } else {
             let cjdns_reportable = hub
@@ -2808,8 +2809,11 @@ impl PeerHub {
         self.clearnet_listen.store(on, Ordering::Relaxed);
     }
 
-    pub fn set_cjdns_reachable(&self, on: bool, only_net: &[crate::OnlyNet]) {
+    pub fn set_cjdns_reachable(&self, on: bool) {
         self.cjdns_reachable.store(on, Ordering::Relaxed);
+    }
+
+    pub fn set_cjdns_reporting(&self, on: bool, only_net: &[crate::OnlyNet]) {
         self.cjdns_reportable.store(
             on && crate::OnlyNet::Cjdns.allowed_by(only_net),
             Ordering::Relaxed,

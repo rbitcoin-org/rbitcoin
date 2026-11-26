@@ -7324,13 +7324,14 @@ fn getpeerinfo_and_disconnectnode_support_onion_addr() {
 
 #[test]
 fn getpeerinfo_uses_the_network_class_of_the_socket_address() {
-    use rbitcoin_net::{OnlyNet, PeerConnType, PeerHub};
+    use rbitcoin_net::{NetAddr, OnlyNet, PeerConnType, PeerHub};
 
     let (mut ctx, dir) = ctx_empty();
     let hub = PeerHub::new();
     let bind = "127.0.0.1:18445".parse().unwrap();
     let not_public = "not_publicly_routable";
     let cjdns = "[fc00::1]:18444";
+    let plain_cjdns = "[fc00::2]:18444";
     let cases = [
         ("127.0.0.1:18444", not_public),
         ("192.168.1.5:18444", not_public),
@@ -7350,12 +7351,23 @@ fn getpeerinfo_uses_the_network_class_of_the_socket_address() {
     for (addr, _) in cases {
         hub.register_connecting(addr.parse().unwrap(), bind, true, PeerConnType::Inbound);
     }
+    let plain_socket = plain_cjdns.parse().unwrap();
+    hub.register_connecting_net(
+        plain_socket,
+        NetAddr::Ip(plain_socket),
+        bind,
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
     ctx.peers = Some(Arc::clone(&hub));
 
     let info = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
     let rows = info.as_array().unwrap();
-    assert_eq!(rows.len(), cases.len());
-    for (row, (addr, class)) in rows.iter().zip(cases) {
+    assert_eq!(rows.len(), cases.len() + 1);
+    for (row, (addr, class)) in rows
+        .iter()
+        .zip(cases.into_iter().chain([(plain_cjdns, not_public)]))
+    {
         assert_eq!(row["network"], class, "{addr}: {row}");
     }
 
@@ -7364,11 +7376,13 @@ fn getpeerinfo_uses_the_network_class_of_the_socket_address() {
         (&[OnlyNet::Cjdns][..], "cjdns"),
         (&[OnlyNet::Ipv4][..], not_public),
     ] {
-        hub.set_cjdns_reachable(true, only_net);
+        hub.set_cjdns_reporting(true, only_net);
         let info = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
-        let row = info.as_array().unwrap().last().unwrap();
-        assert_eq!(row["addr"], cjdns);
-        assert_eq!(row["network"], class);
+        let rows = info.as_array().unwrap();
+        for addr in [cjdns, plain_cjdns] {
+            let row = rows.iter().find(|row| row["addr"] == addr).unwrap();
+            assert_eq!(row["network"], class, "{addr}: {row}");
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
