@@ -298,7 +298,7 @@ pub struct AppendTiming {
     pub head_ns: u64,
 }
 
-/// Body bytes and frees one key change holds back from the body.
+/// Slab and page writes, and slab frees, an ingest batch holds back from one body.
 ///
 /// An ingest batch packs every key first. The payloads land only after the
 /// allocator header that stops naming a popped offset is durable, and a
