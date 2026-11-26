@@ -56,6 +56,13 @@ impl SortedHead {
 
     /// Durability barrier (shutdown / SH flush). Data already pwrite'd.
     pub fn flush(&self) -> Result<(), StoreError> {
+        #[cfg(debug_assertions)]
+        if crate::io_handle::take_fail_sync(crate::io_handle::IoHandle::from_file(&self.file)) {
+            return Err(StoreError::io(
+                &self.path,
+                std::io::Error::from_raw_os_error(5),
+            ));
+        }
         self.file
             .durable_sync_data()
             .map_err(|e| StoreError::io(&self.path, e))

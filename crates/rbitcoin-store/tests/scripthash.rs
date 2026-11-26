@@ -377,7 +377,8 @@ fn ingest_keeps_a_replaced_slab_until_its_head_moves() {
 }
 
 /// The replaced slab is not linked into the free list until the ingest head
-/// that stops naming it is synced.
+/// that stops naming it is synced. That sync is `insert_many`'s own, inside
+/// the head upserts; the free step adds none for an ingest key.
 #[test]
 fn ingest_frees_a_replaced_slab_after_the_ingest_head_sync() {
     let dir = tmp();
@@ -461,6 +462,106 @@ fn ingest_frees_a_main_slab_after_the_main_head_sync() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A slab key on a sealed overflow file (L0, or L1 after compaction) is freed
+/// only after that head file is synced.
+#[test]
+fn ingest_frees_a_sealed_ovf_slab_after_the_sealed_head_sync() {
+    for l1 in [false, true] {
+        let dir = tmp();
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        let sh = script_hash(&[0xdb]);
+        assert_eq!(put_create_batch(&t, [rec(sh, 1, 0), rec(sh, 2, 0)]), 2);
+        let fillers: Vec<_> = (0..204u32)
+            .map(|i| {
+                rec(
+                    script_hash(&[0xdc, (i & 0xff) as u8, (i >> 8) as u8]),
+                    5000 + u64::from(i),
+                    0,
+                )
+            })
+            .collect();
+        t.put_create_batch_append(&fillers).unwrap();
+        assert!(
+            t.ingest.lock().unwrap().is_none(),
+            "fillers did not seal ingest"
+        );
+        if l1 {
+            let more: Vec<_> = (0..205u32)
+                .map(|i| {
+                    rec(
+                        script_hash(&[0xe0, (i & 0xff) as u8, (i >> 8) as u8]),
+                        9000 + u64::from(i),
+                        0,
+                    )
+                })
+                .collect();
+            t.put_create_batch_append(&more).unwrap();
+            t.compact_sealed_ovf().unwrap();
+            assert!(t.ovf_l1.lock().unwrap().is_some(), "no L1 after compaction");
+        }
+        assert!(matches!(t.key_home(&sh).unwrap(), KeyHome::SealedOvf));
+        t.flush().unwrap();
+        let off = slab_at(&t.head_value(&sh).unwrap().unwrap());
+        let before = word_at(t.ovf_file(), off);
+        let handle = if l1 {
+            let g = t.ovf_l1.lock().unwrap();
+            rbitcoin_store::io_handle::IoHandle::from_file(&g.as_ref().unwrap().head.val_file)
+        } else {
+            rbitcoin_store::io_handle::IoHandle::from_file(&t.sealed_ovf.lock().unwrap()[0].file)
+        };
+        rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
+        let out = t.put_create_batch_append(&[rec(sh, 3, 0), rec(sh, 4, 0)]);
+        rbitcoin_store::io_handle::disarm_sync(handle);
+        assert_eq!(
+            word_at(t.ovf_file(), off),
+            before,
+            "l1={l1}: old slab linked before its sealed head synced: {out:?}"
+        );
+        assert!(
+            matches!(out, Err(StoreError::Io { .. })),
+            "l1={l1}: {out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A class change whose batch seals the ingest on its last insert still frees
+/// the old slab: the sealed file was synced when it was written.
+#[test]
+fn ingest_frees_a_replaced_slab_when_the_batch_seals_ingest() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let a = script_hash(&[0xdd]);
+    assert_eq!(put_create_batch(&t, [rec(a, 1, 0), rec(a, 2, 0)]), 2);
+    let old = slab_at(&t.head_value(&a).unwrap().unwrap());
+    let fillers: Vec<_> = (0..203u32)
+        .map(|i| {
+            rec(
+                script_hash(&[0xde, (i & 0xff) as u8, (i >> 8) as u8]),
+                5000 + u64::from(i),
+                0,
+            )
+        })
+        .collect();
+    t.put_create_batch_append(&fillers).unwrap();
+    assert!(t.ingest.lock().unwrap().is_some());
+    let b = (0..=255u8)
+        .map(|i| script_hash(&[0xdf, i]))
+        .find(|k| *k > a)
+        .unwrap();
+    let out = t.put_create_batch_append(&[rec(a, 3, 0), rec(a, 4, 0), rec(b, 9000, 0)]);
+    assert!(
+        t.ingest.lock().unwrap().is_none(),
+        "the batch did not seal ingest"
+    );
+    assert!(out.is_ok(), "{out:?}");
+    assert_eq!(create_fks(&t, &a), vec![1, 2, 3, 4]);
+    assert_eq!(create_fks(&t, &b), vec![9000]);
+    let free = read_alloc_header(t.ovf_file()).unwrap().0.free_head;
+    assert_eq!(free[0], old, "the replaced slab was not freed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A popped free slab is written only after a durable header stops naming it.
 #[test]
 fn ingest_never_leaves_a_free_head_on_a_written_slab() {
@@ -486,11 +587,13 @@ fn ingest_never_leaves_a_free_head_on_a_written_slab() {
         drop(t);
         let t = ScriptHashTable::open_tiny(&dir).unwrap();
         let free = read_alloc_header(t.ovf_file()).unwrap().0.free_head;
-        if free[0] == freed {
+        // Until the header barrier passed (the first two syncs), the reused
+        // slab still holds its link.
+        if free[0] == freed || skip < 2 {
             assert_eq!(
                 word_at(t.ovf_file(), freed)[..8],
                 link[..8],
-                "sync {skip}: the free head names a slab that holds a payload"
+                "sync {skip}: a payload landed on a free slab the durable header names"
             );
         }
         assert!(t.head_value(&b).unwrap().is_none());

@@ -180,8 +180,11 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   so a crash leaks that offset instead of leaving a free head on a written
   slab. Otherwise the payloads are synced before the header. The heads move
   last. A slab a class change replaced joins the free list only after the
-  head file that stopped naming it is synced (main, sealed overflow or
-  ingest); its link is synced before the header names it.
+  head that stopped naming it is durable: a main shard or sealed overflow
+  head, updated in place, is synced first; an ingest head was already
+  synced by its insert, or by the seal that moved it to a sealed file. The
+  link is synced before the header names it. Only a body that reused an
+  offset takes the extra barrier.
 - Disconnect tip: **one unlink per scripthash**. A megakey drops that block's
   creates from the tail pages. The saved page image is synced before the undo
   record is published. The page the head names is updated before any earlier
