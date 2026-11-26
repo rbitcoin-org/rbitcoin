@@ -294,7 +294,6 @@ impl MultiList {
         Ok(self.collect(head)?.contains(&target))
     }
 
-    #[doc(hidden)]
     fn pending_pages(&self) -> Result<Vec<(u64, [u8; PAGE as usize])>, StoreError> {
         let pending = self.pending.lock().unwrap();
         if pending.is_empty() {
@@ -343,6 +342,7 @@ impl MultiList {
         self.pending.lock().unwrap().clear();
     }
 
+    #[doc(hidden)]
     pub fn flush(&self) -> Result<(), StoreError> {
         self.file.flush()
     }
