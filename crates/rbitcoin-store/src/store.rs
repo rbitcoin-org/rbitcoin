@@ -2241,11 +2241,11 @@ impl Store {
                     let disconnected = filtered.load(Ordering::Acquire) != seen;
                     log.freeze_open(tip, disconnected.then_some(keep))?;
                     filtered.store(seen, Ordering::Release);
+                    // The appender is held off until this sync and the
+                    // spent.ovf clear both finish. A later append arms again.
+                    spenders.sync_data_only()?;
                 }
-                // Every spender a frozen note names was appended before the
-                // freeze. Sync it before the commit can name its number.
                 let named = txs.settled_count();
-                spenders.sync_data_only()?;
                 txs.sync_class_a_named(named)?;
                 Ok(())
             },
@@ -2367,7 +2367,10 @@ impl Store {
         after_first_read(self);
         let Some(height) = self.spend_snapshot_height() else {
             let tip = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
-            self.spenders.sync_data_only()?;
+            {
+                let _g = self.hold_utxo_view();
+                self.spenders.sync_data_only()?;
+            }
             self.publish_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
             return Ok(());
         };
@@ -2528,7 +2531,10 @@ impl Store {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.headers.flush()?;
         self.txs.flush()?;
-        self.spenders.flush()?;
+        {
+            let _g = self.hold_utxo_view();
+            self.spenders.flush()?;
+        }
         self.scripthash.flush()?;
         self.flush_class_c_tip()?;
         Ok(())
@@ -2789,6 +2795,11 @@ fn restore_open_marks(path: &Path) -> Result<bool, StoreError> {
     let header_body =
         crate::page_guard::restore_store_group(path, crate::page_guard::HEADER_BODY_MARK)?;
     crate::page_guard::restore_store_group(path, crate::page_guard::HEADER_HEAD_MARK)?;
+    crate::page_guard::restore_store_file(
+        path,
+        crate::page_guard::SPENT_OVF_MARK,
+        crate::spender_table::SPENT_OVF_NAME,
+    )?;
     Ok(header_body)
 }
 
