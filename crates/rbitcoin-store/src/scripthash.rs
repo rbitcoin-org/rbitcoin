@@ -341,6 +341,17 @@ struct BodyStage<'a> {
     body: &'a TableFile,
     alloc: &'a Mutex<AllocState>,
     slabs: StagedSlabs,
+    /// Packing took an offset off this body's free list.
+    popped: bool,
+}
+
+/// A head file whose bare in-place update must be synced before a slab its
+/// key replaced is freed. An ingest head needs none: `insert_many` syncs it,
+/// and a seal writes a synced sorted file.
+#[derive(PartialEq)]
+enum MovedHead {
+    MainShard(usize),
+    SealedOvf,
 }
 
 /// Body slab allocator state (persisted in alloc header).
@@ -1082,24 +1093,21 @@ impl From<LocatedHome> for KeyHome {
     }
 }
 
-/// Remember the head file `apply_head_upserts` writes for `key`, once per
-/// main shard or home, so it can be synced before the key's old slab is freed.
-fn note_free_home(
+/// Remember the head file `apply_head_upserts` updates in place for `key`,
+/// once per main shard or for the sealed overflow files.
+fn note_moved_head(
     table: &ScriptHashTable,
-    homes: &mut Vec<(LocatedHome, [u8; 32])>,
+    heads: &mut Vec<MovedHead>,
     key: &[u8; 32],
     kh: KeyHome,
 ) {
-    let home = match kh {
-        KeyHome::Main => LocatedHome::Main,
-        KeyHome::SealedOvf => LocatedHome::SealedOvf,
-        KeyHome::Ingest | KeyHome::Absent => LocatedHome::Ingest,
+    let head = match kh {
+        KeyHome::Main => MovedHead::MainShard(table.shard_index(key)),
+        KeyHome::SealedOvf => MovedHead::SealedOvf,
+        KeyHome::Ingest | KeyHome::Absent => return,
     };
-    let seen = homes.iter().any(|(h, k)| {
-        *h == home && (home != LocatedHome::Main || table.shard_index(k) == table.shard_index(key))
-    });
-    if !seen {
-        homes.push((home, *key));
+    if !heads.contains(&head) {
+        heads.push(head);
     }
 }
 
@@ -1921,8 +1929,7 @@ impl ScriptHashTable {
         let mut head_final: Vec<([u8; 32], ShHeadValue, KeyHome)> = Vec::new();
         let mut written = 0usize;
         let mut stages: BTreeMap<usize, BodyStage<'_>> = BTreeMap::new();
-        let mut popped = false;
-        let mut free_homes: Vec<(LocatedHome, [u8; 32])> = Vec::new();
+        let mut moved_heads: Vec<MovedHead> = Vec::new();
 
         let mut i = 0usize;
         while i < order.len() {
@@ -1971,16 +1978,17 @@ impl ScriptHashTable {
                     body,
                     alloc: alloc_mu,
                     slabs: StagedSlabs::default(),
+                    popped: false,
                 });
             let frees_before = stage.slabs.frees.len();
             let mut alloc = alloc_mu.lock().unwrap();
             let free_before = alloc.free_head;
             let new_val =
                 self.append_sorted_creates(body, &mut alloc, &cur, &add, &mut stage.slabs)?;
-            popped |= alloc.free_head != free_before;
+            stage.popped |= alloc.free_head != free_before;
             drop(alloc);
             if stage.slabs.frees.len() > frees_before {
-                note_free_home(self, &mut free_homes, &key, kh);
+                note_moved_head(self, &mut moved_heads, &key, kh);
             }
             head_final.push((key, new_val, kh));
         }
@@ -1991,29 +1999,23 @@ impl ScriptHashTable {
             let t_head = std::time::Instant::now();
             let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
             // A payload on a popped offset waits for a durable header that no
-            // longer names it. Otherwise the payloads share the first barrier.
-            if !popped {
-                self.write_staged(&stages)?;
+            // longer names it. A body that popped nothing writes its payloads
+            // before the first barrier.
+            for stage in stages.values().filter(|s| !s.popped) {
+                stage.slabs.write_to(stage.body)?;
             }
             self.sync_bodies_for(&head_final)?;
             self.write_alloc_headers_for(&head_final)?;
             self.sync_bodies_for(&head_final)?;
-            if popped {
-                self.write_staged(&stages)?;
-                self.sync_bodies_for(&head_final)?;
+            for stage in stages.values().filter(|s| s.popped) {
+                stage.slabs.write_to(stage.body)?;
+                stage.body.sync_data_only()?;
             }
             self.apply_head_upserts(&head_final, flush_each)?;
-            self.free_replaced_slabs(&stages, &free_homes)?;
+            self.free_replaced_slabs(&stages, &moved_heads)?;
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }
         Ok((written, timing))
-    }
-
-    fn write_staged(&self, stages: &BTreeMap<usize, BodyStage<'_>>) -> Result<(), StoreError> {
-        for stage in stages.values() {
-            stage.slabs.write_to(stage.body)?;
-        }
-        Ok(())
     }
 
     /// Link the slabs a class change replaced once the heads that named them
@@ -2021,10 +2023,24 @@ impl ScriptHashTable {
     fn free_replaced_slabs(
         &self,
         stages: &BTreeMap<usize, BodyStage<'_>>,
-        free_homes: &[(LocatedHome, [u8; 32])],
+        moved_heads: &[MovedHead],
     ) -> Result<(), StoreError> {
-        for (home, key) in free_homes {
-            self.sync_home(*home, key)?;
+        for head in moved_heads {
+            match head {
+                MovedHead::MainShard(si) => {
+                    if let Some(h) = self.sorted_main[*si].read().unwrap().as_ref() {
+                        h.flush()?;
+                    }
+                }
+                MovedHead::SealedOvf => {
+                    for h in self.sealed_ovf.lock().unwrap().iter() {
+                        h.flush()?;
+                    }
+                    if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+                        l1.head.flush()?;
+                    }
+                }
+            }
         }
         for stage in stages.values().filter(|s| !s.slabs.frees.is_empty()) {
             let mut alloc = stage.alloc.lock().unwrap();
