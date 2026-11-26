@@ -6767,10 +6767,18 @@ async fn getcfilters_past_the_send_budget_is_answered_in_full() {
         stop_hash: *t.hashes.last().unwrap(),
     };
     write_peer_msg(raw, NetworkMessage::GetCFilters(req)).await;
-    wait_session_read(&t.node, sess, "getcfilters").await;
+    let first = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let NetworkMessage::CFilter(f) = next_peer_msg(raw).await.unwrap() {
+                return f.block_hash;
+            }
+        }
+    })
+    .await
+    .expect("the filter that crosses the budget is sent");
     drop(held);
     let got = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut got = Vec::new();
+        let mut got = vec![first];
         while got.len() < t.hashes.len() + 1 {
             if let NetworkMessage::CFilter(f) = next_peer_msg(raw).await.unwrap() {
                 got.push(f.block_hash);
@@ -11152,6 +11160,83 @@ fn compact_filter_ranges_past_core_limits_disconnect() {
     };
     serve_filters(&hub, &tx, None, NetworkMessage::GetCFilters(basic.clone())).unwrap();
     assert!(rx.try_recv().is_err(), "filters off is silence");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn outbound_peer() -> Arc<rbitcoin_net::peers::LivePeer> {
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18444));
+    let ver = VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    peers.register(
+        addr,
+        addr,
+        &ver,
+        false,
+        rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
+    )
+}
+
+/// One `getcfilters` queues the filter that crosses the 4 MiB budget and
+/// parks the rest of its range on the session's tail. The peer starts on
+/// the cap, so the first filter is the one that crosses.
+#[test]
+fn getcfilters_parks_the_rest_after_the_filter_that_crosses_the_send_budget() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cf-budget");
+    let hub = std::sync::Arc::new(hub);
+    hub.query.set_block_filter_index(true).unwrap();
+    hub.ensure_genesis().unwrap();
+    hub.mine(2, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip_h = hub.tip_height().unwrap();
+    let peer = outbound_peer();
+    let _at_cap = hold_send_bytes(&peer, rbitcoin_net::peers::PEER_SEND_BUDGET);
+    assert!(
+        !peer.send_over_budget(),
+        "the cap itself is still inside the budget"
+    );
+    let (tx, mut rx) = peer.open_out();
+    let mut follow = PeerFollowState::new();
+    let req = bitcoin::p2p::message_filter::GetCFilters {
+        filter_type: 0,
+        start_height: 0,
+        stop_hash: hub.tip_hash().unwrap(),
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(on_compact_filters(
+            NetworkMessage::GetCFilters(req),
+            &hub,
+            &tx,
+            &mut follow,
+            Some(peer.as_ref()),
+        ))
+        .unwrap();
+    assert!(peer.send_over_budget());
+    let mut n = 0usize;
+    while let Ok(msg) = rx.try_recv().map(Queued::into_out) {
+        match msg {
+            PeerOut::Msg(NetworkMessage::CFilter(_)) => n += 1,
+            other => panic!("expected cfilter, got {other:?}"),
+        }
+    }
+    assert_eq!(n, 1, "only the filter that crosses the budget is queued");
+    assert_eq!(
+        follow.cfilter_tail.len(),
+        tip_h as usize,
+        "the rest of the range is parked"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

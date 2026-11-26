@@ -2616,8 +2616,8 @@ pub async fn peer_session_with(
                 return Ok(());
             }
             // Core `fPauseSend`: no inbound message is read while the writer
-            // is past the send budget or a getdata / getblocktxn tail waits
-            // for serve room. Heartbeat (ping timeout, block-request expiry)
+            // is past the send budget or a getdata / getblocktxn / cfilter
+            // tail waits for serve room. Heartbeat (ping timeout, block-request expiry)
             // still runs.
             let over_budget = session.as_ref().is_some_and(|s| s.send_over_budget());
             // A decoded non-block frame is parked only when the send budget
@@ -3776,7 +3776,7 @@ pub struct PeerFollowState {
     /// session reads no frame while this is non-empty, so it holds the rest
     /// of one request: at most 1,000 `cfilter` messages.
     pub cfilter_tail: VecDeque<NetworkMessage>,
-    /// Ping nonce held until both serve tails are empty. Queuing the pong
+    /// Ping nonce held until every serve tail is empty. Queuing the pong
     /// earlier lets it leave before the rest of that reply. A later ping
     /// replaces this nonce.
     pub parked_pong: Option<u64>,
@@ -4466,7 +4466,7 @@ fn serve_tail_pending(follow: &PeerFollowState) -> bool {
         || !follow.cfilter_tail.is_empty()
 }
 
-/// Queue a pong parked by [`on_ping`] once both serve tails are empty.
+/// Queue a pong parked by [`on_ping`] once every serve tail is empty.
 fn flush_parked_pong(
     out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
