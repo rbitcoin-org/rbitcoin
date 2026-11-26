@@ -98,6 +98,42 @@ fn header_put_get_by_hash_open_flush() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn header_flush_holds_put_lock_until_the_mark_is_cleared() {
+    use rbitcoin_store::array_table::TipFlushHold;
+    use rbitcoin_store::bind_header_flush_hold;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tmp();
+    let t = Arc::new(HeaderTable::create_tiny(&dir).unwrap());
+    t.ensure(&sample([1u8; 32])).unwrap();
+    let hold = Arc::new(TipFlushHold::new(true));
+    let flush_t = Arc::clone(&t);
+    let flush_hold = Arc::clone(&hold);
+    let handle = std::thread::spawn(move || {
+        bind_header_flush_hold(Some(Arc::clone(&flush_hold)));
+        flush_t.flush().unwrap();
+        bind_header_flush_hold(None);
+    });
+    assert!(
+        hold.wait_until_entered(Duration::from_secs(5)),
+        "flush never reached the hold"
+    );
+    let insert_t = Arc::clone(&t);
+    let insert = std::thread::spawn(move || insert_t.ensure(&sample([2u8; 32])).unwrap());
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !insert.is_finished(),
+        "an insert landed in the dirty pages before the mark was cleared"
+    );
+    hold.store(false, Ordering::Release);
+    handle.join().unwrap();
+    insert.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Real block-header fields with PoW-style hash committed to a real parent.
 fn linked_child(parent: &HeaderRecord, parent_fk: Fk, salt: u32) -> HeaderRecord {
     let version = 1;

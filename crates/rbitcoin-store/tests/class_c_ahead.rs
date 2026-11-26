@@ -1,5 +1,5 @@
-//! A header-txs append rewrites a synced partial block. The write-ahead image
-//! must survive a tear between the sidecar and the payload flush.
+//! Class C flushes publish `store/guard/class_c` before the live pages.
+//! Open restores that forward image before any slot read.
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::header_table::block_header_hash;
 use rbitcoin_store::header_table::HeaderRecord;
@@ -72,38 +72,36 @@ fn zero_header_and_block(path: &Path) {
     assert_eq!(check, [0u8; 4096]);
 }
 
+fn class_c_mark(dir: &Path) -> PathBuf {
+    dir.join(rbitcoin_store::page_guard::CLASS_C_MARK)
+}
+
 #[test]
-fn open_drops_header_txs_sidecars_from_different_flushes() {
+fn crash_between_header_txs_first_and_count_is_one_mark() {
     let dir = tmp();
-    let count_side = dir.join("header_txs_count.body.ahead");
-    let first_side = dir.join("header_txs_first.body.ahead");
-    let saved_count = {
+    let body = dir.join("header_txs_first.body");
+    {
         let t = rbitcoin_store::HeaderTxsTable::create(&dir).unwrap();
         let write = rbitcoin_store::ClassCWrite::for_test();
         t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
         t.flush().unwrap();
         t.put_range(&write, Fk(1), Fk(5), 3).unwrap();
-        rbitcoin_store::chain::fail_next_array_flush_after_ahead(
-            &dir.join("header_txs_first.body"),
-        );
+        rbitcoin_store::chain::fail_next_header_txs_flush_after_first(&body);
         assert!(t.flush().is_err());
-        let saved = std::fs::read(&count_side).unwrap();
-        t.put_range(&write, Fk(1), Fk(8), 4).unwrap();
-        rbitcoin_store::chain::fail_next_array_flush_after_ahead(
-            &dir.join("header_txs_first.body"),
+        assert!(
+            class_c_mark(&dir).is_file(),
+            "first and count share one mark"
         );
-        assert!(t.flush().is_err());
-        saved
-    };
-    std::fs::write(&count_side, &saved_count).unwrap();
+    }
+    zero_header_and_block(&dir.join("header_txs_first.body"));
+    zero_header_and_block(&dir.join("header_txs_count.body"));
     let t = rbitcoin_store::HeaderTxsTable::open(&dir).unwrap();
     assert_eq!(
         (t.first.get(0).unwrap(), t.count.get(0).unwrap()),
-        (1, 1),
-        "open restored first from one flush and count from another"
+        (5, 3),
+        "open observed a split first/count pair"
     );
-    assert!(!first_side.exists());
-    assert!(!count_side.exists());
+    assert!(!class_c_mark(&dir).exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -196,8 +194,7 @@ fn torn_header_txs_block_restores_from_ahead_image() {
             s.header_txs.flush().is_err(),
             "the failpoint must stop before the payload flush"
         );
-        assert!(dir.join("header_txs_first.body.ahead").is_file());
-        assert!(dir.join("header_txs_count.body.ahead").is_file());
+        assert!(class_c_mark(&dir).is_file());
     }
 
     zero_header_and_block(&dir.join("header_txs_first.body"));
@@ -223,8 +220,7 @@ fn torn_header_txs_block_restores_from_ahead_image() {
         Some((1, 1)),
         "the page-zero range was not restored"
     );
-    assert!(!dir.join("header_txs_first.body.ahead").exists());
-    assert!(!dir.join("header_txs_count.body.ahead").exists());
+    assert!(!class_c_mark(&dir).exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -258,7 +254,7 @@ fn leftover_ahead_pages_survive_a_later_write() {
             s.header_txs.flush().is_err(),
             "the failpoint must leave the sidecar after a successful payload"
         );
-        assert!(dir.join("header_txs_first.body.ahead").is_file());
+        assert!(class_c_mark(&dir).is_file());
 
         let (rec, ins, outs) = coinbase(1100);
         let tx = s
@@ -354,7 +350,7 @@ fn torn_confirmed_page_zero_restores_from_ahead_image() {
             t.flush().is_err(),
             "the failpoint must stop before the payload flush"
         );
-        assert!(dir.path.join("confirmed.body.ahead").is_file());
+        assert!(class_c_mark(&dir.path).is_file());
     }
 
     zero_header_and_block(&path);
@@ -367,7 +363,7 @@ fn torn_confirmed_page_zero_restores_from_ahead_image() {
         "the committed previous tip was lost"
     );
     assert_eq!(t.get(Height(600)).unwrap(), Some(Fk(601)));
-    assert!(!dir.path.join("confirmed.body.ahead").exists());
+    assert!(!class_c_mark(&dir.path).exists());
 }
 
 /// A disconnect to a length that ends on a 4 KiB boundary writes no slot,
@@ -390,7 +386,7 @@ fn torn_page_zero_after_a_block_aligned_shrink_restores() {
         t.disconnect_tip(&write, Height(510)).unwrap();
         rbitcoin_store::chain::fail_next_array_flush_after_ahead(&path);
         assert!(t.flush().is_err(), "the failpoint must stop the flush");
-        assert!(dir.path.join("confirmed.body.ahead").is_file());
+        assert!(class_c_mark(&dir.path).is_file());
     }
 
     zero_header_and_block(&path);
@@ -416,13 +412,13 @@ fn torn_page_zero_after_a_shrink_to_empty_restores() {
         t.disconnect_tip(&write, Height(0)).unwrap();
         rbitcoin_store::chain::fail_next_array_flush_after_ahead(&path);
         assert!(t.flush().is_err(), "the failpoint must stop the flush");
-        assert!(dir.path.join("confirmed.body.ahead").is_file());
+        assert!(class_c_mark(&dir.path).is_file());
     }
 
     zero_header_and_block(&path);
     let t = ConfirmedTable::open(&dir.path).unwrap();
     assert_eq!(t.tip_height(), None);
-    assert!(!dir.path.join("confirmed.body.ahead").exists());
+    assert!(!class_c_mark(&dir.path).exists());
 }
 
 /// A crash after the payload landed and before the sidecar was removed:
@@ -444,14 +440,14 @@ fn confirmed_ahead_left_after_the_payload_replays_the_same_state() {
             t.flush().is_err(),
             "the failpoint must stop before the sidecar is removed"
         );
-        assert!(dir.path.join("confirmed.body.ahead").is_file());
+        assert!(class_c_mark(&dir.path).is_file());
     }
 
     let t = ConfirmedTable::open(&dir.path).unwrap();
     assert_eq!(t.tip_height(), Some(Height(519)));
     assert_eq!(t.get(Height(0)).unwrap(), Some(Fk(1)));
     assert_eq!(t.get(Height(519)).unwrap(), Some(Fk(520)));
-    assert!(!dir.path.join("confirmed.body.ahead").exists());
+    assert!(!class_c_mark(&dir.path).exists());
 }
 
 #[test]
@@ -460,6 +456,9 @@ fn one_header_txs_failpoint_does_not_clear_another_path() {
     let b = rbitcoin_store::testutil::TempDir::labeled("ahead-b").unwrap();
     let ta = rbitcoin_store::HeaderTxsTable::create(&a.path).unwrap();
     let tb = rbitcoin_store::HeaderTxsTable::create(&b.path).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    ta.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+    tb.put_range(&write, Fk(1), Fk(1), 1).unwrap();
     let pa = a.path.join("header_txs_first.body");
     let pb = b.path.join("header_txs_first.body");
     rbitcoin_store::chain::fail_next_array_flush_after_ahead(&pa);
@@ -476,4 +475,56 @@ fn one_header_txs_failpoint_does_not_clear_another_path() {
         ta.flush().is_err(),
         "arming path b cleared the payload failpoint for path a"
     );
+}
+
+#[test]
+fn one_page_flush_restores_a_mixed_committed_slot() {
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::chain::ConfirmedTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-one-page").unwrap();
+    let path = dir.path.join("confirmed.body");
+    {
+        let t = ConfirmedTable::create(&dir.path).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        for h in 0..80u32 {
+            t.set(&write, Height(h), Fk(u64::from(h) + 1)).unwrap();
+        }
+        t.flush().unwrap();
+        t.set(&write, Height(40), Fk(9_001)).unwrap();
+        rbitcoin_store::chain::fail_next_array_flush_after_ahead(&path);
+        assert!(t.flush().is_err());
+        assert!(class_c_mark(&dir.path).is_file());
+    }
+    zero_header_and_block(&path);
+    let t = ConfirmedTable::open(&dir.path).unwrap();
+    assert_eq!(t.get(Height(39)).unwrap(), Some(Fk(40)));
+    assert_eq!(t.get(Height(40)).unwrap(), Some(Fk(9_001)));
+    assert_eq!(t.get(Height(41)).unwrap(), Some(Fk(42)));
+    assert_eq!(t.tip_height(), Some(Height(79)));
+}
+
+#[test]
+fn flush_from_first_slot_restores_a_mixed_committed_slot() {
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::chain::ConfirmedTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-from-first").unwrap();
+    let path = dir.path.join("confirmed.body");
+    {
+        let t = ConfirmedTable::create(&dir.path).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        for h in 0..600u32 {
+            t.set(&write, Height(h), Fk(u64::from(h) + 1)).unwrap();
+        }
+        t.flush().unwrap();
+        t.set(&write, Height(0), Fk(9_002)).unwrap();
+        rbitcoin_store::chain::fail_next_array_flush_after_ahead(&path);
+        assert!(t.flush().is_err());
+        assert!(class_c_mark(&dir.path).is_file());
+    }
+    zero_header_and_block(&path);
+    let t = ConfirmedTable::open(&dir.path).unwrap();
+    assert_eq!(t.get(Height(0)).unwrap(), Some(Fk(9_002)));
+    assert_eq!(t.get(Height(1)).unwrap(), Some(Fk(2)));
+    assert_eq!(t.get(Height(599)).unwrap(), Some(Fk(600)));
+    assert_eq!(t.tip_height(), Some(Height(599)));
 }

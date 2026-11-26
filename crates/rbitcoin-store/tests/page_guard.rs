@@ -1,7 +1,8 @@
 //! A mark of whole 4 KiB images, and an append that stays off those pages.
 use rbitcoin_primitives::{SCHEMA_VERSION, STORE_MAGIC};
 use rbitcoin_store::page_guard::{
-    append_past_end, arm_page_guard, clear_page_guard, restore_page_guard,
+    append_past_end, arm_page_guard, arm_page_guard_group, clear_page_guard, restore_page_guard,
+    restore_page_guard_group,
 };
 use rbitcoin_store::testutil::TempDir;
 use rbitcoin_store::StoreError;
@@ -288,4 +289,56 @@ fn append_past_end_writes_only_a_fresh_page() {
     let err = append_past_end(&file, &path, 5000, 4096, &[1u8; 8]).unwrap_err();
     assert!(matches!(err, StoreError::Rejected(_)));
     drop(file);
+}
+
+#[test]
+fn group_restore_names_each_file() {
+    let dir = TempDir::labeled("page-guard-group").unwrap();
+    let a = dir.path().join("confirmed.body");
+    let b = dir.path().join("strong_tx.body");
+    let mark = dir.path().join("guard/class_c");
+    write_bytes(&a, 0, &fill(0x11));
+    write_bytes(&b, 0, &fill(0x22));
+    let next_a = fill(0xA1);
+    let next_b = fill(0xB2);
+    arm_page_guard_group(
+        &mark,
+        &[
+            ("confirmed.body", 0, next_a.as_slice()),
+            ("strong_tx.body", 0, next_b.as_slice()),
+        ],
+    )
+    .unwrap();
+    write_bytes(&a, 0, &fill(0x00));
+    write_bytes(&b, 0, &fill(0x00));
+    assert!(restore_page_guard_group(&mark, dir.path()).unwrap());
+    assert_eq!(read_bytes(&a, 0, PAGE), next_a);
+    assert_eq!(read_bytes(&b, 0, PAGE), next_b);
+    assert!(!mark.exists());
+}
+
+#[test]
+fn group_arm_keeps_leftover_pages_the_new_set_does_not_cover() {
+    let dir = TempDir::labeled("page-guard-merge").unwrap();
+    let live = dir.path().join("header.head");
+    let mark = dir.path().join("guard/header.head");
+    let first = fill(0x31);
+    let second = fill(0x32);
+    let third = fill(0x33);
+    arm_page_guard_group(
+        &mark,
+        &[
+            ("header.head", 0, first.as_slice()),
+            ("header.head", PAGE as u64, second.as_slice()),
+        ],
+    )
+    .unwrap();
+    arm_page_guard_group(&mark, &[("header.head", PAGE as u64 * 2, third.as_slice())]).unwrap();
+    write_bytes(&live, 0, &fill(0x00));
+    write_bytes(&live, PAGE as u64, &fill(0x00));
+    write_bytes(&live, PAGE as u64 * 2, &fill(0x00));
+    assert!(restore_page_guard_group(&mark, dir.path()).unwrap());
+    assert_eq!(read_bytes(&live, 0, PAGE), first);
+    assert_eq!(read_bytes(&live, PAGE as u64, PAGE), second);
+    assert_eq!(read_bytes(&live, PAGE as u64 * 2, PAGE), third);
 }

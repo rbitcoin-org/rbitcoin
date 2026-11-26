@@ -3,7 +3,9 @@ use rbitcoin_store::error::StoreError;
 use rbitcoin_store::hashhead::*;
 
 fn tmp_path() -> std::path::PathBuf {
-    rbitcoin_store::testutil::fresh_path("hh")
+    let dir = rbitcoin_store::testutil::fresh_path("hh");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("header.head")
 }
 
 #[test]
@@ -134,11 +136,10 @@ fn torn_chunk_restores_from_ahead_image() {
             "key {i} lost after a torn chunk"
         );
     }
-    let mut side = path.as_os_str().to_os_string();
-    side.push(".ahead");
+    let mark = path.parent().unwrap().join("guard/header.head");
     assert!(
-        !std::path::PathBuf::from(side).exists(),
-        "open must remove the applied ahead image"
+        !mark.exists(),
+        "open must remove the applied header.head mark"
     );
     cleanup_hh(&path);
 }
@@ -173,6 +174,39 @@ fn leftover_ahead_pages_survive_a_later_write() {
         h.get(&a).unwrap(),
         Some(Fk(1)),
         "the committed key on the first page was lost"
+    );
+    cleanup_hh(&path);
+}
+
+#[test]
+fn crash_between_head_and_mlt_restores_both_from_one_mark() {
+    let path = tmp_path();
+    let mut k1 = [0u8; 32];
+    k1[0] = 0xab;
+    k1[15] = 1;
+    k1[16] = 1;
+    let mut k2 = k1;
+    k2[16] = 2;
+    {
+        let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
+        h.insert(&k1, Fk(10)).unwrap();
+        h.flush().unwrap();
+        fail_next_header_head_flush_between_files(&path);
+        assert!(
+            h.insert(&k2, Fk(20)).is_err(),
+            "the failpoint must stop between the mlt write and the head write"
+        );
+        assert!(path.parent().unwrap().join("guard/header.head").is_file());
+    }
+    zero_ahead_blocks(&path, &[k1, k2], DEFAULT_SLOTS);
+    let mut mlt = path.as_os_str().to_os_string();
+    mlt.push(".mlt");
+    zero_pages(&std::path::PathBuf::from(mlt), &[0]);
+    let h = HashHead::open(&path).unwrap();
+    let all = h.get_all(&k1).unwrap();
+    assert!(
+        all.contains(&Fk(10)) && all.contains(&Fk(20)),
+        "one mark must restore header.head and header.head.mlt together, got {all:?}"
     );
     cleanup_hh(&path);
 }
@@ -300,6 +334,13 @@ fn slot_sorted_batch_matches_sequential_inserts() {
 }
 
 fn cleanup_hh(path: &std::path::Path) {
+    if let Some(dir) = path.parent() {
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with("rbitcoin-hh-") {
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+    }
     let _ = std::fs::remove_file(path);
     let mut mlt = path.as_os_str().to_os_string();
     mlt.push(".mlt");
