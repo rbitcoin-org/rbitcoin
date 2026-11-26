@@ -78,10 +78,27 @@ impl OnlyNet {
 /// `is_documentation` is still unstable.
 #[doc(hidden)]
 pub fn ipv6_special_unroutable(v: Ipv6Addr) -> bool {
-    if ipv6_documentation_or_orchid(v) {
+    ipv6_special_unroutable_for::<true>(v)
+}
+
+fn ipv6_special_unroutable_for<const GOSSIP: bool>(v: Ipv6Addr) -> bool {
+    let o = v.octets();
+    if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0x0d && o[3] == 0xb8 {
         return true;
     }
-    let o = v.octets();
+    // RFC 9637 documentation. Core `IsRFC9637` rejects this in `IsValid`.
+    if o[0] == 0x3f && o[1] == 0xff && (o[2] & 0xf0) == 0 {
+        return true;
+    }
+    if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0x00 && (o[3] & 0xf0) == 0x10 {
+        return true;
+    }
+    if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0x00 && (o[3] & 0xf0) == 0x20 {
+        return true;
+    }
+    if !GOSSIP {
+        return false;
+    }
     // RFC 5180 benchmarking. The IPv4 twin is `198.18.0.0/15`. The last
     // 80 bits are free, so the whole prefix has to go.
     if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0x00 && o[3] == 0x02 && o[4] == 0x00 && o[5] == 0x00
@@ -89,15 +106,6 @@ pub fn ipv6_special_unroutable(v: Ipv6Addr) -> bool {
         return true;
     }
     o[0] == 0x01 && o[1] == 0x00 && o[2..8].iter().all(|&b| b == 0)
-}
-
-fn ipv6_documentation_or_orchid(v: Ipv6Addr) -> bool {
-    matches!(
-        v.octets(),
-        [0x20, 0x01, 0x0d, 0xb8, ..]
-            | [0x3f, 0xff, 0x00..=0x0f, ..]
-            | [0x20, 0x01, 0x00, 0x10..=0x2f, ..]
-    )
 }
 
 /// Core `GetLinkedIPv4`: the IPv4 an IPv4-mapped, NAT64 (RFC 6052), SIIT
@@ -216,7 +224,7 @@ fn ipv6_peer_unroutable(v: Ipv6Addr) -> bool {
         || v.is_loopback()
         || v.is_unique_local()
         || v.segments()[..4] == [0xfe80, 0, 0, 0]
-        || ipv6_documentation_or_orchid(v)
+        || ipv6_special_unroutable_for::<false>(v)
 }
 
 /// Clearnet bogon. CJDNS `fc00::/8` is an overlay, not a unique-local bogon.
