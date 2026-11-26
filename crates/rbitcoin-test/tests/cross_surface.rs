@@ -3813,7 +3813,12 @@ async fn onion_listener_separates_source_ip_grants() {
     }
     let tor = FakeTor::start().await;
     *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
-    let (direct, onion, rpc) = (ephemeral_addr(), ephemeral_addr(), ephemeral_addr());
+    let (direct, onion, rpc, health) = (
+        ephemeral_addr(),
+        ephemeral_addr(),
+        ephemeral_addr(),
+        ephemeral_addr(),
+    );
     let mut cfg = listen_and_exit_cfg(&td.path()).with_p2p_listen(direct);
     cfg.apply_kv("listen", &format!("{onion}=onion")).unwrap();
     cfg.apply_kv(
@@ -3828,14 +3833,36 @@ async fn onion_listener_separates_source_ip_grants() {
     cfg.tor.control = Some(tor.addr);
     cfg.tor.password = Some(TOR_PASSWORD.into());
     cfg.rpc.listen = Some(rpc);
+    cfg.listen.health = Some(health);
+    cfg.metrics = true;
     cfg.max_run_secs = Some(60);
 
     let node = spawn_run_p2p(cfg);
-    wait_listeners(&[rpc]).await;
+    wait_listeners(&[rpc, health]).await;
+    let streams = [
+        TcpStream::connect(direct).await.unwrap(),
+        TcpStream::connect(onion).await.unwrap(),
+    ];
+    let sockets = streams
+        .each_ref()
+        .map(|stream| stream.local_addr().unwrap());
+    let connecting = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let info = jsonrpc(rpc, "getpeerinfo", json!([])).await;
+            if info["result"]
+                .as_array()
+                .is_some_and(|rows| rows.len() == 2)
+            {
+                break info;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both connecting peers");
+    let connecting_metrics = scrape_metrics(health).await;
     let mut connections = Vec::new();
-    for addr in [direct, onion] {
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let local = stream.local_addr().unwrap();
+    for ((stream, addr), local) in streams.into_iter().zip([direct, onion]).zip(sockets) {
         let handshake = connect_and_handshake(
             stream,
             bitcoin::p2p::Magic::REGTEST,
@@ -3854,7 +3881,35 @@ async fn onion_listener_separates_source_ip_grants() {
         );
     }
     let info = jsonrpc(rpc, "getpeerinfo", json!([])).await;
+    let metrics = scrape_metrics(health).await;
     stop_run_p2p(rpc, node).await;
+    for (established, snapshot, samples) in [
+        (false, &connecting, connecting_metrics),
+        (true, &info, metrics),
+    ] {
+        let rows = snapshot["result"].as_array().unwrap();
+        for ((bind, socket), network) in [direct, onion]
+            .into_iter()
+            .zip(sockets)
+            .zip(["ipv4", "onion"])
+        {
+            let row = rows
+                .iter()
+                .find(|row| row["addrbind"] == bind.to_string())
+                .unwrap();
+            assert_eq!(row["addr"], socket.to_string(), "{snapshot}");
+            assert_eq!(
+                row["version"].as_u64().unwrap() > 0,
+                established,
+                "{snapshot}"
+            );
+            assert_eq!(row["network"], network, "{snapshot}");
+            assert_eq!(
+                samples[&format!("rbitcoin_peers{{network=\"{network}\"}}")],
+                1.0
+            );
+        }
+    }
     let rows = info["result"].as_array().unwrap();
     for (bind, expected) in [(direct, json!(["relay"])), (onion, json!(["addr"]))] {
         let row = rows

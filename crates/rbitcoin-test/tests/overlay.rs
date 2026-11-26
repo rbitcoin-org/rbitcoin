@@ -205,7 +205,7 @@ async fn tor_onion_two_node_v2() {
         assert!(row["addr"].as_str().unwrap().contains(".onion"), "{peers}");
         assert_ne!(row["addr"], "0.0.0.0", "{peers}");
 
-        let bin = wait_peer_network(b_rpc, "ipv4", true, Duration::from_secs(30)).await;
+        let bin = wait_peer_network(b_rpc, "onion", true, Duration::from_secs(30)).await;
         let brow = bin["result"]
             .as_array()
             .unwrap()

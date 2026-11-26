@@ -89,10 +89,7 @@ pub fn render(status: &NodeStatus) -> String {
             "Peer connections by network (getpeerinfo.network).",
         );
         for network in ["ipv4", "ipv6", "onion", "i2p", "cjdns"] {
-            let n = rows
-                .iter()
-                .filter(|p| p.net.network_label() == network)
-                .count();
+            let n = rows.iter().filter(|p| p.network == network).count();
             out.sample("rbitcoin_peers", &format!("{{network=\"{network}\"}}"), n);
         }
         let (recv, sent) = peers.byte_totals();

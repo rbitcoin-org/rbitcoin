@@ -1865,10 +1865,20 @@ impl LivePeer {
             let g = self.tx_inv();
             (g.last_inv_sequence, g.inv_to_send)
         };
+        let hub = self.owner.upgrade();
+        let network = if self.inbound
+            && self.net.socket_addr().is_some()
+            && hub.as_deref().and_then(PeerHub::onion_bind) == Some(self.addrbind)
+        {
+            crate::OnlyNet::Onion.label()
+        } else {
+            self.net.network_label()
+        };
         PeerInfo {
             id: self.id,
             addr: self.addr,
             net: self.net,
+            network,
             addrbind: self.addrbind,
             subver: self.subver.clone(),
             inbound: self.inbound,
@@ -1898,12 +1908,11 @@ impl LivePeer {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
-            permissions: self
-                .owner
-                .upgrade()
+            permissions: hub
+                .as_ref()
                 .map(|h| h.permission_strings(self.addr, self.inbound, self.addrbind))
                 .unwrap_or_default(),
-            mapped_as: self.owner.upgrade().and_then(|h| {
+            mapped_as: hub.and_then(|h| {
                 h.asmap().and_then(|m| {
                     let asn = m.mapped_as(self.addr.ip());
                     (asn != 0).then_some(asn)
@@ -2058,6 +2067,8 @@ pub struct PeerInfo {
     pub id: u64,
     pub addr: SocketAddr,
     pub net: crate::NetAddr,
+    /// Connection network reported by RPC and metrics.
+    pub network: &'static str,
     pub addrbind: SocketAddr,
     pub subver: String,
     pub inbound: bool,
