@@ -4,6 +4,10 @@
 //! when an outpoint has multiple annotated spenders do we allocate nodes here.
 //!
 //! Fixed 16 B records (1-based fk): packed `(fk:u40, vin:u16)` | `next:u64`.
+//!
+//! The first append after a sync arms `guard/spent.ovf` with the current
+//! page 0 and tail block. Later appends in that window leave the mark.
+//! Sync removes it.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -85,6 +89,7 @@ impl SpenderTable {
         }
         let packed = pack_spent_field(spending_tx_fk, vin)?;
         // Single annotator role: load → write → publish count.
+        self.arm_guard()?;
         let id = self.count.load(Ordering::Acquire) + 1;
         let mut buf = [0u8; SPENDER_RECORD_LEN];
         buf[0..8].copy_from_slice(&packed.to_le_bytes());
@@ -108,11 +113,74 @@ impl SpenderTable {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.body.flush()
+        self.body.flush()?;
+        self.clear_mark()
     }
 
     pub fn sync_data_only(&self) -> Result<(), StoreError> {
-        self.body.sync_data_only()
+        self.body.sync_data_only()?;
+        self.clear_mark()
+    }
+
+    fn store_dir(&self) -> Result<&Path, StoreError> {
+        self.body
+            .path()
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or(StoreError::Corrupt("spent.ovf has no directory"))
+    }
+
+    /// Page 0 and the block that holds the published end, before this append.
+    fn arm_guard(&self) -> Result<(), StoreError> {
+        let dir = self.store_dir()?;
+        let mark = dir.join(crate::page_guard::SPENT_OVF_MARK);
+        if mark.try_exists().map_err(|e| StoreError::io(&mark, e))? {
+            return Ok(());
+        }
+        let logical = self.body.logical_len();
+        let page = crate::page_guard::PAGE;
+        let mut offs = vec![0u64];
+        if logical > 0 {
+            let tail = (logical - 1) & !(page - 1);
+            if tail != 0 {
+                offs.push(tail);
+            }
+        }
+        let mut images = Vec::with_capacity(offs.len());
+        for off in offs {
+            images.push((off, self.page_image(off)?));
+        }
+        let refs: Vec<(u64, &[u8])> = images
+            .iter()
+            .map(|(off, image)| (*off, image.as_slice()))
+            .collect();
+        crate::page_guard::promote_meta_31(dir)?;
+        crate::page_guard::arm_page_guard(&mark, &refs)
+    }
+
+    fn page_image(&self, offset: u64) -> Result<Vec<u8>, StoreError> {
+        let mut image = vec![0u8; crate::page_guard::PAGE as usize];
+        let file_len = self
+            .body
+            .read_file
+            .metadata()
+            .map_err(|e| StoreError::io(self.body.path(), e))?
+            .len();
+        if offset >= file_len {
+            return Ok(image);
+        }
+        let n = (file_len - offset).min(crate::page_guard::PAGE) as usize;
+        self.body.pread_exact(offset, &mut image[..n])?;
+        Ok(image)
+    }
+
+    fn clear_mark(&self) -> Result<(), StoreError> {
+        let dir = self.store_dir()?;
+        let mark = dir.join(crate::page_guard::SPENT_OVF_MARK);
+        if !mark.try_exists().map_err(|e| StoreError::io(&mark, e))? {
+            return Ok(());
+        }
+        crate::page_guard::clear_page_guard(&mark, &self.body.read_file, self.body.path())
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {

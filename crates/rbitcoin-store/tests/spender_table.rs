@@ -2,6 +2,7 @@ use rbitcoin_primitives::Fk;
 use rbitcoin_store::error::StoreError;
 use rbitcoin_store::file::FILE_HEADER_LEN;
 use rbitcoin_store::spender_table::*;
+use rbitcoin_store::Store;
 
 #[test]
 fn append_get_chain() {
@@ -145,4 +146,92 @@ fn spender_get_reads_the_packed_record() {
         other => panic!("missing spender must be NotFound, got {other:?}"),
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+const PAGE: usize = 4096;
+
+fn page_at(path: &std::path::Path, off: u64) -> Vec<u8> {
+    let mut file = std::fs::File::open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let mut buf = vec![0u8; PAGE];
+    if off >= len {
+        return buf;
+    }
+    let n = ((len - off) as usize).min(PAGE);
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(off)).unwrap();
+    std::io::Read::read_exact(&mut file, &mut buf[..n]).unwrap();
+    buf
+}
+
+/// A fixture with no `meta` still arms. The mark is the pre-append pages.
+#[test]
+fn fixture_without_meta_arms_spent_ovf_once() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-nometa").unwrap();
+    let t = SpenderTable::create(dir.path()).unwrap();
+    assert!(!dir.path().join("meta").exists());
+    let mark = dir.path().join("guard/spent.ovf");
+    t.append(Fk(1), 1, Fk::NULL).unwrap();
+    assert!(mark.is_file(), "a fixture with no meta still arms");
+    assert!(!dir.path().join("meta").exists());
+    let armed = std::fs::read(&mark).unwrap();
+    t.append(Fk(2), 2, Fk::NULL).unwrap();
+    assert_eq!(
+        std::fs::read(&mark).unwrap(),
+        armed,
+        "a later append must not snapshot the torn page"
+    );
+}
+
+/// Sync clears the mark. A crash that leaves it restores the pre-append
+/// pages, including a tail past page 0, and does not keep the torn bytes.
+#[test]
+fn torn_spent_ovf_reopens_as_the_pre_append_pages() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-restore").unwrap();
+    let path = dir.path().to_path_buf();
+    let committed = 256u64;
+    let mark = path.join("guard/spent.ovf");
+    let ovf = path.join("spent.ovf");
+    let tail_off = 4096u64;
+    let pre_tail;
+    let pre_page0;
+    let kept;
+    {
+        let s = Store::create_tiny(&path).unwrap();
+        for i in 1..=committed {
+            s.spenders.append(Fk(i), i as u32, Fk::NULL).unwrap();
+        }
+        s.spenders.sync_data_only().unwrap();
+        assert!(!mark.exists(), "sync clears the spent.ovf mark");
+        assert_eq!(s.spenders.count(), committed);
+        kept = s.spenders.get(Fk(committed)).unwrap();
+        pre_page0 = page_at(&ovf, 0);
+        pre_tail = page_at(&ovf, tail_off);
+        let first = s.spenders.append(Fk(committed + 1), 1, Fk::NULL).unwrap();
+        assert!(mark.is_file());
+        let armed = std::fs::read(&mark).unwrap();
+        let second = s.spenders.append(Fk(committed + 2), 2, first).unwrap();
+        assert_eq!(std::fs::read(&mark).unwrap(), armed);
+        assert_eq!(s.spenders.count(), committed + 2);
+        let _ = (second, first);
+    }
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).open(&ovf).unwrap();
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).unwrap();
+        std::io::Write::write_all(&mut file, &[0xffu8; PAGE]).unwrap();
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(tail_off)).unwrap();
+        std::io::Write::write_all(&mut file, &[0xffu8; PAGE]).unwrap();
+        file.sync_all().unwrap();
+    }
+    assert!(mark.is_file(), "the crash leaves the mark");
+    let s = Store::open_tiny(&path).unwrap();
+    assert!(!mark.exists(), "open removes the mark");
+    assert_eq!(s.spenders.count(), committed);
+    assert_eq!(s.spenders.get(Fk(committed)).unwrap(), kept);
+    assert!(matches!(
+        s.spenders.get(Fk(committed + 1)),
+        Err(StoreError::NotFound)
+    ));
+    assert_eq!(page_at(&ovf, 0), pre_page0);
+    assert_eq!(page_at(&ovf, tail_off), pre_tail);
+    assert_ne!(page_at(&ovf, 0), vec![0xffu8; PAGE]);
 }
