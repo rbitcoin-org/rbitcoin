@@ -4024,9 +4024,7 @@ impl TxTable {
     /// A failure latches: every later call refuses until restart. Calls run
     /// one at a time (the tip barrier and the spend checkpoint can overlap).
     pub fn sync_class_a_data(&self) -> Result<(), StoreError> {
-        self.class_a_latched(|| {
-            self.sync_class_a_stems(self.synced_named.load(std::sync::atomic::Ordering::Acquire))
-        })
+        self.sync_class_a_quiescent(None)
     }
 
     /// Call `on_fail` once, when a Class A sync or append write first fails.
@@ -4042,7 +4040,33 @@ impl TxTable {
     /// `named` is at most [`Self::settled_count`]: every row of those
     /// creates was written, and a failed write latched before this sync.
     pub fn sync_class_a_named(&self, named: u64) -> Result<(), StoreError> {
-        self.class_a_latched(|| self.sync_class_a_stems(named))
+        self.sync_class_a_quiescent(Some(named))
+    }
+
+    /// Seal and clear only when no append is in a pwrite. `Ok` means a crash
+    /// keeps this generation: the mark is gone and the slot matches the bytes.
+    fn sync_class_a_quiescent(&self, named: Option<u64>) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
+        loop {
+            self.refuse_if_class_a_failed()?;
+            if self.class_a_writes.load(Ordering::Acquire) != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            let mut sealed = false;
+            self.class_a_latched(|| {
+                if self.class_a_writes.load(Ordering::Acquire) != 0 {
+                    return Ok(());
+                }
+                let named = named.unwrap_or_else(|| self.synced_named.load(Ordering::Acquire));
+                self.sync_class_a_stems(named)?;
+                sealed = true;
+                Ok(())
+            })?;
+            if sealed {
+                return Ok(());
+            }
+        }
     }
 
     /// Keep `tear_guard/armed` across a Class A sync. The test holds an
@@ -4160,12 +4184,19 @@ impl TxTable {
             &self.input.off,
             &self.input.body,
         ];
-        let generation = crate::class_a_pages::write_barrier(&self.hot_dir, &files, named)?;
+        let mark = self.class_a_mark.load(Ordering::Acquire);
+        let protect = match mark {
+            0 => None,
+            generation => Some(generation - 1),
+        };
+        let generation =
+            crate::class_a_pages::write_barrier(&self.hot_dir, &files, named, protect)?;
         self.class_a_slot
             .store(generation.saturating_add(1), Ordering::Release);
-        // `write_barrier` does not clear. This caller does, and only when
-        // the appender is not inside a write: that is the quiescent point
-        // after the seal. An overlapping append keeps the old generation.
+        // `write_barrier` does not clear. This caller does, after the seal,
+        // and only when no append is in a pwrite. The sync holds
+        // `class_a_sync` across that clear, so the next append cannot start
+        // until the mark is gone.
         if self.class_a_writes.load(Ordering::Acquire) == 0 {
             crate::class_a_pages::clear_armed(&self.hot_dir)?;
             self.class_a_mark.store(0, Ordering::Release);

@@ -363,12 +363,25 @@ pub fn arm_named_generation(hot: &Path, generation: u64) -> Result<(), StoreErro
     if path.try_exists().map_err(|e| StoreError::io(&path, e))? {
         return Ok(());
     }
+    publish_armed(&path, generation)
+}
+
+fn armed_bytes(generation: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(ARMED_LEN);
     buf.extend_from_slice(ARMED_MAGIC);
     buf.extend_from_slice(&rbitcoin_primitives::SCHEMA_VERSION.to_le_bytes());
     buf.extend_from_slice(&0u16.to_le_bytes());
     buf.extend_from_slice(&generation.to_le_bytes());
-    file::write_synced_tmp_rename(&path, &buf)
+    buf
+}
+
+fn publish_armed(path: &Path, generation: u64) -> Result<(), StoreError> {
+    file::write_synced_tmp_rename(path, &armed_bytes(generation))
+}
+
+/// Overwrite an existing mark. The previous bytes stay until the rename.
+fn replace_armed(path: &Path, generation: u64) -> Result<(), StoreError> {
+    publish_armed(path, generation)
 }
 
 /// The appender's arm. Promotes `meta` to 31 and syncs it before the rename
@@ -382,19 +395,13 @@ pub(crate) fn arm_for_appender(hot: &Path) -> Result<u64, StoreError> {
         if newest <= generation {
             return Ok(generation);
         }
-        // The sealed slot is the committed image. Publish its count before
-        // dropping the mark that still names the older generation.
-        if let Some(slot) = slot_by_generation(&dir, newest)? {
-            let settled = le_u64(&slot.raw[16..24]);
-            let current = crate::tx_table::read_class_a_synced(hot)?;
-            if settled > current {
-                file::write_synced_tmp_rename(
-                    &hot.join(crate::tx_table::CLASS_A_SYNCED_NAME),
-                    &settled.to_le_bytes(),
-                )?;
-            }
+        // The newer slot is a quiescent seal. Name it by replacing the mark
+        // in one rename, so a crash still has one of the two generations.
+        if meta_version(hot)?.is_some_and(|ver| ver < 31) {
+            return Err(StoreError::Rejected("class A arm while meta is 30"));
         }
-        clear_armed_file(&dir.join("armed"))?;
+        replace_armed(&dir.join("armed"), newest)?;
+        return Ok(newest);
     }
     if meta_version(hot)?.is_some_and(|ver| ver < 31) {
         crate::store::write_meta_at(hot, 31)?;
@@ -448,15 +455,6 @@ fn newest_generation(dir: &Path) -> Result<u64, StoreError> {
         (Some(a), None) => a.generation,
         (None, Some(b)) => b.generation,
         (None, None) => 0,
-    })
-}
-
-fn slot_by_generation(dir: &Path, generation: u64) -> Result<Option<TailSlot>, StoreError> {
-    let (slot0, slot1) = load_tails(dir)?;
-    Ok(match (slot0, slot1) {
-        (Some(slot), _) if slot.generation == generation => Some(slot),
-        (_, Some(slot)) if slot.generation == generation => Some(slot),
-        _ => None,
     })
 }
 
@@ -1129,6 +1127,31 @@ fn read_tail_images(
     Ok(())
 }
 
+/// Slot to overwrite, and the generation to write. `protect` is the
+/// generation `armed` names. That slot stays, even when it is the older one.
+fn barrier_slot(
+    slot0: &Option<TailSlot>,
+    slot1: &Option<TailSlot>,
+    protect: Option<u64>,
+) -> (u8, u64) {
+    let next = match (slot0, slot1) {
+        (None, None) => 1,
+        (Some(a), None) => a.generation.saturating_add(1),
+        (None, Some(b)) => b.generation.saturating_add(1),
+        (Some(a), Some(b)) => a.generation.max(b.generation).saturating_add(1),
+    };
+    let holds = |slot: &Option<TailSlot>| {
+        protect.is_some_and(|generation| slot.as_ref().is_some_and(|s| s.generation == generation))
+    };
+    if holds(slot0) && !holds(slot1) {
+        return (1, next);
+    }
+    if holds(slot1) && !holds(slot0) {
+        return (0, next);
+    }
+    inactive_slot(slot0, slot1)
+}
+
 fn inactive_slot(slot0: &Option<TailSlot>, slot1: &Option<TailSlot>) -> (u8, u64) {
     match (
         slot0.as_ref().map(|slot| slot.generation),
@@ -1151,6 +1174,7 @@ pub(crate) fn write_barrier(
     hot: &Path,
     files: &[&TableFile; STEM_N],
     settled: u64,
+    protect: Option<u64>,
 ) -> Result<u64, StoreError> {
     for (file, name) in files.iter().zip(STEMS) {
         debug_assert!(
@@ -1161,7 +1185,7 @@ pub(crate) fn write_barrier(
     ensure_guard(hot)?;
     let dir = guard_dir(hot);
     let (slot0, slot1) = load_tails(&dir)?;
-    let (inactive, generation) = inactive_slot(&slot0, &slot1);
+    let (inactive, generation) = barrier_slot(&slot0, &slot1, protect);
     let tail_path = dir.join(if inactive == 0 { "tail.0" } else { "tail.1" });
     let tail = open_rw(&tail_path)?;
     let first_path = dir.join("first");

@@ -1079,19 +1079,52 @@ fn write_barrier_does_not_clear_armed_while_an_append_is_in_flight() {
     let s = Store::create_tiny(&dir).unwrap();
     s.put_tx_full_batch_indexed(&[coinbase([0x33u8; 32])], false)
         .unwrap();
-    assert!(dir.join("tear_guard/armed").is_file());
+    let armed = dir.join("tear_guard/armed");
+    assert!(armed.is_file());
     s.txs.hold_class_a_append_for_test();
-    s.txs.sync_class_a_named(1).unwrap();
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| s.txs.sync_class_a_named(1));
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(200) {
+            assert!(
+                armed.is_file(),
+                "sync cleared armed while an append was in flight"
+            );
+            assert!(
+                !handle.is_finished(),
+                "sync returned while an append was in flight"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        s.txs.release_class_a_append_for_test();
+        handle.join().unwrap().unwrap();
+    });
     assert!(
-        dir.join("tear_guard/armed").is_file(),
-        "the barrier must not clear armed"
+        !armed.exists(),
+        "an idle sync clears after the append finishes"
     );
-    s.txs.release_class_a_append_for_test();
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A mark that names an older generation is replaced in one rename when a
+/// newer slot is already sealed. The file is present before and after.
+#[test]
+fn newer_sealed_slot_replaces_the_armed_mark_in_place() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    s.put_tx_full_batch_indexed(&[coinbase([0x44u8; 32])], false)
+        .unwrap();
     s.txs.sync_class_a_named(1).unwrap();
-    assert!(
-        !dir.join("tear_guard/armed").exists(),
-        "an idle sync clears after the seal"
-    );
+    assert!(!dir.join("tear_guard/armed").exists());
+    plant_armed(&dir, 0);
+    s.put_tx_full_batch_indexed(&[coinbase([0x45u8; 32])], false)
+        .unwrap();
+    let mut raw = [0u8; 16];
+    read_at(&dir.join("tear_guard/armed"), 0, &mut raw);
+    assert_eq!(&raw[0..4], b"CARM");
+    let generation = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    assert!(generation > 0, "the mark still names the empty generation");
     drop(s);
     let _ = std::fs::remove_dir_all(&dir);
 }
