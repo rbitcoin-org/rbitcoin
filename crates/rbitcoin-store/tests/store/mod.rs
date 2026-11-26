@@ -173,7 +173,8 @@ fn occupied_schema23_header_body_opens_as_24() {
     assert_eq!(got.weight, 0);
     drop(s);
     let meta = std::fs::read(dir.join("meta")).unwrap();
-    assert_eq!(u16::from_le_bytes([meta[4], meta[5]]), SCHEMA_VERSION);
+    // Open rewrites 22–29 to schema 30. The first Class A arm publishes 31.
+    assert_eq!(u16::from_le_bytes([meta[4], meta[5]]), 30);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -910,7 +911,8 @@ fn open_schema22_occupied_rewrites_create_ovf_12_to_16() {
     assert_eq!(tx.output_count, n_out);
     assert_eq!(outs.len(), n_out as usize);
     drop(s);
-    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+    // Open rewrites 22–29 to schema 30. The first Class A arm publishes 31.
+    assert_eq!(read_store_meta_ver(&dir), 30);
     assert_eq!(ovf_data_len(&dir), 16);
     let _ = std::fs::remove_dir_all(&dir);
 }
