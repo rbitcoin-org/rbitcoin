@@ -1454,7 +1454,7 @@ impl TableFile {
         let logical = self.header_len_to_persist();
         self.persist_logical_len(logical)?;
         #[cfg(debug_assertions)]
-        if crate::io_handle::take_fail_sync(self.io_handle()) {
+        if crate::io_handle::take_fail_flush(self.io_handle()) {
             return Err(StoreError::io(
                 &self.path,
                 std::io::Error::from_raw_os_error(5),

@@ -1168,7 +1168,7 @@ fn a_failed_tip_shrink_after_an_unlink_keeps_the_scripthash_mark() {
     let (dir, q, _c, _key) = heavy_chain("sh-dirty-shrink-fail");
     q.store().scripthash.flush().unwrap();
     assert!(!sh_dirty_marked(dir.path()));
-    rbitcoin_store::io_handle::arm_fail_sync(q.store().confirmed.arr.file.io_handle(), 1);
+    rbitcoin_store::io_handle::arm_fail_flush(q.store().confirmed.arr.file.io_handle(), 1);
     assert!(q.disconnect_tip().is_err(), "the tip shrink sync failed");
     // A write-behind flush between the unlink and the failure clears the mark.
     let _ = q.store().scripthash.flush();

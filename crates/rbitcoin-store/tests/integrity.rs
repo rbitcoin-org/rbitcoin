@@ -1280,11 +1280,18 @@ fn class_a_sync_failure_stops_the_class_c_commit() {
 /// dropped pages (#2138).
 #[test]
 fn a_failed_shutdown_step_still_syncs_a_dirty_scripthash_index() {
+    use rbitcoin_store::io_handle::{arm_fail_flush, arm_fail_sync, IoHandle};
+    type Arm = fn(IoHandle, u32);
     let header_body: ClassAPick = |s| s.headers.body.io_handle();
-    for (name, pick, seal) in [
-        ("headers.body", header_body, true),
-        (CLASS_A_FILES[0].0, CLASS_A_FILES[0].1, true),
-        ("no seal", header_body, false),
+    for (name, pick, arm, seal) in [
+        ("headers.body", header_body, arm_fail_flush as Arm, true),
+        (
+            CLASS_A_FILES[0].0,
+            CLASS_A_FILES[0].1,
+            arm_fail_sync as Arm,
+            true,
+        ),
+        ("no seal", header_body, arm_fail_flush as Arm, false),
     ] {
         let dir = tmp();
         let s = Store::create_tiny(&dir).unwrap();
@@ -1297,7 +1304,7 @@ fn a_failed_shutdown_step_still_syncs_a_dirty_scripthash_index() {
         let marker = dir.join(rbitcoin_store::scripthash::SH_DIRTY_NAME);
         assert!(marker.exists(), "{name}");
         if seal {
-            rbitcoin_store::io_handle::arm_fail_sync(pick(&s), 1);
+            arm(pick(&s), 1);
         }
         rbitcoin_log::capture_logs(true);
         let flushed = s.flush_for_shutdown(seal);
