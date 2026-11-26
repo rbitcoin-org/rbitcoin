@@ -1,4 +1,4 @@
-use crate::chain::{ConfirmedTable, HeaderTxsTable, StrongTxTable};
+use crate::chain::{flush_class_c_tables, ConfirmedTable, HeaderTxsTable, StrongTxTable};
 use crate::error::StoreError;
 use crate::hashhead::{HeadOpenOpts, HeadScale};
 use crate::header_table::{HeaderRecord, HeaderTable};
@@ -535,6 +535,9 @@ impl Store {
         }
         let meta_ver = check_meta(&path)?;
         open_layout_refuse_old(&path, meta_ver)?;
+        crate::page_guard::restore_store_group(&path, crate::page_guard::CLASS_C_MARK)?;
+        crate::page_guard::restore_store_group(&path, crate::page_guard::HEADER_BODY_MARK)?;
+        crate::page_guard::restore_store_group(&path, crate::page_guard::HEADER_HEAD_MARK)?;
         drop_unread_store_leftovers(&path);
         let scripthash = if path.join("scripthash.body").exists() {
             ScriptHashTable::open_with_scale(&path, layout.head_scale)?
@@ -907,7 +910,7 @@ impl Store {
         // A durable body association must name durable creates.
         self.txs.sync_class_a_data()?;
         self.headers.flush()?;
-        self.header_txs.flush()?;
+        flush_class_c_tables(&[&self.header_txs.first, &self.header_txs.count])?;
         Ok(())
     }
 
@@ -2067,8 +2070,11 @@ impl Store {
         self.txs.sync_class_a_data()?;
         // Headers first so conf tip cannot reference a non-durable header_fk.
         self.headers.flush()?;
-        self.strong_tx.flush()?;
-        self.header_txs.flush()?;
+        flush_class_c_tables(&[
+            &self.strong_tx.table,
+            &self.header_txs.first,
+            &self.header_txs.count,
+        ])?;
         Ok(())
     }
 
@@ -2472,9 +2478,16 @@ impl Store {
     /// The tip this call sealed, `None` for an empty chain. After a failed
     /// Class A write or sync, the latch fails this call.
     pub fn flush_class_c_tip(&self) -> Result<Option<Height>, StoreError> {
-        self.flush_class_c_pre_tip()?;
-        // Commit point on disk: tip advance only after strong/header_txs.
-        self.confirmed.flush()?;
+        self.txs.sync_class_a_data()?;
+        self.headers.flush()?;
+        // One mark for the four Class C files, then tip_seal. Confirmed is
+        // last in the persist order so a kill cannot advance tip first.
+        flush_class_c_tables(&[
+            &self.strong_tx.table,
+            &self.header_txs.first,
+            &self.header_txs.count,
+            &self.confirmed.arr,
+        ])?;
         self.publish_tip_seal()?;
         Ok(self.confirmed.tip_height())
     }
@@ -2484,7 +2497,7 @@ impl Store {
     /// Used by **disconnect** after RAM truncate so tip shrink is durable **before**
     /// unstrong. Do not use for connect (would tip-first).
     pub fn flush_confirmed_only(&self) -> Result<(), StoreError> {
-        self.confirmed.flush()?;
+        flush_class_c_tables(&[&self.confirmed.arr])?;
         self.publish_tip_seal()?;
         Ok(())
     }
@@ -2492,7 +2505,7 @@ impl Store {
     /// Class C **disconnect** post-clear barrier: strong after tip already
     /// shrunk and flushed via [`Self::flush_confirmed_only`].
     pub fn flush_class_c_after_disconnect_tip(&self) -> Result<(), StoreError> {
-        self.strong_tx.flush()?;
+        flush_class_c_tables(&[&self.strong_tx.table])?;
         // header_txs unchanged on disconnect (archive association remains).
         Ok(())
     }
