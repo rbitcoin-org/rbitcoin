@@ -529,15 +529,16 @@ fn drop_ahead_sidecar(dir: &Path, name: &str) -> Result<(), StoreError> {
         _ => PathBuf::from(ahead),
     };
     match std::fs::remove_file(&side) {
-        Ok(()) => {
-            if let Some(parent) = side.parent() {
-                fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-            }
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(StoreError::io(&side, e)),
+        Ok(()) => {}
+        // An earlier unlink may have landed and its directory sync failed.
+        // Sync again so the sidecar cannot come back after the mark is gone.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(StoreError::io(&side, e)),
     }
+    if let Some(parent) = side.parent().filter(|p| p.is_dir()) {
+        fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+    }
+    Ok(())
 }
 
 /// Read one 4 KiB block. Bytes past EOF are zeros. A missing file is zeros.
