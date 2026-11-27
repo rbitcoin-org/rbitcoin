@@ -334,6 +334,10 @@ impl Mempool {
             self.slots = slots;
         }
         committed?;
+        // The full slot image published each row's current status. A queued
+        // death index may now name the replacement that just became durable.
+        self.death_slots.clear();
+        self.deaths_unsynced = false;
         self.promote_pending_slots();
         self.clear_dirty();
         self.last_persist_ms = self.now_ms();
@@ -1115,6 +1119,11 @@ impl Mempool {
                 self.slots_file
                     .set_len(need)
                     .map_err(|e| MempoolError::io(slots_path, e))?;
+                // The growth mark publishes `slot_cap` in page 0 and does not
+                // image the zero tail. The longer file has to be durable first.
+                self.slots_file
+                    .sync_all()
+                    .map_err(|e| MempoolError::io(slots_path, e))?;
             }
             let mut page_off = 0u64;
             while (page_off as usize) < ram.len() {
@@ -1239,10 +1248,13 @@ impl Mempool {
     }
 
     fn adopt_body_len(&mut self, path: &Path, logical: u64) -> Result<(), MempoolError> {
+        // The LIVE bytes are already synced and the mark is gone. A later
+        // `set_len` failure must not keep the old durable length, or a death
+        // of this tail is skipped.
+        self.body_persisted_len = logical;
         self.body_file
             .set_len(logical)
             .map_err(|e| MempoolError::io(path, e))?;
-        self.body_persisted_len = logical;
         Ok(())
     }
 
@@ -1266,6 +1278,9 @@ impl Mempool {
         live_count: u32,
         live_body_bytes: u64,
     ) -> Result<(), MempoolError> {
+        // An interrupted flush mark still names the pre-compact pages. Apply
+        // it and drop it before the packed names replace those files.
+        restore_mempool_mark(&self.dir)?;
         let body_path = self.dir.join("tx.body");
         let slots_path = self.dir.join("slots");
         let body_tmp = self.dir.join("tx.body.tmp");
@@ -1499,10 +1514,21 @@ pub fn quarantine_sidecar(dir: &Path) -> Result<PathBuf, MempoolError> {
         dest = dir.join(format!("torn-{secs}-{n}"));
     }
     fs::create_dir(&dest).map_err(|e| MempoolError::io(&dest, e))?;
-    for name in ["meta", "slots", "tx.body", "slots.tmp", "tx.body.tmp"] {
+    for name in [
+        "meta",
+        "slots",
+        "tx.body",
+        "slots.tmp",
+        "tx.body.tmp",
+        "guard/flush",
+    ] {
         let src = dir.join(name);
         if src.exists() {
-            fs::rename(&src, dest.join(name)).map_err(|e| MempoolError::io(&src, e))?;
+            let to = dest.join(name);
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent).map_err(|e| MempoolError::io(parent, e))?;
+            }
+            fs::rename(&src, &to).map_err(|e| MempoolError::io(&src, e))?;
         }
     }
     Ok(dest)
