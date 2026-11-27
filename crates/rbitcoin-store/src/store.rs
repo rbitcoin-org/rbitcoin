@@ -536,7 +536,7 @@ impl Store {
         let meta_ver = check_meta(&path)?;
         // A mark finishes a torn header.body page before the width probe in
         // open_layout_refuse_old reads its length.
-        restore_open_marks(&path)?;
+        let header_body_replayed = restore_open_marks(&path)?;
         open_layout_refuse_old(&path, meta_ver)?;
         drop_unread_store_leftovers(&path);
         let scripthash = if path.join("scripthash.body").exists() {
@@ -581,7 +581,11 @@ impl Store {
         }
         let cold_path = layout.is_split().then_some(seqsigwit_dir);
         let store = Self {
-            headers: HeaderTable::open_with_scale(&path, layout.head_scale)?,
+            headers: HeaderTable::open_after_restore(
+                &path,
+                layout.head_scale,
+                header_body_replayed,
+            )?,
             txs,
             spenders: SpenderTable::open(&path)?,
             scripthash,
@@ -2779,11 +2783,13 @@ pub fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
 }
 
 /// Copy armed page images back before trim or the tip walk.
-fn restore_open_marks(path: &Path) -> Result<(), StoreError> {
+/// `Ok(true)` when a `guard/header.body` mark was replayed.
+fn restore_open_marks(path: &Path) -> Result<bool, StoreError> {
     crate::page_guard::restore_store_group(path, crate::page_guard::CLASS_C_MARK)?;
-    crate::page_guard::restore_store_group(path, crate::page_guard::HEADER_BODY_MARK)?;
+    let header_body =
+        crate::page_guard::restore_store_group(path, crate::page_guard::HEADER_BODY_MARK)?;
     crate::page_guard::restore_store_group(path, crate::page_guard::HEADER_HEAD_MARK)?;
-    Ok(())
+    Ok(header_body)
 }
 
 #[doc(hidden)]
