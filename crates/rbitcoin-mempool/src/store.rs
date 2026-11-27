@@ -9,8 +9,8 @@
 //!
 //! Schema **4** packed live records (`fee‖weight‖sigops‖accept_secs‖…`); schema 1–3
 //! recode on open. Body is append-only (`body_persisted_len`);
-//! `persist_due` syncs the dirty tail, then syncs new LIVE slots, then writes meta,
-//! as one `guard/flush` mark. Compact still renames packed images. An admit
+//! `persist_due` syncs fresh body blocks, then publishes the shared body pages,
+//! new LIVE slots, and meta as one `guard/flush` mark. Compact still renames packed images. An admit
 //! compacts first when dead payloads reach the live payload bytes, so a full
 //! pool that reuses the slot each eviction frees does not grow `tx.body` until
 //! a block. DEAD of a durable slot is folded into that same flush. A batch
@@ -22,8 +22,8 @@
 //!
 //! Process-owned buffers (`meta` fields + `slots` / `body` `Vec`s) are the
 //! source of truth. Sidecar files are updated with normal `read`/`write` /
-//! `pwrite`-style IO — **no `memmap2`**. Flush bumps generation and `sync_data`
-//! of the body before slots, then slots before meta.
+//! `pwrite`-style IO — **no `memmap2`**. Flush bumps generation and commits
+//! through the same `guard/flush` mark.
 
 use crate::error::MempoolError;
 use crate::packed::{
@@ -265,9 +265,9 @@ impl Mempool {
 
     /// Persist buffers, bump generation, and fsync sidecar files.
     ///
-    /// Admits persist on [`Self::persist_due`] (5 s, body `sync_data` before
-    /// LIVE slots). A crash may lose admits since the last persist.
-    /// [`Self::flush`] is the durable checkpoint (generation + the same order).
+    /// Admits persist on [`Self::persist_due`] (5 s, one `guard/flush` mark).
+    /// A crash may lose admits since the last persist.
+    /// [`Self::flush`] is the durable checkpoint (generation + the same mark).
     pub fn flush(&mut self) -> Result<(), MempoolError> {
         self.generation = self.generation.saturating_add(1);
         self.persist_body_then_slots()
