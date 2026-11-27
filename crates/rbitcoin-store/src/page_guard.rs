@@ -174,8 +174,15 @@ pub fn restore_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreEr
         data.durable_sync_data()
             .map_err(|e| StoreError::io(data_path, e))?;
     }
-    // The created directory entry has to be durable before the mark is gone.
-    fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
+    // A created directory entry has to be durable before the mark is gone.
+    let mut parents: Vec<&Path> = Vec::new();
+    for (_, _, data_path) in &opened {
+        let parent = data_path.parent().unwrap_or(dir);
+        if !parents.contains(&parent) {
+            fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+            parents.push(parent);
+        }
+    }
     remove_mark(mark)?;
     Ok(true)
 }

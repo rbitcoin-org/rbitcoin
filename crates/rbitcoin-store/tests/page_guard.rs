@@ -650,3 +650,28 @@ fn fit_restore_syncs_the_sidecar_directory_when_it_is_gone() {
         );
     }
 }
+
+/// A restore that creates a file one directory down syncs that directory
+/// before the mark goes away, so a second crash cannot lose the name.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn group_restore_syncs_a_nested_file_parent_before_the_mark_is_gone() {
+    let dir = TempDir::labeled("page-guard-restore-nested").unwrap();
+    let sub = dir.path().join("scripthash.body");
+    std::fs::create_dir_all(&sub).unwrap();
+    let mark = dir.path().join("guard").join("sh-00");
+    let image = fill(0x5B);
+    arm_page_guard_group(&mark, &[("scripthash.body/00", 0, image.as_slice())]).unwrap();
+    let live = sub.join("00");
+    assert!(!live.exists());
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    assert!(restore_page_guard_group(&mark, dir.path()).unwrap());
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    let sub_at = synced.iter().position(|p| p == &sub);
+    let guard_at = synced.iter().position(|p| p == mark.parent().unwrap());
+    assert!(
+        sub_at.is_some() && guard_at.is_some() && sub_at < guard_at,
+        "the nested live dir must be durable before the mark is unlinked, got {synced:?}"
+    );
+    assert_eq!(read_bytes(&live, 0, PAGE), image);
+}
