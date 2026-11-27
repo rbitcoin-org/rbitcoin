@@ -9,6 +9,7 @@ use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
 use crate::fuse8_filter::SealedFuse8;
 use crate::hashhead::{sh_main_shard_count, HeadScale};
 use crate::io_backend::ReadIoBackend;
+use crate::page_guard::{self, PAGE};
 use crate::scripthash_head::{prefix_shard_of, ScriptHashHead};
 use crate::scripthash_layout::{
     head_key_from_full, pack8, pack8_bytes, payload_start, slab_bytes, ShHeadValue,
@@ -31,9 +32,18 @@ use crate::scripthash_sorted_head::SortedHead;
 use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{le_u64, uleb128_len, Fk, TableKind};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
+
+#[cfg(debug_assertions)]
+use std::cell::Cell;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static FAIL_CLEAR_SH_GUARD: Cell<bool> = const { Cell::new(false) };
+}
 
 #[path = "scripthash_unlink.rs"]
 #[doc(hidden)]
@@ -334,6 +344,55 @@ impl StagedSlabs {
         }
         Ok(())
     }
+}
+
+#[derive(Default)]
+pub(super) struct ArmedSh {
+    files: BTreeMap<String, BTreeSet<String>>,
+}
+
+fn body_sh_mark(dir: &Path, body: &TableFile) -> Result<String, StoreError> {
+    let rel = page_guard::guard_rel_name(dir, body.path())?;
+    if let Some(rest) = rel.strip_prefix("scripthash.body/") {
+        Ok(page_guard::sh_mark(rest))
+    } else {
+        Ok(page_guard::sh_mark("ovf"))
+    }
+}
+
+fn image_range(
+    pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+    mark: &str,
+    rel: &str,
+    path: &Path,
+    file: &File,
+    off: u64,
+    len: u64,
+) -> Result<(), StoreError> {
+    if len == 0 {
+        return Ok(());
+    }
+    let first = (off / PAGE) * PAGE;
+    let last = ((off + len - 1) / PAGE) * PAGE;
+    let mut block = first;
+    while block <= last {
+        let key = (mark.to_string(), rel.to_string(), block);
+        if let std::collections::btree_map::Entry::Vacant(e) = pages.entry(key) {
+            e.insert(page_guard::read_live_page(path, file, block)?);
+        }
+        block = block.saturating_add(PAGE);
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_sh_guard_clear() -> bool {
+    FAIL_CLEAR_SH_GUARD.with(|c| c.replace(false))
+}
+
+#[cfg(not(debug_assertions))]
+fn take_fail_sh_guard_clear() -> bool {
+    false
 }
 
 /// One body's share of an ingest batch.
@@ -789,6 +848,7 @@ pub fn discard_incomplete_scripthash_head(dir: &Path, n_shards: usize) -> Result
     if sorted_main_present(dir, n_shards) {
         return Ok(());
     }
+    page_guard::clear_sh_marks(dir)?;
     remove_store_path(&dir.join("scripthash.head"))
 }
 
@@ -1180,6 +1240,7 @@ impl ScriptHashTable {
     }
 
     pub fn open_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
+        page_guard::restore_sh_marks(dir)?;
         let expected = sh_main_shard_count(scale);
         discard_incomplete_scripthash_head(dir, expected)?;
         discard_leftover_oa_overflow(dir)?;
@@ -1196,6 +1257,7 @@ impl ScriptHashTable {
         n_shards: usize,
         scale: HeadScale,
     ) -> Result<Self, StoreError> {
+        page_guard::restore_sh_marks(dir)?;
         let n_shards = n_shards.max(1);
         let mut bodies = Vec::with_capacity(n_shards);
         let mut allocs = Vec::with_capacity(n_shards);
@@ -1320,6 +1382,7 @@ impl ScriptHashTable {
             bump: payload0,
             free_head: [0; SH_MAX_CLASS as usize + 1],
         };
+        page_guard::clear_sh_marks(&self.store_dir)?;
         // The unlink undo record shares the prefix block with the header. An
         // armed one names pages of the old body, so it goes with them.
         for (i, body) in self.bodies.iter().enumerate() {
@@ -2026,6 +2089,17 @@ impl ScriptHashTable {
         batch: &IngestBatch<'_>,
         flush_each: bool,
     ) -> Result<(), StoreError> {
+        let _hold = page_guard::hold_marks();
+        let armed = self.arm_staged_batch(batch)?;
+        self.land_staged_batch(batch, flush_each)?;
+        self.clear_armed_sh(&armed)
+    }
+
+    fn land_staged_batch(
+        &self,
+        batch: &IngestBatch<'_>,
+        flush_each: bool,
+    ) -> Result<(), StoreError> {
         for stage in batch.stages.values().filter(|s| !s.popped) {
             stage.slabs.write_to(stage.body)?;
         }
@@ -2038,6 +2112,318 @@ impl ScriptHashTable {
         }
         self.apply_head_upserts(&batch.head_final, flush_each)?;
         self.free_replaced_slabs(&batch.stages, &batch.moved_heads)
+    }
+
+    fn arm_staged_batch(&self, batch: &IngestBatch<'_>) -> Result<ArmedSh, StoreError> {
+        let mut pages: BTreeMap<(String, String, u64), [u8; PAGE as usize]> = BTreeMap::new();
+        if batch
+            .head_final
+            .iter()
+            .any(|(_, _, kh)| matches!(kh, KeyHome::Ingest | KeyHome::Absent))
+        {
+            self.ensure_ingest()?;
+        }
+        for stage in batch.stages.values() {
+            self.image_body_stage(&mut pages, stage)?;
+        }
+        for (key, _, kh) in &batch.head_final {
+            self.image_head_key(&mut pages, key, *kh)?;
+        }
+        self.publish_sh_pages(&pages)
+    }
+
+    fn image_body_stage(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        stage: &BodyStage<'_>,
+    ) -> Result<(), StoreError> {
+        let mark = body_sh_mark(&self.store_dir, stage.body)?;
+        let rel = page_guard::guard_rel_name(&self.store_dir, stage.body.path())?;
+        image_range(
+            pages,
+            &mark,
+            &rel,
+            stage.body.path(),
+            &stage.body.read_file,
+            0,
+            1,
+        )?;
+        let mut at = 0usize;
+        for &(off, len) in &stage.slabs.writes {
+            image_range(
+                pages,
+                &mark,
+                &rel,
+                stage.body.path(),
+                &stage.body.read_file,
+                off,
+                len as u64,
+            )?;
+            at = at.saturating_add(len);
+        }
+        let _ = at;
+        for &(_, off) in &stage.slabs.frees {
+            image_range(
+                pages,
+                &mark,
+                &rel,
+                stage.body.path(),
+                &stage.body.read_file,
+                off,
+                8,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn image_head_key(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        key: &[u8; 32],
+        kh: KeyHome,
+    ) -> Result<(), StoreError> {
+        match kh {
+            KeyHome::Main => self.image_main_head(pages, key),
+            KeyHome::SealedOvf => self.image_sealed_head(pages, key),
+            KeyHome::Ingest | KeyHome::Absent => self.image_ingest_head(pages, key),
+        }
+    }
+
+    fn image_main_head(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        key: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        let hk = head_key_from_full(key);
+        let si = self.shard_index(key);
+        let Some(slot) = self.sorted_main.get(si) else {
+            return self.image_ingest_head(pages, key);
+        };
+        let g = slot.read().unwrap();
+        let Some(h) = g.as_ref() else {
+            return self.image_ingest_head(pages, key);
+        };
+        let Some(off) = h.value_word_offset(&hk)? else {
+            drop(g);
+            return self.image_ingest_head(pages, key);
+        };
+        let vp = crate::scripthash_mphf::val_path(&h.base);
+        let rel = page_guard::guard_rel_name(&self.store_dir, &vp)?;
+        let mark = page_guard::sh_mark(&format!("{si:02x}"));
+        image_range(pages, &mark, &rel, &vp, &h.val_file, off, 8)
+    }
+
+    fn image_sealed_head(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        key: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        let hk = head_key_from_full(key);
+        let mark = page_guard::sh_mark("ovf");
+        {
+            let g = self.sealed_ovf.lock().unwrap();
+            for h in g.iter().rev() {
+                if let Some(off) = h.value_word_offset(&hk)? {
+                    let rel = page_guard::guard_rel_name(&self.store_dir, h.path())?;
+                    image_range(pages, &mark, &rel, h.path(), &h.file, off, 8)?;
+                    return Ok(());
+                }
+            }
+        }
+        if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+            if let Some(off) = l1.head.value_word_offset(&hk)? {
+                let vp = crate::scripthash_mphf::val_path(&l1.head.base);
+                let rel = page_guard::guard_rel_name(&self.store_dir, &vp)?;
+                image_range(pages, &mark, &rel, &vp, &l1.head.val_file, off, 8)?;
+                return Ok(());
+            }
+        }
+        self.image_ingest_head(pages, key)
+    }
+
+    fn rearm_ingest_pages(&self, keys: &[[u8; 32]]) -> Result<(), StoreError> {
+        let mark = self.store_dir.join(page_guard::sh_mark("ovf"));
+        if !mark.try_exists().map_err(|e| StoreError::io(&mark, e))? {
+            return Ok(());
+        }
+        let mut pages: BTreeMap<(String, String, u64), [u8; PAGE as usize]> = BTreeMap::new();
+        for key in keys {
+            self.image_ingest_head(&mut pages, key)?;
+        }
+        self.publish_sh_pages(&pages).map(|_| ())
+    }
+
+    fn image_ingest_head(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        key: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        self.ensure_ingest()?;
+        let g = self.ingest.lock().unwrap();
+        let Some(h) = g.as_ref() else {
+            return Ok(());
+        };
+        let off = h.probe_slot_off(key)?;
+        let rel = page_guard::guard_rel_name(&self.store_dir, h.file.path())?;
+        let mark = page_guard::sh_mark("ovf");
+        image_range(
+            pages,
+            &mark,
+            &rel,
+            h.file.path(),
+            &h.file.read_file,
+            off,
+            crate::scripthash_layout::SH_HEAD_SLOT_SIZE as u64,
+        )
+    }
+
+    pub(super) fn arm_suffix_pages(
+        &self,
+        body: &TableFile,
+        scripthash: &[u8; 32],
+        home: LocatedHome,
+        offs: &[u64],
+        image_head: bool,
+    ) -> Result<ArmedSh, StoreError> {
+        let mut pages: BTreeMap<(String, String, u64), [u8; PAGE as usize]> = BTreeMap::new();
+        let mark = body_sh_mark(&self.store_dir, body)?;
+        let rel = page_guard::guard_rel_name(&self.store_dir, body.path())?;
+        for &off in offs {
+            image_range(
+                &mut pages,
+                &mark,
+                &rel,
+                body.path(),
+                &body.read_file,
+                off,
+                1,
+            )?;
+        }
+        if image_head {
+            self.image_head_key(&mut pages, scripthash, KeyHome::from(home))?;
+        }
+        self.publish_sh_pages(&pages)
+    }
+
+    pub(super) fn arm_unlink_rewrites(
+        &self,
+        batch: &unlink::UnlinkBatch,
+    ) -> Result<ArmedSh, StoreError> {
+        let mut pages: BTreeMap<(String, String, u64), [u8; PAGE as usize]> = BTreeMap::new();
+        if batch
+            .rewrites
+            .iter()
+            .any(|j| matches!(j.home, LocatedHome::Ingest | LocatedHome::Main))
+        {
+            self.ensure_ingest()?;
+        }
+        for job in &batch.rewrites {
+            let kh = KeyHome::from(job.home);
+            let body = self.body_for(&job.scripthash, kh);
+            let mark = body_sh_mark(&self.store_dir, body)?;
+            let rel = page_guard::guard_rel_name(&self.store_dir, body.path())?;
+            image_range(&mut pages, &mark, &rel, body.path(), &body.read_file, 0, 1)?;
+            let mut at = 0usize;
+            for &(off, len) in &job.staged.writes {
+                image_range(
+                    &mut pages,
+                    &mark,
+                    &rel,
+                    body.path(),
+                    &body.read_file,
+                    off,
+                    len as u64,
+                )?;
+                at = at.saturating_add(len);
+            }
+            let _ = at;
+            if unlink::frees_old_pages(&job.old) {
+                match &job.old {
+                    ShHeadValue::Slab { off, .. } => {
+                        image_range(
+                            &mut pages,
+                            &mark,
+                            &rel,
+                            body.path(),
+                            &body.read_file,
+                            *off,
+                            8,
+                        )?;
+                    }
+                    ShHeadValue::Extent { last_page } => {
+                        image_range(
+                            &mut pages,
+                            &mark,
+                            &rel,
+                            body.path(),
+                            &body.read_file,
+                            *last_page,
+                            SH_PAGE_SIZE as u64,
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
+            self.image_head_key(&mut pages, &job.scripthash, kh)?;
+        }
+        self.publish_sh_pages(&pages)
+    }
+
+    fn publish_sh_pages(
+        &self,
+        pages: &BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+    ) -> Result<ArmedSh, StoreError> {
+        let mut by_mark: BTreeMap<String, Vec<(String, u64, [u8; PAGE as usize])>> =
+            BTreeMap::new();
+        let mut armed = ArmedSh::default();
+        for ((mark, rel, off), image) in pages {
+            by_mark
+                .entry(mark.clone())
+                .or_default()
+                .push((rel.clone(), *off, *image));
+            armed
+                .files
+                .entry(mark.clone())
+                .or_default()
+                .insert(rel.clone());
+        }
+        for (mark, recs) in &by_mark {
+            let refs: Vec<(&str, u64, &[u8])> = recs
+                .iter()
+                .map(|(rel, off, image)| (rel.as_str(), *off, image.as_slice()))
+                .collect();
+            page_guard::arm_store_group(&self.store_dir, mark, &refs)?;
+        }
+        Ok(armed)
+    }
+
+    pub(super) fn clear_armed_sh(&self, armed: &ArmedSh) -> Result<(), StoreError> {
+        #[cfg(debug_assertions)]
+        if take_fail_sh_guard_clear() {
+            return Err(StoreError::Corrupt("scripthash page guard clear failed"));
+        }
+        use std::fs::OpenOptions;
+        for (mark, rels) in &armed.files {
+            let mark_path = self.store_dir.join(mark);
+            let mut opened: Vec<(File, PathBuf)> = Vec::new();
+            for rel in rels {
+                let path = self.store_dir.join(rel);
+                match OpenOptions::new().read(true).write(true).open(&path) {
+                    Ok(f) => opened.push((f, path)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(StoreError::io(&path, e)),
+                }
+            }
+            let refs: Vec<(&File, &Path)> = opened.iter().map(|(f, p)| (f, p.as_path())).collect();
+            page_guard::clear_page_guard_rel(&mark_path, &self.store_dir, &refs)?;
+        }
+        Ok(())
+    }
+
+    /// Leave the next scripthash page-guard clear behind.
+    #[cfg(debug_assertions)]
+    pub fn fail_next_sh_guard_clear(&self) {
+        FAIL_CLEAR_SH_GUARD.with(|c| c.set(true));
     }
 
     /// Link the slabs a class change replaced once the heads that named them
@@ -2233,6 +2619,8 @@ impl ScriptHashTable {
                 continue;
             }
             self.ensure_ingest()?;
+            let rest: Vec<[u8; 32]> = ups[i..].iter().map(|(k, _)| *k).collect();
+            self.rearm_ingest_pages(&rest)?;
             let n = (room as usize).min(ups.len() - i);
             {
                 let g = self.ingest.lock().unwrap();
@@ -2287,6 +2675,7 @@ impl ScriptHashTable {
         let sealed = SortedHead::write(&path, &recs)?;
         self.sealed_ovf.lock().unwrap().push(sealed);
         let p = ingest_path(&self.store_dir);
+        page_guard::drop_sh_rel(&self.store_dir, "scripthash.ovf/ingest")?;
         // Drop the fd before unlink so the name can go away on Windows.
         *self.ingest.lock().unwrap() = None;
         crate::scripthash_head::remove_ingest_files(&p)?;
@@ -2428,9 +2817,9 @@ impl ScriptHashTable {
         body: &TableFile,
         alloc: &mut AllocState,
         live: &[Fk],
-    ) -> Result<ShHeadValue, StoreError> {
+    ) -> Result<(ShHeadValue, StagedSlabs, bool), StoreError> {
         if live.is_empty() {
-            return Ok(ShHeadValue::Empty);
+            return Ok((ShHeadValue::Empty, StagedSlabs::default(), false));
         }
         for w in live.windows(2) {
             if w[1].0 <= w[0].0 {
@@ -2440,9 +2829,10 @@ impl ScriptHashTable {
             }
         }
         let mut staged = StagedSlabs::default();
+        let free_before = alloc.free_head;
         let val = self.pack_entries(body, alloc, live, false, &mut staged)?;
-        staged.write_to(body)?;
-        Ok(val)
+        let popped = alloc.free_head != free_before;
+        Ok((val, staged, popped))
     }
 
     /// Append strictly increasing `new_ents` (all already `> durable max`) without

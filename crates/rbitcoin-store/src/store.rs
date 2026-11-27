@@ -2788,6 +2788,7 @@ fn restore_open_marks(path: &Path) -> Result<(), StoreError> {
         crate::page_guard::SPENT_OVF_MARK,
         crate::spender_table::SPENT_OVF_NAME,
     )?;
+    crate::page_guard::restore_sh_marks(path)?;
     Ok(())
 }
 
