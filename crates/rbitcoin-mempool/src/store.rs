@@ -257,10 +257,7 @@ impl Mempool {
     /// [`Self::flush`] is the durable checkpoint (generation + the same order).
     pub fn flush(&mut self) -> Result<(), MempoolError> {
         self.generation = self.generation.saturating_add(1);
-        self.persist_body_then_slots()?;
-        self.deaths_unsynced = false;
-        self.death_slots.clear();
-        Ok(())
+        self.persist_body_then_slots()
     }
 
     /// Time-based body persist: dirty admits wait [`PERSIST_INTERVAL_MS`].
@@ -281,7 +278,7 @@ impl Mempool {
         let old_persisted = self.body_persisted_len;
         let mut ranges = self.slot_ranges_since(old_persisted);
         ranges.extend(self.death_ranges());
-        self.commit_guarded(true, &ranges, None, true, &[])?;
+        self.commit_guarded(true, &ranges, None, true, &[], false)?;
         self.deaths_unsynced = false;
         self.death_slots.clear();
         self.clear_dirty();
@@ -329,15 +326,11 @@ impl Mempool {
             Some(bytes) => bytes,
             None => stashed.as_deref().unwrap_or(&[]),
         };
-        let committed = self.commit_guarded(true, &[], Some(ram), true, &[]);
+        let committed = self.commit_guarded(true, &[], Some(ram), true, &[], true);
         if let Some(slots) = stashed {
             self.slots = slots;
         }
         committed?;
-        // The full slot image published each row's current status. A queued
-        // death index may now name the replacement that just became durable.
-        self.death_slots.clear();
-        self.deaths_unsynced = false;
         self.promote_pending_slots();
         self.clear_dirty();
         self.last_persist_ms = self.now_ms();
@@ -918,7 +911,7 @@ impl Mempool {
             Some(bytes) => bytes,
             None => stashed.as_deref().unwrap_or(&[]),
         };
-        let committed = self.commit_guarded(false, &[], Some(ram), true, &[]);
+        let committed = self.commit_guarded(false, &[], Some(ram), true, &[], true);
         if let Some(slots) = stashed {
             self.slots = slots;
         }
@@ -970,7 +963,7 @@ impl Mempool {
 
     #[doc(hidden)]
     pub fn persist_meta(&mut self) -> Result<(), MempoolError> {
-        self.commit_guarded(false, &[], None, true, &[])
+        self.commit_guarded(false, &[], None, true, &[], false)
     }
 
     /// Publish durable DEAD bytes and `live_count` in one mark.
@@ -987,10 +980,7 @@ impl Mempool {
         }
         let ranges = self.death_ranges();
         let dead_at: Vec<usize> = ranges.iter().map(|(off, _)| *off).collect();
-        self.commit_guarded(false, &ranges, None, true, &dead_at)?;
-        self.deaths_unsynced = false;
-        self.death_slots.clear();
-        Ok(())
+        self.commit_guarded(false, &ranges, None, true, &dead_at, true)
     }
 
     /// One forward mark for the pages this flush dirties.
@@ -1000,6 +990,12 @@ impl Mempool {
     /// files. Slot images start from the disk page and overlay only `ranges`,
     /// so a neighbor byte stays. `full_slots` is the demoted slot image and
     /// replaces whole pages that differ.
+    ///
+    /// `retire_deaths` drops the queued deaths once this commit is durable:
+    /// a full slot image published each row's current status, and a death
+    /// sync published those deaths. A failure after that point, such as the
+    /// `tx.body` trim, does not bring them back, or a later death sync could
+    /// stamp a slot an admit reused.
     fn commit_guarded(
         &mut self,
         body: bool,
@@ -1007,6 +1003,7 @@ impl Mempool {
         full_slots: Option<&[u8]>,
         meta: bool,
         stamp_dead: &[usize],
+        retire_deaths: bool,
     ) -> Result<(), MempoolError> {
         let body_path = self.dir.join("tx.body");
         let slots_path = self.slots_path();
@@ -1029,14 +1026,7 @@ impl Mempool {
         if meta {
             self.collect_meta_image(&meta_path, &mut images)?;
         }
-        self.publish_flush_mark(
-            &body_path,
-            &slots_path,
-            &meta_path,
-            logical,
-            fresh_body,
-            images,
-        )
+        self.publish_flush_mark(logical, fresh_body, images, retire_deaths)
     }
 
     /// Fresh body bytes are synced here, before the mark. Shared pages,
@@ -1182,14 +1172,21 @@ impl Mempool {
 
     fn publish_flush_mark(
         &mut self,
-        body_path: &Path,
-        slots_path: &Path,
-        meta_path: &Path,
         logical: Option<u64>,
         fresh_body: bool,
         images: Vec<(String, u64, [u8; 4096])>,
+        retire_deaths: bool,
     ) -> Result<(), MempoolError> {
+        let body_path = self.dir.join("tx.body");
+        let body_path = body_path.as_path();
+        let slots_path = self.slots_path();
+        let slots_path = slots_path.as_path();
+        let meta_path = self.dir.join("meta");
+        let meta_path = meta_path.as_path();
         if images.is_empty() {
+            if retire_deaths {
+                self.retire_deaths();
+            }
             if let Some(logical) = logical {
                 if fresh_body {
                     self.adopt_body_len(body_path, logical)?;
@@ -1241,10 +1238,18 @@ impl Mempool {
             live.push((&self.meta_file, meta_path));
         }
         rbitcoin_store::page_guard::clear_page_guard_files(&mark, &live).map_err(map_store)?;
+        if retire_deaths {
+            self.retire_deaths();
+        }
         if let Some(logical) = logical {
             self.adopt_body_len(body_path, logical)?;
         }
         Ok(())
+    }
+
+    fn retire_deaths(&mut self) {
+        self.death_slots.clear();
+        self.deaths_unsynced = false;
     }
 
     fn adopt_body_len(&mut self, path: &Path, logical: u64) -> Result<(), MempoolError> {
@@ -1252,6 +1257,13 @@ impl Mempool {
         // `set_len` failure must not keep the old durable length, or a death
         // of this tail is skipped.
         self.body_persisted_len = logical;
+        #[cfg(debug_assertions)]
+        if take_fail_body_adopt(&self.dir) {
+            return Err(MempoolError::io(
+                path,
+                std::io::Error::other("injected tx.body trim failure"),
+            ));
+        }
         self.body_file
             .set_len(logical)
             .map_err(|e| MempoolError::io(path, e))?;
@@ -1372,6 +1384,30 @@ pub fn fail_next_mempool_guard_before_write(dir: &Path) {
 #[cfg(debug_assertions)]
 fn take_fail_mempool_guard(dir: &Path) -> bool {
     let mut armed = FAIL_MEMPOOL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = armed.iter().position(|p| p == dir) else {
+        return false;
+    };
+    armed.remove(i);
+    true
+}
+
+#[cfg(debug_assertions)]
+static FAIL_BODY_ADOPT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// The next mempool flush in `dir` commits and clears its mark, then fails
+/// the `tx.body` trim that follows.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_mempool_body_adopt(dir: &Path) {
+    FAIL_BODY_ADOPT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(dir.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_body_adopt(dir: &Path) -> bool {
+    let mut armed = FAIL_BODY_ADOPT.lock().unwrap_or_else(|e| e.into_inner());
     let Some(i) = armed.iter().position(|p| p == dir) else {
         return false;
     };
