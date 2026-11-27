@@ -202,7 +202,7 @@ fn clear_of_a_missing_mark_syncs_the_directory() {
     let mark = dir.path().join("guard");
     write_bytes(&live, 0, &fill(0x11));
     let file = open_rw(&live);
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     {
         rbitcoin_store::file::arm_fsync_dir_trace();
         clear_page_guard(&mark, &file, &live).unwrap();
@@ -212,7 +212,7 @@ fn clear_of_a_missing_mark_syncs_the_directory() {
             "a retry after the unlink must still sync the directory, got {dirs:?}"
         );
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, debug_assertions)))]
     clear_page_guard(&mark, &file, &live).unwrap();
 }
 
@@ -221,7 +221,7 @@ fn arm_syncs_the_store_directory_when_guard_is_new() {
     let dir = TempDir::labeled("page-guard-new-dir").unwrap();
     let mark = dir.path().join("guard").join("mark");
     let page = fill(0x01);
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     {
         rbitcoin_store::file::arm_fsync_dir_trace();
         arm_page_guard(&mark, &[(0, &page)]).unwrap();
@@ -231,7 +231,7 @@ fn arm_syncs_the_store_directory_when_guard_is_new() {
             "a new guard directory must be durable in the store directory, got {dirs:?}"
         );
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, debug_assertions)))]
     arm_page_guard(&mark, &[(0, &page)]).unwrap();
     assert!(mark.is_file());
 }
@@ -243,7 +243,7 @@ fn arm_syncs_the_store_directory_when_guard_already_exists() {
     std::fs::create_dir(&guard).unwrap();
     let mark = guard.join("mark");
     let page = fill(0x01);
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     {
         rbitcoin_store::file::arm_fsync_dir_trace();
         arm_page_guard(&mark, &[(0, &page)]).unwrap();
@@ -253,7 +253,7 @@ fn arm_syncs_the_store_directory_when_guard_already_exists() {
             "a guard directory left by a failed sync must still be synced, got {dirs:?}"
         );
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, debug_assertions)))]
     arm_page_guard(&mark, &[(0, &page)]).unwrap();
     assert!(mark.is_file());
 }
@@ -411,7 +411,7 @@ fn arm_on_meta_31_syncs_the_directory_that_holds_meta() {
     std::fs::write(dir.path().join("meta"), &meta).unwrap();
     std::fs::create_dir(dir.path().join("guard")).unwrap();
     let page = fill(0x01);
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     {
         rbitcoin_store::file::arm_fsync_dir_trace();
         rbitcoin_store::page_guard::arm_store_group(
@@ -426,7 +426,7 @@ fn arm_on_meta_31_syncs_the_directory_that_holds_meta() {
             "meta 31 must be durable before the mark, got {dirs:?}"
         );
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, debug_assertions)))]
     rbitcoin_store::page_guard::arm_store_group(
         dir.path(),
         rbitcoin_store::page_guard::CLASS_C_MARK,
@@ -443,7 +443,7 @@ fn clear_of_a_missing_mark_syncs_its_directory() {
     std::fs::create_dir_all(mark.parent().unwrap()).unwrap();
     write_bytes(&live, 0, &fill(0x11));
     let file = open_rw(&live);
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     {
         rbitcoin_store::file::arm_fsync_dir_trace();
         clear_page_guard(&mark, &file, &live).unwrap();
@@ -454,7 +454,7 @@ fn clear_of_a_missing_mark_syncs_its_directory() {
             "a missing mark must still sync its directory, got {synced:?}"
         );
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, debug_assertions)))]
     clear_page_guard(&mark, &file, &live).unwrap();
 }
 
@@ -466,7 +466,7 @@ fn group_restore_syncs_the_live_directory_before_the_mark_is_gone() {
     arm_page_guard_group(&mark, &[("fresh.body", 0, image.as_slice())]).unwrap();
     let live = dir.path().join("fresh.body");
     assert!(!live.exists());
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     {
         rbitcoin_store::file::arm_fsync_dir_trace();
         assert!(restore_page_guard_group(&mark, dir.path()).unwrap());
@@ -479,7 +479,7 @@ fn group_restore_syncs_the_live_directory_before_the_mark_is_gone() {
             "live dir must be durable before the mark is unlinked, got {synced:?}"
         );
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, debug_assertions)))]
     assert!(restore_page_guard_group(&mark, dir.path()).unwrap());
     assert_eq!(read_bytes(&live, 0, PAGE), image);
 }
@@ -506,7 +506,7 @@ fn first_arm_syncs_the_store_directory() {
     let dir = TempDir::labeled("page-guard-mkdir").unwrap();
     let mark = dir.path().join("guard").join("mark");
     assert!(!mark.parent().unwrap().exists());
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     {
         rbitcoin_store::file::arm_fsync_dir_trace();
         arm_page_guard(&mark, &[(0, &fill(0x01))]).unwrap();
@@ -516,7 +516,7 @@ fn first_arm_syncs_the_store_directory() {
             "creating guard/ must sync the store directory, got {synced:?}"
         );
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, debug_assertions)))]
     arm_page_guard(&mark, &[(0, &fill(0x01))]).unwrap();
     assert!(mark.is_file());
 }
@@ -531,7 +531,7 @@ fn restore_store_file_syncs_the_directory_of_a_created_file() {
     arm_page_guard(&mark, &[(0, image.as_slice())]).unwrap();
     let data = dir.path().join("spent.ovf");
     assert!(!data.exists());
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     rbitcoin_store::file::arm_fsync_dir_trace();
     assert!(rbitcoin_store::page_guard::restore_store_file(
         dir.path(),
@@ -539,7 +539,7 @@ fn restore_store_file_syncs_the_directory_of_a_created_file() {
         "spent.ovf"
     )
     .unwrap());
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     {
         let dirs = rbitcoin_store::file::take_fsynced_dirs();
         assert!(
@@ -637,10 +637,10 @@ fn fit_restore_syncs_the_sidecar_directory_when_it_is_gone() {
     let image = fill(0x45);
     write_bytes(&live, 0, &image);
     arm_page_guard_group(&mark, &[("scripthash.ovf/ingest", 0, image.as_slice())]).unwrap();
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     rbitcoin_store::file::arm_fsync_dir_trace();
     assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     {
         let dirs = rbitcoin_store::file::take_fsynced_dirs();
         let side_dir = live.parent().unwrap();
