@@ -1,8 +1,8 @@
 //! A mark of whole 4 KiB images, and an append that stays off those pages.
 use rbitcoin_primitives::{SCHEMA_VERSION, STORE_MAGIC};
 use rbitcoin_store::page_guard::{
-    append_past_end, arm_page_guard, arm_page_guard_group, clear_page_guard, restore_page_guard,
-    restore_page_guard_group, restore_page_guard_group_fit,
+    append_past_end, arm_page_guard, arm_page_guard_group, clear_page_guard, guard_rel_name,
+    restore_page_guard, restore_page_guard_group, restore_page_guard_group_fit,
 };
 use rbitcoin_store::testutil::TempDir;
 use rbitcoin_store::StoreError;
@@ -579,4 +579,36 @@ fn fit_restore_does_not_extend_a_short_file() {
     assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
     assert_eq!(std::fs::metadata(&live).unwrap().len(), 16);
     assert_eq!(read_bytes(&live, 0, 16), image[..16]);
+}
+
+#[test]
+fn guard_rel_name_uses_forward_slashes() {
+    let dir = TempDir::labeled("page-guard-slash").unwrap();
+    let live = dir.path().join("scripthash.ovf").join("ingest");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::fs::File::create(&live).unwrap();
+    assert_eq!(
+        guard_rel_name(dir.path(), &live).unwrap(),
+        "scripthash.ovf/ingest"
+    );
+}
+
+#[test]
+fn fit_restore_drops_the_ahead_sidecar() {
+    let dir = TempDir::labeled("page-guard-ahead").unwrap();
+    let live = dir.path().join("scripthash.ovf").join("ingest");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    let ahead = live.parent().unwrap().join("ingest.ahead");
+    let mark = dir.path().join("guard/sh-ovf");
+    let image = fill(0x44);
+    write_bytes(&live, 0, &image);
+    write_bytes(&ahead, 0, b"SHA1ahead");
+    arm_page_guard_group(&mark, &[("scripthash.ovf/ingest", 0, image.as_slice())]).unwrap();
+    write_bytes(&live, 0, &fill(0x00));
+    assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
+    assert!(
+        !ahead.exists(),
+        "ahead replay would overwrite the restored page"
+    );
+    assert_eq!(read_bytes(&live, 0, PAGE), image);
 }
