@@ -815,8 +815,33 @@ pub fn commit_forward_appends(
         let end = w.at.saturating_add(w.bytes.len() as u64);
         logical[i] = logical[i].max(w.new_logical).max(end);
     }
-    let mut fresh: Vec<(usize, usize, u64, std::ops::Range<usize>)> = Vec::new();
-    let mut images: Vec<(usize, u64, [u8; PAGE as usize])> = Vec::new();
+    let planned = plan_forward_pages(&files, writes, &logical)?;
+    sync_fresh_spans(&files, writes, &planned.fresh)?;
+    let names: Vec<String> = files
+        .iter()
+        .map(|f| guard_rel_name(dir, f.path()))
+        .collect::<Result<_, _>>()?;
+    publish_forward_images(dir, mark, &files, &names, &planned.images)?;
+    for (fi, file) in files.iter().enumerate() {
+        file.adopt_durable_len(logical[fi]);
+    }
+    Ok(())
+}
+
+struct ForwardPages {
+    fresh: Vec<(usize, usize, u64, std::ops::Range<usize>)>,
+    images: Vec<(usize, u64, [u8; PAGE as usize])>,
+}
+
+/// Shared pages (page 0 and the committed tail block) become the image.
+/// Bytes strictly past that tail are fresh spans, synced before the mark.
+fn plan_forward_pages(
+    files: &[&TableFile],
+    writes: &[ForwardAppend<'_>],
+    logical: &[u64],
+) -> Result<ForwardPages, StoreError> {
+    let mut fresh = Vec::new();
+    let mut images = Vec::new();
     for (fi, file) in files.iter().enumerate() {
         let old = file.logical_len();
         let new_logical = logical[fi];
@@ -824,24 +849,7 @@ pub fn commit_forward_appends(
         if new_logical != old {
             pages.insert(0u64);
         }
-        for (wi, w) in writes.iter().enumerate() {
-            if w.file.path() != file.path() || w.bytes.is_empty() {
-                continue;
-            }
-            let mut i = 0usize;
-            while i < w.bytes.len() {
-                let off = w.at + i as u64;
-                let page = off & !(PAGE - 1);
-                let page_hi = (page + PAGE - off) as usize;
-                let end = i.saturating_add(page_hi).min(w.bytes.len());
-                if shared_page(page, old) {
-                    pages.insert(page);
-                } else {
-                    fresh.push((fi, wi, off, i..end));
-                }
-                i = end;
-            }
-        }
+        collect_forward_spans(fi, file, writes, old, &mut pages, &mut fresh);
         for page in pages {
             let mut image = read_live_page(file.path(), &file.read_file, page)?;
             if page == 0 {
@@ -856,8 +864,44 @@ pub fn commit_forward_appends(
             images.push((fi, page, image));
         }
     }
+    Ok(ForwardPages { fresh, images })
+}
+
+fn collect_forward_spans(
+    fi: usize,
+    file: &TableFile,
+    writes: &[ForwardAppend<'_>],
+    old: u64,
+    pages: &mut std::collections::BTreeSet<u64>,
+    fresh: &mut Vec<(usize, usize, u64, std::ops::Range<usize>)>,
+) {
+    for (wi, w) in writes.iter().enumerate() {
+        if w.file.path() != file.path() || w.bytes.is_empty() {
+            continue;
+        }
+        let mut i = 0usize;
+        while i < w.bytes.len() {
+            let off = w.at + i as u64;
+            let page = off & !(PAGE - 1);
+            let page_hi = (page + PAGE - off) as usize;
+            let end = i.saturating_add(page_hi).min(w.bytes.len());
+            if shared_page(page, old) {
+                pages.insert(page);
+            } else {
+                fresh.push((fi, wi, off, i..end));
+            }
+            i = end;
+        }
+    }
+}
+
+fn sync_fresh_spans(
+    files: &[&TableFile],
+    writes: &[ForwardAppend<'_>],
+    fresh: &[(usize, usize, u64, std::ops::Range<usize>)],
+) -> Result<(), StoreError> {
     let mut synced = std::collections::HashSet::new();
-    for (fi, wi, at, range) in &fresh {
+    for (fi, wi, at, range) in fresh {
         let file = files[*fi];
         let bytes = &writes[*wi].bytes[range.clone()];
         let end = at.saturating_add(bytes.len() as u64);
@@ -868,41 +912,44 @@ pub fn commit_forward_appends(
     for fi in &synced {
         files[*fi].sync_data_only()?;
     }
-    let names: Vec<String> = files
-        .iter()
-        .map(|f| guard_rel_name(dir, f.path()))
-        .collect::<Result<_, _>>()?;
-    if !images.is_empty() {
-        let refs: Vec<(&str, u64, &[u8])> = images
-            .iter()
-            .map(|(fi, off, image)| (names[*fi].as_str(), *off, image.as_slice()))
-            .collect();
-        arm_store_group(dir, mark, &refs)?;
-        #[cfg(debug_assertions)]
-        if take_fail_forward(dir) {
-            return Err(StoreError::io(
-                dir.join(mark),
-                std::io::Error::other("injected forward guard failure"),
-            ));
-        }
-        for (fi, off, image) in &images {
-            let file = files[*fi];
-            file.ensure_capacity(off.saturating_add(PAGE))?;
-            write_restored_page(&file.read_file, file.path(), *off, image, false)?;
-        }
-        let live: Vec<(&File, &Path)> = images
-            .iter()
-            .map(|(fi, _, _)| *fi)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .map(|fi| (&files[fi].read_file, files[fi].path()))
-            .collect();
-        clear_page_guard_rel(&dir.join(mark), dir, &live)?;
-    }
-    for (fi, file) in files.iter().enumerate() {
-        file.adopt_durable_len(logical[fi]);
-    }
     Ok(())
+}
+
+fn publish_forward_images(
+    dir: &Path,
+    mark: &str,
+    files: &[&TableFile],
+    names: &[String],
+    images: &[(usize, u64, [u8; PAGE as usize])],
+) -> Result<(), StoreError> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let refs: Vec<(&str, u64, &[u8])> = images
+        .iter()
+        .map(|(fi, off, image)| (names[*fi].as_str(), *off, image.as_slice()))
+        .collect();
+    arm_store_group(dir, mark, &refs)?;
+    #[cfg(debug_assertions)]
+    if take_fail_forward(dir) {
+        return Err(StoreError::io(
+            dir.join(mark),
+            std::io::Error::other("injected forward guard failure"),
+        ));
+    }
+    for (fi, off, image) in images {
+        let file = files[*fi];
+        file.ensure_capacity(off.saturating_add(PAGE))?;
+        write_restored_page(&file.read_file, file.path(), *off, image, None)?;
+    }
+    let live: Vec<(&File, &Path)> = images
+        .iter()
+        .map(|(fi, _, _)| *fi)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|fi| (&files[fi].read_file, files[fi].path()))
+        .collect();
+    clear_page_guard_rel(&dir.join(mark), dir, &live)
 }
 
 fn shared_page(page: u64, old: u64) -> bool {
