@@ -373,6 +373,29 @@ fn clear_drops_only_the_synced_file() {
     assert!(!mark.exists());
 }
 
+/// A clear removes a legacy single-file mark it can parse. A mark of a kind
+/// it does not know stays, and the clear is `Corrupt`.
+#[test]
+fn clear_keeps_a_mark_of_an_unknown_kind() {
+    let dir = TempDir::labeled("page-guard-unknown-kind").unwrap();
+    let head = dir.path().join("header.head");
+    let mark = dir.path().join("guard/header.head");
+    arm_page_guard_group(&mark, &[("header.head", 0, fill(0x41).as_slice())]).unwrap();
+    let mut raw = std::fs::read(&mark).unwrap();
+    raw[6..8].copy_from_slice(&7u16.to_le_bytes());
+    std::fs::write(&mark, &raw).unwrap();
+    write_bytes(&head, 0, &fill(0x41));
+    let head_file = open_rw(&head);
+    let err = clear_page_guard(&mark, &head_file, &head).unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
+    assert_eq!(std::fs::read(&mark).unwrap(), raw);
+
+    let legacy = dir.path().join("guard/legacy");
+    arm_page_guard(&legacy, &[(0, fill(0x41).as_slice())]).unwrap();
+    clear_page_guard(&legacy, &head_file, &head).unwrap();
+    assert!(!legacy.exists());
+}
+
 #[test]
 fn clear_of_a_missing_mark_syncs_its_directory() {
     let dir = TempDir::labeled("page-guard-missing-clear").unwrap();

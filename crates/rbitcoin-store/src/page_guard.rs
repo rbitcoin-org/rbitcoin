@@ -216,7 +216,12 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
     };
     let pages = match mark_group_pages(&raw) {
         Ok(pages) => pages,
-        Err(StoreError::Corrupt("page guard mark reserved")) => return remove_mark(path),
+        Err(StoreError::Corrupt("page guard mark reserved")) => {
+            // Only a single-file mark that parses is removed. A kind this
+            // binary does not know stays for the restore to refuse.
+            mark_pages(&raw)?;
+            return remove_mark(path);
+        }
         Err(e) => return Err(e),
     };
     let mut keep = Vec::new();
