@@ -8,4 +8,4 @@ Changed
   tail, new slots, durable deaths, and meta. `tx.head` seal always renames
   `NNNNNN.mlt` into place. The segment meta `mlt` flag says that file must
   exist; an older segment without the flag still loads a missing file as an
-  empty map.
+  empty map. Open refuses a leftover `txstat.body.ahead`.
