@@ -131,7 +131,7 @@ pub fn restore_page_guard(mark: &Path, data: &File, data_path: &Path) -> Result<
     };
     let pages = mark_pages(&raw)?;
     for (offset, at) in pages {
-        write_restored_page(data, data_path, offset, &raw[at..at + PAGE as usize], false)?;
+        write_restored_page(data, data_path, offset, &raw[at..at + PAGE as usize], None)?;
     }
     data.durable_sync_data()
         .map_err(|e| StoreError::io(data_path, e))?;
@@ -168,7 +168,7 @@ pub fn restore_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreEr
         let Some((_, data, live)) = opened.iter().find(|(have, _, _)| have == name) else {
             return Err(StoreError::Corrupt("page guard file name"));
         };
-        write_restored_page(data, live, *offset, &raw[*at..*at + PAGE as usize], false)?;
+        write_restored_page(data, live, *offset, &raw[*at..*at + PAGE as usize], None)?;
     }
     for (_, data, data_path) in &opened {
         data.durable_sync_data()
@@ -211,23 +211,28 @@ pub fn restore_page_guard_group_fit(mark: &Path, dir: &Path) -> Result<bool, Sto
         drop_ahead_sidecar(dir, name)?;
         dropped_ahead.push(name.clone());
     }
-    let mut opened: Vec<(String, File, PathBuf)> = Vec::new();
+    let mut opened: Vec<(String, File, PathBuf, u64)> = Vec::new();
     for (name, offset, at) in &pages {
         let data_path = dir.join(name);
-        if !opened.iter().any(|(have, _, _)| have == name) {
+        if !opened.iter().any(|(have, _, _, _)| have == name) {
             let file = match OpenOptions::new().read(true).write(true).open(&data_path) {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(StoreError::io(&data_path, e)),
             };
-            opened.push((name.clone(), file, data_path.clone()));
+            let len = file
+                .metadata()
+                .map_err(|e| StoreError::io(&data_path, e))?
+                .len();
+            opened.push((name.clone(), file, data_path.clone(), len));
         }
-        let Some((_, data, live)) = opened.iter().find(|(have, _, _)| have == name) else {
+        let Some((_, data, live, len)) = opened.iter().find(|(have, _, _, _)| have == name) else {
             continue;
         };
-        write_restored_page(data, live, *offset, &raw[*at..*at + PAGE as usize], true)?;
+        let image = &raw[*at..*at + PAGE as usize];
+        write_restored_page(data, live, *offset, image, Some(*len))?;
     }
-    for (_, data, data_path) in &opened {
+    for (_, data, data_path, _) in &opened {
         data.durable_sync_data()
             .map_err(|e| StoreError::io(data_path, e))?;
     }
@@ -643,19 +648,17 @@ fn valid_guard_name(name: &str) -> bool {
     n == 1 || n == 2
 }
 
+/// `fit_len` is the live length read before this restore's first write.
+/// `None` or an empty file takes the whole image.
 fn write_restored_page(
     data: &File,
     live: &Path,
     offset: u64,
     image: &[u8],
-    fit: bool,
+    fit_len: Option<u64>,
 ) -> Result<(), StoreError> {
-    let len = if fit {
-        data.metadata().map_err(|e| StoreError::io(live, e))?.len()
-    } else {
-        0
-    };
-    if !fit || len == 0 {
+    let len = fit_len.unwrap_or(0);
+    if len == 0 {
         return handle_pwrite_all(data, live, offset, image);
     }
     if offset >= len {
