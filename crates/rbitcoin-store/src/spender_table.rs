@@ -25,7 +25,7 @@ pub const SPENT_OVF_NAME: &str = "spent.ovf";
 pub const LEGACY_SPENDERS_BODY: &str = "spenders.body";
 
 /// The annotate freeze. [`Self::new`] borrows [`crate::store::UtxoViewGuard`]
-/// for the sync and the clear.
+/// for the node sync, then the length write and its sync.
 pub struct SpenderFreeze<'a> {
     _view: std::marker::PhantomData<&'a ()>,
 }
@@ -43,7 +43,8 @@ pub struct SpenderTable {
     pub body: TableFile,
     pub count: AtomicU64,
     /// A body sync failed. A retry can return 0 after the kernel dropped
-    /// the dirty pages, so the mark stays until restart.
+    /// the dirty pages, so every later flush is refused until restart and
+    /// no length is published over them.
     sync_failed: AtomicBool,
 }
 
