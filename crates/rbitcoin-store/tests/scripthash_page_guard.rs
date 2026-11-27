@@ -3,7 +3,9 @@ use rbitcoin_primitives::Fk;
 use rbitcoin_store::error::StoreError;
 use rbitcoin_store::file::FILE_HEADER_LEN;
 use rbitcoin_store::scripthash::*;
-use rbitcoin_store::scripthash_head::ScriptHashHead;
+use rbitcoin_store::scripthash_head::{
+    load_occ_sidecar, ScriptHashHead, CHUNK_CACHE_MAX, OCC_SCAN_BYTE_CAP, SLOTS_PER_CHUNK,
+};
 use rbitcoin_store::scripthash_layout::{ShHeadValue, SH_HEAD_SLOT_SIZE};
 use rbitcoin_store::scripthash_pages::{SH_PAGE_SIZE, SH_PAGE_STREAM_MAX};
 use rbitcoin_store::Store;
@@ -397,6 +399,213 @@ fn extent_free_restores_an_interior_page() {
     let t = ScriptHashTable::open_tiny(&dir).unwrap();
     assert_eq!(page_bytes(t.ovf_file().path(), body_off)[..8], before[..8]);
     assert_eq!(create_fks(&t, &a).len(), n as usize);
+}
+
+/// A truncated `guard/sh-*.tmp` is a rename leftover, not a mark.
+#[test]
+fn sh_page_guard_kept_tmp_open() {
+    let dir = tmp();
+    let path = dir.path().to_path_buf();
+    drop(Store::create_tiny(&path).unwrap());
+    let guard = path.join("guard");
+    std::fs::create_dir_all(&guard).unwrap();
+    let torn = guard.join("sh-ovf.tmp");
+    std::fs::write(&torn, b"torn").unwrap();
+    let s = Store::open_tiny(&path).unwrap();
+    std::fs::create_dir_all(&guard).unwrap();
+    std::fs::write(&torn, b"torn").unwrap();
+    s.scripthash.reset_all_bodies().unwrap();
+    assert!(!torn.exists(), "reset left the scripthash temp");
+}
+
+/// One batch seals on the first key. A later key that already lived in
+/// ingest must follow that row into the sealed file.
+#[test]
+fn sh_page_guard_kept_mid_batch_seal() {
+    let dir = tmp();
+    let existing = script_hash(&[0x01]);
+    let new_key = (0u16..20_000)
+        .map(|i| script_hash(&i.to_le_bytes()))
+        .find(|k| *k < existing)
+        .expect("a key that sorts before the resident one");
+    let mut prior = vec![rec(existing, 1)];
+    for i in 0u32.. {
+        let sh = script_hash(&(10_000u32 + i).to_le_bytes());
+        if sh == existing || sh == new_key {
+            continue;
+        }
+        prior.push(rec(sh, 1));
+        if prior.len() == 204 {
+            break;
+        }
+    }
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    t.put_create_batch_append(&prior).unwrap();
+    assert_eq!(
+        t.ingest.lock().unwrap().as_ref().unwrap().occupied(),
+        204,
+        "one slot of room before the seal"
+    );
+    put_create_batch(&t, [rec(new_key, 9), rec(existing, 2)]);
+    let ingest_has = t
+        .ingest
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|h| h.get(&existing).unwrap())
+        .is_some();
+    assert!(
+        !ingest_has,
+        "the resident key was inserted into the new ingest"
+    );
+    assert_eq!(t.key_home(&existing).unwrap(), KeyHome::SealedOvf);
+    assert_eq!(create_fks(&t, &existing), vec![1, 2]);
+    assert_eq!(t.key_home(&new_key).unwrap(), KeyHome::SealedOvf);
+    assert_eq!(create_fks(&t, &new_key), vec![9]);
+}
+
+/// Previewing more than one chunk-cache wave must not publish `Fk(1)` or
+/// drop a displaced page from the mark.
+#[test]
+fn sh_page_guard_kept_preview_chunks() {
+    let dir = tmp();
+    let slots = 65_536u64;
+    let (a, b, chunk, displaced_page) = displaced_in_early_chunk(slots);
+    let ingest = ingest_path(&dir);
+    let mut seed = [0u8; 32];
+    seed[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+    {
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        drop(t);
+        let h = ScriptHashHead::create_with_slots(&ingest, slots).unwrap();
+        h.insert(&seed, &ShHeadValue::inline_one(Fk(1))).unwrap();
+        h.flush().unwrap();
+    }
+    let mut recs = vec![rec(a, 2), rec(b, 3)];
+    for extra in (chunk + 1)..=(chunk + CHUNK_CACHE_MAX as u64) {
+        recs.push(rec(
+            key_in_chunk(extra, slots, displaced_page, &recs),
+            4 + extra,
+        ));
+    }
+    let before;
+    {
+        let t = ScriptHashTable::open_tiny(&dir).unwrap();
+        assert!(t.ingest.lock().unwrap().is_some(), "open kept the head");
+        before = std::fs::read(&ingest).unwrap();
+        t.fail_next_sh_guard_clear();
+        let err = t.put_create_batch_append(&recs).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err}");
+        assert!(
+            std::fs::read(&ingest).unwrap() != before,
+            "the commit did not write the head"
+        );
+        assert!(!sh_marks(&dir).is_empty(), "the crash leaves the mark");
+        drop(t);
+    }
+    rbitcoin_store::page_guard::restore_sh_marks(dir.path()).unwrap();
+    assert!(
+        std::fs::read(&ingest).unwrap() == before,
+        "a flushed preview page stayed dirty"
+    );
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert!(t.head_value(&a).unwrap().is_none());
+    assert!(t.head_value(&b).unwrap().is_none());
+    assert_eq!(
+        t.head_value(&seed).unwrap(),
+        Some(ShHeadValue::inline_one(Fk(1)))
+    );
+}
+
+/// The occ sidecar is armed with the slot pages. Open must not keep the
+/// count `stage_rewrites` published after the slots were put back.
+#[test]
+fn sh_page_guard_kept_occ_restore() {
+    let dir = tmp();
+    let slots = ((OCC_SCAN_BYTE_CAP / SH_HEAD_SLOT_SIZE as u64) + 1).next_power_of_two();
+    let ingest = ingest_path(&dir);
+    let a = script_hash(&[0xa1]);
+    let b = script_hash(&[0xa2]);
+    {
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        drop(t);
+        let h = ScriptHashHead::create_with_slots(&ingest, slots).unwrap();
+        h.insert(&a, &ShHeadValue::inline_one(Fk(1))).unwrap();
+        h.flush().unwrap();
+    }
+    {
+        let t = ScriptHashTable::open_tiny(&dir).unwrap();
+        assert_eq!(t.ingest.lock().unwrap().as_ref().unwrap().occupied(), 1);
+        t.fail_next_sh_guard_clear();
+        let err = t.put_create_batch_append(&[rec(b, 2)]).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err}");
+        assert_eq!(load_occ_sidecar(&ingest), Some(2));
+        assert!(!sh_marks(&dir).is_empty(), "the crash leaves the mark");
+        drop(t);
+    }
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert_eq!(
+        t.ingest.lock().unwrap().as_ref().unwrap().occupied(),
+        1,
+        "open kept the occ count from the failed commit"
+    );
+    assert!(t.head_value(&b).unwrap().is_none());
+    assert_eq!(
+        t.head_value(&a).unwrap(),
+        Some(ShHeadValue::inline_one(Fk(1)))
+    );
+}
+
+fn key_in_chunk(chunk: u64, slots: u64, avoid_page: u64, have: &[ScriptHashRecord]) -> [u8; 32] {
+    for i in 0u64..2_000_000 {
+        let mut sh = [0u8; 32];
+        sh[0..8].copy_from_slice(&i.to_le_bytes());
+        sh[16..24].copy_from_slice(&chunk.to_le_bytes());
+        if have.iter().any(|r| r.scripthash == sh) {
+            continue;
+        }
+        let slot = ScriptHashHead::hash_slot(&ScriptHashHead::to_key(&sh), slots);
+        if slot / SLOTS_PER_CHUNK != chunk {
+            continue;
+        }
+        if ScriptHashHead::slot_file_off(slot) / 4096 == avoid_page {
+            continue;
+        }
+        return sh;
+    }
+    panic!("no key in chunk {chunk} outside page {avoid_page}");
+}
+
+/// Two keys share a slot in an early chunk. The next slot sits on another
+/// page of that same chunk, so a one-slot probe does not image it.
+fn displaced_in_early_chunk(slots: u64) -> ([u8; 32], [u8; 32], u64, u64) {
+    let chunks = slots / SLOTS_PER_CHUNK;
+    for chunk in 1..chunks.saturating_sub(CHUNK_CACHE_MAX as u64) {
+        let mut seen: Vec<(u64, [u8; 32])> = Vec::new();
+        for i in 0u64..80_000 {
+            let mut sh = [0u8; 32];
+            sh[0..8].copy_from_slice(&i.to_le_bytes());
+            sh[31] = 0xd0;
+            let slot = ScriptHashHead::hash_slot(&ScriptHashHead::to_key(&sh), slots);
+            if slot / SLOTS_PER_CHUNK != chunk {
+                continue;
+            }
+            let next = (slot + 1) & (slots - 1);
+            if next / SLOTS_PER_CHUNK != chunk {
+                continue;
+            }
+            let page = ScriptHashHead::slot_file_off(slot) / 4096;
+            let next_page = ScriptHashHead::slot_file_off(next) / 4096;
+            if page == next_page {
+                continue;
+            }
+            if let Some((_, other)) = seen.iter().find(|(s, k)| *s == slot && *k != sh) {
+                return (*other, sh, chunk, next_page);
+            }
+            seen.push((slot, sh));
+        }
+    }
+    panic!("no early chunk held a displaced slot on the next page");
 }
 
 fn displaced_pair(slots: u64) -> ([u8; 32], [u8; 32], u64) {
