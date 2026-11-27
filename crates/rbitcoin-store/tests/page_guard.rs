@@ -1,9 +1,8 @@
 //! A mark of whole 4 KiB images, and an append that stays off those pages.
 use rbitcoin_primitives::{SCHEMA_VERSION, STORE_MAGIC};
 use rbitcoin_store::page_guard::{
-    append_past_end, arm_page_guard, arm_page_guard_group, clear_page_guard, clear_page_guard_rel,
-    clear_sh_marks, guard_rel_name, restore_page_guard, restore_page_guard_group,
-    restore_page_guard_group_fit,
+    append_past_end, arm_page_guard_group, clear_page_guard, clear_page_guard_rel, clear_sh_marks,
+    guard_rel_name, restore_page_guard_group, restore_page_guard_group_fit,
 };
 use rbitcoin_store::testutil::TempDir;
 use rbitcoin_store::StoreError;
@@ -52,52 +51,20 @@ fn open_rw(path: &Path) -> std::fs::File {
 }
 
 #[test]
-fn backward_restore_puts_the_preimage_back() {
-    let dir = TempDir::labeled("page-guard-back").unwrap();
-    let live = dir.path().join("live");
-    let mark = dir.path().join("guard");
-    let pre = fill(0x11);
-    write_bytes(&live, 0, &pre);
-    arm_page_guard(&mark, &[(0, &pre)]).unwrap();
-    write_bytes(&live, 0, &fill(0x22));
-    let file = open_rw(&live);
-    assert!(restore_page_guard(&mark, &file, &live).unwrap());
-    drop(file);
-    assert_eq!(read_bytes(&live, 0, PAGE), pre);
-    assert!(!mark.exists());
-}
-
-#[test]
-fn forward_restore_writes_the_armed_image() {
-    let dir = TempDir::labeled("page-guard-fwd").unwrap();
-    let live = dir.path().join("live");
-    let mark = dir.path().join("guard");
-    write_bytes(&live, 0, &fill(0x11));
-    let next = fill(0x33);
-    arm_page_guard(&mark, &[(0, &next)]).unwrap();
-    write_bytes(&live, 100, &[0xAB; 50]);
-    let file = open_rw(&live);
-    assert!(restore_page_guard(&mark, &file, &live).unwrap());
-    drop(file);
-    assert_eq!(read_bytes(&live, 0, PAGE), next);
-    assert!(!mark.exists());
-}
-
-#[test]
 fn restore_copies_every_armed_page() {
     let dir = TempDir::labeled("page-guard-two").unwrap();
     let live = dir.path().join("live");
-    let mark = dir.path().join("guard");
+    let mark = dir.path().join("guard/live");
     let first = fill(0x41);
     let second = fill(0x42);
-    write_bytes(&live, 0, &first);
-    write_bytes(&live, PAGE as u64, &second);
-    arm_page_guard(&mark, &[(0, &first), (PAGE as u64, &second)]).unwrap();
     write_bytes(&live, 0, &fill(0x00));
     write_bytes(&live, PAGE as u64, &fill(0x00));
-    let file = open_rw(&live);
-    assert!(restore_page_guard(&mark, &file, &live).unwrap());
-    drop(file);
+    arm_page_guard_group(
+        &mark,
+        &[("live", 0, &first), ("live", PAGE as u64, &second)],
+    )
+    .unwrap();
+    assert!(restore_page_guard_group(&mark, dir.path()).unwrap());
     assert_eq!(read_bytes(&live, 0, PAGE), first);
     assert_eq!(read_bytes(&live, PAGE as u64, PAGE), second);
     assert!(!mark.exists());
@@ -107,92 +74,79 @@ fn restore_copies_every_armed_page() {
 fn missing_mark_leaves_the_mixed_page() {
     let dir = TempDir::labeled("page-guard-absent").unwrap();
     let live = dir.path().join("live");
-    let mark = dir.path().join("guard");
+    let mark = dir.path().join("guard/live");
     let mixed = fill(0x44);
     write_bytes(&live, 0, &mixed);
+    std::fs::create_dir_all(mark.parent().unwrap()).unwrap();
+    assert!(!restore_page_guard_group(&mark, dir.path()).unwrap());
     let file = open_rw(&live);
-    assert!(!restore_page_guard(&mark, &file, &live).unwrap());
     clear_page_guard(&mark, &file, &live).unwrap();
     drop(file);
     assert_eq!(read_bytes(&live, 0, PAGE), mixed);
     assert!(!mark.exists());
 }
 
+/// A mark that does not parse, an unopenable schema, and a kind this binary
+/// does not read (including the old single-file kind 0) are not absence.
 #[test]
 fn a_mark_that_does_not_parse_is_not_absence() {
     let dir = TempDir::labeled("page-guard-bad").unwrap();
     let live = dir.path().join("live");
-    let mark = dir.path().join("guard");
+    let mark = dir.path().join("guard/live");
     let mixed = fill(0x55);
     write_bytes(&live, 0, &mixed);
+    std::fs::create_dir_all(mark.parent().unwrap()).unwrap();
     std::fs::write(&mark, b"nope").unwrap();
-    let file = open_rw(&live);
-    let err = restore_page_guard(&mark, &file, &live).unwrap_err();
+    let err = restore_page_guard_group(&mark, dir.path()).unwrap_err();
     assert!(matches!(err, StoreError::Corrupt(_)));
-    drop(file);
     assert_eq!(read_bytes(&live, 0, PAGE), mixed);
     assert!(mark.exists());
 
-    let mut raw = Vec::new();
-    raw.extend_from_slice(&STORE_MAGIC);
-    raw.extend_from_slice(&1u16.to_le_bytes());
-    raw.extend_from_slice(&0u16.to_le_bytes());
-    raw.extend_from_slice(&1u32.to_le_bytes());
-    raw.extend_from_slice(&0u64.to_le_bytes());
-    raw.extend_from_slice(&mixed);
-    std::fs::write(&mark, &raw).unwrap();
-    let file = open_rw(&live);
-    let err = restore_page_guard(&mark, &file, &live).unwrap_err();
-    assert!(matches!(err, StoreError::Corrupt(_)));
-    drop(file);
-    assert_eq!(read_bytes(&live, 0, PAGE), mixed);
-
-    raw[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
-    raw[6] = 1;
-    std::fs::write(&mark, &raw).unwrap();
-    let file = open_rw(&live);
-    let err = restore_page_guard(&mark, &file, &live).unwrap_err();
-    assert!(matches!(err, StoreError::Corrupt(_)));
-    drop(file);
-    assert_eq!(read_bytes(&live, 0, PAGE), mixed);
-    assert!(mark.exists());
+    std::fs::remove_file(&mark).unwrap();
+    arm_page_guard_group(&mark, &[("live", 0, fill(0x66).as_slice())]).unwrap();
+    let good = std::fs::read(&mark).unwrap();
+    for (at, bytes) in [(4, 1u16), (6, 0u16), (6, 7u16)] {
+        let mut raw = good.clone();
+        raw[at..at + 2].copy_from_slice(&bytes.to_le_bytes());
+        std::fs::write(&mark, &raw).unwrap();
+        let err = restore_page_guard_group(&mark, dir.path()).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Corrupt(_)),
+            "{at}={bytes}: {err:?}"
+        );
+        assert_eq!(read_bytes(&live, 0, PAGE), mixed);
+        assert!(mark.exists());
+    }
 }
 
 #[test]
 fn arm_refuses_a_page_that_is_not_one_image() {
     let dir = TempDir::labeled("page-guard-arm").unwrap();
-    let mark = dir.path().join("guard");
+    let mark = dir.path().join("guard/live");
     let page = fill(0x01);
-    let err = arm_page_guard(&mark, &[]).unwrap_err();
+    let err = arm_page_guard_group(&mark, &[]).unwrap_err();
     assert!(matches!(err, StoreError::Corrupt(_)));
-    let err = arm_page_guard(&mark, &[(100, &page)]).unwrap_err();
+    let err = arm_page_guard_group(&mark, &[("live", 100, &page)]).unwrap_err();
     assert!(matches!(err, StoreError::Corrupt(_)));
-    let err = arm_page_guard(&mark, &[(0, &page[..10])]).unwrap_err();
+    let err = arm_page_guard_group(&mark, &[("live", 0, &page[..10])]).unwrap_err();
     assert!(matches!(err, StoreError::Corrupt(_)));
-    let err = arm_page_guard(&mark, &[(0, &page), (0, &page)]).unwrap_err();
+    let err = arm_page_guard_group(&mark, &[("live", 0, &page), ("live", 0, &page)]).unwrap_err();
     assert!(matches!(err, StoreError::Corrupt(_)));
     assert!(!mark.exists());
 }
 
 #[test]
-fn arm_refuses_a_second_mark_and_a_bare_name() {
-    let dir = TempDir::labeled("page-guard-twice").unwrap();
-    let mark = dir.path().join("guard");
+fn arm_refuses_a_bare_name() {
+    let dir = TempDir::labeled("page-guard-bare").unwrap();
     let live = dir.path().join("live");
     let page = fill(0x01);
-    arm_page_guard(&mark, &[(0, &page)]).unwrap();
-    let before = std::fs::read(&mark).unwrap();
-    let err = arm_page_guard(&mark, &[(0, &page)]).unwrap_err();
-    assert!(matches!(err, StoreError::Rejected(_)));
-    assert_eq!(std::fs::read(&mark).unwrap(), before);
-
     let bare = Path::new("page-guard-bare-name");
-    let err = arm_page_guard(bare, &[(0, &page)]).unwrap_err();
+    let err = arm_page_guard_group(bare, &[("live", 0, &page)]).unwrap_err();
     assert!(matches!(err, StoreError::Rejected(_)));
     let file = open_rw(&live);
     let err = clear_page_guard(bare, &file, &live).unwrap_err();
     assert!(matches!(err, StoreError::Rejected(_)));
-    let err = restore_page_guard(bare, &file, &live).unwrap_err();
+    let err = restore_page_guard_group(bare, dir.path()).unwrap_err();
     assert!(matches!(err, StoreError::Rejected(_)));
 }
 
@@ -225,7 +179,7 @@ fn arm_syncs_the_store_directory_when_guard_is_new() {
     #[cfg(all(unix, debug_assertions))]
     {
         rbitcoin_store::file::arm_fsync_dir_trace();
-        arm_page_guard(&mark, &[(0, &page)]).unwrap();
+        arm_page_guard_group(&mark, &[("live", 0, &page)]).unwrap();
         let dirs = rbitcoin_store::file::take_fsynced_dirs();
         assert!(
             dirs.iter().any(|d| d == dir.path()),
@@ -233,7 +187,7 @@ fn arm_syncs_the_store_directory_when_guard_is_new() {
         );
     }
     #[cfg(not(all(unix, debug_assertions)))]
-    arm_page_guard(&mark, &[(0, &page)]).unwrap();
+    arm_page_guard_group(&mark, &[("live", 0, &page)]).unwrap();
     assert!(mark.is_file());
 }
 
@@ -247,7 +201,7 @@ fn arm_syncs_the_store_directory_when_guard_already_exists() {
     #[cfg(all(unix, debug_assertions))]
     {
         rbitcoin_store::file::arm_fsync_dir_trace();
-        arm_page_guard(&mark, &[(0, &page)]).unwrap();
+        arm_page_guard_group(&mark, &[("live", 0, &page)]).unwrap();
         let dirs = rbitcoin_store::file::take_fsynced_dirs();
         assert!(
             dirs.iter().any(|d| d == dir.path()),
@@ -255,7 +209,7 @@ fn arm_syncs_the_store_directory_when_guard_already_exists() {
         );
     }
     #[cfg(not(all(unix, debug_assertions)))]
-    arm_page_guard(&mark, &[(0, &page)]).unwrap();
+    arm_page_guard_group(&mark, &[("live", 0, &page)]).unwrap();
     assert!(mark.is_file());
 }
 
@@ -375,8 +329,8 @@ fn clear_drops_only_the_synced_file() {
     assert!(!mark.exists());
 }
 
-/// A clear removes a legacy single-file mark it can parse. A mark of a kind
-/// it does not know stays, and the clear is `Corrupt`.
+/// A mark of a kind this binary does not know stays, and the clear is
+/// `Corrupt`.
 #[test]
 fn clear_keeps_a_mark_of_an_unknown_kind() {
     let dir = TempDir::labeled("page-guard-unknown-kind").unwrap();
@@ -392,10 +346,12 @@ fn clear_keeps_a_mark_of_an_unknown_kind() {
     assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
     assert_eq!(std::fs::read(&mark).unwrap(), raw);
 
-    let legacy = dir.path().join("guard/legacy");
-    arm_page_guard(&legacy, &[(0, fill(0x41).as_slice())]).unwrap();
-    clear_page_guard(&legacy, &head_file, &head).unwrap();
-    assert!(!legacy.exists());
+    // The single-file kind 0 is no longer read either.
+    raw[6..8].copy_from_slice(&0u16.to_le_bytes());
+    std::fs::write(&mark, &raw).unwrap();
+    let err = clear_page_guard(&mark, &head_file, &head).unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
+    assert_eq!(std::fs::read(&mark).unwrap(), raw);
 }
 
 /// A retry after the `meta` rename landed and its directory sync failed
@@ -507,7 +463,7 @@ fn first_arm_syncs_the_store_directory() {
     #[cfg(all(unix, debug_assertions))]
     {
         rbitcoin_store::file::arm_fsync_dir_trace();
-        arm_page_guard(&mark, &[(0, &fill(0x01))]).unwrap();
+        arm_page_guard_group(&mark, &[("live", 0, &fill(0x01))]).unwrap();
         let synced = rbitcoin_store::file::take_fsynced_dirs();
         assert!(
             synced.iter().any(|p| p == dir.path()),
@@ -515,38 +471,8 @@ fn first_arm_syncs_the_store_directory() {
         );
     }
     #[cfg(not(all(unix, debug_assertions)))]
-    arm_page_guard(&mark, &[(0, &fill(0x01))]).unwrap();
+    arm_page_guard_group(&mark, &[("live", 0, &fill(0x01))]).unwrap();
     assert!(mark.is_file());
-}
-
-/// A restore that creates the data file syncs the directory that gained it
-/// before the mark goes away, so a second crash cannot lose the file.
-#[test]
-fn restore_store_file_syncs_the_directory_of_a_created_file() {
-    let dir = TempDir::labeled("page-guard-restore-create").unwrap();
-    let mark = dir.path().join("guard/spent.ovf");
-    let image = fill(0x5a);
-    arm_page_guard(&mark, &[(0, image.as_slice())]).unwrap();
-    let data = dir.path().join("spent.ovf");
-    assert!(!data.exists());
-    #[cfg(all(unix, debug_assertions))]
-    rbitcoin_store::file::arm_fsync_dir_trace();
-    assert!(rbitcoin_store::page_guard::restore_store_file(
-        dir.path(),
-        "guard/spent.ovf",
-        "spent.ovf"
-    )
-    .unwrap());
-    #[cfg(all(unix, debug_assertions))]
-    {
-        let dirs = rbitcoin_store::file::take_fsynced_dirs();
-        assert!(
-            dirs.iter().any(|d| d == dir.path()),
-            "the directory that gained spent.ovf was not synced, got {dirs:?}"
-        );
-    }
-    assert_eq!(read_bytes(&data, 0, PAGE), image);
-    assert!(!mark.exists());
 }
 
 #[test]
