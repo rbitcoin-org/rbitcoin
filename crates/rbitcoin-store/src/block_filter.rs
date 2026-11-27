@@ -446,6 +446,9 @@ impl BlockFilterTable {
         filter: &[u8],
     ) -> Result<bool, StoreError> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        // A failed put's mark can name this body page. Open would copy the
+        // old bytes back over the repair.
+        self.refuse_pending_mark()?;
         let inner = self.read();
         let Some((si, local)) = inner.locate(height) else {
             return Err(StoreError::NotFound);
