@@ -1764,3 +1764,47 @@ fn live_slot_accept_secs_and_txid_roundtrip() {
     assert_eq!(live[0].packed.fee_sat, 15);
     assert_eq!(live[0].slot, slot);
 }
+
+/// A persist that failed after its arm already wrote and synced the fresh
+/// body blocks. The retry writes that range again, and the stale armed
+/// entry for `tx.body` must not reject it.
+#[cfg(debug_assertions)]
+#[test]
+fn a_retried_body_persist_rewrites_its_fresh_range() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let mut ids = Vec::new();
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let first = Txid::from_byte_array([0xB0; 32]);
+        put_live(&mut mp, &first, 1, 400);
+        ids.push(first);
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        mp.persist_due().unwrap();
+        let mut n = 1u32;
+        while mp.body_logical_len().unwrap() < 2 * 4096 {
+            let mut id = [0xB1; 32];
+            id[..4].copy_from_slice(&n.to_le_bytes());
+            let txid = Txid::from_byte_array(id);
+            put_live(&mut mp, &txid, 1, 400);
+            ids.push(txid);
+            n += 1;
+        }
+        mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
+        fail_next_mempool_guard_before_write(&dir);
+        assert!(mp.persist_due().is_err());
+        mp.persist_due()
+            .expect("the retry rewrites the fresh body range");
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert_eq!(live.len(), ids.len());
+    assert!(ids.iter().all(|id| live.contains(id)));
+    let _ = fs::remove_dir_all(&dir);
+}
