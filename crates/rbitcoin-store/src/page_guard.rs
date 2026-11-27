@@ -1302,14 +1302,19 @@ fn probe_unarmed(path: &Path, committed_end: u64, offset: u64, len: u64) {
         && path
             .parent()
             .is_some_and(|d| d.join("tear_guard").join("armed").is_file());
+    let big = committed_end >= PAGE;
     let class = if committed_end <= crate::file::FILE_HEADER_LEN as u64 {
         "HEADER_ONLY"
-    } else if len_only && !page0_dirty {
-        "LEN_CLEAN"
-    } else if len_only {
-        "LEN_DIRTY"
     } else if class_a_armed {
         "CLASS_A_ARMED"
+    } else if crate::class_a_pages::STEMS.contains(&base.as_str()) {
+        "CLASS_A_UNARMED"
+    } else if len_only && !page0_dirty && big {
+        "LEN_CLEAN_BIG"
+    } else if len_only && !page0_dirty {
+        "LEN_CLEAN_SMALL"
+    } else if len_only {
+        "LEN_DIRTY"
     } else {
         "OTHER"
     };
@@ -1320,7 +1325,7 @@ fn probe_unarmed(path: &Path, committed_end: u64, offset: u64, len: u64) {
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().chars().filter(|c| !c.is_ascii_digit()).collect())
         .unwrap_or_default();
-    let key = format!("{class} {parent}/{name} page0={} len={len}", offset < PAGE);
+    let key = format!("{class} {parent}/{name} page0={}", offset < PAGE);
     {
         let mut seen = SEEN
             .get_or_init(|| Mutex::new(HashSet::new()))
@@ -1340,7 +1345,7 @@ fn probe_unarmed(path: &Path, committed_end: u64, offset: u64, len: u64) {
         })
         .take(10)
         .collect();
-    let mut out = format!("UNARMED {key} end={committed_end} off={offset}\n");
+    let mut out = format!("UNARMED {key} end={committed_end} off={offset} len={len}\n");
     for f in frames {
         out.push_str("    ");
         out.push_str(f);
