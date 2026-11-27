@@ -5,12 +5,14 @@
 //!
 //! Fixed 16 B records (1-based fk): packed `(fk:u40, vin:u16)` | `next:u64`.
 //!
-//! The first append after a sync arms `guard/spent.ovf` with the current
-//! page 0 and tail block. Later appends in that window leave the mark.
-//! Sync removes it.
+//! An append writes past the durable end and moves only the RAM length.
+//! [`SpenderTable::flush`] syncs the nodes, then writes and syncs the length
+//! that names them, so the durable length is always that of some flush. A
+//! crash keeps the nodes below it and ignores the bytes past it, with no
+//! mark (the sector rule, crash-recovery.md).
 
 use crate::error::StoreError;
-use crate::file::{fsync_parent_dir, TableFile, FILE_HEADER_LEN};
+use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::tx_table::{pack_spent_field, unpack_spent_field};
 use rbitcoin_primitives::{le_u64, Fk, TableKind};
 use std::path::Path;
@@ -109,12 +111,14 @@ impl SpenderTable {
         }
         let packed = pack_spent_field(spending_tx_fk, vin)?;
         // Single annotator role: load → write → publish count.
-        self.arm_guard()?;
         let id = self.count.load(Ordering::Acquire) + 1;
         let mut buf = [0u8; SPENDER_RECORD_LEN];
         buf[0..8].copy_from_slice(&packed.to_le_bytes());
         buf[8..16].copy_from_slice(&next.0.to_le_bytes());
-        self.body.write_at(Self::offset(id), &buf)?;
+        let at = Self::offset(id);
+        self.body.write_uncommitted(at, &buf)?;
+        // RAM only: the header keeps the last flushed length.
+        let _ = self.body.publish_end(at + SPENDER_RECORD_LEN as u64, false);
         self.count.store(id, Ordering::Release);
         Ok(Fk(id))
     }
@@ -132,14 +136,21 @@ impl SpenderTable {
         Ok((spend_tx, vin, Fk(le_u64!(buf, 8))))
     }
 
+    /// Sync the nodes, then write and sync the length that names them.
     pub fn flush(&self, _freeze: &SpenderFreeze<'_>) -> Result<(), StoreError> {
         self.refuse_if_sync_failed()?;
-        self.finish_sync(self.body.flush())
+        self.finish_sync(self.publish_synced())
     }
 
-    pub fn sync_data_only(&self, _freeze: &SpenderFreeze<'_>) -> Result<(), StoreError> {
-        self.refuse_if_sync_failed()?;
-        self.finish_sync(self.body.sync_data_only())
+    fn publish_synced(&self) -> Result<(), StoreError> {
+        self.body.sync_data_only()?;
+        if !self.body.catch_up_header() {
+            return Err(StoreError::io(
+                self.body.path(),
+                std::io::Error::other("spent.ovf length write failed"),
+            ));
+        }
+        self.body.flush()
     }
 
     fn refuse_if_sync_failed(&self) -> Result<(), StoreError> {
@@ -152,93 +163,13 @@ impl SpenderTable {
         Ok(())
     }
 
-    /// Latch the first body sync error and leave the mark in place.
+    /// Latch the first sync error. A retried fsync can return 0 after the
+    /// kernel dropped the dirty pages, so no later flush publishes a length.
     fn finish_sync(&self, synced: Result<(), StoreError>) -> Result<(), StoreError> {
-        if let Err(e) = synced {
+        if synced.is_err() {
             self.sync_failed.store(true, Ordering::Release);
-            return Err(e);
         }
-        self.clear_mark()
-    }
-
-    fn store_dir(&self) -> Result<&Path, StoreError> {
-        self.body
-            .path()
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .ok_or(StoreError::Corrupt("spent.ovf has no directory"))
-    }
-
-    /// Page 0 and the block that holds the published end, before this append.
-    fn arm_guard(&self) -> Result<(), StoreError> {
-        let dir = self.store_dir()?;
-        let mark = dir.join(crate::page_guard::SPENT_OVF_MARK);
-        if mark.try_exists().map_err(|e| StoreError::io(&mark, e))? {
-            // The rename can land and the directory sync can fail. A retry
-            // must finish that sync before it writes the body. It must not
-            // replace the image this mark already holds.
-            let parent = mark
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .ok_or(StoreError::Corrupt("spent.ovf mark has no directory"))?;
-            fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-            return Ok(());
-        }
-        let logical = self.body.logical_len();
-        let page = crate::page_guard::PAGE;
-        let mut offs = vec![0u64];
-        if logical > 0 {
-            let tail = (logical - 1) & !(page - 1);
-            if tail != 0 {
-                offs.push(tail);
-            }
-        }
-        let mut images = Vec::with_capacity(offs.len());
-        for off in offs {
-            images.push((off, self.page_image(off)?));
-        }
-        let refs: Vec<(u64, &[u8])> = images
-            .iter()
-            .map(|(off, image)| (*off, image.as_slice()))
-            .collect();
-        crate::page_guard::promote_meta_31(dir)?;
-        crate::page_guard::arm_page_guard(&mark, &refs)
-    }
-
-    fn page_image(&self, offset: u64) -> Result<Vec<u8>, StoreError> {
-        let mut image = vec![0u8; crate::page_guard::PAGE as usize];
-        let file_len = self
-            .body
-            .read_file
-            .metadata()
-            .map_err(|e| StoreError::io(self.body.path(), e))?
-            .len();
-        if offset >= file_len {
-            return Ok(image);
-        }
-        let n = (file_len - offset).min(crate::page_guard::PAGE) as usize;
-        self.body.pread_exact(offset, &mut image[..n])?;
-        Ok(image)
-    }
-
-    fn clear_mark(&self) -> Result<(), StoreError> {
-        let dir = self.store_dir()?;
-        let mark = dir.join(crate::page_guard::SPENT_OVF_MARK);
-        if !mark.try_exists().map_err(|e| StoreError::io(&mark, e))? {
-            // Unlink can land and the directory sync can fail. The checkpoint
-            // must not publish until that sync has been retried. A directory
-            // that was never created never held a mark, so there is no
-            // barrier to finish.
-            let parent = mark
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .ok_or(StoreError::Corrupt("spent.ovf mark has no directory"))?;
-            if parent.try_exists().map_err(|e| StoreError::io(parent, e))? {
-                fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-            }
-            return Ok(());
-        }
-        crate::page_guard::clear_page_guard(&mark, &self.body.read_file, self.body.path())
+        synced
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
