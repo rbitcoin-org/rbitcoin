@@ -390,11 +390,6 @@ fn take_fail_sh_guard_clear() -> bool {
     FAIL_CLEAR_SH_GUARD.with(|c| c.replace(false))
 }
 
-#[cfg(not(debug_assertions))]
-fn take_fail_sh_guard_clear() -> bool {
-    false
-}
-
 /// One body's share of an ingest batch.
 struct BodyStage<'a> {
     body: &'a TableFile,
