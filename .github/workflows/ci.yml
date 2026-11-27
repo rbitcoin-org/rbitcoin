@@ -198,6 +198,9 @@ jobs:
           f="${{ runner.temp }}/pg-probe.log"
           if [ -f "$f" ]; then
             echo "distinct keys: $(grep -c '^UNARMED' "$f")"
+            for c in HEADER_ONLY LEN_CLEAN LEN_DIRTY CLASS_A_ARMED OTHER; do
+              echo "class $c: $(grep -c "^UNARMED $c " "$f")"
+            done
             cat "$f"
           else
             echo "no probe log"

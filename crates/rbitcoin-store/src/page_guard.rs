@@ -104,15 +104,22 @@ pub fn check_armed_write(
     len: u64,
 ) -> Result<(), StoreError> {
     if len == 0 || !shares_committed_page(committed_end, offset, len) {
+        #[cfg(debug_assertions)]
+        probe_note_write(path, offset, len);
         return Ok(());
     }
     let map = armed_map().lock().unwrap_or_else(|e| e.into_inner());
     let Some(pages) = map.get(path) else {
         drop(map);
         #[cfg(debug_assertions)]
-        probe_unarmed(path, committed_end, offset, len);
+        {
+            probe_unarmed(path, committed_end, offset, len);
+            probe_note_write(path, offset, len);
+        }
         return Ok(());
     };
+    #[cfg(debug_assertions)]
+    probe_note_write(path, offset, len);
     let Some(end) = offset.checked_add(len) else {
         return Err(StoreError::Rejected("write is outside the armed pages"));
     };
@@ -1237,25 +1244,83 @@ fn mark_group_pages(raw: &[u8]) -> Result<Vec<(String, u64, usize)>, StoreError>
     Ok(pages)
 }
 
-/// PROBE ONLY (never merged): record each distinct unarmed write that shares
-/// a committed page, with its callers, to `$RBITCOIN_PAGE_GUARD_PROBE`.
+/// PROBE ONLY (never merged): pages with unsynced written bytes other than
+/// the 8-byte length field, per file.
+#[cfg(debug_assertions)]
+fn probe_dirty() -> &'static Mutex<HashMap<PathBuf, HashSet<u64>>> {
+    static D: OnceLock<Mutex<HashMap<PathBuf, HashSet<u64>>>> = OnceLock::new();
+    D.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// PROBE ONLY: note a door write's pages as dirty (length-only writes excluded).
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn probe_note_write(path: &Path, offset: u64, len: u64) {
+    if len == 0 || (offset >= 8 && offset + len <= 16) {
+        return;
+    }
+    let mut d = probe_dirty().lock().unwrap_or_else(|e| e.into_inner());
+    let set = d.entry(path.to_path_buf()).or_default();
+    let mut page = offset & !(PAGE - 1);
+    let end = offset + len;
+    while page < end {
+        set.insert(page);
+        page += PAGE;
+    }
+}
+
+/// PROBE ONLY: a sync made every written page of `path` durable.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn probe_note_synced(path: &Path) {
+    probe_dirty()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path);
+}
+
+/// PROBE ONLY (never merged): classify each unarmed write that shares a
+/// committed page and record one line per (class, file, page0, len) with
+/// its callers to `$RBITCOIN_PAGE_GUARD_PROBE`.
 #[cfg(debug_assertions)]
 fn probe_unarmed(path: &Path, committed_end: u64, offset: u64, len: u64) {
     use std::io::Write as _;
     let Some(log) = std::env::var_os("RBITCOIN_PAGE_GUARD_PROBE") else {
         return;
     };
-    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let name: String = path
+    let base: String = path
         .file_name()
-        .map(|n| n.to_string_lossy().chars().filter(|c| !c.is_ascii_digit()).collect())
+        .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let len_only = offset >= 8 && offset + len <= 16;
+    let page0_dirty = probe_dirty()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)
+        .is_some_and(|s| s.contains(&0));
+    let class_a_armed = crate::class_a_pages::STEMS.contains(&base.as_str())
+        && path
+            .parent()
+            .is_some_and(|d| d.join("tear_guard").join("armed").is_file());
+    let class = if committed_end <= crate::file::FILE_HEADER_LEN as u64 {
+        "HEADER_ONLY"
+    } else if len_only && !page0_dirty {
+        "LEN_CLEAN"
+    } else if len_only {
+        "LEN_DIRTY"
+    } else if class_a_armed {
+        "CLASS_A_ARMED"
+    } else {
+        "OTHER"
+    };
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let name: String = base.chars().filter(|c| !c.is_ascii_digit()).collect();
     let parent: String = path
         .parent()
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().chars().filter(|c| !c.is_ascii_digit()).collect())
         .unwrap_or_default();
-    let key = format!("{parent}/{name} page0={} len={len}", offset < PAGE);
+    let key = format!("{class} {parent}/{name} page0={} len={len}", offset < PAGE);
     {
         let mut seen = SEEN
             .get_or_init(|| Mutex::new(HashSet::new()))
@@ -1270,7 +1335,9 @@ fn probe_unarmed(path: &Path, committed_end: u64, offset: u64, len: u64) {
         .lines()
         .map(str::trim)
         .filter(|l| l.contains("rbitcoin_"))
-        .filter(|l| !l.contains("page_guard::probe_unarmed") && !l.contains("page_guard::check_armed_write"))
+        .filter(|l| {
+            !l.contains("page_guard::probe_unarmed") && !l.contains("page_guard::check_armed_write")
+        })
         .take(10)
         .collect();
     let mut out = format!("UNARMED {key} end={committed_end} off={offset}\n");

@@ -1423,9 +1423,15 @@ impl TableFile {
                 std::io::Error::from_raw_os_error(5),
             ));
         }
-        self.read_file
+        let r = self
+            .read_file
             .durable_sync_data()
-            .map_err(|e| StoreError::io(&self.path, e))
+            .map_err(|e| StoreError::io(&self.path, e));
+        #[cfg(debug_assertions)]
+        if r.is_ok() {
+            crate::page_guard::probe_note_synced(&self.path);
+        }
+        r
     }
 
     /// [`Self::sync_data_only`] on every file, with the waits overlapped.
@@ -1474,6 +1480,10 @@ impl TableFile {
         let res = crate::bulk_io::sync_data_batch(&handles)
             .unwrap_or_else(|| vec![i32::MIN; handles.len()]);
         for (f, r) in files.iter().zip(res.iter().copied()) {
+            #[cfg(debug_assertions)]
+            if r == 0 || r == i32::MIN {
+                crate::page_guard::probe_note_synced(&f.path);
+            }
             match r {
                 0 => {}
                 // Never submitted: sync it here.
@@ -1536,11 +1546,17 @@ impl TableFile {
                 std::io::Error::from_raw_os_error(5),
             ));
         }
-        self.file
+        let r = self
+            .file
             .lock()
             .unwrap()
             .durable_sync_data()
-            .map_err(|e| StoreError::io(&self.path, e))
+            .map_err(|e| StoreError::io(&self.path, e));
+        #[cfg(debug_assertions)]
+        if r.is_ok() {
+            crate::page_guard::probe_note_synced(&self.path);
+        }
+        r
     }
 
     /// Persist HWM / trailer without waiting on `sync_data`.
