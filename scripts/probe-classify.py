@@ -15,6 +15,8 @@ RULES = [
      "legacy unlink undo replay at open, or its test hook"),
     (r".*", r".*", r"testutil::tear_|flush_observing|test_tear_",
      "test hook"),
+    (r".*", r".*", r"^PROBE \S+ \S+ test-body:",
+     "a test body writes the file directly"),
 ]
 lines = open(sys.argv[1], errors="replace").read().split("\n")
 lines = [re.sub(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", "", l) for l in lines]
