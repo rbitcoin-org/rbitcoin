@@ -24,7 +24,6 @@ use std::collections::BTreeSet;
 thread_local! {
     static WATCH_READABLE: Cell<bool> = const { Cell::new(false) };
     static READABLE_BROKE: Cell<bool> = const { Cell::new(false) };
-    static FAIL_CLEAR_UNDO: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_DEFERRED_FREE: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -249,11 +248,6 @@ impl ScriptHashTable {
     #[cfg(debug_assertions)]
     pub fn readable_broke(&self) -> bool {
         READABLE_BROKE.with(|c| c.get())
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn fail_next_undo_clear(&self) {
-        FAIL_CLEAR_UNDO.with(|c| c.set(true));
     }
 
     #[doc(hidden)]
@@ -1282,10 +1276,6 @@ pub fn restore_page(body: &TableFile, rec: &UndoRec) -> Result<(), StoreError> {
 
 #[doc(hidden)]
 pub fn clear_undo_keep_image(body: &TableFile, alloc: &AllocState) -> Result<(), StoreError> {
-    #[cfg(debug_assertions)]
-    if FAIL_CLEAR_UNDO.with(|c| c.replace(false)) {
-        return Err(StoreError::Corrupt("scripthash undo clear failed"));
-    }
     persist_undo(body, alloc, None)?;
     body.sync_data_only()?;
     Ok(())

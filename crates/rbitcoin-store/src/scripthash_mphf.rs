@@ -127,12 +127,13 @@ impl MphfHead {
         }
         std::fs::rename(&staging, &mp).map_err(|e| StoreError::io(&mp, e))?;
         let vp = val_path(base);
-        if let Some(dir) = store_dir_holding_sh(base) {
-            if let Ok(rel) = crate::page_guard::guard_rel_name(dir, &vp) {
+        crate::file::write_synced_tmp_rename_then(&vp, &val, || {
+            if let Some(dir) = store_dir_holding_sh(base) {
+                let rel = crate::page_guard::guard_rel_name(dir, &vp)?;
                 crate::page_guard::drop_sh_rel(dir, &rel)?;
             }
-        }
-        crate::file::write_synced_tmp_rename(&vp, &val)?;
+            Ok(())
+        })?;
         Self::open(base)
     }
 
