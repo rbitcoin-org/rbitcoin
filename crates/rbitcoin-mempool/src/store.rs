@@ -1224,7 +1224,24 @@ impl Mempool {
             .map(|(name, off, image)| (name.as_str(), *off, image.as_slice()))
             .collect();
         let mark = self.dir.join("guard/flush");
-        rbitcoin_store::page_guard::arm_page_guard_group(&mark, &refs).map_err(map_store)?;
+        let armed =
+            rbitcoin_store::page_guard::arm_page_guard_group(&mark, &refs).map_err(map_store);
+        #[cfg(debug_assertions)]
+        let armed = armed.and_then(|()| match take_fail_mempool_arm(&self.dir) {
+            true => Err(MempoolError::io(
+                &mark,
+                std::io::Error::other("injected mempool arm failure after rename"),
+            )),
+            false => Ok(()),
+        });
+        if let Err(e) = armed {
+            // The rename can land before the directory sync fails. A mark
+            // that may be visible stays armed until a commit clears it.
+            if mark.try_exists().unwrap_or(true) {
+                self.flush_mark_armed = true;
+            }
+            return Err(e);
+        }
         self.flush_mark_armed = true;
         #[cfg(debug_assertions)]
         if take_fail_mempool_guard(&self.dir) {
@@ -1410,6 +1427,30 @@ pub fn fail_next_mempool_guard_before_write(dir: &Path) {
 #[cfg(debug_assertions)]
 fn take_fail_mempool_guard(dir: &Path) -> bool {
     let mut armed = FAIL_MEMPOOL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = armed.iter().position(|p| p == dir) else {
+        return false;
+    };
+    armed.remove(i);
+    true
+}
+
+#[cfg(debug_assertions)]
+static FAIL_MEMPOOL_ARM: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// The next mempool flush in `dir` publishes `guard/flush`, then its arm
+/// returns an error, as a failed directory sync after the rename would.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_mempool_arm_after_rename(dir: &Path) {
+    FAIL_MEMPOOL_ARM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(dir.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_mempool_arm(dir: &Path) -> bool {
+    let mut armed = FAIL_MEMPOOL_ARM.lock().unwrap_or_else(|e| e.into_inner());
     let Some(i) = armed.iter().position(|p| p == dir) else {
         return false;
     };
