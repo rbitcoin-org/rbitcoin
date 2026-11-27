@@ -483,12 +483,16 @@ fn truncated_flush_mark_is_quarantined_with_the_sidecar() {
         .expect("a torn flush mark is quarantined with the sidecar");
     assert!(!dir.join("guard/flush").exists());
     assert!(dir.join("fee_history").is_file());
-    assert!(
-        fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|ent| ent.ok())
-            .any(|ent| ent.file_name().to_string_lossy().starts_with("torn-")),
-        "the unreadable mark moves aside with the sidecar"
+    let torn = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|ent| ent.ok())
+        .find(|ent| ent.file_name().to_string_lossy().starts_with("torn-"))
+        .expect("the unreadable mark moves aside with the sidecar")
+        .path();
+    assert_eq!(
+        fs::read(torn.join("guard/flush")).unwrap(),
+        b"torn",
+        "the quarantine keeps the unreadable mark as it was"
     );
     let _ = fs::remove_dir_all(&dir);
 }
