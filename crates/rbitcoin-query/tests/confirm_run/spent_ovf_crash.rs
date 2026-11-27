@@ -1,5 +1,5 @@
-//! A crash that leaves `guard/spent.ovf` restores the pre-append nodes.
-//! Replay then appends the nodes the chain's spend delta names.
+//! A crash between checkpoints reopens `spent.ovf` at the checkpoint's
+//! length. Replay then appends the nodes the chain's spend delta names.
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version};
 use bitcoin::hashes::Hash;
@@ -84,15 +84,8 @@ fn mine(prev: bitcoin::BlockHash, time: u32, height: u32, extra: Vec<Transaction
     block
 }
 
-fn page0(path: &std::path::Path) -> Vec<u8> {
-    let mut file = std::fs::File::open(path).unwrap();
-    let n = file.metadata().unwrap().len().min(4096) as usize;
-    let mut buf = vec![0u8; 4096];
-    std::io::Read::read_exact(&mut file, &mut buf[..n]).unwrap();
-    buf
-}
-
-/// Checkpoint two overflow nodes, append a third, and stop before the clear.
+/// Checkpoint two overflow nodes, append more, and die before the next
+/// checkpoint.
 /// Open shows the two. Replay appends the third from the connected block.
 #[test]
 fn torn_spent_ovf_replay_appends_the_delta_node() {
@@ -128,22 +121,17 @@ fn torn_spent_ovf_replay_appends_the_delta_node() {
     let _tx_a = connect_spend(&q, 49_0000_0000, parent_time + 600);
     q.store().checkpoint_spend_through(hy).unwrap();
     assert_eq!(q.store().spenders.count(), 0);
-    let mark = q.store().path().join("guard/spent.ovf");
-    assert!(!mark.exists());
 
     q.disconnect_tip().unwrap();
     let _tx_b = connect_spend(&q, 48_0000_0000, parent_time + 1_200);
     assert_eq!(q.store().spenders.count(), 2, "promote appends both nodes");
-    assert!(mark.is_file(), "the first append after sync arms");
     q.store().checkpoint_spend_through(hy).unwrap();
-    assert!(!mark.exists(), "the checkpoint sync clears the mark");
     assert_eq!(q.store().spenders.count(), 2);
     let pre = [
         q.store().spenders.get(Fk(1)).unwrap(),
         q.store().spenders.get(Fk(2)).unwrap(),
     ];
     let ovf = q.store().path().join("spent.ovf");
-    let pre_page = page0(&ovf);
     let before = q.spenders_raw(c1.as_byte_array(), 0).unwrap();
     let before_fks: Vec<_> = before.iter().map(|p| p.spending_tx_fk).collect();
     assert!(before_fks.contains(&pre[0].0) && before_fks.contains(&pre[1].0));
@@ -151,26 +139,22 @@ fn torn_spent_ovf_replay_appends_the_delta_node() {
     q.disconnect_tip().unwrap();
     let tx_c = connect_spend(&q, 47_0000_0000, parent_time + 1_800);
     assert_eq!(q.store().spenders.count(), 3);
-    assert!(mark.is_file());
-    let armed = std::fs::read(&mark).unwrap();
     q.store().spenders.append(Fk(9), 1, Fk(3)).unwrap();
-    assert_eq!(
-        std::fs::read(&mark).unwrap(),
-        armed,
-        "a later append must not snapshot the torn page"
-    );
-    {
-        let mut file = std::fs::OpenOptions::new().write(true).open(&ovf).unwrap();
-        std::io::Write::write_all(&mut file, &[0xffu8; 4096]).unwrap();
-        file.sync_all().unwrap();
-    }
     let fk_c = q.tx_fk_by_txid(tx_c.as_byte_array()).unwrap().unwrap();
     let store = q.store().path().to_path_buf();
-    drop(q);
+    // The process dies before the next checkpoint. The appended nodes sit
+    // past the durable length, torn.
+    std::mem::forget(q);
+    {
+        let end = rbitcoin_store::spender_table::SpenderTable::offset(3);
+        let mut file = std::fs::OpenOptions::new().write(true).open(&ovf).unwrap();
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(end)).unwrap();
+        std::io::Write::write_all(&mut file, &[0xffu8; 32]).unwrap();
+        file.sync_all().unwrap();
+    }
 
     let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
     q.set_spend_index(true);
-    assert!(!store.join("guard/spent.ovf").exists());
     assert_eq!(q.store().spenders.count(), 2);
     assert_eq!(q.store().spenders.get(Fk(1)).unwrap(), pre[0]);
     assert_eq!(q.store().spenders.get(Fk(2)).unwrap(), pre[1]);
@@ -178,8 +162,6 @@ fn torn_spent_ovf_replay_appends_the_delta_node() {
         q.store().spenders.get(Fk(3)),
         Err(rbitcoin_store::StoreError::NotFound)
     ));
-    assert_eq!(page0(&store.join("spent.ovf")), pre_page);
-    assert_ne!(page0(&store.join("spent.ovf")), vec![0xffu8; 4096]);
     let restored = q.spenders_raw(c1.as_byte_array(), 0).unwrap();
     let restored_fks: Vec<_> = restored.iter().map(|p| p.spending_tx_fk).collect();
     assert!(restored_fks.contains(&pre[0].0) && restored_fks.contains(&pre[1].0));

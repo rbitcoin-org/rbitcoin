@@ -2237,9 +2237,9 @@ impl Store {
                     let disconnected = filtered.load(Ordering::Acquire) != seen;
                     log.freeze_open(tip, disconnected.then_some(keep))?;
                     filtered.store(seen, Ordering::Release);
-                    // The appender is held off until this sync and the
-                    // spent.ovf clear both finish. A later append arms again.
-                    spenders.sync_data_only(&crate::spender_table::SpenderFreeze::new(&g))?;
+                    // The appender is held off until the nodes and then
+                    // the spent.ovf length that names them are synced.
+                    spenders.flush(&crate::spender_table::SpenderFreeze::new(&g))?;
                 }
                 let named = txs.settled_count();
                 txs.sync_class_a_named(named)?;
@@ -2795,11 +2795,6 @@ fn restore_hot_marks(path: &Path) -> Result<bool, StoreError> {
     let header_body =
         crate::page_guard::restore_store_group(path, crate::page_guard::HEADER_BODY_MARK)?;
     crate::page_guard::restore_store_group(path, crate::page_guard::HEADER_HEAD_MARK)?;
-    crate::page_guard::restore_store_file(
-        path,
-        crate::page_guard::SPENT_OVF_MARK,
-        crate::spender_table::SPENT_OVF_NAME,
-    )?;
     restore_sh_marks_or_rebuild(path)?;
     Ok(header_body)
 }
