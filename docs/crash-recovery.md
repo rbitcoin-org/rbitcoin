@@ -75,16 +75,28 @@ the window, rebuilds a derived index from Class A, or cuts the tail.
 
 ## Two doors
 
-A write that shares a 4 KiB block with a committed byte goes through
-`page_guard`. The writer stores the pre-image of every page that write will
-touch, syncs that mark, writes the live bytes, syncs them, then removes the
-mark. Open copies the images back while the mark is there, and accepts the
-live pages only after the mark is gone. A write that shares no committed
-block is an append: `append_past_end`, or bytes strictly past the committed
-end. The committed end is the durable header length, not a RAM high-water.
-Class A still names a slot generation in `tear_guard/armed` rather than a
-page list. When that file is absent, open restores only a tail that is still
-all zeros.
+**The sector rule.** The store assumes the device writes a 512-byte sector
+whole or not at all, and that nothing below the filesystem re-encodes data in
+larger units (for example dm-crypt with a 4 KiB sector on a 512-byte disk, or
+a RAID 5/6 stripe without a write journal). The kernel writes a whole page
+back, but a sector whose bytes did not change lands unchanged. A crash can
+therefore leave any subset of the changed sectors new. A write needs no mark
+when every such subset is a state open accepts. Two shapes always pass:
+
+- An append: every byte is at or past the committed end, including bytes that
+  share the committed tail block. It is synced before the length that names
+  it is published, so a torn append is bytes open does not read.
+- A write inside one sector, such as the 8-byte length at offset 8 or a
+  `txstat` cell. It lands old or new.
+
+Any other write that changes committed bytes in more than one sector goes
+through `page_guard`. The writer stores the pre-image of every page that
+write will touch, syncs that mark, writes the live bytes, syncs them, then
+removes the mark. Open copies the images back while the mark is there, and
+accepts the live pages only after the mark is gone. The committed end is the
+durable header length, not a RAM high-water. Class A still names a slot
+generation in `tear_guard/armed` rather than a page list. When that file is
+absent, open restores only a tail that is still all zeros.
 
 **The marks.** `confirmed.body`, `header_txs_*`, and `strong_tx` use
 `store/guard/class_c`. `header.body` uses `store/guard/header.body`.

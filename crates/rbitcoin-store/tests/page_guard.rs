@@ -259,20 +259,25 @@ fn arm_syncs_the_store_directory_when_guard_already_exists() {
     assert!(mark.is_file());
 }
 
+/// An append is every byte at or past the committed end, including bytes
+/// that share the committed tail block: those committed sectors are written
+/// back unchanged, so a tear cannot reach them. A byte below the end is not.
 #[test]
-fn append_past_end_writes_only_a_fresh_page() {
+fn append_past_end_takes_the_tail_block_past_the_end() {
     let dir = TempDir::labeled("page-guard-append").unwrap();
     let path = dir.path().join("live");
     let file = open_rw(&path);
     file.set_len(100).unwrap();
 
-    let err = append_past_end(&file, &path, 100, 100, &[1, 2, 3]).unwrap_err();
+    append_past_end(&file, &path, 100, 100, &[1, 2, 3]).unwrap();
+    let err = append_past_end(&file, &path, 100, 99, &[7, 7]).unwrap_err();
     assert!(matches!(err, StoreError::Rejected(_)));
     let err = append_past_end(&file, &path, 4096, 0, &fill(0x01)).unwrap_err();
     assert!(matches!(err, StoreError::Rejected(_)));
     append_past_end(&file, &path, 100, 50, &[]).unwrap();
     append_past_end(&file, &path, 100, 4096, &[9u8; 16]).unwrap();
     drop(file);
+    assert_eq!(read_bytes(&path, 100, 3), vec![1, 2, 3]);
     assert_eq!(read_bytes(&path, 4096, 16), vec![9u8; 16]);
     assert_eq!(read_bytes(&path, 0, 100), vec![0u8; 100]);
 
@@ -282,14 +287,6 @@ fn append_past_end_writes_only_a_fresh_page() {
     append_past_end(&file, &path, 0, 0, &image).unwrap();
     drop(file);
     assert_eq!(read_bytes(&path, 0, PAGE), image);
-
-    let path = dir.path().join("span");
-    let file = open_rw(&path);
-    file.set_len(4096).unwrap();
-    append_past_end(&file, &path, 4096, 4096, &fill(0x77)).unwrap();
-    let err = append_past_end(&file, &path, 5000, 4096, &[1u8; 8]).unwrap_err();
-    assert!(matches!(err, StoreError::Rejected(_)));
-    drop(file);
 }
 
 #[test]
@@ -727,7 +724,7 @@ fn write_outside_the_armed_pages_is_rejected() {
     let past = tail + PAGE as u64;
     file.write_at(past, &[0x22; 16]).unwrap();
     let err = file
-        .write_at(PAGE as u64, &[0x33; 16])
+        .write_at(PAGE as u64 + 256, &[0x33; 512])
         .expect_err("page 1 is committed and not armed");
     match err {
         StoreError::Rejected(msg) => assert_eq!(msg, "write is outside the armed pages"),
@@ -753,8 +750,9 @@ fn arm_page0(dir: &TempDir, mark: &str) {
 }
 
 fn page1_is_rejected(file: &rbitcoin_store::file::TableFile) {
+    // Crosses a 512-byte sector boundary, so a tear can mix two sectors.
     let err = file
-        .write_at(PAGE as u64, &[0x33; 16])
+        .write_at(PAGE as u64 + 256, &[0x33; 512])
         .expect_err("page 1 is committed and still armed");
     match err {
         StoreError::Rejected(msg) => assert_eq!(msg, "write is outside the armed pages"),
@@ -815,14 +813,14 @@ fn a_removed_mark_forgets_its_pages_when_the_dir_sync_fails() {
     arm_page_guard_group(&mark, &[("live", 0, fill(0x11).as_slice())]).unwrap();
     let committed = 2 * PAGE as u64;
     assert!(
-        rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64, 8).is_err(),
+        rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64 + 256, 512).is_err(),
         "page 1 is committed and not armed"
     );
     rbitcoin_store::page_guard::fail_next_mark_dir_sync(&dir.path().join("guard"));
     let file = open_rw(&live);
     assert!(clear_page_guard(&mark, &file, &live).is_err());
     assert!(!mark.exists());
-    rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64, 8)
+    rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64 + 256, 512)
         .expect("the removed mark still armed page 0");
 }
 
@@ -841,8 +839,26 @@ fn zero_fill_fallback_keeps_one_committed_end() {
     rbitcoin_store::file::skip_next_punch_hole(&path);
     file.zero_range(past + 1, 1024 * 1024 + 1)
         .expect("the whole range shares no committed page");
-    match file.zero_range(PAGE as u64, 16) {
+    match file.zero_range(PAGE as u64 + 256, 512) {
         Err(StoreError::Rejected(msg)) => assert_eq!(msg, "write is outside the armed pages"),
         other => panic!("expected reject, got {other:?}"),
     }
+}
+
+/// The sector rule for the release check: an append that starts at the
+/// committed end inside its tail block, and an in-place write inside one
+/// 512-byte sector, are allowed on a file with a live arm. A committed range
+/// that crosses a sector boundary and is not armed is still rejected.
+#[test]
+fn release_check_follows_the_sector_rule() {
+    let dir = TempDir::labeled("page-guard-sector").unwrap();
+    let (file, _path) = committed_body(&dir);
+    let committed = file.logical_len();
+    assert!(!committed.is_multiple_of(PAGE as u64));
+    arm_page0(&dir, "guard/mark");
+    file.write_at(committed, &[0x55; 64])
+        .expect("an append inside the committed tail block");
+    file.write_at(PAGE as u64 + 8, &[0x66; 8])
+        .expect("an in-place write inside one sector");
+    page1_is_rejected(&file);
 }
