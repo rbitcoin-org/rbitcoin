@@ -2794,9 +2794,10 @@ fn restore_open_marks(path: &Path) -> Result<bool, StoreError> {
 
 #[doc(hidden)]
 pub fn open_layout_refuse_old(path: &Path, meta_ver: u16) -> Result<(), StoreError> {
-    // Schema 24/25 always rewrites. A crash that left meta at 31 beside a
-    // 96-byte body is not a multiple of 88, so the same conversion still runs.
-    if (24..=25).contains(&meta_ver) || HeaderTable::header_body_needs_v24_rewrite(path)? {
+    // Only meta 24/25 names 96-byte rows. The conversion renames the body
+    // before any meta write, so a later meta beside a 96-byte length is a
+    // corrupt body, and `HeaderTable` open refuses it.
+    if (24..=25).contains(&meta_ver) {
         HeaderTable::rewrite_v24_body_to_88(path)?;
     }
     unlink_leftover_spent_off(path)?;

@@ -456,32 +456,6 @@ impl HeaderTable {
         Ok(())
     }
 
-    /// `true` when `header.body` is still schema-24 rows (96 B, not also 88 B).
-    ///
-    /// A length that divides both widths is left to [`Self::rewrite_v24_body_to_88`]
-    /// on a schema 24/25 open. Calling that scan on every later open would read
-    /// `header.head` again whenever the row count is a multiple of 12.
-    pub(crate) fn header_body_needs_v24_rewrite(dir: &Path) -> Result<bool, StoreError> {
-        let path = dir.join("header.body");
-        let mut file = match std::fs::File::open(&path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(StoreError::io(&path, e)),
-        };
-        let mut hdr = [0u8; FILE_HEADER_LEN];
-        match std::io::Read::read(&mut file, &mut hdr) {
-            Ok(n) if n == FILE_HEADER_LEN => {}
-            Ok(_) => return Ok(false),
-            Err(e) => return Err(StoreError::io(&path, e)),
-        }
-        let mut raw = [0u8; 8];
-        raw.copy_from_slice(&hdr[8..16]);
-        let body_len = u64::from_le_bytes(raw).saturating_sub(FILE_HEADER_LEN as u64);
-        Ok(body_len > 0
-            && body_len % HEADER_RECORD_LEN_V24 as u64 == 0
-            && body_len % HEADER_RECORD_LEN as u64 != 0)
-    }
-
     pub fn head_target_slots(&self) -> u64 {
         self.head.target_slots
     }
