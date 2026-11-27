@@ -42,6 +42,8 @@ assert_fail "a call split before its parenthesis fails an empty baseline" \
   python3 "$PY" --root "$FIX/split-call"
 assert_fail "a call split by comment-only and blank lines fails an empty baseline" \
   python3 "$PY" --root "$FIX/split-comment"
+assert_fail "a path-qualified FileExt::write_at fails an empty baseline" \
+  python3 "$PY" --root "$FIX/fileext-write-at"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "page-write-ratchet.test.sh: $PASS passed, $FAIL failed"
