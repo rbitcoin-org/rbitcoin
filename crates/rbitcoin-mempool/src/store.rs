@@ -149,6 +149,9 @@ pub struct Mempool {
     /// The live slot table is `slots.tmp`: a compact renamed the body but not
     /// the slots. Writes stay there until a persist or the next open links it.
     slots_pending: bool,
+    /// `slots` file length known durable. A `set_len` whose sync failed is
+    /// visible in the file length but not counted here, so a retry syncs it.
+    slots_len_synced: u64,
 }
 
 impl Mempool {
@@ -166,6 +169,10 @@ impl Mempool {
         let (meta_file, generation, slot_cap, live_count, meta_schema) =
             open_or_init_meta(&meta_path)?;
         let (slots_file, slots) = open_or_init_slots(&slots_path, slot_cap)?;
+        let slots_len_synced = slots_file
+            .metadata()
+            .map_err(|e| MempoolError::io(&slots_path, e))?
+            .len();
         let (body_file, body) = open_or_init_body(&body_path)?;
         let body_persisted_len = body_logical_len(&body)? as u64;
 
@@ -191,6 +198,7 @@ impl Mempool {
             deaths_unsynced: false,
             death_slots: Vec::new(),
             slots_pending: false,
+            slots_len_synced,
         };
         let mut body_hdr = [0u8; BODY_HEADER];
         body_hdr.copy_from_slice(&mp.body[..BODY_HEADER]);
@@ -1105,15 +1113,25 @@ impl Mempool {
                 .metadata()
                 .map_err(|e| MempoolError::io(slots_path, e))?
                 .len();
-            if need > have {
-                self.slots_file
-                    .set_len(need)
-                    .map_err(|e| MempoolError::io(slots_path, e))?;
+            if need > self.slots_len_synced {
+                if need > have {
+                    self.slots_file
+                        .set_len(need)
+                        .map_err(|e| MempoolError::io(slots_path, e))?;
+                }
                 // The growth mark publishes `slot_cap` in page 0 and does not
                 // image the zero tail. The longer file has to be durable first.
+                #[cfg(debug_assertions)]
+                if grow_sync_fails(&self.dir) {
+                    return Err(MempoolError::io(
+                        slots_path,
+                        std::io::Error::other("injected slot growth sync failure"),
+                    ));
+                }
                 self.slots_file
                     .durable_sync_all()
                     .map_err(|e| MempoolError::io(slots_path, e))?;
+                self.slots_len_synced = need;
             }
             let mut page_off = 0u64;
             while (page_off as usize) < ram.len() {
@@ -1333,6 +1351,8 @@ impl Mempool {
         live_count: u32,
         live_body_bytes: u64,
     ) {
+        // `write_file_synced` synced the whole packed table.
+        self.slots_len_synced = slots.len() as u64;
         self.slots = slots;
         self.slots_file = slots_file;
         self.live_count = live_count;
@@ -1389,6 +1409,30 @@ fn take_fail_mempool_guard(dir: &Path) -> bool {
     };
     armed.remove(i);
     true
+}
+
+#[cfg(debug_assertions)]
+static FAIL_GROW_SYNC: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// While set for `dir`, the sync that makes a longer `slots` file durable
+/// fails. It stays set until cleared, so a retry fails the same way.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_mempool_grow_sync_fails(dir: &Path, fails: bool) {
+    let mut armed = FAIL_GROW_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+    armed.retain(|p| p != dir);
+    if fails {
+        armed.push(dir.to_path_buf());
+    }
+}
+
+#[cfg(debug_assertions)]
+fn grow_sync_fails(dir: &Path) -> bool {
+    FAIL_GROW_SYNC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|p| p == dir)
 }
 
 #[cfg(debug_assertions)]
