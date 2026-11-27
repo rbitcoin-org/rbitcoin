@@ -1069,6 +1069,30 @@ fn arm_errors_while_meta_is_30_and_plain_open_does_not_promote() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An append can latch its failure after a sync passed the latch check at
+/// entry and before the sync reads a zero writer count. The sync refuses
+/// the seal and leaves `armed` in place.
+#[cfg(debug_assertions)]
+#[test]
+fn sync_refuses_a_failure_latched_before_the_writer_count() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    s.put_tx_full_batch_indexed(&[coinbase([0x44u8; 32])], false)
+        .unwrap();
+    let armed = dir.join("tear_guard/armed");
+    assert!(armed.is_file());
+    rbitcoin_store::testutil::set_before_class_a_seal(Some(Box::new(|txs| {
+        rbitcoin_store::testutil::latch_class_a_failure(txs);
+    })));
+    assert!(
+        s.txs.sync_class_a_data().is_err(),
+        "a sync sealed over a latched append failure"
+    );
+    assert!(armed.is_file(), "a sync cleared armed over a failed append");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `write_barrier` on the sync path leaves `armed` while an append is in
 /// flight. An idle sync clears it, after the seal.
 #[test]

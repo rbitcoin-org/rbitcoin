@@ -1240,6 +1240,28 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// A one-shot test hook run inside a Class A seal.
+#[doc(hidden)]
+pub type SealHook = Box<dyn FnOnce(&TxTable)>;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    pub(crate) static BEFORE_SEAL: std::cell::RefCell<Option<SealHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run the one-shot hook a test set with
+/// [`crate::testutil::set_before_class_a_seal`]. It runs on the sync thread
+/// after the latch check at entry and before the writer count is read.
+fn run_before_seal_hook(txs: &TxTable) {
+    #[cfg(debug_assertions)]
+    if let Some(hook) = BEFORE_SEAL.with(|c| c.borrow_mut().take()) {
+        hook(txs);
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = txs;
+}
+
 thread_local! {
     pub(crate) static WRITERS_AT_LATCH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -4103,10 +4125,15 @@ impl TxTable {
             }
             let mut sealed = false;
             self.class_a_latched(|| {
+                run_before_seal_hook(self);
                 let mine = class_a_writer_depth(self as *const Self as *const ());
                 if self.class_a_writes.load(Ordering::Acquire) != mine {
                     return Ok(());
                 }
+                // A failed append latches before it drops its count. It may
+                // have done both since the check at entry, so check again
+                // after the count, before the seal.
+                self.refuse_if_class_a_failed()?;
                 let named = named.unwrap_or_else(|| self.synced_named.load(Ordering::Acquire));
                 self.sync_class_a_stems(named)?;
                 sealed = true;
@@ -4146,7 +4173,7 @@ impl TxTable {
         Ok(())
     }
 
-    fn latch_class_a_failure(&self) {
+    pub(crate) fn latch_class_a_failure(&self) {
         let writers = self
             .class_a_writes
             .load(std::sync::atomic::Ordering::Acquire);
