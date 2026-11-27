@@ -741,3 +741,33 @@ fn array_open_rejects_a_ragged_body() {
     ));
     let _ = std::fs::remove_file(&path);
 }
+
+/// An fd-only write that fails after its arm leaves images a later write
+/// must not drop. The later write refuses until reopen restores the mark.
+#[cfg(debug_assertions)]
+#[test]
+fn fd_write_refuses_while_an_earlier_mark_is_armed() {
+    let dir = tmp_path();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("slots.body");
+    let file = rbitcoin_store::file::TableFile::create(&path, TableKind::ArrayLink).unwrap();
+    file.write_at(ArrayTable::offset(0), &vec![0u8; 8 * 1100])
+        .unwrap();
+    drop(file);
+    let t =
+        with_class_c_inram_max_bytes(0, || ArrayTable::open(&path, TableKind::ArrayLink).unwrap());
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    rbitcoin_store::chain::fail_next_fd_write_before_live(&path);
+    assert!(t.set(&write, 0, 7).is_err());
+    let mark = dir.join("guard/class_c");
+    assert!(mark.is_file());
+    let armed = std::fs::read(&mark).unwrap();
+    assert!(
+        matches!(t.set(&write, 1000, 9), Err(StoreError::Rejected(_))),
+        "a later fd write went ahead over an armed mark"
+    );
+    assert_eq!(std::fs::read(&mark).unwrap(), armed);
+    drop(t);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -975,27 +975,112 @@ impl ArrayTable {
         zero_gap: bool,
     ) -> Result<(), StoreError> {
         let _hold = page_guard::hold_marks();
+        self.refuse_armed_class_c()?;
         let pages = self.fd_guard_pages(pairs, max_idx, zero_gap)?;
         let mark = self.arm_class_c(&pages)?;
-        let len = self.len.load(Ordering::Acquire);
-        let wrote = (|| {
-            for &(index, value) in pairs {
-                if index < len {
-                    self.file
-                        .write_at(Self::offset(index), &value.to_le_bytes())?;
-                }
-            }
-            if max_idx < len {
-                return Ok(());
-            }
-            self.append_fd(len, max_idx, pairs, zero_gap)
-        })();
+        self.write_fd_live(pairs, max_idx, zero_gap)?;
         if let Some(mark) = mark {
-            if wrote.is_ok() {
-                page_guard::clear_page_guard(&mark, &self.file.read_file, self.file.path())?;
+            page_guard::clear_page_guard(&mark, &self.file.read_file, self.file.path())?;
+        }
+        Ok(())
+    }
+
+    /// Both columns of an fd-only pair under one `store/guard/class_c` mark.
+    ///
+    /// Both columns' pages are imaged before either is written, so open
+    /// reads the old pair or the new pair, never one column of each.
+    pub(crate) fn write_fd_pair(
+        a: &ArrayTable,
+        a_pairs: &[(u64, u64)],
+        b: &ArrayTable,
+        b_pairs: &[(u64, u64)],
+        zero_gap: bool,
+    ) -> Result<(), StoreError> {
+        let max_of = |pairs: &[(u64, u64)]| pairs.iter().map(|(i, _)| *i).max();
+        let (Some(a_max), Some(b_max)) = (max_of(a_pairs), max_of(b_pairs)) else {
+            return Ok(());
+        };
+        if !zero_gap
+            && (!a.extension_is_dense(a_max, a_pairs) || !b.extension_is_dense(b_max, b_pairs))
+        {
+            return Err(StoreError::Corrupt("array set skips slots"));
+        }
+        let _a_odd = a.begin_store()?;
+        let _b_odd = b.begin_store()?;
+        let _hold = page_guard::hold_marks();
+        a.refuse_armed_class_c()?;
+        let a_pages = a.fd_guard_pages(a_pairs, a_max, zero_gap)?;
+        let b_pages = b.fd_guard_pages(b_pairs, b_max, zero_gap)?;
+        let dir = a.store_dir()?;
+        let (a_name, b_name) = (a.guard_name()?, b.guard_name()?);
+        let refs: Vec<(&str, u64, &[u8])> = a_pages
+            .iter()
+            .map(|(off, image)| (a_name, *off, image.as_slice()))
+            .chain(
+                b_pages
+                    .iter()
+                    .map(|(off, image)| (b_name, *off, image.as_slice())),
+            )
+            .collect();
+        if !refs.is_empty() {
+            page_guard::arm_store_group(dir, page_guard::CLASS_C_MARK, &refs)?;
+        }
+        a.write_fd_live(a_pairs, a_max, zero_gap)?;
+        b.write_fd_live(b_pairs, b_max, zero_gap)?;
+        if !refs.is_empty() {
+            page_guard::clear_page_guard_files(
+                &dir.join(page_guard::CLASS_C_MARK),
+                &[
+                    (&a.file.read_file, a.file.path()),
+                    (&b.file.read_file, b.file.path()),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_fd_only(&self) -> bool {
+        !self.in_ram
+    }
+
+    /// A failed fd write leaves its mark. A later write would arm its own
+    /// pages and then clear the file, dropping images it never rewrote.
+    /// Refuse until reopen restores that mark.
+    fn refuse_armed_class_c(&self) -> Result<(), StoreError> {
+        let mark = self.store_dir()?.join(page_guard::CLASS_C_MARK);
+        if mark.try_exists().map_err(|e| StoreError::io(&mark, e))? {
+            return Err(StoreError::Rejected(
+                "an earlier Class C write is still armed; reopen restores it",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The live bytes of one fd write, under a mark the caller armed.
+    fn write_fd_live(
+        &self,
+        pairs: &[(u64, u64)],
+        max_idx: u64,
+        zero_gap: bool,
+    ) -> Result<(), StoreError> {
+        #[cfg(debug_assertions)]
+        if crate::chain::take_fail_fd_before_live(self.file.path()) {
+            return Err(StoreError::io(
+                self.file.path(),
+                std::io::Error::other("injected fd write failure before live bytes"),
+            ));
+        }
+        let len = self.len.load(Ordering::Acquire);
+        for &(index, value) in pairs {
+            if index < len {
+                self.file
+                    .write_at(Self::offset(index), &value.to_le_bytes())?;
             }
         }
-        wrote
+        if max_idx < len {
+            return Ok(());
+        }
+        self.append_fd(len, max_idx, pairs, zero_gap)
     }
 
     /// Bytes, then the file length, then `len`. `write_at` would publish the
