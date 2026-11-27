@@ -1227,3 +1227,31 @@ fn spent_body_is_unchanged_by_class_a_restore_and_fold_replay_wins() {
     assert_eq!(got, vec![0x5au8; keep]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A panic inside a Class A append still releases its writer count and
+/// latches the failure. A sync on another thread then refuses instead of
+/// waiting forever for a writer that is gone.
+#[cfg(debug_assertions)]
+#[test]
+fn a_panicking_append_releases_its_writer_count() {
+    let dir = tmp();
+    let s = std::sync::Arc::new(Store::create_tiny(&dir).unwrap());
+    rbitcoin_store::tx_table::set_after_bodies_for_test(Some(Box::new(|| {
+        panic!("injected panic inside a Class A append");
+    })));
+    let appending = std::sync::Arc::clone(&s);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        appending.put_tx_full_batch_indexed(&[coinbase([0x55u8; 32])], false)
+    }));
+    assert!(unwound.is_err(), "the hook did not run inside the append");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let syncing = std::sync::Arc::clone(&s);
+    std::thread::spawn(move || {
+        let _ = tx.send(syncing.txs.sync_class_a_data().is_err());
+    });
+    let refused = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("a sync waited for a writer that unwound");
+    assert!(refused, "a sync sealed over an append that panicked");
+    let _ = std::fs::remove_dir_all(&dir);
+}
