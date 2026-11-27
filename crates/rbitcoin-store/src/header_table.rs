@@ -337,12 +337,43 @@ impl HeaderTable {
         }
         let count = body_len / HEADER_RECORD_LEN as u64;
         let head = HeaderHead::open(dir.join("header.head"), count, scale)?;
-        Ok(Self {
+        let table = Self {
             body,
             head,
             count: std::sync::atomic::AtomicU64::new(count),
             put_lock: Mutex::new(()),
-        })
+        };
+        table.index_unindexed_tail()?;
+        Ok(table)
+    }
+
+    /// Insert the tail rows `header.head` does not name.
+    ///
+    /// `ensure_batch` syncs the body before the head insert, so a crash in
+    /// between, or a forward body mark open just replayed, leaves rows the
+    /// head does not name. They are a suffix: the walk stops at the first row
+    /// a lookup finds. A clean open does one lookup.
+    fn index_unindexed_tail(&self) -> Result<(), StoreError> {
+        let mut missing: Vec<([u8; 32], Fk)> = Vec::new();
+        let mut id = self.count.load(std::sync::atomic::Ordering::Acquire);
+        while id > 0 {
+            let fk = Fk(id);
+            let rec = self.get(fk)?;
+            if self.get_by_hash_unlocked(&rec.hash)?.is_some() {
+                break;
+            }
+            missing.push((rec.hash, fk));
+            id -= 1;
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        missing.reverse();
+        rbitcoin_log::warn!(
+            "store: indexing {} header rows header.head did not name",
+            missing.len()
+        );
+        self.head.insert_many(&missing)
     }
 
     /// Schema 24/25 → 26: strip trailing `size`/`weight` so each row is 88 B.
