@@ -924,45 +924,70 @@ fn open_indexes_a_first_header_row_the_head_does_not_name() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Meta 31 beside a still-96-byte `header.body` is the crash between the old
-/// promote and the rename. Open must convert the body without a schema-24 gate.
+/// Meta 31 beside a 96-byte `header.body` is not a schema-24 store. Only
+/// meta 24/25 names the old width, so open refuses the length and does not
+/// rewrite the body.
 #[test]
-fn open_heals_v24_header_body_when_meta_is_already_31() {
-    use rbitcoin_store::file::FILE_HEADER_LEN;
-    use rbitcoin_store::header_table::{HEADER_RECORD_LEN, HEADER_RECORD_LEN_V24};
+fn open_refuses_a_96_byte_header_body_when_meta_is_31() {
     let dir = tmp();
-    let hash = [0x61u8; 32];
     {
         let s = Store::create_tiny(&dir).unwrap();
-        let hdr = HeaderRecord {
-            prev_fk: Fk::NULL,
-            version: 1,
-            timestamp: 1,
-            bits: 0x1d00ffff,
-            nonce: 1,
-            merkle_root: [1u8; 32],
-            hash,
-            size: 0,
-            weight: 0,
-        };
-        s.put_header(&hdr).unwrap();
+        s.put_header(&loose_header(0x61)).unwrap();
         s.flush().unwrap();
     }
     widen_header_body_to_96(&dir);
     write_store_meta_ver(&dir, 31);
-    let s = Store::open_tiny(&dir).unwrap();
-    let got = s.get_header(Fk(1)).unwrap();
-    assert_eq!(got.hash, hash);
-    assert_eq!(s.header_count(), 1);
-    drop(s);
-    let bytes = std::fs::read(dir.join("header.body")).unwrap();
-    let logical = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    assert_eq!(logical, FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN as u64);
-    assert_ne!(
-        logical,
-        FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN_V24 as u64
-    );
+    let before = std::fs::read(dir.join("header.body")).unwrap();
+    assert_refuses_header_body_size(&dir);
+    assert_eq!(std::fs::read(dir.join("header.body")).unwrap(), before);
     assert_eq!(read_store_meta_ver(&dir), 31);
+}
+
+/// A corrupt length that reads as one 96-byte row must not send a modern
+/// body through the schema-24 conversion, which would keep one row of two.
+#[test]
+fn open_does_not_convert_a_modern_header_body_by_its_length() {
+    use rbitcoin_store::file::FILE_HEADER_LEN;
+    use rbitcoin_store::header_table::HEADER_RECORD_LEN_V24;
+    for ver in [30u16, 31] {
+        let dir = tmp();
+        {
+            let s = Store::create_tiny(&dir).unwrap();
+            s.put_header(&loose_header(0x71)).unwrap();
+            s.put_header(&loose_header(0x72)).unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, ver);
+        let body = dir.join("header.body");
+        let mut bytes = std::fs::read(&body).unwrap();
+        let forged = FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN_V24 as u64;
+        bytes[8..16].copy_from_slice(&forged.to_le_bytes());
+        std::fs::write(&body, &bytes).unwrap();
+        assert_refuses_header_body_size(&dir);
+        assert_eq!(std::fs::read(&body).unwrap(), bytes, "meta {ver}");
+    }
+}
+
+fn loose_header(byte: u8) -> HeaderRecord {
+    HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x1d00ffff,
+        nonce: 1,
+        merkle_root: [1u8; 32],
+        hash: [byte; 32],
+        size: 0,
+        weight: 0,
+    }
+}
+
+fn assert_refuses_header_body_size(dir: &Path) {
+    match Store::open_tiny(dir) {
+        Err(StoreError::Corrupt(m)) => assert_eq!(m, "header body size"),
+        Err(other) => panic!("wrong refusal: {other}"),
+        Ok(_) => panic!("open accepted a header body length that is not 88-byte rows"),
+    }
 }
 
 fn widen_header_body_to_96(dir: &Path) {
