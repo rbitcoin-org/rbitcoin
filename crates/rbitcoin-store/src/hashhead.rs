@@ -515,11 +515,7 @@ impl HashHead {
 
     pub fn open(path: impl Into<std::path::PathBuf>) -> Result<Self, StoreError> {
         let path = path.into();
-        if let Some(dir) = path.parent() {
-            if !dir.as_os_str().is_empty() {
-                page_guard::restore_store_group(dir, page_guard::HEADER_HEAD_MARK)?;
-            }
-        }
+        page_guard::restore_store_group(head_dir(&path)?, page_guard::HEADER_HEAD_MARK)?;
         let file = TableFile::open(&path, TableKind::HashHead)?;
         let multi = MultiList::open(&path)?;
         let body = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
@@ -927,9 +923,7 @@ impl HashHead {
         if head.is_empty() && mlt.is_empty() {
             return Ok(());
         }
-        let Some(dir) = self.file.path().parent() else {
-            return Err(StoreError::Rejected("page guard mark has no directory"));
-        };
+        let dir = head_dir(self.file.path())?;
         let head_name = page_guard::guard_file_name(self.file.path())?;
         let mlt_name = page_guard::guard_file_name(self.multi.file.path())?;
         let mut refs: Vec<(&str, u64, &[u8])> = Vec::with_capacity(head.len() + mlt.len());
@@ -943,9 +937,7 @@ impl HashHead {
     }
 
     fn clear_head_mark(&self) -> Result<(), StoreError> {
-        let Some(dir) = self.file.path().parent() else {
-            return Err(StoreError::Rejected("page guard mark has no directory"));
-        };
+        let dir = head_dir(self.file.path())?;
         page_guard::clear_page_guard_files(
             &dir.join(page_guard::HEADER_HEAD_MARK),
             &[
@@ -963,6 +955,15 @@ impl HashHead {
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.multi.flush_async()?;
         self.file.flush_async()
+    }
+}
+
+/// Directory that holds `path` and `guard/header.head`. A bare file name
+/// has none, so open, arm, and clear all refuse it the same way.
+fn head_dir(path: &std::path::Path) -> Result<&std::path::Path, StoreError> {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => Ok(dir),
+        _ => Err(StoreError::Rejected("page guard mark has no directory")),
     }
 }
 
