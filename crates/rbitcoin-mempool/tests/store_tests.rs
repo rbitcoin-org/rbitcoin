@@ -101,6 +101,70 @@ fn schema2_converts_on_open_with_unknown_sigops() {
     assert_eq!(mp.load_live_txs().unwrap()[0].packed.sigop_cost, Some(12));
 }
 
+/// Move the one live record of a closed pool so it starts at body offset `to`.
+fn move_only_record(dir: &Path, to: usize) {
+    let mut slots = fs::read(dir.join("slots")).unwrap();
+    let body = fs::read(dir.join("tx.body")).unwrap();
+    let off = SLOTS_HEADER;
+    assert_eq!(slots[off], SLOT_LIVE);
+    let b_off = u64::from_le_bytes(slots[off + 4..off + 12].try_into().unwrap()) as usize;
+    let b_len = u32::from_le_bytes(slots[off + 12..off + 16].try_into().unwrap()) as usize;
+    assert!(to >= b_off);
+    let mut new_body = body[..b_off].to_vec();
+    new_body.resize(to, 0);
+    new_body.extend_from_slice(&body[b_off..b_off + b_len]);
+    let len = new_body.len() as u64;
+    new_body[8..16].copy_from_slice(&len.to_le_bytes());
+    slots[off + 4..off + 12].copy_from_slice(&(to as u64).to_le_bytes());
+    fs::write(dir.join("tx.body"), new_body).unwrap();
+    fs::write(dir.join("slots"), slots).unwrap();
+}
+
+/// A recomputed cost whose 8 bytes cross a 512-byte sector stays unknown on
+/// disk: a torn write could mix new bytes with the old 0xFF bytes into a
+/// cost under the block limit. The next open recomputes it.
+#[test]
+fn a_sigop_cost_across_a_sector_is_not_written_in_place() {
+    let dir = tmp_dir();
+    let tx = tiny_tx();
+    let tid = tx.compute_txid();
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.append_live_tx(
+            &tx,
+            &tid,
+            &tx.compute_wtxid(),
+            55,
+            400,
+            12,
+            1_700_000_000,
+            &[],
+        )
+        .unwrap();
+        mp.flush().unwrap();
+    }
+    downgrade_to_schema2(&dir);
+    let record = 510 - SIGOP_COST_OFF;
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    assert_eq!(live[0].packed.sigop_cost, None);
+    drop(mp);
+    move_only_record(&dir, record);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    assert_eq!(live[0].packed.txid, tid);
+    mp.set_sigop_cost(live[0].slot, 0x0400).unwrap();
+    assert_eq!(
+        mp.load_live_txs().unwrap()[0].packed.sigop_cost,
+        Some(0x0400)
+    );
+    drop(mp);
+    let body = fs::read(dir.join("tx.body")).unwrap();
+    assert_eq!(&body[510..518], &[0xFFu8; 8], "the field crosses a sector");
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    assert_eq!(mp.load_live_txs().unwrap()[0].packed.sigop_cost, None);
+}
+
 /// Schema 3 records keep fee, weight, sigops and vin aux, and get the
 /// migrate's wall-clock second as their accept time.
 #[test]
