@@ -778,6 +778,55 @@ fn open_restores_the_header_body_mark_before_the_width_probe() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A header row on disk that `header.head` does not name is the crash after
+/// the body write and before the head insert, or a forward body mark open
+/// replays. Open indexes that tail, so the next put finds the row instead
+/// of appending a second one.
+#[test]
+fn open_indexes_header_rows_the_head_does_not_name() {
+    use rbitcoin_store::file::FILE_HEADER_LEN;
+    use rbitcoin_store::header_table::HEADER_RECORD_LEN;
+    let header = |hash: [u8; 32]| HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x1d00ffff,
+        nonce: 1,
+        merkle_root: [1u8; 32],
+        hash,
+        size: 0,
+        weight: 0,
+    };
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.put_header(&header([0x63u8; 32])).unwrap();
+        s.flush().unwrap();
+    }
+    let late = header([0x64u8; 32]);
+    let body = dir.join("header.body");
+    let mut image = std::fs::read(&body).unwrap();
+    let row_end = FILE_HEADER_LEN + HEADER_RECORD_LEN;
+    image.truncate(row_end);
+    image.extend_from_slice(&late.encode());
+    let len = (row_end + HEADER_RECORD_LEN) as u64;
+    image[8..16].copy_from_slice(&len.to_le_bytes());
+    image.resize(4096, 0);
+    rbitcoin_store::page_guard::arm_page_guard_group(
+        &dir.join(rbitcoin_store::page_guard::HEADER_BODY_MARK),
+        &[("header.body", 0, image.as_slice())],
+    )
+    .unwrap();
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.header_count(), 2);
+    let found = s.get_header_by_hash(&late.hash).unwrap().map(|(fk, _)| fk);
+    assert_eq!(found, Some(Fk(2)), "the replayed row is not in header.head");
+    assert_eq!(s.put_header(&late).unwrap(), Fk(2));
+    assert_eq!(s.header_count(), 2, "a second row for one hash");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Meta 31 beside a still-96-byte `header.body` is the crash between the old
 /// promote and the rename. Open must convert the body without a schema-24 gate.
 #[test]
