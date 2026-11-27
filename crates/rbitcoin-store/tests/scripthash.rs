@@ -4908,3 +4908,43 @@ fn a_removed_mark_whose_dir_sync_failed_is_written_again() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A large ingest with no `.occ` opens with unknown occupancy and no room.
+/// When it holds no rows the seal has nothing to move. It retires the empty
+/// table instead of leaving the append loop to retry forever.
+#[test]
+fn append_retires_an_empty_ingest_with_unknown_occupancy() {
+    use rbitcoin_store::scripthash_head::{occ_sidecar_path, ScriptHashHead, OCC_SCAN_BYTE_CAP};
+    use rbitcoin_store::scripthash_layout::SH_HEAD_SLOT_SIZE;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("sh-empty-ingest").unwrap();
+    let slots = ((OCC_SCAN_BYTE_CAP / SH_HEAD_SLOT_SIZE as u64) + 1).next_power_of_two();
+    let ingest = ingest_path(&dir);
+    {
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        drop(t);
+        let h = ScriptHashHead::create_with_slots(&ingest, slots).unwrap();
+        h.flush().unwrap();
+    }
+    let _ = std::fs::remove_file(occ_sidecar_path(&ingest));
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    let key = [0xc1u8; 32];
+    let (tx, rx) = std::sync::mpsc::channel();
+    // A detached thread, so a retry loop fails the test instead of hanging it.
+    std::thread::spawn(move || {
+        let rec = ScriptHashRecord {
+            scripthash: key,
+            create_tx_fk: Fk(1),
+        };
+        let got = t.put_create_batch_append(&[rec]).map(|_| ());
+        let _ = tx.send((t, got));
+    });
+    let (t, got) = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the append never finished");
+    got.unwrap();
+    assert_eq!(
+        t.head_value(&key).unwrap(),
+        Some(rbitcoin_store::scripthash_layout::ShHeadValue::inline_one(
+            Fk(1)
+        ))
+    );
+}

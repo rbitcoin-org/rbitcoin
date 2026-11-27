@@ -2843,6 +2843,12 @@ impl ScriptHashTable {
             recs
         };
         if recs.is_empty() {
+            // Nothing to move. An empty table can still report no room when
+            // its occupancy is unknown, so retire it instead of returning
+            // with that table in place. The next insert creates a new one.
+            let p = ingest_path(&self.store_dir);
+            *self.ingest.lock().unwrap() = None;
+            crate::scripthash_head::remove_ingest_files(&p)?;
             return Ok(());
         }
         recs.sort_unstable_by_key(|a| a.0);
