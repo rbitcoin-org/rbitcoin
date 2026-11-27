@@ -520,3 +520,33 @@ fn first_arm_syncs_the_store_directory() {
     arm_page_guard(&mark, &[(0, &fill(0x01))]).unwrap();
     assert!(mark.is_file());
 }
+
+/// A restore that creates the data file syncs the directory that gained it
+/// before the mark goes away, so a second crash cannot lose the file.
+#[test]
+fn restore_store_file_syncs_the_directory_of_a_created_file() {
+    let dir = TempDir::labeled("page-guard-restore-create").unwrap();
+    let mark = dir.path().join("guard/spent.ovf");
+    let image = fill(0x5a);
+    arm_page_guard(&mark, &[(0, image.as_slice())]).unwrap();
+    let data = dir.path().join("spent.ovf");
+    assert!(!data.exists());
+    #[cfg(unix)]
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    assert!(rbitcoin_store::page_guard::restore_store_file(
+        dir.path(),
+        "guard/spent.ovf",
+        "spent.ovf"
+    )
+    .unwrap());
+    #[cfg(unix)]
+    {
+        let dirs = rbitcoin_store::file::take_fsynced_dirs();
+        assert!(
+            dirs.iter().any(|d| d == dir.path()),
+            "the directory that gained spent.ovf was not synced, got {dirs:?}"
+        );
+    }
+    assert_eq!(read_bytes(&data, 0, PAGE), image);
+    assert!(!mark.exists());
+}
