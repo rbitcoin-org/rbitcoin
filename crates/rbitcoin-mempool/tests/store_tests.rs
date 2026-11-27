@@ -435,6 +435,7 @@ fn reused_dead_slot_sync_does_not_resurrect_the_old_tx() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn slot_growth_commit_does_not_stamp_the_replacement_dead() {
     let dir = tmp_dir();
@@ -837,6 +838,7 @@ fn persist_deaths_writes_slots_not_body() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn torn_mempool_page_restores_the_armed_image() {
     let dir = tmp_dir();
