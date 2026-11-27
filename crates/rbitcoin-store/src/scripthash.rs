@@ -2801,7 +2801,7 @@ impl ScriptHashTable {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if name.starts_with("sh-") {
+            if page_guard::published_sh_mark(name) {
                 return Ok(true);
             }
         }
@@ -2822,6 +2822,14 @@ impl ScriptHashTable {
 
     #[doc(hidden)]
     pub fn seal_ingest(&self) -> Result<(), StoreError> {
+        // A commit that failed before its clear left body and ingest images
+        // armed. A seal would drop only the ingest image, and open could then
+        // roll back a slab the sealed head names. Open restores first.
+        if self.sh_mark_present()? {
+            return Err(StoreError::Rejected(
+                "scripthash: a commit guard is still armed; restart to restore it before a seal",
+            ));
+        }
         let mut recs = {
             let g = self.ingest.lock().unwrap();
             let Some(g) = g.as_ref() else {

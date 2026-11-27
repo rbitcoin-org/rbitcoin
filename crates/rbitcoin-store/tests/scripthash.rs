@@ -4907,3 +4907,4 @@ fn a_removed_mark_whose_dir_sync_failed_is_written_again() {
     assert!(marker.exists(), "the next write marks again");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
