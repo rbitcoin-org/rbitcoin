@@ -612,3 +612,16 @@ fn fit_restore_drops_the_ahead_sidecar() {
     );
     assert_eq!(read_bytes(&live, 0, PAGE), image);
 }
+
+/// A crash can leave a truncated `guard/sh-*.tmp`. Dropping a name skips it,
+/// as restore does, and leaves it for reset to remove.
+#[test]
+fn drop_sh_rel_skips_an_unpublished_temp() {
+    let dir = TempDir::labeled("page-guard-drop-tmp").unwrap();
+    std::fs::create_dir_all(dir.path().join("guard")).unwrap();
+    let tmp = dir.path().join("guard/sh-ovf.tmp");
+    std::fs::write(&tmp, b"half a mark").unwrap();
+    rbitcoin_store::page_guard::drop_sh_rel(dir.path(), "scripthash.ovf/ingest").unwrap();
+    assert!(tmp.is_file());
+}
+
