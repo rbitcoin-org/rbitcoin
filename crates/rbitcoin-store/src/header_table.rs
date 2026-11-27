@@ -47,6 +47,8 @@ pub const HEADER_HEAD_EMPTY_REFUSE: &str =
 
 const HEADER_HEAD_AHEAD: &str =
     "header.head.ahead is a legacy page image; this open does not restore it";
+const HEADER_HEAD_GEN_AHEAD: &str =
+    "a header.head.gN.ahead is a legacy page image; this open does not restore it";
 
 fn legacy_ahead(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
@@ -199,6 +201,7 @@ impl HeaderHead {
             if !p.is_file() {
                 break;
             }
+            crate::file::refuse_if_present(&legacy_ahead(&p), HEADER_HEAD_GEN_AHEAD)?;
             gens.push(HashHead::open(p)?);
             i += 1;
         }
