@@ -77,8 +77,6 @@ jobs:
         run: ./scripts/hex-ratchet.test.sh
       - name: hex ratchet
         run: ./scripts/hex-ratchet.sh
-      - name: write probe classifier self-test
-        run: ./scripts/write-probe-classify.test.sh
       - name: page-write ratchet self-test
         run: ./scripts/page-write-ratchet.test.sh
       - name: page-write ratchet
@@ -87,6 +85,8 @@ jobs:
         run: ./scripts/src-test-modules.test.sh
       - name: src test modules
         run: ./scripts/src-test-modules.sh
+      - name: write probe classifier self-test
+        run: ./scripts/write-probe-classify.test.sh
       - name: doc attach self-test
         run: ./scripts/doc-attach.test.sh
       - name: doc attach
