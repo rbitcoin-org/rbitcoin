@@ -219,10 +219,12 @@ fn an_mlt_append_is_durable_before_a_head_mark_that_names_only_the_head() {
     cleanup_hh(&path);
 }
 
-/// A head flush whose `.mlt` length flush fails leaves that length in RAM.
-/// The next flush finishes it instead of refusing the rows as an overwrite.
+/// A head flush whose `.mlt` length flush fails may have made that length
+/// durable. The `.mlt` refuses later inserts until reopen, which reads the
+/// rows the durable length names.
+#[cfg(debug_assertions)]
 #[test]
-fn a_failed_mlt_length_flush_is_finished_by_the_next_insert() {
+fn a_failed_mlt_length_flush_refuses_inserts_until_reopen() {
     let path = tmp_path();
     let mut k1 = [0u8; 32];
     k1[0] = 0xab;
@@ -238,15 +240,16 @@ fn a_failed_mlt_length_flush_is_finished_by_the_next_insert() {
         h.flush().unwrap();
         rbitcoin_store::io_handle::arm_fail_flush(h.multi.file.io_handle(), 1);
         assert!(h.insert(&k2, Fk(20)).is_err());
-        h.insert(&k3, Fk(30)).unwrap();
-        h.flush().unwrap();
+        assert!(
+            h.insert(&k3, Fk(30)).is_err(),
+            "an insert after a failed .mlt flush was accepted"
+        );
     }
     let h = HashHead::open(&path).unwrap();
-    let all = h.get_all(&k1).unwrap();
-    assert!(
-        all.contains(&Fk(10)) && all.contains(&Fk(30)),
-        "the insert after a failed .mlt flush must land, got {all:?}"
-    );
+    assert!(h.get_all(&k1).unwrap().contains(&Fk(10)));
+    h.insert(&k3, Fk(30)).expect("an insert after reopen");
+    h.flush().unwrap();
+    assert!(h.get_all(&k1).unwrap().contains(&Fk(30)));
     cleanup_hh(&path);
 }
 

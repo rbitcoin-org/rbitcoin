@@ -110,9 +110,6 @@ pub struct BlockFilterTable {
     pub inner: RwLock<Inner>,
     /// Serializes `put` and `truncate_through` (one writer at a time).
     pub writer: Mutex<()>,
-    /// A put failed after a length may have become durable. Reopen fits the
-    /// files, so writers wait for it.
-    blocked: std::sync::atomic::AtomicBool,
 }
 
 /// A filter's bytes and idx facts.
@@ -210,17 +207,18 @@ impl BlockFilterTable {
             dirs: Self::seg_dirs(dir),
             inner: RwLock::new(Inner { segs, tail_end }),
             writer: Mutex::new(()),
-            blocked: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// A failed put may have made one length durable and not the other.
     /// Reopen fits the files to each other, so writers wait for it.
+    /// A failed put poisoned its segment files, and a length may be
+    /// durable in one of a pair and not the other. Reopen fits the pairs, so
+    /// every put, cut, and repair waits for it.
     fn refuse_after_failed_put(&self) -> Result<(), StoreError> {
-        if self.blocked.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(StoreError::Rejected(
-                "an earlier blockfilter put failed; reopen fits the files",
-            ));
+        for seg in &self.read().segs {
+            seg.idx.refuse_if_poisoned()?;
+            seg.body.refuse_if_poisoned()?;
         }
         Ok(())
     }
@@ -584,13 +582,10 @@ impl BlockFilterTable {
             // before the idx length that names its records.
             let committed = page_guard::commit_appends(&writes);
             drop(writes);
-            if let Err(e) = committed {
-                // A length may be durable already, including a rolled pair's.
-                // Leave the files for reopen and publish nothing.
-                self.blocked
-                    .store(true, std::sync::atomic::Ordering::Release);
-                return Err(e);
-            }
+            // A length may be durable already, including a rolled pair's.
+            // The failed group is poisoned: leave the files for reopen and
+            // publish nothing.
+            committed?;
             let tail_end = plans.last().map(|p| p.body_end);
             (counts, rolled, tail_end)
         };

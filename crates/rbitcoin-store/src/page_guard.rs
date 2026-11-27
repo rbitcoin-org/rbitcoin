@@ -892,10 +892,25 @@ pub struct Append<'a> {
 /// bytes and length, before the index length that names it. A crash leaves
 /// each file at its old length or its new one, and bytes past a length are
 /// not read. A format whose last record ends at the body length must fit
-/// that record on open, as `sp_tweaks` does. On an error the caller must not write these files again until
-/// reopen: a length may already be durable.
+/// that record on open, as `sp_tweaks` does. On an error a length may
+/// already be durable, so every file in the group is poisoned: it refuses
+/// writes until reopen fits the group.
 #[doc(hidden)]
 pub fn commit_appends(writes: &[Append<'_>]) -> Result<(), StoreError> {
+    let committed = commit_appends_once(writes);
+    if committed.is_err() {
+        for w in writes {
+            w.file.poison();
+        }
+    }
+    committed
+}
+
+fn commit_appends_once(writes: &[Append<'_>]) -> Result<(), StoreError> {
+    // Refuse before any write, so a retry cannot stack on the group.
+    for w in writes {
+        w.file.refuse_if_poisoned()?;
+    }
     let mut files: Vec<(&TableFile, u64)> = Vec::new();
     for w in writes {
         if w.file.trailing_header {

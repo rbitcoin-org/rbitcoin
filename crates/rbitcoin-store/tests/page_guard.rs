@@ -823,3 +823,57 @@ fn release_check_follows_the_sector_rule() {
     }
     page1_is_rejected(&file);
 }
+
+/// A failed `commit_appends` may have published one length of its group
+/// and not another. Every file in the group refuses writes until reopen.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_append_poisons_its_group_until_reopen() {
+    use rbitcoin_primitives::TableKind;
+    use rbitcoin_store::error::StoreError;
+    use rbitcoin_store::file::{TableFile, FILE_HEADER_LEN};
+    use rbitcoin_store::page_guard::{commit_appends, Append};
+    let dir = rbitcoin_store::testutil::TempDir::labeled("append-poison").unwrap();
+    let (pa, pb) = (dir.path.join("a"), dir.path.join("b"));
+    let a = TableFile::create(&pa, TableKind::ArrayLink).unwrap();
+    let b = TableFile::create(&pb, TableKind::ArrayLink).unwrap();
+    let at = FILE_HEADER_LEN as u64;
+    let row = [7u8; 8];
+    let group = |a: &TableFile, b: &TableFile| {
+        commit_appends(&[
+            Append {
+                file: a,
+                at,
+                bytes: &row,
+                new_logical: at + 8,
+            },
+            Append {
+                file: b,
+                at,
+                bytes: &row,
+                new_logical: at + 8,
+            },
+        ])
+    };
+    // `a`'s length lands; `b`'s length flush fails.
+    rbitcoin_store::io_handle::arm_fail_flush(b.io_handle(), 1);
+    assert!(group(&a, &b).is_err());
+    for f in [&a, &b] {
+        let end = f.logical_len();
+        for refused in [
+            f.write_at_pwrite(FILE_HEADER_LEN as u64, &[1]),
+            f.write_uncommitted(end, &[1]),
+            f.set_logical_len(FILE_HEADER_LEN as u64),
+            group(&a, &b),
+        ] {
+            match refused {
+                Err(StoreError::Rejected(m)) => assert!(m.contains("reopen"), "{m}"),
+                other => panic!("a write after a failed append: {other:?}"),
+            }
+        }
+    }
+    drop((a, b));
+    let a = TableFile::open(&pa, TableKind::ArrayLink).unwrap();
+    a.write_at_pwrite(FILE_HEADER_LEN as u64, &[1])
+        .expect("reopen clears the poison");
+}

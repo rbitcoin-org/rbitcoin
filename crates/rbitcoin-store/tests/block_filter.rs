@@ -316,7 +316,7 @@ fn a_later_put_waits_for_reopen_after_a_failed_put() {
     }]);
     match err {
         Err(StoreError::Rejected(msg)) => {
-            assert!(msg.contains("blockfilter"), "{msg}");
+            assert!(msg.contains("reopen"), "{msg}");
         }
         other => panic!("a failed put must refuse the next put, got {other:?}"),
     }

@@ -61,9 +61,6 @@ pub struct SpTweaksTable {
     pub dirs: SegDirs,
     pub origin: u32,
     pub inner: Mutex<Inner>,
-    /// A put failed after a length may have become durable. Reopen fits the
-    /// files, so writers wait for it.
-    blocked: std::sync::atomic::AtomicBool,
 }
 
 impl SpTweaksTable {
@@ -129,7 +126,6 @@ impl SpTweaksTable {
             dirs,
             origin: origin.0,
             inner: Mutex::new(Inner { segs: vec![seg] }),
-            blocked: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -175,17 +171,18 @@ impl SpTweaksTable {
             dirs,
             origin,
             inner: Mutex::new(Inner { segs }),
-            blocked: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// A failed put may have made one length durable and not the other.
     /// Reopen fits the files to each other, so writers wait for it.
-    fn refuse_after_failed_put(&self) -> Result<(), StoreError> {
-        if self.blocked.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(StoreError::Rejected(
-                "an earlier sp_tweaks put failed; reopen fits the files",
-            ));
+    /// A failed put poisoned its segment files, and a length may be
+    /// durable in one of a pair and not the other. Reopen fits the last
+    /// record, so every put and cut waits for it.
+    fn refuse_after_failed_put(inner: &Inner) -> Result<(), StoreError> {
+        for seg in &inner.segs {
+            seg.idx.refuse_if_poisoned()?;
+            seg.body.refuse_if_poisoned()?;
         }
         Ok(())
     }
@@ -476,8 +473,8 @@ impl SpTweaksTable {
             }
             expect = Height(expect.0.saturating_add(1));
         }
-        self.refuse_after_failed_put()?;
         let mut inner = self.lock();
+        Self::refuse_after_failed_put(&inner)?;
         let mut i = 0usize;
         struct Plan {
             si: usize,
@@ -584,8 +581,6 @@ impl SpTweaksTable {
         let committed = page_guard::commit_appends(&writes);
         drop(writes);
         if let Err(e) = committed {
-            self.blocked
-                .store(true, std::sync::atomic::Ordering::Release);
             // A length may be durable already, including a rolled pair's, so
             // the files stay as the commit left them for reopen and its
             // last-record fit. Readers keep the old prefix: take the planned
@@ -667,7 +662,7 @@ impl SpTweaksTable {
     /// then checks the new last record.
     pub fn trim_last_record(&self, n_tx: u32) -> Result<TrimLast, StoreError> {
         let mut inner = self.lock();
-        self.refuse_after_failed_put()?;
+        Self::refuse_after_failed_put(&inner)?;
         let Some(seg) = inner.segs.iter_mut().rev().find(|s| s.n_slots > 0) else {
             return Ok(TrimLast::Clean);
         };
@@ -716,7 +711,7 @@ impl SpTweaksTable {
         let mut inner = self.lock();
         // A failed put may have made one length durable and not the other.
         // Reopen and the last-record fit settle the pair before a cut.
-        self.refuse_after_failed_put()?;
+        Self::refuse_after_failed_put(&inner)?;
         let total: u64 = inner.segs.iter().map(|s| s.n_slots).sum();
         if keep >= total {
             return Ok(());

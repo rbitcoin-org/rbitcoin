@@ -300,10 +300,6 @@ pub struct HeaderTable {
     /// Serializes check-then-put so two threads cannot both miss and both append
     /// the same full hash (I1 + I4).
     pub put_lock: Mutex<()>,
-    /// A failed append may have made its length durable, and a failed head
-    /// insert leaves rows a retry would append again. Puts are refused until
-    /// reopen, which indexes what the durable length names.
-    blocked: std::sync::atomic::AtomicBool,
 }
 
 impl HeaderTable {
@@ -323,7 +319,6 @@ impl HeaderTable {
             head,
             count: std::sync::atomic::AtomicU64::new(0),
             put_lock: Mutex::new(()),
-            blocked: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -356,7 +351,6 @@ impl HeaderTable {
             head,
             count: std::sync::atomic::AtomicU64::new(count),
             put_lock: Mutex::new(()),
-            blocked: std::sync::atomic::AtomicBool::new(false),
         };
         table.index_unindexed_tail()?;
         if body_marked {
@@ -484,11 +478,10 @@ impl HeaderTable {
             return Ok(Vec::new());
         }
         let _g = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if self.blocked.load(Ordering::Acquire) {
-            return Err(StoreError::Rejected(
-                "an earlier header append failed; reopen the store",
-            ));
-        }
+        // A failed append or head insert poisoned the body: a retry would
+        // rewrite rows below a durable length or append a second row for
+        // one hash. Reopen indexes what the durable length names.
+        self.body.refuse_if_poisoned()?;
         let mut out = Vec::with_capacity(recs.len());
         let mut fresh: Vec<(Fk, HeaderRecord)> = Vec::new();
         let mut seen: Vec<([u8; 32], Fk)> = Vec::new();
@@ -552,14 +545,11 @@ impl HeaderTable {
             bytes: &blob,
             new_logical: new_len,
         }]);
-        if let Err(e) = appended {
-            self.blocked.store(true, Ordering::Release);
-            return Err(e);
-        }
+        appended?;
         self.count
             .store(base.saturating_add(fresh.len() as u64), Ordering::Release);
         if let Err(e) = self.head.insert_many(&head_entries) {
-            self.blocked.store(true, Ordering::Release);
+            self.body.poison();
             return Err(e);
         }
         if first {

@@ -298,34 +298,24 @@ impl MultiList {
     ///
     /// Rows take consecutive ids, so they are one run. `commit_appends` makes
     /// them durable before the length that names them, with no mark, so the
-    /// head mark armed after this never images `.mlt`. A commit that failed
-    /// after its sync left its rows synced and its length in RAM: those rows
-    /// are skipped and the flush below finishes that length.
+    /// head mark armed after this never images `.mlt`. A failed commit
+    /// poisons `.mlt`: later inserts are refused until reopen.
     fn commit_pending(&self) -> Result<(), StoreError> {
         let mut pending = self.pending.lock().unwrap();
-        if pending.is_empty() {
+        let Some((first, _)) = pending.first() else {
             return Ok(());
-        }
-        let done = self.file.logical_len();
-        let mut at = None;
-        let mut bytes = Vec::with_capacity(pending.len() * MULTI_REC_LEN);
-        for (id, buf) in pending.iter() {
-            let off = Self::offset(*id);
-            if off < done {
-                continue;
-            }
-            at.get_or_insert(off);
-            bytes.extend_from_slice(buf);
-        }
-        match at {
-            Some(at) => page_guard::commit_appends(&[page_guard::Append {
-                file: &self.file,
-                at,
-                bytes: &bytes,
-                new_logical: at + bytes.len() as u64,
-            }])?,
-            None => self.file.flush()?,
-        }
+        };
+        let at = Self::offset(*first);
+        let bytes: Vec<u8> = pending
+            .iter()
+            .flat_map(|(_, buf)| buf.iter().copied())
+            .collect();
+        page_guard::commit_appends(&[page_guard::Append {
+            file: &self.file,
+            at,
+            bytes: &bytes,
+            new_logical: at + bytes.len() as u64,
+        }])?;
         pending.clear();
         Ok(())
     }
