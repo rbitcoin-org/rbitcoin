@@ -229,7 +229,7 @@ pub fn restore_page_guard(mark: &Path, data: &File, data_path: &Path) -> Result<
     }
     data.durable_sync_data()
         .map_err(|e| StoreError::io(data_path, e))?;
-    remove_mark(mark)?;
+    remove_mark(mark, || {})?;
     Ok(true)
 }
 
@@ -242,7 +242,7 @@ pub fn restore_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreEr
     if !replay_page_guard_group(mark, dir)? {
         return Ok(false);
     }
-    remove_mark(mark)?;
+    remove_mark(mark, || {})?;
     Ok(true)
 }
 
@@ -344,12 +344,11 @@ pub fn restore_page_guard_group_fit(mark: &Path, dir: &Path) -> Result<bool, Sto
         data.durable_sync_data()
             .map_err(|e| StoreError::io(data_path, e))?;
     }
-    remove_mark(mark)?;
     let mut names = HashSet::new();
     for (name, _, _) in &pages {
         names.insert(name.clone());
     }
-    forget_armed_names(mark, &names);
+    remove_mark(mark, || forget_armed_names(mark, &names))?;
     Ok(true)
 }
 
@@ -401,7 +400,7 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
             // Only a single-file mark that parses is removed. A kind this
             // binary does not know stays for the restore to refuse.
             mark_pages(&raw)?;
-            return remove_mark(path);
+            return remove_mark(path, || {});
         }
         Err(e) => return Err(e),
     };
@@ -415,9 +414,7 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
         keep.push((name, offset, raw[at..at + PAGE as usize].to_vec()));
     }
     if keep.is_empty() {
-        remove_mark(path)?;
-        forget_armed_names(path, &dropped);
-        return Ok(());
+        return remove_mark(path, || forget_armed_names(path, &dropped));
     }
     let count = u32::try_from(keep.len())
         .map_err(|_| StoreError::Corrupt("page guard arm is too large"))?;
@@ -874,15 +871,50 @@ fn ensure_mark_parent(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn remove_mark(path: &Path) -> Result<(), StoreError> {
+/// Unlink `path`, run `forget` once the mark is gone, then sync its
+/// directory. A failed directory sync must not leave the release check
+/// holding pages of a mark that no longer exists.
+fn remove_mark(path: &Path, forget: impl FnOnce()) -> Result<(), StoreError> {
     let parent = mark_parent(path)?;
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(StoreError::io(path, e)),
     }
+    forget();
+    #[cfg(debug_assertions)]
+    if take_fail_mark_dir_sync(parent) {
+        return Err(StoreError::io(
+            parent,
+            std::io::Error::other("injected guard directory sync failure"),
+        ));
+    }
     fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
     Ok(())
+}
+
+#[cfg(debug_assertions)]
+static FAIL_MARK_DIR_SYNC: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// The next mark removal in guard directory `dir` unlinks the mark and then
+/// fails its directory sync.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_mark_dir_sync(dir: &Path) {
+    FAIL_MARK_DIR_SYNC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(dir.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_mark_dir_sync(dir: &Path) -> bool {
+    let mut armed = FAIL_MARK_DIR_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = armed.iter().position(|p| p == dir) else {
+        return false;
+    };
+    armed.remove(i);
+    true
 }
 
 /// Writes `bytes` at `offset` when no byte of the write shares a 4 KiB block
