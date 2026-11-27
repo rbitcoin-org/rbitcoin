@@ -297,6 +297,50 @@ fn a_failed_put_stays_out_of_the_read_watermark() {
     assert_eq!(t.slot(Height(0)).unwrap(), Some(slot(0)));
 }
 
+/// A crash can leave the body length durable and the idx length old. Open
+/// cuts the body back to the idx, and the next put lands at the cut.
+#[test]
+fn open_cuts_a_body_length_published_before_its_idx() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    let idx_path = {
+        let inner = t.inner.read().unwrap();
+        let idx = &inner.segs.last().unwrap().idx;
+        rbitcoin_store::io_handle::arm_fail_flush(idx.io_handle(), 1);
+        idx.path().to_path_buf()
+    };
+    let mut old_header = [0u8; FILE_HEADER_LEN];
+    fs::File::open(&idx_path)
+        .unwrap()
+        .read_exact(&mut old_header)
+        .unwrap();
+    assert!(t
+        .put(&[BlockFilterRecord {
+            height: Height(1),
+            slot: slot(1),
+            filter: &[1, 1, 1, 1],
+        }])
+        .is_err());
+    drop(t);
+    // The idx length pwrite never reached the disk.
+    let mut idx = fs::OpenOptions::new().write(true).open(&idx_path).unwrap();
+    idx.write_all(&old_header).unwrap();
+    drop(idx);
+    let t = BlockFilterTable::open(&dir).unwrap();
+    assert_eq!(t.next_height(), Height(1));
+    t.put(&[BlockFilterRecord {
+        height: Height(1),
+        slot: slot(1),
+        filter: &[7, 7],
+    }])
+    .unwrap();
+    drop(t);
+    let t = BlockFilterTable::open(&dir).unwrap();
+    assert_eq!(t.filter(Height(1)).unwrap().unwrap().0, vec![7, 7]);
+    assert_eq!(t.filter(Height(0)).unwrap().unwrap().0, vec![0u8; 3]);
+}
+
 /// A reader of a committed height does not wait for a put's syncs and mark.
 #[test]
 fn a_committed_filter_reads_during_a_put() {
@@ -353,8 +397,8 @@ fn repair_refuses_after_a_failed_put() {
 }
 
 /// A new table's `meta` and its two directories are durable before the
-/// first put can return. The first forward commit syncs only the segment
-/// files and their own directories.
+/// first put can return. A put syncs only the segment files and their own
+/// directories.
 #[cfg(all(unix, debug_assertions))]
 #[test]
 fn create_syncs_the_new_table_directories() {

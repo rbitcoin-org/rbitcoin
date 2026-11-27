@@ -445,8 +445,8 @@ impl BlockFilterTable {
         filter: &[u8],
     ) -> Result<bool, StoreError> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        // A failed put's mark can name this body page. Open would copy the
-        // old bytes back over the repair.
+        // A failed put may have made one length durable and not the other.
+        // Reopen fits the pair before a repair writes into it.
         self.refuse_after_failed_put()?;
         let inner = self.read();
         let Some((si, local)) = inner.locate(height) else {

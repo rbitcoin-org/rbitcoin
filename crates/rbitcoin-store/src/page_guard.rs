@@ -938,7 +938,8 @@ pub struct Append<'a> {
 /// files first appear. A body listed before its index is therefore durable,
 /// bytes and length, before the index length that names it. A crash leaves
 /// each file at its old length or its new one, and bytes past a length are
-/// not read. On an error the caller must not write these files again until
+/// not read. A format whose last record ends at the body length must fit
+/// that record on open, as `sp_tweaks` does. On an error the caller must not write these files again until
 /// reopen: a length may already be durable.
 #[doc(hidden)]
 pub fn commit_appends(writes: &[Append<'_>]) -> Result<(), StoreError> {
