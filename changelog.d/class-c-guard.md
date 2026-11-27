@@ -13,4 +13,5 @@ Changed
   rewritten to 88-byte records. Open refuses a leftover
   `confirmed.body.ahead`, `header_txs_first.body.ahead`,
   `header_txs_count.body.ahead`, or `header.head.ahead`.
-  `txstat.body.ahead` and scripthash `ingest.ahead` still replay.
+  Scripthash `ingest.ahead` still replays. `txstat.body.ahead` is refused
+  once the txstat guard is the recovery path.
