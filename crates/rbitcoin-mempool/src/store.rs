@@ -281,7 +281,7 @@ impl Mempool {
         let old_persisted = self.body_persisted_len;
         let mut ranges = self.slot_ranges_since(old_persisted);
         ranges.extend(self.death_ranges());
-        self.commit_guarded(true, &ranges, None, true)?;
+        self.commit_guarded(true, &ranges, None, true, &[])?;
         self.deaths_unsynced = false;
         self.death_slots.clear();
         self.clear_dirty();
@@ -329,7 +329,7 @@ impl Mempool {
             Some(bytes) => bytes,
             None => stashed.as_deref().unwrap_or(&[]),
         };
-        let committed = self.commit_guarded(true, &[], Some(ram), true);
+        let committed = self.commit_guarded(true, &[], Some(ram), true, &[]);
         if let Some(slots) = stashed {
             self.slots = slots;
         }
@@ -914,7 +914,7 @@ impl Mempool {
             Some(bytes) => bytes,
             None => stashed.as_deref().unwrap_or(&[]),
         };
-        let committed = self.commit_guarded(false, &[], Some(ram), true);
+        let committed = self.commit_guarded(false, &[], Some(ram), true, &[]);
         if let Some(slots) = stashed {
             self.slots = slots;
         }
@@ -966,21 +966,24 @@ impl Mempool {
 
     #[doc(hidden)]
     pub fn persist_meta(&mut self) -> Result<(), MempoolError> {
-        self.commit_guarded(false, &[], None, true)
+        self.commit_guarded(false, &[], None, true, &[])
     }
 
     /// Publish durable DEAD bytes and `live_count` in one mark.
     ///
-    /// Slot status is what open reloads. The mark carries the slot pages and
-    /// meta together. `deaths_unsynced` stays set until that mark is cleared,
-    /// so a failed call retries. Does not rewrite the slot table (unpersisted
-    /// LIVE rows stay off disk) and does not rename `tx.body`.
+    /// The status byte written is [`SLOT_DEAD`], not whatever RAM holds now.
+    /// An admit can reuse the slot before this flush; copying RAM would mark
+    /// the old on-disk record LIVE again. The replacement waits for the body
+    /// persist. `deaths_unsynced` stays set until the mark is cleared, so a
+    /// failed call retries. Does not rewrite the slot table and does not
+    /// rename `tx.body`.
     pub fn sync_deaths(&mut self) -> Result<(), MempoolError> {
         if !self.deaths_unsynced {
             return Ok(());
         }
         let ranges = self.death_ranges();
-        self.commit_guarded(false, &ranges, None, true)?;
+        let dead_at: Vec<usize> = ranges.iter().map(|(off, _)| *off).collect();
+        self.commit_guarded(false, &ranges, None, true, &dead_at)?;
         self.deaths_unsynced = false;
         self.death_slots.clear();
         Ok(())
@@ -999,6 +1002,7 @@ impl Mempool {
         slot_ranges: &[(usize, usize)],
         full_slots: Option<&[u8]>,
         meta: bool,
+        stamp_dead: &[usize],
     ) -> Result<(), MempoolError> {
         let body_path = self.dir.join("tx.body");
         let slots_path = self.slots_path();
@@ -1017,6 +1021,7 @@ impl Mempool {
             &slots_name,
             &mut images,
         )?;
+        stamp_slot_dead(&slots_name, stamp_dead, &mut images);
         if meta {
             self.collect_meta_image(&meta_path, &mut images)?;
         }
@@ -1281,21 +1286,52 @@ impl Mempool {
         self.last_persist_ms = self.now_ms();
         self.body_dirty = false;
         if let Err(e) = fs::rename(&slots_tmp, &slots_path) {
-            self.slots = slots;
-            self.slots_file = slots_file;
-            self.live_count = live_count;
-            self.live_body_bytes = live_body_bytes;
+            self.adopt_slot_table(slots, slots_file, live_count, live_body_bytes);
             self.slots_pending = true;
             // The body is committed. A failed meta leaves a stale live_count,
             // which open reconciles from the slot table.
             let _ = self.persist_meta();
             return Err(MempoolError::io(&slots_path, e));
         }
+        self.adopt_slot_table(slots, slots_file, live_count, live_body_bytes);
+        self.persist_meta()
+    }
+
+    /// The packed table is the table. Dead rows are gone and the rest moved,
+    /// so indexes recorded against the previous table name different records.
+    fn adopt_slot_table(
+        &mut self,
+        slots: Vec<u8>,
+        slots_file: File,
+        live_count: u32,
+        live_body_bytes: u64,
+    ) {
         self.slots = slots;
         self.slots_file = slots_file;
         self.live_count = live_count;
         self.live_body_bytes = live_body_bytes;
-        self.persist_meta()
+        self.death_slots.clear();
+        self.deaths_unsynced = false;
+    }
+}
+
+/// Force status bytes to [`SLOT_DEAD`] on slot images this flush already built.
+///
+/// A one-byte death flush must not copy RAM: the slot may have been reused.
+fn stamp_slot_dead(slots_name: &str, offsets: &[usize], images: &mut [(String, u64, [u8; 4096])]) {
+    if offsets.is_empty() {
+        return;
+    }
+    let page = rbitcoin_store::page_guard::PAGE;
+    for &off in offsets {
+        let page_off = (off as u64) & !(page - 1);
+        let dst = (off as u64 - page_off) as usize;
+        for (name, at, image) in images.iter_mut() {
+            if name == slots_name && *at == page_off && dst < image.len() {
+                image[dst] = SLOT_DEAD;
+                break;
+            }
+        }
     }
 }
 
