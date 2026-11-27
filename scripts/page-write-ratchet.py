@@ -17,7 +17,8 @@ write. `handle_pwrite_all(` does not match inside `pwrite_all`.
 `write_at`, `write_at_pwrite`, `write_uncommitted`, `pwrite_all`,
 `persist_hwm`, `persist_logical_len`, `write_trailer`, and `zero_range`
 go through `TableFile::pwrite_all` or the same armed-page check. They
-are the door, not a raw site.
+are the door, not a raw site. A path-qualified `FileExt::write_at(` is
+the raw positional write and is counted.
 """
 
 import argparse
@@ -30,6 +31,7 @@ CRATES = ("rbitcoin-mempool", "rbitcoin-store")
 
 # (token, pattern, crates that count it). None counts both crates.
 TOKENS = (
+    ("FileExt_write_at", r"FileExt::write_at\s*\(", None),
     ("WriteOp", r"(?<![A-Za-z0-9_])WriteOp\s*\{", None),
     ("fs_write", r"(?<![A-Za-z0-9_])fs::write\s*\(", None),
     ("handle_pwrite_all", r"(?<![A-Za-z0-9_])handle_pwrite_all\s*\(", None),
