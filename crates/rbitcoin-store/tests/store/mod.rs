@@ -950,6 +950,27 @@ fn assert_first_header_row_indexed(s: &Store, first: &HeaderRecord) {
     assert_eq!(s.header_count(), 1);
 }
 
+/// A `guard/sh-*` mark that does not parse is scripthash damage, not
+/// Class A damage. Open requests a scripthash rebuild, drops the scripthash
+/// marks, and opens.
+#[test]
+fn open_rebuilds_scripthash_on_a_corrupt_sh_mark() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::create_dir_all(dir.join("guard")).unwrap();
+    std::fs::write(dir.join("guard/sh-ovf"), b"not a guard file").unwrap();
+    let s = Store::open_tiny(&dir).expect("a corrupt sh mark stopped open");
+    drop(s);
+    assert!(dir
+        .join(rbitcoin_store::scripthash::SH_REBUILD_NAME)
+        .is_file());
+    assert!(!dir.join("guard/sh-ovf").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Meta 31 beside a 96-byte `header.body` is not a schema-24 store. Only
 /// meta 24/25 names the old width, so open refuses the length and does not
 /// rewrite the body.
