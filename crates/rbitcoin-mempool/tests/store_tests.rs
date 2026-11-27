@@ -413,6 +413,107 @@ fn dead_pwrite_of_flushed_slot_is_immediate() {
 }
 
 #[test]
+fn reused_dead_slot_sync_does_not_resurrect_the_old_tx() {
+    let dir = tmp_dir();
+    let old = Txid::from_byte_array([0xA1; 32]);
+    let new = Txid::from_byte_array([0xA2; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        let slot = put_live(&mut mp, &old, 1, 400);
+        mp.flush().unwrap();
+        mp.mark_slot_dead(slot).unwrap();
+        let reused = put_live(&mut mp, &new, 2, 400);
+        assert_eq!(reused, slot, "a dead slot is reused");
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    assert!(
+        live.iter().all(|tx| tx.packed.txid != old),
+        "the evicted tx must not reload"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reused_dead_slot_persist_due_publishes_the_new_tx() {
+    let dir = tmp_dir();
+    let old = Txid::from_byte_array([0xB1; 32]);
+    let new = Txid::from_byte_array([0xB2; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let slot = put_live(&mut mp, &old, 1, 400);
+        mp.flush().unwrap();
+        mp.set_now_ms(0);
+        mp.mark_slot_dead(slot).unwrap();
+        let reused = put_live(&mut mp, &new, 2, 400);
+        assert_eq!(reused, slot);
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        mp.persist_due().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    let ids: Vec<_> = live.iter().map(|tx| tx.packed.txid).collect();
+    assert!(ids.contains(&new), "the replacement must be durable");
+    assert!(!ids.contains(&old), "the evicted tx must stay gone");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_then_admit_does_not_publish_a_stale_death() {
+    let dir = tmp_dir();
+    let keep = Txid::from_byte_array([0xC1; 32]);
+    let gone = Txid::from_byte_array([0xC2; 32]);
+    let later = Txid::from_byte_array([0xC3; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        put_live(&mut mp, &keep, 1, 400);
+        let dead = put_live(&mut mp, &gone, 1, 400);
+        mp.flush().unwrap();
+        mp.mark_slot_dead(dead).unwrap();
+        mp.compact().unwrap();
+        let admitted = put_live(&mut mp, &later, 3, 400);
+        assert_eq!(admitted, dead, "the freed index is reused");
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp
+        .load_live_txs()
+        .expect("a stale death must not publish a zero-length live row");
+    let ids: Vec<_> = live.iter().map(|tx| tx.packed.txid).collect();
+    assert!(ids.contains(&keep), "the packed survivor stays live");
+    assert!(!ids.contains(&gone));
+    assert!(
+        !ids.contains(&later),
+        "the new admit waits for a body persist"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_clears_a_death_index_that_now_names_the_survivor() {
+    let dir = tmp_dir();
+    let keep = Txid::from_byte_array([0xD1; 32]);
+    let gone = Txid::from_byte_array([0xD2; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        let dead = put_live(&mut mp, &gone, 1, 400);
+        put_live(&mut mp, &keep, 1, 400);
+        mp.flush().unwrap();
+        mp.mark_slot_dead(dead).unwrap();
+        mp.compact().unwrap();
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    let ids: Vec<_> = live.iter().map(|tx| tx.packed.txid).collect();
+    assert!(ids.contains(&keep), "the packed survivor stays live");
+    assert!(!ids.contains(&gone));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn dead_of_unpersisted_admit_does_not_resurrect() {
     let dir = tmp_dir();
     {
