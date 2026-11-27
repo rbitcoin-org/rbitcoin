@@ -361,3 +361,27 @@ fn a_committed_filter_reads_during_a_put() {
     });
     assert_eq!(t.next_height(), Height(2));
 }
+
+/// A repair of a committed filter waits for reopen while a failed put's
+/// mark is armed. That mark can name the same body page, and open would put
+/// the old bytes back over the repair.
+#[cfg(debug_assertions)]
+#[test]
+fn repair_refuses_while_a_forward_mark_is_armed() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    let (bytes, got) = t.filter(Height(0)).unwrap().unwrap();
+    rbitcoin_store::page_guard::fail_next_forward_after_arm(&dir);
+    assert!(t
+        .put(&[BlockFilterRecord {
+            height: Height(1),
+            slot: slot(1),
+            filter: &[1, 1, 1, 1],
+        }])
+        .is_err());
+    assert!(matches!(
+        t.repair_body(Height(0), &got, &bytes),
+        Err(StoreError::Rejected(_))
+    ));
+}
