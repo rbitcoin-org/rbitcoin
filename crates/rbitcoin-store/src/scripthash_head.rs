@@ -452,23 +452,6 @@ impl ScriptHashHead {
         FILE_HEADER_LEN as u64 + slot * SH_HEAD_SLOT_SIZE as u64
     }
 
-    /// File offset of the slot this key occupies, or the empty slot it will take.
-    #[doc(hidden)]
-    pub fn probe_slot_off(&self, full: &[u8; 32]) -> Result<u64, StoreError> {
-        let key = Self::to_key(full);
-        let slots = self.state.lock().unwrap().slots;
-        let mut cache = SlotPageCache::new(self, slots).preview();
-        let mut slot = Self::hash_slot(&key, slots);
-        for _ in 0..slots {
-            let (k, v) = cache.read_slot(slot)?;
-            if is_empty_slot(&k, &v) || k == key {
-                return Ok(Self::slot_file_off(slot));
-            }
-            slot = (slot + 1) & (slots - 1);
-        }
-        Err(StoreError::Corrupt(SH_HEAD_FULL))
-    }
-
     #[doc(hidden)]
     pub fn to_key(full: &[u8; 32]) -> ShHeadKey {
         head_key_from_full(full)

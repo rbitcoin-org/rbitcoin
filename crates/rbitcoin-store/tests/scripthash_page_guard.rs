@@ -723,3 +723,61 @@ fn deferred_empty_commit_restores_the_head_and_chain() {
         "open did not restore the head and chain the empty commit wrote"
     );
 }
+
+/// Two keys in one ingest chunk, on either side of a 4 KiB boundary.
+fn chunk_straddling_scripts() -> ([u8; 32], [u8; 32]) {
+    let slots = 256u64;
+    let (mut low, mut high) = (None, None);
+    for i in 0u16..8192 {
+        let sh = script_hash(&i.to_le_bytes());
+        let slot = ScriptHashHead::hash_slot(&ScriptHashHead::to_key(&sh), slots);
+        if slot / SLOTS_PER_CHUNK != 1 {
+            continue;
+        }
+        let first = ScriptHashHead::slot_file_off(slot) / 4096;
+        let last = (ScriptHashHead::slot_file_off(slot) + SH_HEAD_SLOT_SIZE as u64 - 1) / 4096;
+        match (first, last) {
+            (0, 0) if low.is_none() => low = Some(sh),
+            (1, 1) if high.is_none() => high = Some(sh),
+            _ => {}
+        }
+        if let (Some(a), Some(b)) = (low, high) {
+            return (a, b);
+        }
+    }
+    panic!("no ingest chunk held keys on both of its pages");
+}
+
+/// An ingest unlink rewrites the whole chunk that holds its key. A torn
+/// write to that chunk's other page restores from the mark.
+#[test]
+fn ingest_unlink_restores_the_other_page_of_its_chunk() {
+    let dir = tmp();
+    let (a, b) = chunk_straddling_scripts();
+    {
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        put_create_batch(&t, (1..=3u64).map(|i| rec(a, i)).collect::<Vec<_>>());
+        put_create_batch(&t, [rec(b, 9)]);
+        t.flush().unwrap();
+        let ingest = ingest_path(&dir);
+        let (off_a, off_b) = {
+            let g = t.ingest.lock().unwrap();
+            let h = g.as_ref().unwrap();
+            (
+                h.value_word_offset(&a).unwrap().unwrap(),
+                h.value_word_offset(&b).unwrap().unwrap(),
+            )
+        };
+        assert_ne!(off_a / 4096, off_b / 4096, "the keys share a page");
+        t.fail_next_sh_guard_clear();
+        let err = t.unlink_creates_batch(&[(a, vec![Fk(1)])]).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err}");
+        assert!(!sh_marks(&dir).is_empty(), "the crash leaves the mark");
+        tear_bytes(&ingest, off_b, 8);
+        drop(t);
+    }
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert!(sh_marks(&dir).is_empty(), "open removes the mark");
+    assert_eq!(create_fks(&t, &b), vec![9]);
+    assert_eq!(create_fks(&t, &a), vec![1, 2, 3]);
+}
