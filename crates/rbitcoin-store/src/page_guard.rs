@@ -8,7 +8,7 @@
 //! [`append_past_end`] writes only when the range shares no 4 KiB block with a
 //! byte below `committed_end`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -43,6 +43,77 @@ pub const TXSTAT_MARK: &str = "guard/txstat";
 pub const BLOCKFILTER_MARK: &str = "guard/blockfilter";
 /// Forward images for one `sp_tweaks` put (body tail, idx tail, page 0).
 pub const SP_TWEAKS_MARK: &str = "guard/sp_tweaks";
+
+fn armed_map() -> &'static Mutex<HashMap<PathBuf, HashSet<u64>>> {
+    static ARMED: OnceLock<Mutex<HashMap<PathBuf, HashSet<u64>>>> = OnceLock::new();
+    ARMED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_group(mark: &Path, pages: &[(&str, u64, &[u8])], leftover: &[(String, u64, Vec<u8>)]) {
+    let Some(dir) = mark
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .and_then(|parent| parent.parent())
+        .filter(|dir| !dir.as_os_str().is_empty())
+    else {
+        return;
+    };
+    let mut by_file: HashMap<String, HashSet<u64>> = HashMap::new();
+    for (file, offset, _) in leftover {
+        by_file.entry(file.clone()).or_default().insert(*offset);
+    }
+    for &(file, offset, _) in pages {
+        by_file.entry(file.to_string()).or_default().insert(offset);
+    }
+    let mut map = armed_map().lock().unwrap_or_else(|e| e.into_inner());
+    for (file, offs) in by_file {
+        map.insert(dir.join(file), offs);
+    }
+}
+
+fn forget_armed(path: &Path) {
+    armed_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path);
+}
+
+/// Reject a range that shares a committed page when `path` has a live arm
+/// and the range is not inside the pages that arm names.
+///
+/// A range that shares no committed block is an append and is allowed. A
+/// path with no live arm is not checked. `committed_end` is the durable
+/// header length, not a RAM high-water.
+#[doc(hidden)]
+pub fn check_armed_write(
+    path: &Path,
+    committed_end: u64,
+    offset: u64,
+    len: u64,
+) -> Result<(), StoreError> {
+    if len == 0 || !shares_committed_page(committed_end, offset, len) {
+        return Ok(());
+    }
+    let map = armed_map().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pages) = map.get(path) else {
+        return Ok(());
+    };
+    let Some(end) = offset.checked_add(len) else {
+        return Err(StoreError::Rejected("write is outside the armed pages"));
+    };
+    let mut page = offset & !(PAGE - 1);
+    let last = end.saturating_sub(1) & !(PAGE - 1);
+    loop {
+        if !pages.contains(&page) {
+            return Err(StoreError::Rejected("write is outside the armed pages"));
+        }
+        if page >= last {
+            break;
+        }
+        page = page.saturating_add(PAGE);
+    }
+    Ok(())
+}
 
 #[doc(hidden)]
 pub fn arm_page_guard(path: &Path, pages: &[(u64, &[u8])]) -> Result<(), StoreError> {
@@ -123,7 +194,9 @@ pub fn arm_page_guard_group(path: &Path, pages: &[(&str, u64, &[u8])]) -> Result
     for &(file, offset, image) in pages {
         encode_group_record(&mut buf, file, offset, image)?;
     }
-    write_synced_tmp_rename(path, &buf)
+    write_synced_tmp_rename(path, &buf)?;
+    remember_group(path, pages, &leftover);
+    Ok(())
 }
 
 /// Copies every image onto `data` when `mark` exists.
@@ -186,6 +259,9 @@ pub fn restore_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreEr
     // The created directory entry has to be durable before the mark is gone.
     fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
     remove_mark(mark)?;
+    for (_, _, data_path) in &opened {
+        forget_armed(data_path);
+    }
     Ok(true)
 }
 
@@ -261,7 +337,11 @@ pub fn clear_page_guard_files(path: &Path, files: &[(&File, &Path)]) -> Result<(
     for (_, data_path) in files {
         synced.insert(guard_file_name(data_path)?.to_string());
     }
-    retain_unsynced(path, &synced)
+    retain_unsynced(path, &synced)?;
+    for (_, data_path) in files {
+        forget_armed(data_path);
+    }
+    Ok(())
 }
 
 /// Rewrite `path` without records for `synced`. Delete it when none remain.

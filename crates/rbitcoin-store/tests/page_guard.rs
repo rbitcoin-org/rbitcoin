@@ -650,3 +650,39 @@ fn fit_restore_syncs_the_sidecar_directory_when_it_is_gone() {
         );
     }
 }
+
+/// The release check uses the committed end, not the RAM high-water, and the
+/// pages this arm names. A later page inside that high-water is still an
+/// append when it shares no committed byte. A committed page the arm does
+/// not name is rejected.
+#[test]
+fn write_outside_the_armed_pages_is_rejected() {
+    let dir = TempDir::labeled("page-guard-range").unwrap();
+    let path = dir.path().join("body");
+    let file =
+        rbitcoin_store::file::TableFile::create(&path, rbitcoin_primitives::TableKind::ScriptHash)
+            .unwrap();
+    let payload = vec![0x11u8; PAGE * 2];
+    file.write_at(rbitcoin_store::file::FILE_HEADER_LEN as u64, &payload)
+        .unwrap();
+    let committed = file.logical_len();
+    assert!(committed > PAGE as u64);
+    assert!(!file.publish_end(committed + PAGE as u64 * 2, false));
+    let image = vec![0u8; PAGE];
+    arm_page_guard_group(
+        &dir.path().join("guard/mark"),
+        &[("body", 0, image.as_slice())],
+    )
+    .unwrap();
+    let tail = (committed - 1) & !(PAGE as u64 - 1);
+    let past = tail + PAGE as u64;
+    file.write_at(past, &[0x22; 16]).unwrap();
+    let err = file
+        .write_at(PAGE as u64, &[0x33; 16])
+        .expect_err("page 1 is committed and not armed");
+    match err {
+        StoreError::Rejected(msg) => assert_eq!(msg, "write is outside the armed pages"),
+        other => panic!("expected reject, got {other:?}"),
+    }
+    file.write_at(64, &[0x44; 8]).unwrap();
+}

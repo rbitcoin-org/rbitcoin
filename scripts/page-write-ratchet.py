@@ -12,9 +12,12 @@ line, or a line that is now lower (or whose file is gone) fails.
 
 `write_all(` is counted only in rbitcoin-mempool. The store uses it to
 fill a temp file inside the rename helper, which is not a live page
-write. `write_at(` does not match `write_at_pwrite(`. `pwrite_all(`
-does not match `handle_pwrite_all(`. `pwrite_all`, `write_uncommitted`,
-`write_trailer`, and `persist_logical_len` are tokens.
+write. `handle_pwrite_all(` does not match inside `pwrite_all`.
+
+`write_at`, `write_at_pwrite`, `write_uncommitted`, `pwrite_all`,
+`persist_hwm`, `persist_logical_len`, `write_trailer`, and `zero_range`
+go through `TableFile::pwrite_all` or the same armed-page check. They
+are the door, not a raw site.
 """
 
 import argparse
@@ -30,21 +33,13 @@ TOKENS = (
     ("WriteOp", r"(?<![A-Za-z0-9_])WriteOp\s*\{", None),
     ("fs_write", r"(?<![A-Za-z0-9_])fs::write\s*\(", None),
     ("handle_pwrite_all", r"(?<![A-Za-z0-9_])handle_pwrite_all\s*\(", None),
-    ("persist_hwm", r"(?<![A-Za-z0-9_])persist_hwm\s*\(", None),
-    ("persist_logical_len", r"(?<![A-Za-z0-9_])persist_logical_len\s*\(", None),
     ("pwrite", r"(?<![A-Za-z0-9_])pwrite\s*\(", None),
-    ("pwrite_all", r"(?<![A-Za-z0-9_])pwrite_all\s*\(", None),
     ("pwrite_batch", r"(?<![A-Za-z0-9_])pwrite_batch\s*\(", None),
     ("pwrite_exact", r"(?<![A-Za-z0-9_])pwrite_exact\s*\(", None),
     ("set_file_len", r"(?<![A-Za-z0-9_])set_file_len\s*\(", None),
     ("set_len", r"(?<![A-Za-z0-9_])set_len\s*\(", None),
     ("truncate", r"(?<![A-Za-z0-9_])truncate\s*\(", None),
     ("write_all", r"(?<![A-Za-z0-9_])write_all\s*\(", ("rbitcoin-mempool",)),
-    ("write_at", r"(?<![A-Za-z0-9_])write_at\s*\(", None),
-    ("write_at_pwrite", r"(?<![A-Za-z0-9_])write_at_pwrite\s*\(", None),
-    ("write_trailer", r"(?<![A-Za-z0-9_])write_trailer\s*\(", None),
-    ("write_uncommitted", r"(?<![A-Za-z0-9_])write_uncommitted\s*\(", None),
-    ("zero_range", r"(?<![A-Za-z0-9_])zero_range\s*\(", None),
 )
 
 

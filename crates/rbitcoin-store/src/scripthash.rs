@@ -2389,24 +2389,8 @@ impl ScriptHashTable {
         key: &[u8; 32],
     ) -> Result<(), StoreError> {
         self.ensure_ingest()?;
-        let g = self.ingest.lock().unwrap();
-        let Some(h) = g.as_ref() else {
-            return Ok(());
-        };
-        let off = h.probe_slot_off(key)?;
-        let path = h.file.path().to_path_buf();
-        let rel = page_guard::guard_rel_name(&self.store_dir, &path)?;
-        let mark = page_guard::sh_mark("ovf");
-        image_range(
-            pages,
-            &mark,
-            &rel,
-            &path,
-            &h.file.read_file,
-            off,
-            crate::scripthash_layout::SH_HEAD_SLOT_SIZE as u64,
-        )?;
-        self.image_occ_sidecar(pages, &mark, &path)
+        // Flush writes the whole dirty chunk, not the one slot the key occupies.
+        self.image_live_ingest(pages, std::slice::from_ref(key))
     }
 
     /// Page 0 of `{head}.occ`. Restore writes only the bytes the sidecar has.
