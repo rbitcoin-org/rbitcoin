@@ -385,3 +385,26 @@ fn repair_refuses_while_a_forward_mark_is_armed() {
         Err(StoreError::Rejected(_))
     ));
 }
+
+/// A new table's `meta` and its two directories are durable before the
+/// first put can return. The first forward commit syncs only the segment
+/// files and their own directories.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn create_syncs_the_new_table_directories() {
+    let dir = tmp_dir();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let _t = BlockFilterTable::create(&dir).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    for want in [
+        dir.to_path_buf(),
+        BlockFilterTable::idx_dir(&dir),
+        BlockFilterTable::body_dir(&dir),
+    ] {
+        assert!(
+            synced.contains(&want),
+            "{} was not synced, got {synced:?}",
+            want.display()
+        );
+    }
+}
