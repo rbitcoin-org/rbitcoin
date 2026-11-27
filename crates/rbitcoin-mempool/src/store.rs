@@ -1091,9 +1091,13 @@ impl Mempool {
             };
             let fresh_from = fresh_from.max(old);
             if fresh_from < logical {
-                pwrite_at(
+                // A failed earlier attempt may have written this range and
+                // left an arm on `tx.body`. The durable end is `old`, and the
+                // range shares no block with it, so the retry is an append.
+                pwrite_from(
                     &mut self.body_file,
                     body_path,
+                    old,
                     fresh_from,
                     &self.body[fresh_from as usize..logical as usize],
                 )?;
@@ -1575,13 +1579,25 @@ fn read_page(file: &mut File, path: &Path, off: u64) -> Result<[u8; 4096], Mempo
     Ok(image)
 }
 
+/// Write a page the current mark names. The whole file length counts as
+/// committed.
 fn pwrite_at(file: &mut File, path: &Path, off: u64, bytes: &[u8]) -> Result<(), MempoolError> {
     let committed = file
         .metadata()
         .map_err(|e| MempoolError::io(path, e))?
         .len();
-    // Fresh bytes land before the mark, so this file has no arm yet and the
-    // append is allowed. A page the current mark names is the only in-place write.
+    pwrite_from(file, path, committed, off, bytes)
+}
+
+/// Write `bytes` at `off`. A range that shares a block below `committed`
+/// has to be a page the current mark names.
+fn pwrite_from(
+    file: &mut File,
+    path: &Path,
+    committed: u64,
+    off: u64,
+    bytes: &[u8],
+) -> Result<(), MempoolError> {
     rbitcoin_store::page_guard::check_armed_write(path, committed, off, bytes.len() as u64)
         .map_err(map_store)?;
     file.seek(SeekFrom::Start(off))
