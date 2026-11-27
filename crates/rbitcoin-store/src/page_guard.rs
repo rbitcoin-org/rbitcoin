@@ -927,6 +927,12 @@ fn collect_forward_spans(
             let end = i.saturating_add(page_hi).min(w.bytes.len());
             if shared_page(page, old) {
                 pages.insert(page);
+            } else if let Some(last) = fresh
+                .last_mut()
+                .filter(|last| last.0 == fi && last.1 == wi && last.3.end == i)
+            {
+                // Fresh pages of one write are its suffix: one pwrite.
+                last.3.end = end;
             } else {
                 fresh.push((fi, wi, off, i..end));
             }
