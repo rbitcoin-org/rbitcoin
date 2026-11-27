@@ -861,6 +861,25 @@ fn v24_header_conversion_publishes_no_mark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A store with no chain yet but with a guard mark is not an incomplete
+/// first creation. An unreadable mark is refused, not wiped with the store.
+#[test]
+fn an_unreadable_mark_is_not_an_incomplete_creation() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::create_dir_all(dir.join("guard")).unwrap();
+    std::fs::write(dir.join("guard/class_c"), b"not a guard file").unwrap();
+    assert!(
+        Store::open_or_create_tiny(&dir).is_err(),
+        "an unreadable mark was replaced as an incomplete creation"
+    );
+    assert!(dir.join("guard/class_c").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Meta 31 beside a still-96-byte `header.body` is the crash between the old
 /// promote and the rename. Open must convert the body without a schema-24 gate.
 #[test]
