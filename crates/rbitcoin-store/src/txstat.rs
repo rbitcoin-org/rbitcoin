@@ -18,7 +18,6 @@
 
 use crate::error::StoreError;
 use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
-use crate::page_guard::{self, PAGE};
 use rbitcoin_primitives::{
     le_u32, le_u64, read_uleb128, uleb128_len, write_uleb128, Fk, TableKind,
 };
@@ -36,30 +35,6 @@ pub const BLK_SLOT: u64 = 16;
 /// Overflow blob ceiling. A longer on-disk length is corrupt, not an allocation.
 #[doc(hidden)]
 pub const TXSTAT_BLOB_CEILING: usize = 16 * 1024 * 1024;
-
-#[cfg(debug_assertions)]
-static FAIL_BEFORE_CLEAR: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-
-/// The next interior txstat stamp writes the live page, then returns before
-/// the mark is cleared.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn fail_next_txstat_guard_before_clear(path: &Path) {
-    FAIL_BEFORE_CLEAR
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(path.to_path_buf());
-}
-
-#[cfg(debug_assertions)]
-fn take_fail_before_clear(path: &Path) -> bool {
-    let mut armed = FAIL_BEFORE_CLEAR.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(i) = armed.iter().position(|p| p == path) else {
-        return false;
-    };
-    armed.remove(i);
-    true
-}
 
 #[doc(hidden)]
 pub fn checked_blob_len(len: usize, remain: u64) -> Result<usize, StoreError> {
@@ -254,82 +229,23 @@ pub struct TxStat {
     /// Serialises [`Self::put_header_blob`]'s read of the `ovf` end and its
     /// append. Readers stamp blocks too, so appends run on several threads.
     ovf_append: Mutex<()>,
-    /// One stamp at a time. The IBD append and a read-side stamp share the
-    /// body, and the page mark is one file for body and blk.
+    /// One body writer at a time. The IBD append checks the count it extends,
+    /// and a read-side stamp must not race it.
     journal: Mutex<()>,
 }
 
-/// Pages Class A `first` and the partial tail do not image.
+/// Write stamp bytes in place, then sync them.
 ///
-/// Page 0 belongs to `tear_guard/first`. The partial last block belongs to
-/// the tail slot. A page-aligned length has no partial tail, so its last
-/// full page is armed. Pages past the published length are not.
-fn interior_page(page: u64, logical: u64) -> bool {
-    if page == 0 || page >= logical {
-        return false;
-    }
-    if logical.is_multiple_of(PAGE) {
-        return true;
-    }
-    page != (logical - 1) & !(PAGE - 1)
-}
-
-/// Backward-arm interior pages, then pwrite `bytes`.
-///
-/// A page-0 write and a write that only touches the Class A tail publish
-/// with the same pwrite as before. Open copies `guard/txstat` before Class A
-/// restore, so a page-0 image here would put a stamp back onto a page
-/// `first` is about to zero.
-fn stamp_guarded(file: &TableFile, start: u64, bytes: &[u8]) -> Result<(), StoreError> {
+/// Cells are 8 bytes at 8-aligned offsets and block slots 16 bytes at
+/// 16-aligned offsets, so each sits inside one 512-byte sector. A tear
+/// leaves every cell or slot old or new, and an unstamped cell reads as the
+/// fallback (crash-recovery.md, the sector rule). No mark.
+fn stamp(file: &TableFile, start: u64, bytes: &[u8]) -> Result<(), StoreError> {
     if bytes.is_empty() {
         return Ok(());
     }
-    let Some(dir) = file.path().parent().filter(|p| !p.as_os_str().is_empty()) else {
-        return Err(StoreError::Rejected("page guard mark has no directory"));
-    };
-    // Hold the mark before the read. A second stamp must not publish a page
-    // it sampled before the first stamp cleared, and a mark still armed from
-    // a failed stamp is the before-image of that torn page.
-    let _hold = page_guard::hold_marks();
-    page_guard::restore_store_group(dir, page_guard::TXSTAT_MARK)?;
-    let logical = file.logical_len();
-    let first = start & !(PAGE - 1);
-    let last = (start + bytes.len() as u64 - 1) & !(PAGE - 1);
-    let mut images = Vec::new();
-    let mut page = first;
-    while page <= last {
-        if interior_page(page, logical) {
-            let image = page_guard::read_live_page(file.path(), &file.read_file, page)?;
-            images.push((page, image));
-        }
-        page += PAGE;
-    }
-    if images.is_empty() {
-        file.write_at_pwrite(start, bytes)?;
-        file.sync_data_only()?;
-        return Ok(());
-    }
-    let name = page_guard::guard_file_name(file.path())?;
-    let refs: Vec<(&str, u64, &[u8])> = images
-        .iter()
-        .map(|(off, image)| (name, *off, image.as_slice()))
-        .collect();
-    page_guard::arm_store_group(dir, page_guard::TXSTAT_MARK, &refs)?;
     file.write_at_pwrite(start, bytes)?;
-    file.sync_data_only()?;
-    #[cfg(debug_assertions)]
-    if take_fail_before_clear(file.path()) {
-        return Err(StoreError::io(
-            file.path(),
-            std::io::Error::other("injected txstat guard failure"),
-        ));
-    }
-    page_guard::clear_page_guard(
-        &dir.join(page_guard::TXSTAT_MARK),
-        &file.read_file,
-        file.path(),
-    )?;
-    Ok(())
+    file.sync_data_only()
 }
 
 impl TxStat {
@@ -606,7 +522,7 @@ impl TxStat {
             return Err(StoreError::Corrupt("txstat overflow needs header blob"));
         }
         let off = Self::entry_offset(id)?;
-        stamp_guarded(&self.body, off, &cell)?;
+        stamp(&self.body, off, &cell)?;
         Ok(())
     }
 
@@ -638,7 +554,7 @@ impl TxStat {
                 tails.push((idx, t));
             }
         }
-        stamp_guarded(&self.body, start, &blob)?;
+        stamp(&self.body, start, &blob)?;
         let raw = encode_ovf_blob(&tails)?;
         self.put_header_blob(header_fk, &raw)
     }
@@ -703,7 +619,7 @@ impl TxStat {
         slot[0..8].copy_from_slice(&off.to_le_bytes());
         slot[8..12].copy_from_slice(&len.to_le_bytes());
         slot[12..16].copy_from_slice(&n.to_le_bytes());
-        stamp_guarded(&self.blk, slot_off, &slot)?;
+        stamp(&self.blk, slot_off, &slot)?;
         Ok(())
     }
 

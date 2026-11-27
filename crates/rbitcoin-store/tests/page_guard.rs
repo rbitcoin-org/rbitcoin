@@ -813,7 +813,8 @@ fn a_removed_mark_forgets_its_pages_when_the_dir_sync_fails() {
     arm_page_guard_group(&mark, &[("live", 0, fill(0x11).as_slice())]).unwrap();
     let committed = 2 * PAGE as u64;
     assert!(
-        rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64 + 256, 512).is_err(),
+        rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64 + 256, 512)
+            .is_err(),
         "page 1 is committed and not armed"
     );
     rbitcoin_store::page_guard::fail_next_mark_dir_sync(&dir.path().join("guard"));

@@ -2777,10 +2777,9 @@ pub fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
 
 /// Copy armed page images back before trim or the tip walk.
 ///
-/// Filter, tweak, and txstat marks live next to those files. A split store
-/// keeps txstat (and, once enabled, the filter and tweak dirs) on the cold
-/// directory, so both directories are restored here. The header marks are
-/// replayed by the header table open.
+/// Filter and tweak marks live next to those files. A split store keeps
+/// those dirs, once enabled, on the cold directory, so both directories are
+/// restored here. The header marks are replayed by the header table open.
 #[doc(hidden)]
 pub fn restore_open_marks(layout: &StoreLayout) -> Result<(), StoreError> {
     restore_hot_marks(&layout.dir)?;
@@ -2804,7 +2803,6 @@ fn restore_hot_marks(path: &Path) -> Result<(), StoreError> {
 }
 
 fn restore_side_marks(path: &Path) -> Result<(), StoreError> {
-    crate::page_guard::restore_store_group(path, crate::page_guard::TXSTAT_MARK)?;
     crate::page_guard::restore_store_group(path, crate::page_guard::BLOCKFILTER_MARK)?;
     crate::page_guard::restore_store_group(path, crate::page_guard::SP_TWEAKS_MARK)?;
     Ok(())
