@@ -730,59 +730,10 @@ fn open_refuses_a_legacy_generation_ahead_sidecar() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A torn `header.body` page 0 whose bytes 8..16 read as a 96-byte body is
-/// read from the restored mark, not refused as a bad length or converted.
-#[test]
-fn open_restores_a_torn_header_body_page_zero_from_its_mark() {
-    use rbitcoin_store::file::FILE_HEADER_LEN;
-    use rbitcoin_store::header_table::HEADER_RECORD_LEN_V24;
-    let dir = tmp();
-    let hash = [0x62u8; 32];
-    {
-        let s = Store::create_tiny(&dir).unwrap();
-        let hdr = HeaderRecord {
-            prev_fk: Fk::NULL,
-            version: 1,
-            timestamp: 1,
-            bits: 0x1d00ffff,
-            nonce: 1,
-            merkle_root: [1u8; 32],
-            hash,
-            size: 0,
-            weight: 0,
-        };
-        s.put_header(&hdr).unwrap();
-        s.flush().unwrap();
-    }
-    let body = dir.join("header.body");
-    let live = std::fs::read(&body).unwrap();
-    let mut image = vec![0u8; 4096];
-    let keep = live.len().min(4096);
-    image[..keep].copy_from_slice(&live[..keep]);
-    rbitcoin_store::page_guard::arm_page_guard_group(
-        &dir.join(rbitcoin_store::page_guard::HEADER_BODY_MARK),
-        &[("header.body", 0, image.as_slice())],
-    )
-    .unwrap();
-    let mut torn = live.clone();
-    torn[..4].copy_from_slice(b"TORN");
-    let v24_len = FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN_V24 as u64;
-    torn[8..16].copy_from_slice(&v24_len.to_le_bytes());
-    std::fs::write(&body, &torn).unwrap();
-    let s = Store::open_tiny(&dir).unwrap();
-    assert_eq!(s.get_header(Fk(1)).unwrap().hash, hash);
-    assert_eq!(s.header_count(), 1);
-    drop(s);
-    assert!(!dir
-        .join(rbitcoin_store::page_guard::HEADER_BODY_MARK)
-        .exists());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// A header row on disk that `header.head` does not name is the crash after
-/// the body write and before the head insert, or a forward body mark open
-/// replays. Open indexes that tail, so the next put finds the row instead
-/// of appending a second one.
+/// the body length is durable and before the head insert. Open indexes that
+/// tail with no mark, so the next put finds the row instead of appending a
+/// second one.
 #[test]
 fn open_indexes_header_rows_the_head_does_not_name() {
     use rbitcoin_store::file::FILE_HEADER_LEN;
@@ -805,23 +756,12 @@ fn open_indexes_header_rows_the_head_does_not_name() {
         s.flush().unwrap();
     }
     let late = header([0x64u8; 32]);
-    let body = dir.join("header.body");
-    let mut image = std::fs::read(&body).unwrap();
-    let row_end = FILE_HEADER_LEN + HEADER_RECORD_LEN;
-    image.truncate(row_end);
-    image.extend_from_slice(&late.encode());
-    let len = (row_end + HEADER_RECORD_LEN) as u64;
-    image[8..16].copy_from_slice(&len.to_le_bytes());
-    image.resize(4096, 0);
-    rbitcoin_store::page_guard::arm_page_guard_group(
-        &dir.join(rbitcoin_store::page_guard::HEADER_BODY_MARK),
-        &[("header.body", 0, image.as_slice())],
-    )
-    .unwrap();
+    append_header_row(&dir, FILE_HEADER_LEN + HEADER_RECORD_LEN, &late);
+    assert!(!dir.join("guard").join("header.body").exists());
     let s = Store::open_tiny(&dir).unwrap();
     assert_eq!(s.header_count(), 2);
     let found = s.get_header_by_hash(&late.hash).unwrap().map(|(fk, _)| fk);
-    assert_eq!(found, Some(Fk(2)), "the replayed row is not in header.head");
+    assert_eq!(found, Some(Fk(2)), "the unnamed row is not in header.head");
     assert_eq!(s.put_header(&late).unwrap(), Fk(2));
     assert_eq!(s.header_count(), 2, "a second row for one hash");
     drop(s);
@@ -880,8 +820,8 @@ fn an_unreadable_mark_is_not_an_incomplete_creation() {
 }
 
 /// A crash during the very first header append can leave that row on disk
-/// with an empty `header.head`. Open must index it from the replayed body
-/// mark, not refuse the store as one whose head was lost.
+/// with an empty `header.head`. The `guard/header.body` flag tells open to
+/// index it, not refuse the store as one whose head was lost.
 #[test]
 fn open_indexes_a_first_header_row_the_head_does_not_name() {
     let dir = tmp();
@@ -892,9 +832,9 @@ fn open_indexes_a_first_header_row_the_head_does_not_name() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An open that stops after the body mark replayed and before the head names
-/// the row must leave the mark. The next open then still indexes the row
-/// instead of refusing an empty head with no mark.
+/// An open that stops after it reads the flag and before the head names the
+/// row must leave the flag. The next open then still indexes the row instead
+/// of refusing an empty head with no flag.
 #[test]
 fn open_keeps_the_header_body_mark_until_the_head_names_the_row() {
     let dir = tmp();
@@ -918,29 +858,33 @@ fn open_keeps_the_header_body_mark_until_the_head_names_the_row() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An empty store whose `guard/header.body` mark holds one first row, as a
-/// crash during that append leaves it.
+/// An empty store with one first header row durable in `header.body`, its
+/// length published, and the `guard/header.body` flag, as a crash before
+/// the head insert leaves it.
 fn arm_first_header_row_mark(dir: &Path) -> HeaderRecord {
     use rbitcoin_store::file::FILE_HEADER_LEN;
-    use rbitcoin_store::header_table::HEADER_RECORD_LEN;
     let first = loose_header(0x66);
     {
         let s = Store::create_tiny(dir).unwrap();
         s.flush().unwrap();
     }
-    let body = dir.join("header.body");
-    let mut image = std::fs::read(&body).unwrap();
-    image.truncate(FILE_HEADER_LEN);
-    image.extend_from_slice(&first.encode());
-    let len = (FILE_HEADER_LEN + HEADER_RECORD_LEN) as u64;
-    image[8..16].copy_from_slice(&len.to_le_bytes());
-    image.resize(4096, 0);
-    rbitcoin_store::page_guard::arm_page_guard_group(
-        &dir.join(rbitcoin_store::page_guard::HEADER_BODY_MARK),
-        &[("header.body", 0, image.as_slice())],
-    )
-    .unwrap();
+    let flag = dir.join(rbitcoin_store::page_guard::HEADER_BODY_MARK);
+    std::fs::create_dir_all(flag.parent().unwrap()).unwrap();
+    std::fs::write(&flag, b"").unwrap();
+    append_header_row(dir, FILE_HEADER_LEN, &first);
     first
+}
+
+/// Write `row` at `at` in `header.body` and publish the length past it.
+fn append_header_row(dir: &Path, at: usize, row: &HeaderRecord) {
+    use rbitcoin_store::header_table::HEADER_RECORD_LEN;
+    let body = dir.join("header.body");
+    let mut bytes = std::fs::read(&body).unwrap();
+    bytes.truncate(at);
+    bytes.extend_from_slice(&row.encode());
+    let len = (at + HEADER_RECORD_LEN) as u64;
+    bytes[8..16].copy_from_slice(&len.to_le_bytes());
+    std::fs::write(&body, &bytes).unwrap();
 }
 
 fn assert_first_header_row_indexed(s: &Store, first: &HeaderRecord) {

@@ -1,10 +1,9 @@
 use crate::error::StoreError;
 use crate::file::{self, TableFile, FILE_HEADER_LEN};
 use crate::hashhead::{initial_slots_for, HashHead, HeadScale};
-use crate::page_guard::{self, PAGE};
+use crate::page_guard;
 use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rbitcoin_primitives::{bytes, le_i32, le_u32, le_u64, Fk, TableKind};
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
@@ -297,6 +296,9 @@ pub struct HeaderTable {
     /// Serializes check-then-put so two threads cannot both miss and both append
     /// the same full hash (I1 + I4).
     pub put_lock: Mutex<()>,
+    /// A failed append may have made its length durable. Puts are refused
+    /// until reopen, so no retry rewrites rows below that length.
+    blocked: std::sync::atomic::AtomicBool,
 }
 
 impl HeaderTable {
@@ -316,6 +318,7 @@ impl HeaderTable {
             head,
             count: std::sync::atomic::AtomicU64::new(0),
             put_lock: Mutex::new(()),
+            blocked: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -327,13 +330,13 @@ impl HeaderTable {
         Self::open_with_scale(dir, HeadScale::Tiny)
     }
 
-    /// A `guard/header.body` mark is an append that may not have reached the
-    /// head, so an empty head beside those rows is that append, not a lost
-    /// index. Open replays the mark, indexes the rows the head does not name,
-    /// and removes the mark only once the head insert is durable. An open that
-    /// stops in between leaves the mark for the next one.
+    /// A `guard/header.body` flag is a first append that may not have reached
+    /// the head, so an empty head beside those rows is that append, not a
+    /// lost index. Open indexes the rows the head does not name, and removes
+    /// the flag only once the head insert is durable. An open that stops in
+    /// between leaves the flag for the next one.
     pub fn open_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
-        let body_marked = page_guard::replay_store_group(dir, page_guard::HEADER_BODY_MARK)?;
+        let body_marked = page_guard::store_flag_armed(dir, page_guard::HEADER_BODY_MARK)?;
         page_guard::restore_store_group(dir, page_guard::HEADER_HEAD_MARK)?;
         let body = TableFile::open(dir.join("header.body"), TableKind::Header)?;
         let body_len = body.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
@@ -348,24 +351,19 @@ impl HeaderTable {
             head,
             count: std::sync::atomic::AtomicU64::new(count),
             put_lock: Mutex::new(()),
+            blocked: std::sync::atomic::AtomicBool::new(false),
         };
         table.index_unindexed_tail()?;
         if body_marked {
-            let _hold = page_guard::hold_marks();
-            page_guard::clear_page_guard(
-                &dir.join(page_guard::HEADER_BODY_MARK),
-                &table.body.read_file,
-                table.body.path(),
-            )?;
+            page_guard::clear_store_flag(dir, page_guard::HEADER_BODY_MARK)?;
         }
         Ok(table)
     }
 
     /// Insert the tail rows `header.head` does not name.
     ///
-    /// `ensure_batch` syncs the body before the head insert, so a crash in
-    /// between, or a forward body mark open just replayed, leaves rows the
-    /// head does not name. They are a suffix: the walk stops at the first row
+    /// `ensure_batch` makes the body rows and their length durable before the
+    /// head insert, so a crash in between leaves rows the head does not name. They are a suffix: the walk stops at the first row
     /// a lookup finds. A clean open does one lookup.
     fn index_unindexed_tail(&self) -> Result<(), StoreError> {
         let mut missing: Vec<([u8; 32], Fk)> = Vec::new();
@@ -481,6 +479,11 @@ impl HeaderTable {
             return Ok(Vec::new());
         }
         let _g = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.blocked.load(Ordering::Acquire) {
+            return Err(StoreError::Rejected(
+                "an earlier header append failed; reopen the store",
+            ));
+        }
         let mut out = Vec::with_capacity(recs.len());
         let mut fresh: Vec<(Fk, HeaderRecord)> = Vec::new();
         let mut seen: Vec<([u8; 32], Fk)> = Vec::new();
@@ -519,35 +522,35 @@ impl HeaderTable {
             head_entries.push((rec.hash, *fk));
         }
         let new_len = offset.saturating_add(blob.len() as u64);
-        let pages = compose_body_pages(&self.body, offset, &blob, new_len)?;
         let Some(dir) = self.body.path().parent() else {
-            return Err(StoreError::Rejected("page guard mark has no directory"));
+            return Err(StoreError::Rejected("header body has no directory"));
         };
-        {
-            // Drop before `insert_many`. That flush takes the same hold.
-            let _hold = page_guard::hold_marks();
-            let name = page_guard::guard_file_name(self.body.path())?;
-            let refs: Vec<(&str, u64, &[u8])> = pages
-                .iter()
-                .map(|(off, image)| (name, *off, image.as_slice()))
-                .collect();
-            page_guard::arm_store_group(dir, page_guard::HEADER_BODY_MARK, &refs)?;
-            self.body.write_at(offset, &blob)?;
-            // Head insert fdatasyncs. The body must be durable first so a crash
-            // cannot leave header.head naming an fk above the durable row count.
-            self.body.sync_data_only()?;
+        // Before the first row the head is empty, and open refuses an empty
+        // head beside body rows as a lost index. The flag says those rows are
+        // this append. Later appends need none: open indexes the tail the
+        // head does not name.
+        let first = base == 0;
+        if first {
+            page_guard::arm_store_flag(dir, page_guard::HEADER_BODY_MARK)?;
+        }
+        // Rows, sync, then length, sync: the head insert below never names
+        // a row whose bytes and length are not durable.
+        let appended = page_guard::commit_appends(&[page_guard::Append {
+            file: &self.body,
+            at: offset,
+            bytes: &blob,
+            new_logical: new_len,
+        }]);
+        if let Err(e) = appended {
+            self.blocked.store(true, Ordering::Release);
+            return Err(e);
         }
         self.count
             .store(base.saturating_add(fresh.len() as u64), Ordering::Release);
         self.head.insert_many(&head_entries)?;
-        // The body mark stays until the head names these rows, so a crash in
-        // between always leaves a mark that open replays and then indexes.
-        let _hold = page_guard::hold_marks();
-        page_guard::clear_page_guard(
-            &dir.join(page_guard::HEADER_BODY_MARK),
-            &self.body.read_file,
-            self.body.path(),
-        )?;
+        if first {
+            page_guard::clear_store_flag(dir, page_guard::HEADER_BODY_MARK)?;
+        }
         Ok(out)
     }
 
@@ -672,54 +675,4 @@ impl HeaderTable {
         self.head.flush_async()?;
         Ok(())
     }
-}
-
-fn compose_body_pages(
-    body: &TableFile,
-    offset: u64,
-    blob: &[u8],
-    new_logical: u64,
-) -> Result<Vec<(u64, [u8; PAGE as usize])>, StoreError> {
-    let old_logical = body.logical_len();
-    let mut pages = BTreeSet::new();
-    if new_logical != old_logical {
-        pages.insert(0u64);
-    }
-    if !blob.is_empty() {
-        let first = (offset / PAGE) * PAGE;
-        let last = ((offset + blob.len() as u64 - 1) / PAGE) * PAGE;
-        let mut page = first;
-        while page <= last {
-            pages.insert(page);
-            page += PAGE;
-        }
-    }
-    let mut images = Vec::with_capacity(pages.len());
-    for page in pages {
-        let mut image = [0u8; PAGE as usize];
-        if page < old_logical {
-            let n = ((old_logical - page) as usize).min(PAGE as usize);
-            body.pread_all(page, &mut image[..n])?;
-        }
-        if page == 0 {
-            image[..FILE_HEADER_LEN]
-                .copy_from_slice(&file::encode_leading_header(TableKind::Header, new_logical));
-        }
-        overlay_bytes(&mut image, page, offset, blob);
-        images.push((page, image));
-    }
-    Ok(images)
-}
-
-fn overlay_bytes(image: &mut [u8; PAGE as usize], page: u64, off: u64, bytes: &[u8]) {
-    let end = off.saturating_add(bytes.len() as u64);
-    let lo = off.max(page);
-    let hi = end.min(page + PAGE);
-    if lo >= hi {
-        return;
-    }
-    let src = (lo - off) as usize;
-    let dst = (lo - page) as usize;
-    let n = (hi - lo) as usize;
-    image[dst..dst + n].copy_from_slice(&bytes[src..src + n]);
 }
