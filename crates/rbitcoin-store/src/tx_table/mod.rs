@@ -1240,6 +1240,10 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    static WRITERS_AT_LATCH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// One-shot hook run inside the next Class A append on this thread, after
 /// its bodies and locators publish and before `txid.body`, `txstat`, and
 /// `input`. Tests run a spend commit or scripthash mark in that window.
@@ -4136,6 +4140,12 @@ impl TxTable {
         crate::class_a_pages::arm_named_generation(&self.hot_dir, generation)
     }
 
+    /// Writer count sampled when the failure hook last ran on this thread.
+    #[doc(hidden)]
+    pub fn class_a_writers_at_last_failure_for_test() -> usize {
+        WRITERS_AT_LATCH.with(|slot| slot.get())
+    }
+
     /// Run `sync` on Class A fds under the latch: refuse once one failed,
     /// one at a time, and latch a failure.
     fn class_a_latched(
@@ -4165,6 +4175,10 @@ impl TxTable {
     }
 
     fn latch_class_a_failure(&self) {
+        let writers = self
+            .class_a_writes
+            .load(std::sync::atomic::Ordering::Acquire);
+        WRITERS_AT_LATCH.with(|slot| slot.set(writers));
         let first = !self
             .class_a_failed
             .swap(true, std::sync::atomic::Ordering::AcqRel);
@@ -4185,12 +4199,15 @@ impl TxTable {
         self.enter_class_a_write()?;
         let depth = enter_class_a_writer_depth(self as *const Self as *const ());
         let written = write();
+        if written.is_err() {
+            // Latch while this append still counts as in flight. A sync that
+            // samples the writer count inside the failure hook must not see
+            // zero and clear the mark over a write that just failed.
+            self.latch_class_a_failure();
+        }
         self.class_a_writes
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         drop(depth);
-        if written.is_err() {
-            self.latch_class_a_failure();
-        }
         written
     }
 
