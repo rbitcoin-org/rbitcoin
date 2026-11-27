@@ -2247,10 +2247,55 @@ impl ScriptHashTable {
             return Ok(());
         }
         let mut pages: BTreeMap<(String, String, u64), [u8; PAGE as usize]> = BTreeMap::new();
-        for key in keys {
-            self.image_ingest_head(&mut pages, key)?;
+        let empty = self
+            .ingest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|h| h.is_known_empty());
+        if empty {
+            self.image_empty_ingest(&mut pages, keys)?;
+        } else {
+            for key in keys {
+                self.image_ingest_head(&mut pages, key)?;
+            }
         }
         self.publish_sh_pages(&pages).map(|_| ())
+    }
+
+    /// An empty ingest table places later keys past the first probe. Image
+    /// every slot this batch will write, not only each key's first empty slot.
+    fn image_empty_ingest(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        keys: &[[u8; 32]],
+    ) -> Result<(), StoreError> {
+        let g = self.ingest.lock().unwrap();
+        let Some(h) = g.as_ref() else {
+            return Ok(());
+        };
+        let slots = h.state.lock().unwrap().slots;
+        let rel = page_guard::guard_rel_name(&self.store_dir, h.file.path())?;
+        let path = h.file.path().to_path_buf();
+        let keyed: Vec<_> = keys.iter().map(ScriptHashHead::to_key).collect();
+        let assigned = ScriptHashHead::assign_empty_slots(slots, &keyed)?;
+        let mark = page_guard::sh_mark("ovf");
+        let mut seen = BTreeSet::new();
+        for slot in assigned {
+            if !seen.insert(slot) {
+                continue;
+            }
+            image_range(
+                pages,
+                &mark,
+                &rel,
+                &path,
+                &h.file.read_file,
+                ScriptHashHead::slot_file_off(slot),
+                crate::scripthash_layout::SH_HEAD_SLOT_SIZE as u64,
+            )?;
+        }
+        Ok(())
     }
 
     fn image_ingest_head(

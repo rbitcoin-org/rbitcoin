@@ -26,6 +26,19 @@ fn create_fks(t: &ScriptHashTable, sh: &[u8; 32]) -> Vec<u64> {
     t.entries(sh).unwrap().iter().map(|(fk, _)| fk.0).collect()
 }
 
+fn page_bytes(path: &Path, off: u64) -> Vec<u8> {
+    let mut file = std::fs::File::open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let mut buf = vec![0u8; SH_PAGE_SIZE];
+    if off >= len {
+        return buf;
+    }
+    let n = ((len - off) as usize).min(SH_PAGE_SIZE);
+    file.seek(SeekFrom::Start(off)).unwrap();
+    std::io::Read::read_exact(&mut file, &mut buf[..n]).unwrap();
+    buf
+}
+
 fn tear_bytes(path: &Path, off: u64, n: usize) {
     let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
     file.seek(SeekFrom::Start(off)).unwrap();
@@ -233,4 +246,61 @@ fn sealed_ovf_torn_page0_opens_after_restore() {
         "restore did not run before sealed magic"
     );
     assert_eq!(create_fks(&t, &sh), vec![1]);
+}
+
+/// Two new keys that share a hash slot: the displaced slot can sit on the
+/// next 4 KiB page. That page is armed before the empty-table write.
+#[test]
+fn empty_ingest_collision_restores_the_displaced_page() {
+    let slots = rbitcoin_store::scripthash::ingest_oa_slots(rbitcoin_store::HeadScale::Tiny);
+    let (a, b, page) = displaced_pair(slots);
+    let dir = tmp();
+    let ingest = ingest_path(&dir);
+    {
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        t.fail_next_sh_guard_clear();
+        let err = t
+            .put_create_batch_append(&[rec(a, 1), rec(b, 2)])
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err}");
+        assert!(ingest.is_file(), "the empty fill created ingest");
+        assert!(!sh_marks(&dir).is_empty(), "the crash leaves the mark");
+        tear_bytes(&ingest, page, SH_PAGE_SIZE);
+        drop(t);
+    }
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert!(sh_marks(&dir).is_empty(), "open removes the mark");
+    let got = page_bytes(&ingest, page);
+    assert_ne!(
+        got,
+        vec![0xffu8; SH_PAGE_SIZE],
+        "the displaced ingest page stayed torn"
+    );
+    assert!(
+        create_fks(&t, &a).is_empty() && create_fks(&t, &b).is_empty(),
+        "open kept keys from the failed commit"
+    );
+}
+
+fn displaced_pair(slots: u64) -> ([u8; 32], [u8; 32], u64) {
+    let mut by_slot: Vec<(u64, [u8; 32])> = Vec::new();
+    for i in 0u32..20_000 {
+        let sh = script_hash(&i.to_le_bytes());
+        let key = rbitcoin_store::scripthash_head::ScriptHashHead::to_key(&sh);
+        let slot = rbitcoin_store::scripthash_head::ScriptHashHead::hash_slot(&key, slots);
+        let off = rbitcoin_store::scripthash_head::ScriptHashHead::slot_file_off(slot);
+        let next = (slot + 1) & (slots - 1);
+        let next_off = rbitcoin_store::scripthash_head::ScriptHashHead::slot_file_off(next);
+        let page = SH_PAGE_SIZE as u64;
+        let covers_next =
+            (off / page) == (next_off / page) || ((off + 24 - 1) / page) == (next_off / page);
+        if covers_next {
+            continue;
+        }
+        if let Some((_, other)) = by_slot.iter().find(|(s, k)| *s == slot && *k != sh) {
+            return (*other, sh, (next_off / page) * page);
+        }
+        by_slot.push((slot, sh));
+    }
+    panic!("no two scripts collided onto a slot whose next page is unimaged");
 }
