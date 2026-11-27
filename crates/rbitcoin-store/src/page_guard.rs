@@ -93,8 +93,9 @@ fn forget_armed_names(mark: &Path, names: &HashSet<String>) {
 /// Reject a range that shares a committed page when `path` has a live arm
 /// and the range is not inside the pages that arm names.
 ///
-/// A range that shares no committed block is an append and is allowed. A
-/// path with no live arm is not checked. `committed_end` is the durable
+/// A range the sector rule already makes crash-safe is allowed: an append
+/// (every byte at or past the committed end) and a write inside one sector.
+/// A path with no live arm is not checked. `committed_end` is the durable
 /// header length, not a RAM high-water.
 #[doc(hidden)]
 pub fn check_armed_write(
@@ -103,7 +104,7 @@ pub fn check_armed_write(
     offset: u64,
     len: u64,
 ) -> Result<(), StoreError> {
-    if len == 0 || !shares_committed_page(committed_end, offset, len) {
+    if len == 0 || offset >= committed_end || within_one_sector(offset, len) {
         return Ok(());
     }
     let map = armed_map().lock().unwrap_or_else(|e| e.into_inner());
@@ -923,8 +924,10 @@ fn take_fail_mark_dir_sync(dir: &Path) -> bool {
     true
 }
 
-/// Writes `bytes` at `offset` when no byte of the write shares a 4 KiB block
-/// with a byte below `committed_end`. An empty write is `Ok`.
+/// Writes `bytes` at `offset` when every byte is at or past `committed_end`.
+/// The write may share the committed tail block: those committed sectors go
+/// back to the device unchanged, so a tear cannot reach them. An empty write
+/// is `Ok`.
 #[doc(hidden)]
 pub fn append_past_end(
     file: &File,
@@ -936,8 +939,8 @@ pub fn append_past_end(
     if bytes.is_empty() {
         return Ok(());
     }
-    if shares_committed_page(committed_end, offset, bytes.len() as u64) {
-        return Err(StoreError::Rejected("append shares a committed page"));
+    if offset < committed_end {
+        return Err(StoreError::Rejected("append overwrites committed bytes"));
     }
     handle_pwrite_all(file, path, offset, bytes)
 }
@@ -1210,15 +1213,16 @@ fn overlay_page(image: &mut [u8; PAGE as usize], page: u64, off: u64, bytes: &[u
     image[dst..dst + n].copy_from_slice(&bytes[src..src + n]);
 }
 
-fn shares_committed_page(committed_end: u64, offset: u64, len: u64) -> bool {
-    if len == 0 || committed_end == 0 {
-        return false;
-    }
-    if offset.checked_add(len - 1).is_none() || offset < committed_end {
-        return true;
-    }
-    let last_committed = (committed_end - 1) / PAGE;
-    offset / PAGE <= last_committed
+/// The device writes a 512-byte sector whole or not at all. A range inside
+/// one sector therefore lands as the old bytes or the new ones.
+pub const SECTOR: u64 = 512;
+
+/// `offset..offset + len` lies inside one 512-byte sector.
+pub fn within_one_sector(offset: u64, len: u64) -> bool {
+    len != 0
+        && offset
+            .checked_add(len - 1)
+            .is_some_and(|last| offset / SECTOR == last / SECTOR)
 }
 
 fn mark_pages(raw: &[u8]) -> Result<Vec<(u64, usize)>, StoreError> {
