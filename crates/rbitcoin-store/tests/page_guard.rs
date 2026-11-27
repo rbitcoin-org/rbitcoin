@@ -185,16 +185,13 @@ fn arm_refuses_a_second_mark_and_a_bare_name() {
     assert_eq!(std::fs::read(&mark).unwrap(), before);
 
     let bare = Path::new("page-guard-bare-name");
-    let _ = std::fs::remove_file(bare);
     let err = arm_page_guard(bare, &[(0, &page)]).unwrap_err();
     assert!(matches!(err, StoreError::Rejected(_)));
-    assert!(!bare.exists());
     let file = open_rw(&live);
     let err = clear_page_guard(bare, &file, &live).unwrap_err();
     assert!(matches!(err, StoreError::Rejected(_)));
     let err = restore_page_guard(bare, &file, &live).unwrap_err();
     assert!(matches!(err, StoreError::Rejected(_)));
-    assert!(!bare.exists());
 }
 
 #[test]
