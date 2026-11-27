@@ -355,6 +355,15 @@ fn staged_rows_publish_only_after_their_sync() {
         1,
         "nothing durable yet"
     );
+    // Every file syncs before any length moves: a failed locator sync, the
+    // last of the three, leaves every header where it was.
+    let staged_body = t.body.logical_len();
+    rbitcoin_store::io_handle::arm_fail_sync(t.loc.io_handle(), 1);
+    assert!(t.publish_staged().is_err());
+    let before = Input::open(dir.path()).unwrap();
+    assert_eq!(before.count(), 1, "a length moved before its sync");
+    assert_eq!(before.body.logical_len(), staged_body - 1100 * REC_LEN);
+    drop(before);
     t.publish_staged().unwrap();
     let reopened = Input::open(dir.path()).unwrap();
     assert_eq!(reopened.count(), 1101);

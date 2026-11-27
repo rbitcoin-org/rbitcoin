@@ -2598,6 +2598,8 @@ impl TxTable {
             self.input.append_staged(&edges)?;
             live.set_done(end);
             if backfill_progress_due(end, id) {
+                // A restart resumes from the last publish.
+                self.class_a_latched(|| self.input.publish_staged())?;
                 rbitcoin_log::info!("store: input backfill progress {end}/{n}");
             }
             let next_id = end + 1;
@@ -2612,7 +2614,8 @@ impl TxTable {
         // The witness stem can be cut after this open returns. The edges
         // have to be durable first, or the next open has no way to rebuild them.
         // These creates are already synced Class A, so no open cuts a torn
-        // row: the rows sync before any length that names them.
+        // row: the rows sync before any length that names them, here and at
+        // each progress publish.
         self.class_a_latched(|| self.input.publish_staged())
     }
 
