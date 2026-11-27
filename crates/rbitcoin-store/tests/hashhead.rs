@@ -547,3 +547,14 @@ fn hashhead_one_key_roundtrip() {
     assert_eq!(h.occupied(), 1);
     cleanup_hh(&path);
 }
+
+/// A bare file name has no directory for `guard/header.head`. Open refuses
+/// it, as the arm and the clear do, instead of skipping the restore.
+#[test]
+fn open_refuses_a_bare_file_name() {
+    match HashHead::open("hashhead-bare-name") {
+        Err(StoreError::Rejected(_)) => {}
+        Err(e) => panic!("bare name opened past the guard: {e:?}"),
+        Ok(_) => panic!("bare name opened"),
+    }
+}
