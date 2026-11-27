@@ -1,14 +1,14 @@
 {
   "new_base": "8e62e4ce4d60c30abc851cb0893e4b80149ac9e4",
   "new_skip": 5931,
-  "old_index": 17659,
-  "old_name": "crates/rbitcoin-store/src/bdz.rs:961:28: replace / with % in g_extract",
+  "old_index": 18532,
+  "old_name": "crates/rbitcoin-store/src/chain.rs:22:9: replace ConfirmedTable::create -> Result<Self, StoreError> with Ok(Default::default())",
   "new_cap_used": true,
   "run_id": "45971287718",
   "new_len": 14660,
   "new_remaining": 8729,
   "old_len": 26038,
-  "old_remaining": 25696,
-  "completed_new": 386,
-  "completed_old": 342
+  "old_remaining": 25165,
+  "completed_new": 0,
+  "completed_old": 873
 }
