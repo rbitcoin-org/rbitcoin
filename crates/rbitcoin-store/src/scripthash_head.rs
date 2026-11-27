@@ -707,31 +707,28 @@ impl ScriptHashHead {
         cap.saturating_sub(occupied)
     }
 
+    /// Slot each key takes on an empty table, including a later key displaced
+    /// by an earlier one in the same batch.
     #[doc(hidden)]
-    pub fn bulk_fill_empty(&self, entries: &[(ShHeadKey, ShHeadValue)]) -> Result<(), StoreError> {
-        debug_assert!(self.is_known_empty());
-        let slots = self.state.lock().unwrap().slots;
-        let nbytes = (slots as usize).saturating_mul(SH_HEAD_SLOT_SIZE);
-        let mut table = vec![0u8; nbytes];
-        let mut occupied = 0u64;
-        for (key, val) in entries {
-            let enc = pack8_bytes(val)?;
+    pub fn assign_empty_slots(slots: u64, keys: &[ShHeadKey]) -> Result<Vec<u64>, StoreError> {
+        if slots == 0 || !slots.is_power_of_two() {
+            return Err(StoreError::Corrupt("scripthash head bulk_fill full"));
+        }
+        let mut owner: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut out = Vec::with_capacity(keys.len());
+        for (i, key) in keys.iter().enumerate() {
             let mut slot = Self::hash_slot(key, slots);
             let mut placed = false;
             for _ in 0..slots {
-                let off = (slot as usize) * SH_HEAD_SLOT_SIZE;
-                let rec = sh_slot_at(&table, off);
-                let slot_key = bytes!(rec, 0, 16);
-                let slot_v = bytes!(rec, 16, 8);
-                if is_empty_slot(&slot_key, &slot_v) {
-                    table[off..off + SH_HEAD_KEY_LEN].copy_from_slice(key);
-                    table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE].copy_from_slice(&enc);
-                    occupied = occupied.saturating_add(1);
-                    placed = true;
-                    break;
-                }
-                if &slot_key == key {
-                    table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE].copy_from_slice(&enc);
+                if let Some(prev) = owner.get(&slot).copied() {
+                    if &keys[prev] == key {
+                        out.push(slot);
+                        placed = true;
+                        break;
+                    }
+                } else {
+                    owner.insert(slot, i);
+                    out.push(slot);
                     placed = true;
                     break;
                 }
@@ -741,8 +738,27 @@ impl ScriptHashHead {
                 return Err(StoreError::Corrupt("scripthash head bulk_fill full"));
             }
         }
-        self.file.write_at(FILE_HEADER_LEN as u64, &table)?;
-        self.set_occupied_known(occupied)?;
+        Ok(out)
+    }
+
+    #[doc(hidden)]
+    pub fn bulk_fill_empty(&self, entries: &[(ShHeadKey, ShHeadValue)]) -> Result<(), StoreError> {
+        debug_assert!(self.is_known_empty());
+        let slots = self.state.lock().unwrap().slots;
+        let keys: Vec<ShHeadKey> = entries.iter().map(|(key, _)| *key).collect();
+        let assigned = Self::assign_empty_slots(slots, &keys)?;
+        let mut final_slot: BTreeMap<u64, [u8; SH_HEAD_SLOT_SIZE]> = BTreeMap::new();
+        for (i, (key, val)) in entries.iter().enumerate() {
+            let enc = pack8_bytes(val)?;
+            let mut rec = [0u8; SH_HEAD_SLOT_SIZE];
+            rec[..SH_HEAD_KEY_LEN].copy_from_slice(key);
+            rec[SH_HEAD_KEY_LEN..].copy_from_slice(&enc);
+            final_slot.insert(assigned[i], rec);
+        }
+        for (slot, rec) in &final_slot {
+            self.file.write_at(Self::slot_file_off(*slot), rec)?;
+        }
+        self.set_occupied_known(final_slot.len() as u64)?;
         Ok(())
     }
 
