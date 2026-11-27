@@ -865,7 +865,7 @@ fn failed_header_write_stops_class_a(
     let counted = std::sync::Arc::clone(&writers_at_fail);
     s.txs.on_class_a_failure(move || {
         counted.store(
-            rbitcoin_store::tx_table::TxTable::class_a_writers_at_last_failure_for_test(),
+            rbitcoin_store::testutil::class_a_writers_at_last_failure(),
             std::sync::atomic::Ordering::SeqCst,
         );
         seen.store(true, std::sync::atomic::Ordering::SeqCst);
