@@ -307,6 +307,23 @@ impl ScriptHashTable {
     }
 
     fn land_unlink_rewrites(&self, batch: &UnlinkBatch) -> Result<(), StoreError> {
+        let groups = self.rewrite_body_groups(batch);
+        self.write_rewrite_groups(batch, &groups)?;
+        self.stage_unlink_heads(batch)?;
+        let ingest_synced = batch
+            .rewrites
+            .iter()
+            .any(|job| matches!(job.home, LocatedHome::Main | LocatedHome::Ingest));
+        self.sync_batch_homes(batch)?;
+        if ingest_synced {
+            if let Some(head) = self.ingest.lock().unwrap().as_ref() {
+                head.drop_ahead()?;
+            }
+        }
+        self.free_rewrite_groups(batch, &groups)
+    }
+
+    fn rewrite_body_groups(&self, batch: &UnlinkBatch) -> Vec<(usize, Vec<usize>)> {
         let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
         for (i, job) in batch.rewrites.iter().enumerate() {
             let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
@@ -317,7 +334,15 @@ impl ScriptHashTable {
                 groups.push((key, vec![i]));
             }
         }
-        for (_, jobs) in &groups {
+        groups
+    }
+
+    fn write_rewrite_groups(
+        &self,
+        batch: &UnlinkBatch,
+        groups: &[(usize, Vec<usize>)],
+    ) -> Result<(), StoreError> {
+        for (_, jobs) in groups {
             let first = &batch.rewrites[jobs[0]];
             let body = self.body_for(&first.scripthash, super::KeyHome::from(first.home));
             let popped = jobs.iter().any(|&i| batch.rewrites[i].popped);
@@ -343,6 +368,10 @@ impl ScriptHashTable {
                 body.sync_data_only()?;
             }
         }
+        Ok(())
+    }
+
+    fn stage_unlink_heads(&self, batch: &UnlinkBatch) -> Result<(), StoreError> {
         let mut ingest_rows = Vec::new();
         for job in &batch.rewrites {
             match job.home {
@@ -359,29 +388,27 @@ impl ScriptHashTable {
                 }
             }
         }
-        if !ingest_rows.is_empty() {
-            let g = self.ingest.lock().unwrap();
-            let Some(head) = g.as_ref() else {
-                return Err(StoreError::Corrupt("scripthash: ingest missing"));
-            };
-            head.stage_rewrites(&ingest_rows)?;
+        if ingest_rows.is_empty() {
+            return Ok(());
         }
-        let ingest_synced = batch
-            .rewrites
-            .iter()
-            .any(|job| matches!(job.home, LocatedHome::Main | LocatedHome::Ingest));
-        self.sync_batch_homes(batch)?;
-        if ingest_synced {
-            if let Some(head) = self.ingest.lock().unwrap().as_ref() {
-                head.drop_ahead()?;
-            }
-        }
+        let g = self.ingest.lock().unwrap();
+        let Some(head) = g.as_ref() else {
+            return Err(StoreError::Corrupt("scripthash: ingest missing"));
+        };
+        head.stage_rewrites(&ingest_rows)
+    }
+
+    fn free_rewrite_groups(
+        &self,
+        batch: &UnlinkBatch,
+        groups: &[(usize, Vec<usize>)],
+    ) -> Result<(), StoreError> {
         for (_, jobs) in groups {
             let first = &batch.rewrites[jobs[0]];
             let body = self.body_for(&first.scripthash, super::KeyHome::from(first.home));
             let alloc_mu = self.alloc_for(&first.scripthash, super::KeyHome::from(first.home));
             let mut alloc = alloc_mu.lock().unwrap();
-            for &i in &jobs {
+            for &i in jobs {
                 let job = &batch.rewrites[i];
                 alloc.live_count = alloc.live_count.saturating_sub(job.removed);
                 if let Err(e) = self.free_if_paged(body, &mut alloc, &job.old) {
