@@ -91,6 +91,27 @@ fn torn_interior_txstat_page_restores_the_pre_stamp_bytes() {
 }
 
 #[test]
+fn a_later_stamp_repairs_the_page_a_failed_stamp_tore() {
+    let dir = TempDir::labeled("txstat-second-stamp").unwrap();
+    let path = dir.join("txstat.body");
+    let rows: Vec<TxStatRow> = (1..=1200u64).map(|i| tiny(i, 100, 10)).collect();
+    let old = pack_cell(&rows[599]).unwrap().0;
+    let later = tiny(7, 7, 7);
+    {
+        let t = TxStat::create(&dir).unwrap();
+        t.append_batch(0, &rows).unwrap();
+        fail_next_txstat_guard_before_clear(&path);
+        assert!(t.write_row(Fk(600), &tiny(9, 9, 9)).is_err());
+        assert!(dir.join("guard/txstat").is_file());
+        t.write_row(Fk(1100), &later).unwrap();
+        assert_eq!(t.get_cell(Fk(600)).unwrap(), old);
+        assert_eq!(t.get_cell(Fk(1100)).unwrap(), pack_cell(&later).unwrap().0);
+    }
+    assert!(!dir.join("guard/txstat").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn create_empty_then_extend_zeros() {
     let dir = TempDir::labeled("txstat-extend").unwrap();
     let t = TxStat::create(&dir).unwrap();
@@ -226,6 +247,24 @@ fn concurrent_header_blobs_keep_their_own_bytes() {
         .filter(|&fk| t.header_blob(Fk(fk)).unwrap() != blob_for(fk))
         .collect();
     assert!(wrong.is_empty(), "headers read another blob: {wrong:?}");
+}
+
+#[test]
+fn open_refuses_a_legacy_txstat_ahead_journal() {
+    let dir = TempDir::labeled("txstat-legacy-ahead").unwrap();
+    let t = TxStat::create(&dir).unwrap();
+    t.append_batch(0, &[tiny(1, 2, 3)]).unwrap();
+    drop(t);
+    std::fs::write(dir.join("txstat.body.ahead"), b"TTA1").unwrap();
+    let err = match TxStat::open(&dir) {
+        Ok(_) => panic!("open accepted a legacy ahead journal"),
+        Err(err) => err,
+    };
+    match err {
+        StoreError::Corrupt(msg) => assert!(msg.contains("txstat.body.ahead"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(dir.path());
 }
 
 #[test]
