@@ -4154,7 +4154,10 @@ impl TxTable {
                 // have done both since the check at entry, so check again
                 // after the count, before the seal.
                 self.refuse_if_class_a_failed()?;
-                let named = named.unwrap_or_else(|| self.synced_named.load(Ordering::Acquire));
+                // Seal at least the synced value. A slot with a lower
+                // `settled` would lower the sidecar when open restores it.
+                let synced = self.synced_named.load(Ordering::Acquire);
+                let named = named.map_or(synced, |n| n.max(synced));
                 self.sync_class_a_stems(named)?;
                 sealed = true;
                 Ok(())

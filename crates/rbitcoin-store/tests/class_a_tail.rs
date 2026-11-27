@@ -1255,3 +1255,32 @@ fn a_panicking_append_releases_its_writer_count() {
     assert!(refused, "a sync sealed over an append that panicked");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A lower named sync after a higher one seals the higher value. A crash
+/// in the next armed append restores that slot and keeps creates 65–128.
+#[test]
+fn lower_named_sync_seals_the_higher_synced_value() {
+    let named = 128u64;
+    let dir = tmp();
+    let txid = [0x80u8; 32];
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let batch: Vec<_> = (1..=named)
+            .map(|i| coinbase(if i == named { txid } else { [i as u8; 32] }))
+            .collect();
+        s.put_tx_full_batch_indexed(&batch, false).unwrap();
+        s.txs.sync_class_a_named(named).unwrap();
+        s.txs.sync_class_a_named(64).unwrap();
+        s.put_tx_full_batch_indexed(&[coinbase([0x81u8; 32])], false)
+            .unwrap();
+        assert!(dir.join("tear_guard/armed").exists());
+    }
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(
+        rbitcoin_store::tx_table::read_class_a_synced(&dir).unwrap(),
+        named
+    );
+    assert_eq!(s.txs.txids.get(Fk(named)).unwrap(), txid);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
