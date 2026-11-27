@@ -5,7 +5,8 @@ Changed
   `store/guard/class_c`. `header.body` uses `store/guard/header.body`. One
   `header.head` generation and its `.mlt` share `store/guard/header.head`.
   Open copies every named 4 KiB image onto its page before any read of
-  those files, then removes the mark. A crash between the two `header_txs`
+  those files, then removes the mark. The `header.body` mark stays until
+  `header.head` durably names its rows. A crash between the two `header_txs`
   columns, or between `header.head` and `header.head.mlt`, cannot leave the
   pair split. Marks publish only after store `meta` is 31. A table fixture
   with no `meta` still arms. Creating `store/guard/` syncs the store

@@ -730,11 +730,10 @@ fn open_refuses_a_legacy_generation_ahead_sidecar() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A torn `header.body` page 0 whose bytes 8..16 read as a 96-byte body
-/// must not reach the schema-24 width probe. Open restores the mark first,
-/// then decides from the restored header.
+/// A torn `header.body` page 0 whose bytes 8..16 read as a 96-byte body is
+/// read from the restored mark, not refused as a bad length or converted.
 #[test]
-fn open_restores_the_header_body_mark_before_the_width_probe() {
+fn open_restores_a_torn_header_body_page_zero_from_its_mark() {
     use rbitcoin_store::file::FILE_HEADER_LEN;
     use rbitcoin_store::header_table::HEADER_RECORD_LEN_V24;
     let dir = tmp();
