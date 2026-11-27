@@ -1300,6 +1300,26 @@ fn class_a_writer_depth(table: *const ()) -> usize {
     })
 }
 
+/// One counted Class A append. Drop latches a failure unless the append
+/// finished, then releases the count, on `Ok`, `Err`, and unwind alike.
+/// The latch comes first: a sync that samples the count inside the failure
+/// hook must not see zero and clear the mark over a write that failed.
+struct ClassAInFlight<'a> {
+    table: &'a TxTable,
+    done: bool,
+}
+
+impl Drop for ClassAInFlight<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.table.latch_class_a_failure();
+        }
+        self.table
+            .class_a_writes
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 struct ClassAWriterDepth {
     prev: (*const (), usize),
 }
@@ -4197,15 +4217,13 @@ impl TxTable {
     ) -> Result<T, StoreError> {
         self.enter_class_a_write()?;
         let depth = enter_class_a_writer_depth(self as *const Self as *const ());
+        let mut in_flight = ClassAInFlight {
+            table: self,
+            done: false,
+        };
         let written = write();
-        if written.is_err() {
-            // Latch while this append still counts as in flight. A sync that
-            // samples the writer count inside the failure hook must not see
-            // zero and clear the mark over a write that just failed.
-            self.latch_class_a_failure();
-        }
-        self.class_a_writes
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        in_flight.done = written.is_ok();
+        drop(in_flight);
         drop(depth);
         written
     }
