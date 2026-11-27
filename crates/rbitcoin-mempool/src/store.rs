@@ -1363,6 +1363,12 @@ fn map_store(e: rbitcoin_store::StoreError) -> MempoolError {
     match e {
         rbitcoin_store::StoreError::Io { path, source } => MempoolError::Io { path, source },
         rbitcoin_store::StoreError::BadMagic => MempoolError::BadMagic,
+        other => map_store_status(other),
+    }
+}
+
+fn map_store_status(e: rbitcoin_store::StoreError) -> MempoolError {
+    match e {
         rbitcoin_store::StoreError::BadSchema(v) => MempoolError::BadSchema(v),
         rbitcoin_store::StoreError::Corrupt(s) => MempoolError::Corrupt(s),
         other => MempoolError::io(
