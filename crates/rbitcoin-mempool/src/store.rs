@@ -137,6 +137,10 @@ pub struct Mempool {
     pub body_dirty: bool,
     /// On-disk body length that slots may legally index (header + durable payloads).
     pub body_persisted_len: u64,
+    /// Durable body length, synced and published. It runs ahead of
+    /// `body_persisted_len` between a body append and the mark that
+    /// publishes the slots naming those records.
+    body_synced_len: u64,
     pub opened: Instant,
     pub mock_now_ms: Option<u64>,
     pub last_persist_ms: u64,
@@ -196,6 +200,7 @@ impl Mempool {
             live_body_bytes: 0,
             body_dirty: false,
             body_persisted_len,
+            body_synced_len: body_persisted_len,
             opened: Instant::now(),
             mock_now_ms: None,
             last_persist_ms: 0,
@@ -278,8 +283,8 @@ impl Mempool {
 
     /// Time-based body persist: dirty admits wait [`PERSIST_INTERVAL_MS`].
     ///
-    /// One mark covers the body tail, the new LIVE slot records, any durable
-    /// DEAD bytes, and meta. Deaths do not wait out the admit interval.
+    /// The body tail and its length are synced first. One mark then covers
+    /// the new LIVE slot records, any durable DEAD bytes, and meta. Deaths do not wait out the admit interval.
     /// Flush / grow / compact still rewrite the full slot table. The body
     /// file is not renamed.
     pub fn persist_due(&mut self) -> Result<(), MempoolError> {
@@ -1016,9 +1021,8 @@ impl Mempool {
 
     /// One forward mark for the pages this flush dirties.
     ///
-    /// Fresh body blocks are synced before the mark. Shared body blocks, slot
-    /// ranges, and meta are the image: a crash copies them onto the live
-    /// files. Slot images start from the disk page and overlay only `ranges`,
+    /// The body tail and its length are synced before the mark. Slot ranges
+    /// and meta are the image: a crash copies them onto the live files. Slot images start from the disk page and overlay only `ranges`,
     /// so a neighbor byte stays. `full_slots` is the demoted slot image and
     /// replaces whole pages that differ.
     ///
@@ -1045,8 +1049,8 @@ impl Mempool {
             .unwrap_or("slots")
             .to_string();
         self.settle_flush_mark(&body_path)?;
-        let appended = if body {
-            self.append_body(&body_path)?
+        let logical = if body {
+            Some(self.append_body(&body_path)?)
         } else {
             None
         };
@@ -1063,9 +1067,12 @@ impl Mempool {
             self.collect_meta_image(&meta_path, &mut images)?;
         }
         self.publish_flush_mark(images, retire_deaths)?;
-        match appended {
-            Some(logical) => self.adopt_body_len(&body_path, logical),
-            None => Ok(()),
+        // The slots that name the appended records are durable now.
+        match logical {
+            Some(logical) if logical != self.body_persisted_len => {
+                self.adopt_body_len(&body_path, logical)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -1087,6 +1094,7 @@ impl Mempool {
         if disk > self.body_persisted_len && disk <= body_logical_len(&self.body)? as u64 {
             self.body_persisted_len = disk;
         }
+        self.body_synced_len = self.body_synced_len.max(self.body_persisted_len);
         self.flush_mark_armed = false;
         Ok(())
     }
@@ -1098,14 +1106,13 @@ impl Mempool {
     /// ignores the bytes past it. The LIVE slots that name these records
     /// arm after this, so they never name a record that is not durable.
     ///
-    /// Returns the new length when records were appended. The caller trims
-    /// the file to it once the slots commit.
-    fn append_body(&mut self, body_path: &Path) -> Result<Option<u64>, MempoolError> {
+    /// Returns the body length. The caller adopts it as the slot watermark,
+    /// and trims the file to it, once the slots commit.
+    fn append_body(&mut self, body_path: &Path) -> Result<u64, MempoolError> {
         let logical = body_logical_len(&self.body)? as u64;
-        let old = self.body_persisted_len.min(logical);
+        let old = self.body_synced_len.min(logical);
         if logical <= old {
-            self.body_persisted_len = logical;
-            return Ok(None);
+            return Ok(logical);
         }
         pwrite_from(
             &mut self.body_file,
@@ -1121,9 +1128,8 @@ impl Mempool {
         self.body_file
             .durable_sync_data()
             .map_err(|e| MempoolError::io(body_path, e))?;
-        // Durable now: a death of one of these records must reach disk.
-        self.body_persisted_len = logical;
-        Ok(Some(logical))
+        self.body_synced_len = logical;
+        Ok(logical)
     }
 
     fn collect_slot_images(
@@ -1356,6 +1362,7 @@ impl Mempool {
         self.body = body;
         self.body_file = body_file;
         self.body_persisted_len = logical as u64;
+        self.body_synced_len = logical as u64;
         self.last_persist_ms = self.now_ms();
         self.body_dirty = false;
         if let Err(e) = fs::rename(&slots_tmp, &slots_path) {
