@@ -2788,8 +2788,25 @@ fn restore_open_marks(path: &Path) -> Result<(), StoreError> {
         crate::page_guard::SPENT_OVF_MARK,
         crate::spender_table::SPENT_OVF_NAME,
     )?;
-    crate::page_guard::restore_sh_marks(path)?;
+    restore_sh_marks_or_rebuild(path)?;
     Ok(())
+}
+
+/// A `guard/sh-*` mark that does not parse is scripthash damage, which
+/// rebuilds from Class A. Request that rebuild and drop the scripthash marks
+/// instead of stopping open. An OS error still stops open.
+fn restore_sh_marks_or_rebuild(path: &Path) -> Result<(), StoreError> {
+    match crate::page_guard::restore_sh_marks(path) {
+        Err(StoreError::Corrupt(why)) => {
+            rbitcoin_log::warn!(
+                "store: scripthash guard mark unreadable ({}); rebuilding the scripthash index",
+                why
+            );
+            crate::scripthash::mark_sh_rebuild(path)?;
+            crate::page_guard::clear_sh_marks(path)
+        }
+        other => other,
+    }
 }
 
 #[doc(hidden)]
