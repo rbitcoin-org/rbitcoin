@@ -186,7 +186,8 @@ fn replay_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreError> 
         data.durable_sync_data()
             .map_err(|e| StoreError::io(data_path, e))?;
     }
-    remove_mark(mark)?;
+    // The created directory entry has to be durable before the mark is gone.
+    fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
     Ok(true)
 }
 
@@ -234,8 +235,7 @@ pub fn restore_page_guard_group_fit(mark: &Path, dir: &Path) -> Result<bool, Sto
         data.durable_sync_data()
             .map_err(|e| StoreError::io(data_path, e))?;
     }
-    // The created directory entry has to be durable before the mark is gone.
-    fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
+    remove_mark(mark)?;
     Ok(true)
 }
 
