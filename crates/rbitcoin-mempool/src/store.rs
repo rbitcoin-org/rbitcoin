@@ -1576,6 +1576,14 @@ fn read_page(file: &mut File, path: &Path, off: u64) -> Result<[u8; 4096], Mempo
 }
 
 fn pwrite_at(file: &mut File, path: &Path, off: u64, bytes: &[u8]) -> Result<(), MempoolError> {
+    let committed = file
+        .metadata()
+        .map_err(|e| MempoolError::io(path, e))?
+        .len();
+    // Fresh bytes land before the mark, so this file has no arm yet and the
+    // append is allowed. A page the current mark names is the only in-place write.
+    rbitcoin_store::page_guard::check_armed_write(path, committed, off, bytes.len() as u64)
+        .map_err(map_store)?;
     file.seek(SeekFrom::Start(off))
         .map_err(|e| MempoolError::io(path, e))?;
     file.write_all(bytes)
