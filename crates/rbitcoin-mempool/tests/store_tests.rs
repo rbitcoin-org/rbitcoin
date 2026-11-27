@@ -120,16 +120,13 @@ fn move_only_record(dir: &Path, to: usize) {
     fs::write(dir.join("slots"), slots).unwrap();
 }
 
-/// A recomputed cost whose 8 bytes cross a 512-byte sector is written low
-/// sector first, synced, then high sector. The cost is durable, and the one
-/// crash state between the two writes decodes as unknown.
-#[test]
-fn a_sigop_cost_across_a_sector_is_written_low_sector_first() {
-    let dir = tmp_dir();
+/// A schema-2 pool whose one LIVE record has its sigop cost crossing the
+/// sector boundary at 512, unknown on disk (0xFF). Returns the txid.
+fn cross_sector_sigop_pool(dir: &Path) -> Txid {
     let tx = tiny_tx();
     let tid = tx.compute_txid();
     {
-        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        let mut mp = Mempool::open_or_create(dir).unwrap();
         mp.append_live_tx(
             &tx,
             &tid,
@@ -143,13 +140,23 @@ fn a_sigop_cost_across_a_sector_is_written_low_sector_first() {
         .unwrap();
         mp.flush().unwrap();
     }
-    downgrade_to_schema2(&dir);
+    downgrade_to_schema2(dir);
     let record = 510 - SIGOP_COST_OFF;
-    let mp = Mempool::open_or_create(&dir).unwrap();
+    let mp = Mempool::open_or_create(dir).unwrap();
     let live = mp.load_live_txs().unwrap();
     assert_eq!(live[0].packed.sigop_cost, None);
     drop(mp);
-    move_only_record(&dir, record);
+    move_only_record(dir, record);
+    tid
+}
+
+/// A recomputed cost whose 8 bytes cross a 512-byte sector is written low
+/// sector first, synced, then high sector. The cost is durable, and the one
+/// crash state between the two writes decodes as unknown.
+#[test]
+fn a_sigop_cost_across_a_sector_is_written_low_sector_first() {
+    let dir = tmp_dir();
+    let tid = cross_sector_sigop_pool(&dir);
     let mut mp = Mempool::open_or_create(&dir).unwrap();
     let live = mp.load_live_txs().unwrap();
     assert_eq!(live[0].packed.txid, tid);
@@ -176,6 +183,27 @@ fn a_sigop_cost_across_a_sector_is_written_low_sector_first() {
     file.seek(SeekFrom::Start(512)).unwrap();
     file.write_all(&[0xFFu8; 6]).unwrap();
     drop(file);
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    assert_eq!(mp.load_live_txs().unwrap()[0].packed.sigop_cost, None);
+}
+
+/// The sync between the two sector writes is the barrier. When it fails,
+/// the high bytes are still the old 0xFF, so the cost reads unknown, not a
+/// mix of new low bytes and a new high byte.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_sigop_sync_leaves_the_high_sector_old() {
+    let dir = tmp_dir();
+    let tid = cross_sector_sigop_pool(&dir);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    assert_eq!(live[0].packed.txid, tid);
+    rbitcoin_mempool::store::set_mempool_sigop_sync_fails(&dir, true);
+    assert!(mp.set_sigop_cost(live[0].slot, 0x0400).is_err());
+    rbitcoin_mempool::store::set_mempool_sigop_sync_fails(&dir, false);
+    drop(mp);
+    let body = fs::read(dir.join("tx.body")).unwrap();
+    assert_eq!(&body[512..518], &[0xFFu8; 6], "the high sector was written");
     let mp = Mempool::open_or_create(&dir).unwrap();
     assert_eq!(mp.load_live_txs().unwrap()[0].packed.sigop_cost, None);
 }

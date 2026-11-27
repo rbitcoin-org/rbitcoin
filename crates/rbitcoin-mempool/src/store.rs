@@ -724,6 +724,13 @@ impl Mempool {
         };
         write(file, 0).map_err(|e| MempoolError::io(&path, e))?;
         if split < 8 {
+            #[cfg(debug_assertions)]
+            if sigop_sync_fails(&self.dir) {
+                return Err(MempoolError::io(
+                    &path,
+                    std::io::Error::other("injected sigop sync failure"),
+                ));
+            }
             file.durable_sync_data()
                 .map_err(|e| MempoolError::io(&path, e))?;
             write(file, split).map_err(|e| MempoolError::io(&path, e))?;
@@ -1488,6 +1495,30 @@ pub fn set_mempool_grow_sync_fails(dir: &Path, fails: bool) {
 #[cfg(debug_assertions)]
 fn grow_sync_fails(dir: &Path) -> bool {
     FAIL_GROW_SYNC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|p| p == dir)
+}
+
+#[cfg(debug_assertions)]
+static FAIL_SIGOP_SYNC: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// While set for `dir`, the sync between the two sector writes of a sigop
+/// cost that crosses a sector fails.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_mempool_sigop_sync_fails(dir: &Path, fails: bool) {
+    let mut armed = FAIL_SIGOP_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+    armed.retain(|p| p != dir);
+    if fails {
+        armed.push(dir.to_path_buf());
+    }
+}
+
+#[cfg(debug_assertions)]
+fn sigop_sync_fails(dir: &Path) -> bool {
+    FAIL_SIGOP_SYNC
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
