@@ -63,6 +63,8 @@ pub const MAX_SLOT_CAP: u32 = 1_048_576;
 /// session. Schema 4 already had these bytes. Older files leave them 0.
 #[doc(hidden)]
 pub const SLOT_REC: usize = 48;
+/// The device writes a 512-byte sector whole (docs/crash-recovery.md).
+const SECTOR: usize = 512;
 
 /// One slot record. `off` names a record inside a table of
 /// `SLOTS_HEADER + cap * SLOT_REC` bytes.
@@ -685,10 +687,11 @@ impl Mempool {
     /// Fill a LIVE record's sigop cost (post-migrate recompute).
     ///
     /// RAM image plus an 8-byte `pwrite` (no fsync) so the next open does not
-    /// recompute it. The field may straddle a sector, so a power-loss tear can
-    /// mix new and old 0xFF bytes; decode treats any cost above the block limit
-    /// as unknown, so a torn value is recomputed. A record still in the
-    /// unpersisted tail is rewritten from RAM by the next tail persist anyway.
+    /// recompute it. A 512-byte sector lands whole, so a field inside one
+    /// sector reads old (unknown) or new after a crash. A field that crosses
+    /// a sector could tear into a cost under the block limit, so it is left
+    /// unknown on disk and the next open recomputes it. A record still in
+    /// the unpersisted tail is rewritten from RAM by the next tail persist.
     pub fn set_sigop_cost(&mut self, slot: u32, cost: u64) -> Result<(), MempoolError> {
         if slot >= self.slot_cap {
             return Err(MempoolError::Corrupt("slot OOB"));
@@ -701,6 +704,9 @@ impl Mempool {
         let body_off = le_u64!(rec, 4);
         let at = body_off as usize + SIGOP_COST_OFF;
         self.body[at..at + 8].copy_from_slice(&cost.to_le_bytes());
+        if at % SECTOR + 8 > SECTOR {
+            return Ok(());
+        }
         let path = self.dir.join("tx.body");
         self.body_file
             .seek(SeekFrom::Start(at as u64))
