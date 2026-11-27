@@ -752,3 +752,28 @@ fn clear_sh_marks_forgets_the_armed_pages() {
     assert!(!dir.path().join("guard/sh-ovf").exists());
     file.write_at(PAGE as u64, &[0x77; 16]).unwrap();
 }
+
+/// A clear that unlinks the mark and then fails its directory sync still
+/// drops that mark's pages from the release check. The mark is gone, and a
+/// retry takes the missing-mark path.
+#[cfg(debug_assertions)]
+#[test]
+fn a_removed_mark_forgets_its_pages_when_the_dir_sync_fails() {
+    let dir = TempDir::labeled("page-guard-forget").unwrap();
+    let live = dir.path().join("live");
+    write_bytes(&live, 0, &fill(0x11));
+    write_bytes(&live, PAGE as u64, &fill(0x12));
+    let mark = dir.path().join("guard/live");
+    arm_page_guard_group(&mark, &[("live", 0, fill(0x11).as_slice())]).unwrap();
+    let committed = 2 * PAGE as u64;
+    assert!(
+        rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64, 8).is_err(),
+        "page 1 is committed and not armed"
+    );
+    rbitcoin_store::page_guard::fail_next_mark_dir_sync(&dir.path().join("guard"));
+    let file = open_rw(&live);
+    assert!(clear_page_guard(&mark, &file, &live).is_err());
+    assert!(!mark.exists());
+    rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64, 8)
+        .expect("the removed mark still armed page 0");
+}
