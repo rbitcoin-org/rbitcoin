@@ -1338,13 +1338,18 @@ fn stamp_slot_dead(slots_name: &str, offsets: &[usize], images: &mut [(String, u
         return;
     }
     let page = rbitcoin_store::page_guard::PAGE;
+    let by_page: std::collections::HashMap<u64, usize> = images
+        .iter()
+        .enumerate()
+        .filter(|(_, (name, _, _))| name == slots_name)
+        .map(|(i, (_, at, _))| (*at, i))
+        .collect();
     for &off in offsets {
         let page_off = (off as u64) & !(page - 1);
         let dst = (off as u64 - page_off) as usize;
-        for (name, at, image) in images.iter_mut() {
-            if name == slots_name && *at == page_off && dst < image.len() {
-                image[dst] = SLOT_DEAD;
-                break;
+        if let Some(&i) = by_page.get(&page_off) {
+            if let Some(byte) = images[i].2.get_mut(dst) {
+                *byte = SLOT_DEAD;
             }
         }
     }
