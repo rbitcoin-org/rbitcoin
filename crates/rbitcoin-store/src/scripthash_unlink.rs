@@ -93,6 +93,9 @@ pub(super) struct PendingEmpty {
     pages_left: Option<Vec<(u8, u64)>>,
     /// `live_count` already dropped `removed`. A header retry must not do it again.
     live_applied: bool,
+    /// The first arm's mark. A retry lands under it and clears it whole; a
+    /// second arm would replace its pre-images with this attempt's bytes.
+    armed: Option<super::ArmedSh>,
 }
 
 pub enum SuffixPlan {
@@ -491,6 +494,7 @@ impl ScriptHashTable {
             job.old = old;
             job.removed = removed;
             job.pages_left = None;
+            job.armed = None;
             return;
         }
         q.push(PendingEmpty {
@@ -501,6 +505,7 @@ impl ScriptHashTable {
             head_synced: false,
             pages_left: None,
             live_applied: false,
+            armed: None,
         });
     }
 
@@ -607,11 +612,25 @@ impl ScriptHashTable {
         if job.pages_left.is_none() {
             job.pages_left = Some(self.deferred_page_list(job)?);
         }
+        let armed = match job.armed.take() {
+            Some(armed) => armed,
+            None => {
+                let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
+                let mut offs = vec![0u64];
+                offs.extend(job.pages_left.iter().flatten().map(|&(_, off)| off));
+                self.arm_suffix_pages(body, &job.scripthash, job.home, &offs, !job.head_synced)?
+            }
+        };
+        let landed = self.land_one_empty(job);
+        let cleared = landed.and_then(|()| self.clear_armed_sh(&armed));
+        if cleared.is_err() {
+            job.armed = Some(armed);
+        }
+        cleared
+    }
+
+    fn land_one_empty(&self, job: &mut PendingEmpty) -> Result<(), StoreError> {
         let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
-        let mut offs = vec![0u64];
-        offs.extend(job.pages_left.iter().flatten().map(|&(_, off)| off));
-        let armed =
-            self.arm_suffix_pages(body, &job.scripthash, job.home, &offs, !job.head_synced)?;
         if !job.head_synced {
             self.unlink_write_home(&job.scripthash, job.home, &ShHeadValue::Empty)?;
             self.sync_home(job.home, &job.scripthash)?;
@@ -629,24 +648,13 @@ impl ScriptHashTable {
             }
             next = next.saturating_add(1);
         }
+        job.pages_left = Some(Vec::new());
         if !job.live_applied {
             alloc.live_count = alloc.live_count.saturating_sub(job.removed);
             job.live_applied = true;
         }
-        if let Err(e) = body.sync_data_only() {
-            job.pages_left = Some(Vec::new());
-            return Err(e);
-        }
-        if let Err(e) = write_alloc_header(body, &alloc) {
-            job.pages_left = Some(Vec::new());
-            return Err(e);
-        }
-        drop(alloc);
-        if let Err(e) = self.clear_armed_sh(&armed) {
-            job.pages_left = Some(Vec::new());
-            return Err(e);
-        }
-        Ok(())
+        body.sync_data_only()?;
+        write_alloc_header(body, &alloc)
     }
 
     /// Page offsets, read before any freelist write. A later free error
