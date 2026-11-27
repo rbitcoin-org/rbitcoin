@@ -605,3 +605,26 @@ fn a_kept_failed_put_stays_out_of_reads_and_blocks_cuts() {
     ));
     assert_eq!(t.get_block(Height(0), 1).unwrap(), Some(vec![Some(tweak)]));
 }
+
+/// A new table's `meta` and its two directories are durable before the
+/// first put can return. The first forward commit syncs only the segment
+/// files and their own directories.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn create_syncs_the_new_table_directories() {
+    let dir = tmp_dir();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let _t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    for want in [
+        dir.to_path_buf(),
+        SpTweaksTable::idx_dir(&dir),
+        SpTweaksTable::body_dir(&dir),
+    ] {
+        assert!(
+            synced.contains(&want),
+            "{} was not synced, got {synced:?}",
+            want.display()
+        );
+    }
+}
