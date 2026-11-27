@@ -339,31 +339,6 @@ fn mark_parent(path: &Path) -> Result<&Path, StoreError> {
     }
 }
 
-/// Create `path`'s parent when it is missing, and sync the directory that
-/// gained that entry. An existing parent is left alone.
-fn ensure_mark_parent(path: &Path) -> Result<(), StoreError> {
-    let parent = mark_parent(path)?;
-    if parent.is_dir() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(parent).map_err(|e| StoreError::io(parent, e))?;
-    if let Some(grand) = parent.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fsync_parent_dir(grand).map_err(|e| StoreError::io(grand, e))?;
-    }
-    Ok(())
-}
-
-fn remove_mark(path: &Path) -> Result<(), StoreError> {
-    let parent = mark_parent(path)?;
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(StoreError::io(path, e)),
-    }
-    fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-    Ok(())
-}
-
 /// Create `path`'s directory and sync that directory's parent.
 ///
 /// The mark rename syncs the guard directory. The store directory still has
@@ -378,6 +353,17 @@ fn ensure_mark_parent(path: &Path) -> Result<(), StoreError> {
     if let Some(grand) = parent.parent().filter(|p| !p.as_os_str().is_empty()) {
         fsync_parent_dir(grand).map_err(|e| StoreError::io(grand, e))?;
     }
+    Ok(())
+}
+
+fn remove_mark(path: &Path) -> Result<(), StoreError> {
+    let parent = mark_parent(path)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(StoreError::io(path, e)),
+    }
+    fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
     Ok(())
 }
 
