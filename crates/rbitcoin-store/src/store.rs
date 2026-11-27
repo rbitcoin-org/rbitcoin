@@ -640,7 +640,9 @@ impl Store {
         match Self::open_layout(layout.clone()) {
             Ok(store) => Ok(store),
             Err(err)
-                if !creation_has_chain(&layout) && replaces_incomplete_first_creation(&err) =>
+                if !creation_has_chain(&layout)
+                    && !has_guard_mark(&layout.dir)
+                    && replaces_incomplete_first_creation(&err) =>
             {
                 rbitcoin_log::warn!(
                     "store: replacing incomplete first creation at {} ({err})",
@@ -2703,6 +2705,18 @@ fn dir_has_chain_payload(dir: &Path) -> bool {
         rbitcoin_primitives::TableKind::Input,
         header,
     )
+}
+
+/// A published `guard/` mark names pages a write was changing, so the
+/// store is not an untouched first creation. An unreadable mark must reach
+/// the caller, not be wiped with the store.
+fn has_guard_mark(dir: &Path) -> bool {
+    std::fs::read_dir(dir.join("guard")).is_ok_and(|rd| {
+        rd.filter_map(Result::ok).any(|ent| {
+            !ent.file_name().to_string_lossy().ends_with(".tmp")
+                && ent.file_type().is_ok_and(|t| t.is_file())
+        })
+    })
 }
 
 fn creation_has_chain(layout: &StoreLayout) -> bool {
