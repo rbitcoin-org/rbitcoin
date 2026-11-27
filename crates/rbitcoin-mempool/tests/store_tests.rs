@@ -120,11 +120,11 @@ fn move_only_record(dir: &Path, to: usize) {
     fs::write(dir.join("slots"), slots).unwrap();
 }
 
-/// A recomputed cost whose 8 bytes cross a 512-byte sector stays unknown on
-/// disk: a torn write could mix new bytes with the old 0xFF bytes into a
-/// cost under the block limit. The next open recomputes it.
+/// A recomputed cost whose 8 bytes cross a 512-byte sector is written low
+/// sector first, synced, then high sector. The cost is durable, and the one
+/// crash state between the two writes decodes as unknown.
 #[test]
-fn a_sigop_cost_across_a_sector_is_not_written_in_place() {
+fn a_sigop_cost_across_a_sector_is_written_low_sector_first() {
     let dir = tmp_dir();
     let tx = tiny_tx();
     let tid = tx.compute_txid();
@@ -160,7 +160,22 @@ fn a_sigop_cost_across_a_sector_is_not_written_in_place() {
     );
     drop(mp);
     let body = fs::read(dir.join("tx.body")).unwrap();
-    assert_eq!(&body[510..518], &[0xFFu8; 8], "the field crosses a sector");
+    assert_eq!(&body[510..518], &0x0400u64.to_le_bytes());
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    assert_eq!(
+        mp.load_live_txs().unwrap()[0].packed.sigop_cost,
+        Some(0x0400)
+    );
+    drop(mp);
+    // A crash after the low sector: new low bytes under the old 0xFF high
+    // bytes decode above the block limit, so the cost reads unknown.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(dir.join("tx.body"))
+        .unwrap();
+    file.seek(SeekFrom::Start(512)).unwrap();
+    file.write_all(&[0xFFu8; 6]).unwrap();
+    drop(file);
     let mp = Mempool::open_or_create(&dir).unwrap();
     assert_eq!(mp.load_live_txs().unwrap()[0].packed.sigop_cost, None);
 }

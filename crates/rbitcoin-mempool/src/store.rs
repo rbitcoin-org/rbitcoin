@@ -689,9 +689,10 @@ impl Mempool {
     /// RAM image plus an 8-byte `pwrite` (no fsync) so the next open does not
     /// recompute it. A 512-byte sector lands whole, so a field inside one
     /// sector reads old (unknown) or new after a crash. A field that crosses
-    /// a sector could tear into a cost under the block limit, so it is left
-    /// unknown on disk and the next open recomputes it. A record still in
-    /// the unpersisted tail is rewritten from RAM by the next tail persist.
+    /// a sector could tear into a cost under the block limit, so its lower
+    /// sector is written and synced first: new low bytes under the old 0xFF
+    /// high bytes decode as unknown. A record still in the unpersisted tail is
+    /// rewritten from RAM by the next tail persist.
     pub fn set_sigop_cost(&mut self, slot: u32, cost: u64) -> Result<(), MempoolError> {
         if slot >= self.slot_cap {
             return Err(MempoolError::Corrupt("slot OOB"));
@@ -703,17 +704,24 @@ impl Mempool {
         let rec = slot_rec(&self.slots, off);
         let body_off = le_u64!(rec, 4);
         let at = body_off as usize + SIGOP_COST_OFF;
-        self.body[at..at + 8].copy_from_slice(&cost.to_le_bytes());
-        if at % SECTOR + 8 > SECTOR {
-            return Ok(());
-        }
+        let bytes = cost.to_le_bytes();
+        self.body[at..at + 8].copy_from_slice(&bytes);
         let path = self.dir.join("tx.body");
-        self.body_file
-            .seek(SeekFrom::Start(at as u64))
-            .map_err(|e| MempoolError::io(&path, e))?;
-        self.body_file
-            .write_all(&cost.to_le_bytes())
-            .map_err(|e| MempoolError::io(&path, e))?;
+        // Little-endian: the low-order bytes sit in the lower sector. Synced
+        // under the old 0xFF high bytes, they decode above the block limit.
+        let split = (SECTOR - at % SECTOR).min(8);
+        let file = &mut self.body_file;
+        let write = |file: &mut File, from: usize| -> std::io::Result<()> {
+            let end = if from == 0 { split } else { 8 };
+            file.seek(SeekFrom::Start((at + from) as u64))?;
+            file.write_all(&bytes[from..end])
+        };
+        write(file, 0).map_err(|e| MempoolError::io(&path, e))?;
+        if split < 8 {
+            file.durable_sync_data()
+                .map_err(|e| MempoolError::io(&path, e))?;
+            write(file, split).map_err(|e| MempoolError::io(&path, e))?;
+        }
         Ok(())
     }
 
