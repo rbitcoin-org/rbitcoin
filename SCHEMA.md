@@ -241,7 +241,7 @@ itself changed.
     guard/header.body                # schema 31 sidecar: forward 4 KiB images for header.body (including header.body.grow). Open copies them before any header body read. Published after meta 31. No SCHEMA_VERSION bump
     guard/header.head                # schema 31 sidecar: forward 4 KiB images for one header.head generation and its .mlt. Open copies both before any head read. Published after meta 31. No SCHEMA_VERSION bump
 
-    *.ahead                          # transient write-ahead page image for txstat.body and scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. Open refuses a leftover confirmed.body.ahead, header_txs_first.body.ahead, header_txs_count.body.ahead, or header.head.ahead instead of restoring it. No SCHEMA_VERSION bump
+    *.ahead                          # transient write-ahead page image for txstat.body and scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. Open refuses a leftover confirmed.body.ahead, header_txs_first.body.ahead, header_txs_count.body.ahead, header.head.ahead, or header.head.gN.ahead instead of restoring it. No SCHEMA_VERSION bump
     scripthash.rebuild               # optional: one byte. The next start wipes and rebuilds the scripthash index; removed when that rebuild finishes. No SCHEMA_VERSION bump
     scripthash.dirty                 # optional: one byte while scripthash writes may be unsynced. A --sh-index start that finds it refuses; a wipe removes it. No SCHEMA_VERSION bump
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
