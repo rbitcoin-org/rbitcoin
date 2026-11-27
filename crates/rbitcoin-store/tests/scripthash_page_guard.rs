@@ -849,3 +849,35 @@ fn seal_that_fails_to_drop_the_ingest_name_keeps_one_copy() {
         assert_eq!(create_fks(&t, k), vec![i as u64 + 1]);
     }
 }
+
+/// A sibling commit's clear drops every record of the files it synced,
+/// including a failed job's images. That job's retry arms again before it
+/// writes a free-list link.
+#[test]
+fn deferred_empty_retry_rearms_after_a_sibling_clear() {
+    let dir = tmp();
+    let a = script_hash(&[0xe3]);
+    let b = script_hash(&[0xe4]);
+    let n = 300u64;
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    put_create_batch(&t, (1..=n).map(|i| rec(a, i)).collect::<Vec<_>>());
+    put_create_batch(&t, (1..=n).map(|i| rec(b, n + i)).collect::<Vec<_>>());
+    let fks_a: Vec<Fk> = (1..=n).map(Fk).collect();
+    let fks_b: Vec<Fk> = (n + 1..=2 * n).map(Fk).collect();
+    t.unlink_creates_batch(&[(a, fks_a), (b, fks_b)]).unwrap();
+    ScriptHashTable::fail_next_deferred_free();
+    assert!(t.commit_deferred_empty_heads().is_err());
+    assert!(t.deferred_empty(&a) != t.deferred_empty(&b));
+    ScriptHashTable::fail_next_deferred_free();
+    assert!(t.commit_deferred_empty_heads().is_err());
+    assert!(
+        !sh_marks(&dir).is_empty(),
+        "the retry wrote under no mark after the sibling cleared it"
+    );
+    t.commit_deferred_empty_heads().unwrap();
+    assert!(sh_marks(&dir).is_empty(), "the retry left an image armed");
+    drop(t);
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert!(create_fks(&t, &a).is_empty());
+    assert!(create_fks(&t, &b).is_empty());
+}
