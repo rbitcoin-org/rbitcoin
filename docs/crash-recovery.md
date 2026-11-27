@@ -38,9 +38,10 @@ transaction.
 - Class C `confirmed[]`, `header_txs_*`, and `strong_tx` share one synced
   `store/guard/class_c` mark of the intended 4 KiB pages before an in-place
   write. `header.body` uses `store/guard/header.body`. One `header.head`
-  generation and its `.mlt` share `store/guard/header.head`. Open copies every
-  named image before reading those files. `txstat.body` and the scripthash
-  ingest head still write a synced `*.ahead` image. An array flush always
+  generation uses `store/guard/header.head`. Its `.mlt` only appends, and the
+  rows and length are synced before that mark arms. Open copies every named
+  image before reading those files. The scripthash ingest head still writes a
+  synced `*.ahead` image. An array flush always
   images page 0, because it rewrites the length there even when a shrink
   writes no slot or empties the table.
 - `confirmed[]` has no null slot below the tip open keeps: the lower of the
@@ -102,7 +103,8 @@ absent, open restores only a tail that is still all zeros.
 
 **The marks.** `confirmed.body`, `header_txs_*`, and `strong_tx` use
 `store/guard/class_c`. `header.body` uses `store/guard/header.body`.
-`header.head` and `header.head.mlt` share `store/guard/header.head`.
+`header.head` uses `store/guard/header.head`. `header.head.mlt` is an append:
+rows, then length, each synced before the head mark arms.
 `spent.ovf` uses `store/guard/spent.ovf`. A scripthash commit, including an
 in-place slab and a head word, uses `store/guard/sh-*`. A `txstat` stamp
 needs no mark: each cell and block slot sits inside one sector, and the stamp

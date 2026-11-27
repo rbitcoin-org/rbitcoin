@@ -178,8 +178,10 @@ fn leftover_ahead_pages_survive_a_later_write() {
     cleanup_hh(&path);
 }
 
+/// `.mlt` only appends. Its rows and length are durable before the head mark
+/// arms, so the mark images `header.head` alone.
 #[test]
-fn crash_between_head_and_mlt_restores_both_from_one_mark() {
+fn an_mlt_append_is_durable_before_a_head_mark_that_names_only_the_head() {
     let path = tmp_path();
     let mut k1 = [0u8; 32];
     k1[0] = 0xab;
@@ -191,22 +193,28 @@ fn crash_between_head_and_mlt_restores_both_from_one_mark() {
         let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
         h.insert(&k1, Fk(10)).unwrap();
         h.flush().unwrap();
-        fail_next_header_head_flush_between_files(&path);
+        fail_next_hash_head_flush_after_ahead(&path);
         assert!(
             h.insert(&k2, Fk(20)).is_err(),
-            "the failpoint must stop between the mlt write and the head write"
+            "the failpoint must stop before the head write"
         );
-        assert!(path.parent().unwrap().join("guard/header.head").is_file());
     }
+    let mark = std::fs::read(path.parent().unwrap().join("guard/header.head")).unwrap();
+    assert!(
+        !mark.windows(4).any(|w| w == b".mlt"),
+        "the head mark must not image header.head.mlt"
+    );
+    assert_eq!(
+        *MultiList::open(&path).unwrap().count.lock().unwrap(),
+        2,
+        "the .mlt rows must be published before the head mark arms"
+    );
     zero_ahead_blocks(&path, &[k1, k2], DEFAULT_SLOTS);
-    let mut mlt = path.as_os_str().to_os_string();
-    mlt.push(".mlt");
-    zero_pages(&std::path::PathBuf::from(mlt), &[0]);
     let h = HashHead::open(&path).unwrap();
     let all = h.get_all(&k1).unwrap();
     assert!(
         all.contains(&Fk(10)) && all.contains(&Fk(20)),
-        "one mark must restore header.head and header.head.mlt together, got {all:?}"
+        "the head mark and the durable .mlt must give both values, got {all:?}"
     );
     cleanup_hh(&path);
 }
