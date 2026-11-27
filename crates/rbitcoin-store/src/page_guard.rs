@@ -192,6 +192,16 @@ pub fn restore_page_guard_group_fit(mark: &Path, dir: &Path) -> Result<bool, Sto
         Err(e) => return Err(StoreError::io(mark, e)),
     };
     let pages = mark_group_pages(&raw)?;
+    // A forward `*.ahead` image is the post-commit page. The backward mark
+    // wins: drop the sidecar before any head open can replay it.
+    let mut dropped_ahead: Vec<String> = Vec::new();
+    for (name, _, _) in &pages {
+        if dropped_ahead.iter().any(|have| have == name) {
+            continue;
+        }
+        drop_ahead_sidecar(dir, name)?;
+        dropped_ahead.push(name.clone());
+    }
     let mut opened: Vec<(String, File, PathBuf)> = Vec::new();
     for (name, offset, at) in &pages {
         let data_path = dir.join(name);
@@ -492,11 +502,36 @@ pub fn guard_rel_name(dir: &Path, path: &Path) -> Result<String, StoreError> {
         .map_err(|_| StoreError::Corrupt("page guard file name"))?;
     let name = rel
         .to_str()
-        .ok_or(StoreError::Corrupt("page guard file name"))?;
-    if !valid_guard_name(name) {
+        .ok_or(StoreError::Corrupt("page guard file name"))?
+        .replace('\\', "/");
+    if !valid_guard_name(&name) {
         return Err(StoreError::Corrupt("page guard file name"));
     }
-    Ok(name.to_string())
+    Ok(name)
+}
+
+/// Remove `{file}.ahead` next to a file the mark is about to restore.
+fn drop_ahead_sidecar(dir: &Path, name: &str) -> Result<(), StoreError> {
+    let live = dir.join(name);
+    let Some(file_name) = live.file_name() else {
+        return Ok(());
+    };
+    let mut ahead = file_name.to_os_string();
+    ahead.push(".ahead");
+    let side = match live.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(ahead),
+        _ => PathBuf::from(ahead),
+    };
+    match std::fs::remove_file(&side) {
+        Ok(()) => {
+            if let Some(parent) = side.parent() {
+                fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StoreError::io(&side, e)),
+    }
 }
 
 /// Read one 4 KiB block. Bytes past EOF are zeros. A missing file is zeros.

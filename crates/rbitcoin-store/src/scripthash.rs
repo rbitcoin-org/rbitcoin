@@ -1972,37 +1972,52 @@ impl ScriptHashTable {
         let heads = self.seed_batch_heads(recs, &order)?;
         timing.seed_ns = t_seed.elapsed().as_nanos() as u64;
 
-        let t_body = std::time::Instant::now();
-        let mut batch = IngestBatch::default();
+        let mut written = 0usize;
         let mut i = 0usize;
         while i < order.len() {
-            let key = recs[order[i]].scripthash;
-            let mut fk_vals: Vec<u64> = Vec::new();
-            while i < order.len() && recs[order[i]].scripthash == key {
-                let fk = recs[order[i]].create_tx_fk;
-                if !fk.is_null() {
-                    fk_vals.push(fk.0);
-                }
-                i += 1;
-            }
-            if fk_vals.is_empty() {
+            if self.ingest_room() == 0 {
+                self.seal_ingest()?;
                 continue;
             }
-            let (cur, kh) = heads
-                .get(&key)
-                .cloned()
-                .unwrap_or((ShHeadValue::Empty, KeyHome::Absent));
-            self.stage_key_creates(&mut batch, key, fk_vals, &cur, kh)?;
-        }
-        timing.body_ns = t_body.elapsed().as_nanos() as u64;
-
-        if !batch.head_final.is_empty() {
+            let room = self.ingest_room();
+            let t_body = std::time::Instant::now();
+            let mut batch = IngestBatch::default();
+            let mut staged = 0u64;
+            while i < order.len() && staged < room {
+                let key = recs[order[i]].scripthash;
+                let mut fk_vals: Vec<u64> = Vec::new();
+                while i < order.len() && recs[order[i]].scripthash == key {
+                    let fk = recs[order[i]].create_tx_fk;
+                    if !fk.is_null() {
+                        fk_vals.push(fk.0);
+                    }
+                    i += 1;
+                }
+                if fk_vals.is_empty() {
+                    continue;
+                }
+                let (cur, kh) = heads
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or((ShHeadValue::Empty, KeyHome::Absent));
+                self.stage_key_creates(&mut batch, key, fk_vals, &cur, kh)?;
+                staged = staged.saturating_add(1);
+            }
+            timing.body_ns = timing
+                .body_ns
+                .saturating_add(t_body.elapsed().as_nanos() as u64);
+            if batch.head_final.is_empty() {
+                continue;
+            }
             let t_head = std::time::Instant::now();
             let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
             self.commit_staged_batch(&batch, flush_each)?;
-            timing.head_ns = t_head.elapsed().as_nanos() as u64;
+            timing.head_ns = timing
+                .head_ns
+                .saturating_add(t_head.elapsed().as_nanos() as u64);
+            written = written.saturating_add(batch.written);
         }
-        Ok((batch.written, timing))
+        Ok((written, timing))
     }
 
     /// Locate the durable head and home of every key the batch names. A key
@@ -2092,7 +2107,10 @@ impl ScriptHashTable {
         let _hold = page_guard::hold_marks();
         let armed = self.arm_staged_batch(batch)?;
         self.land_staged_batch(batch, flush_each)?;
-        self.clear_armed_sh(&armed)
+        self.clear_armed_sh(&armed)?;
+        // Seal only after the mark is gone. A sealed file built while the
+        // mark is armed would name body bytes the restore rolls back.
+        self.maybe_seal_ingest()
     }
 
     fn land_staged_batch(
@@ -2256,9 +2274,7 @@ impl ScriptHashTable {
         if empty {
             self.image_empty_ingest(&mut pages, keys)?;
         } else {
-            for key in keys {
-                self.image_ingest_head(&mut pages, key)?;
-            }
+            self.image_live_ingest(&mut pages, keys)?;
         }
         self.publish_sh_pages(&pages).map(|_| ())
     }
@@ -2294,6 +2310,38 @@ impl ScriptHashTable {
                 ScriptHashHead::slot_file_off(slot),
                 crate::scripthash_layout::SH_HEAD_SLOT_SIZE as u64,
             )?;
+        }
+        Ok(())
+    }
+
+    /// A non-empty ingest probe-inserts the batch in hash-slot order. Image
+    /// every chunk that insert will write, including a key displaced past
+    /// its first empty slot.
+    fn image_live_ingest(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        keys: &[[u8; 32]],
+    ) -> Result<(), StoreError> {
+        let (rel, path, spans) = {
+            let g = self.ingest.lock().unwrap();
+            let Some(h) = g.as_ref() else {
+                return Ok(());
+            };
+            let rel = page_guard::guard_rel_name(&self.store_dir, h.file.path())?;
+            let path = h.file.path().to_path_buf();
+            let spans = h.upsert_write_spans(keys)?;
+            (rel, path, spans)
+        };
+        if spans.is_empty() {
+            return Ok(());
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(|e| StoreError::io(&path, e))?;
+        let mark = page_guard::sh_mark("ovf");
+        for (off, len) in spans {
+            image_range(pages, &mark, &rel, &path, &file, off, len)?;
         }
         Ok(())
     }
@@ -2396,15 +2444,18 @@ impl ScriptHashTable {
                         )?;
                     }
                     ShHeadValue::Extent { last_page } => {
-                        image_range(
-                            &mut pages,
-                            &mark,
-                            &rel,
-                            body.path(),
-                            &body.read_file,
-                            *last_page,
-                            SH_PAGE_SIZE as u64,
-                        )?;
+                        let first = paged_first_from_last(body, *last_page)?;
+                        follow_page_chain(body, first, SH_PAGE_CHAIN_MAX, |body, off| {
+                            image_range(
+                                &mut pages,
+                                &mark,
+                                &rel,
+                                body.path(),
+                                &body.read_file,
+                                off,
+                                SH_PAGE_SIZE as u64,
+                            )
+                        })?;
                     }
                     _ => {}
                 }
@@ -2656,6 +2707,19 @@ impl ScriptHashTable {
 
     #[doc(hidden)]
     pub fn ingest_insert_many(&self, ups: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
+        if ups.is_empty() {
+            return Ok(());
+        }
+        if self.sh_mark_present()? {
+            self.ensure_ingest()?;
+            let keys: Vec<[u8; 32]> = ups.iter().map(|(k, _)| *k).collect();
+            self.rearm_ingest_pages(&keys)?;
+            let g = self.ingest.lock().unwrap();
+            let Some(h) = g.as_ref() else {
+                return Err(StoreError::Corrupt("scripthash: ingest missing"));
+            };
+            return h.insert_many(ups);
+        }
         let mut i = 0usize;
         while i < ups.len() {
             let room = self.ingest_room();
@@ -2678,6 +2742,26 @@ impl ScriptHashTable {
             self.maybe_seal_ingest()?;
         }
         Ok(())
+    }
+
+    fn sh_mark_present(&self) -> Result<bool, StoreError> {
+        let guard = self.store_dir.join("guard");
+        let rd = match std::fs::read_dir(&guard) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(StoreError::io(&guard, e)),
+        };
+        for ent in rd {
+            let ent = ent.map_err(|e| StoreError::io(&guard, e))?;
+            let name = ent.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with("sh-") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[doc(hidden)]
