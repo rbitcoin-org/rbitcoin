@@ -1122,7 +1122,7 @@ impl Mempool {
                 // The growth mark publishes `slot_cap` in page 0 and does not
                 // image the zero tail. The longer file has to be durable first.
                 self.slots_file
-                    .sync_all()
+                    .durable_sync_all()
                     .map_err(|e| MempoolError::io(slots_path, e))?;
             }
             let mut page_off = 0u64;
