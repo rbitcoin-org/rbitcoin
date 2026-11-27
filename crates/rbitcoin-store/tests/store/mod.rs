@@ -880,6 +880,50 @@ fn an_unreadable_mark_is_not_an_incomplete_creation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A crash during the very first header append can leave that row on disk
+/// with an empty `header.head`. Open must index it from the replayed body
+/// mark, not refuse the store as one whose head was lost.
+#[test]
+fn open_indexes_a_first_header_row_the_head_does_not_name() {
+    use rbitcoin_store::file::FILE_HEADER_LEN;
+    use rbitcoin_store::header_table::HEADER_RECORD_LEN;
+    let first = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x1d00ffff,
+        nonce: 1,
+        merkle_root: [1u8; 32],
+        hash: [0x66u8; 32],
+        size: 0,
+        weight: 0,
+    };
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    let body = dir.join("header.body");
+    let mut image = std::fs::read(&body).unwrap();
+    image.truncate(FILE_HEADER_LEN);
+    image.extend_from_slice(&first.encode());
+    let len = (FILE_HEADER_LEN + HEADER_RECORD_LEN) as u64;
+    image[8..16].copy_from_slice(&len.to_le_bytes());
+    image.resize(4096, 0);
+    rbitcoin_store::page_guard::arm_page_guard_group(
+        &dir.join(rbitcoin_store::page_guard::HEADER_BODY_MARK),
+        &[("header.body", 0, image.as_slice())],
+    )
+    .unwrap();
+    let s = Store::open_tiny(&dir).expect("the first unindexed row was refused");
+    let found = s.get_header_by_hash(&first.hash).unwrap().map(|(fk, _)| fk);
+    assert_eq!(found, Some(Fk(1)));
+    assert_eq!(s.put_header(&first).unwrap(), Fk(1));
+    assert_eq!(s.header_count(), 1);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Meta 31 beside a still-96-byte `header.body` is the crash between the old
 /// promote and the rename. Open must convert the body without a schema-24 gate.
 #[test]
