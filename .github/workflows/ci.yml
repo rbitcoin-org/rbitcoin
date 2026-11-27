@@ -196,15 +196,9 @@ jobs:
         if: always()
         run: |
           f="${{ runner.temp }}/pg-probe.log"
-          if [ -f "$f" ]; then
-            echo "distinct keys: $(grep -c '^PROBE' "$f")"
-            for c in CREATE ARMED CLASS_A ONE_SECTOR MULTI_SECTOR LEN_CREATE LEN_CLASS_A LEN_AFTER_SYNC LEN_BEFORE_SYNC; do
-              echo "class $c: $(grep -c "^PROBE $c " "$f")"
-            done
-            cat "$f"
-          else
-            echo "no probe log"
-          fi
+          echo "distinct keys: $(grep -c '^PROBE' "$f")"
+          python3 scripts/probe-classify.py "$f" || true
+          cat "$f"
       # The workspace exclude stays (coverage.test.sh). This one lib test is
       # the address-corpus pin: sha256::Hash Display is internal order.
       - name: bench scripthash pin
