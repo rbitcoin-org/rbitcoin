@@ -2595,7 +2595,7 @@ impl TxTable {
                 INPUT_BACKFILL_SPAN,
                 &mut buf,
             )?;
-            self.input.append(&edges)?;
+            self.input.append_staged(&edges)?;
             live.set_done(end);
             if backfill_progress_due(end, id) {
                 rbitcoin_log::info!("store: input backfill progress {end}/{n}");
@@ -2611,8 +2611,9 @@ impl TxTable {
         rbitcoin_log::info!("store: input backfill complete n={n}");
         // The witness stem can be cut after this open returns. The edges
         // have to be durable first, or the next open has no way to rebuild them.
-        self.flush_input()?;
-        Ok(())
+        // These creates are already synced Class A, so no open cuts a torn
+        // row: the rows sync before any length that names them.
+        self.class_a_latched(|| self.input.publish_staged())
     }
 
     /// `seqsigwit.body` range for one create.
