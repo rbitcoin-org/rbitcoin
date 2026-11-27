@@ -774,7 +774,9 @@ fn open_restores_the_header_body_mark_before_the_width_probe() {
     assert_eq!(s.get_header(Fk(1)).unwrap().hash, hash);
     assert_eq!(s.header_count(), 1);
     drop(s);
-    assert!(!dir.join(rbitcoin_store::page_guard::HEADER_BODY_MARK).exists());
+    assert!(!dir
+        .join(rbitcoin_store::page_guard::HEADER_BODY_MARK)
+        .exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

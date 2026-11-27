@@ -968,7 +968,7 @@ pub fn release_class_c_group_pause() {
 pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreError> {
     let _hold = page_guard::hold_marks();
     let mut owned: Vec<(String, u64, [u8; PAGE as usize])> = Vec::new();
-    let mut dirty: Vec<&ArrayTable> = Vec::new();
+    let mut dirty: Vec<(&ArrayTable, crate::array_table::GuardSpan)> = Vec::new();
     #[cfg(debug_assertions)]
     let mut imaged = false;
     for t in tables {
@@ -977,10 +977,14 @@ pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreEr
             continue;
         }
         let name = t.guard_name()?.to_string();
-        for (off, image) in t.guard_pages()? {
+        let Some((span, pages)) = t.guard_pages()? else {
+            t.file.flush()?;
+            continue;
+        };
+        for (off, image) in pages {
             owned.push((name.clone(), off, image));
         }
-        dirty.push(*t);
+        dirty.push((*t, span));
         #[cfg(debug_assertions)]
         if !imaged {
             imaged = true;
@@ -992,7 +996,7 @@ pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreEr
     if owned.is_empty() {
         return Ok(());
     }
-    let dir = dirty[0].store_dir()?;
+    let dir = dirty[0].0.store_dir()?;
     let refs: Vec<(&str, u64, &[u8])> = owned
         .iter()
         .map(|(n, o, i)| (n.as_str(), *o, i.as_slice()))
@@ -1010,8 +1014,8 @@ pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreEr
         }
     }
     let mut spans = Vec::with_capacity(dirty.len());
-    for t in &dirty {
-        if let Some(span) = t.persist_dirty()? {
+    for (t, imaged) in &dirty {
+        if let Some(span) = t.persist_dirty(imaged)? {
             spans.push((*t, span));
         }
         #[cfg(debug_assertions)]
@@ -1032,7 +1036,7 @@ pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreEr
     }
     let files: Vec<(&File, &Path)> = dirty
         .iter()
-        .map(|t| (&t.file.read_file, t.file.path() as &Path))
+        .map(|(t, _)| (&t.file.read_file, t.file.path() as &Path))
         .collect();
     page_guard::clear_page_guard_files(&dir.join(page_guard::CLASS_C_MARK), &files)?;
     for (t, (n, gen)) in spans {
