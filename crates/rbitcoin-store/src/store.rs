@@ -534,8 +534,10 @@ impl Store {
             return Err(StoreError::NotDirectory(path));
         }
         let meta_ver = check_meta(&path)?;
-        open_layout_refuse_old(&path, meta_ver)?;
+        // A mark finishes a torn header.body page before the width probe in
+        // open_layout_refuse_old reads its length.
         restore_open_marks(&path)?;
+        open_layout_refuse_old(&path, meta_ver)?;
         drop_unread_store_leftovers(&path);
         let scripthash = if path.join("scripthash.body").exists() {
             ScriptHashTable::open_with_scale(&path, layout.head_scale)?
