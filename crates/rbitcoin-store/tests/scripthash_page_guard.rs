@@ -810,3 +810,42 @@ fn deferred_empty_retry_clears_the_first_mark() {
         "open restored a freed chain"
     );
 }
+
+fn sealed_segment_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir.join("scripthash.ovf"))
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.len() == 6 && name.chars().all(|c| c.is_ascii_digit())
+        })
+        .count()
+}
+
+/// A seal whose mark-name drop fails keeps each key in one place. The
+/// retry seals ingest once, not a second segment of the same keys.
+#[test]
+fn seal_that_fails_to_drop_the_ingest_name_keeps_one_copy() {
+    let dir = tmp();
+    let keys: Vec<[u8; 32]> = (0u8..4).map(|i| script_hash(&[0xc0, i])).collect();
+    {
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        for (i, k) in keys.iter().enumerate() {
+            put_create_batch(&t, [rec(*k, i as u64 + 1)]);
+        }
+        t.fail_next_ingest_rel_drop();
+        assert!(t.seal_ingest().is_err());
+        t.seal_ingest().unwrap();
+        assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1, "keys sealed twice");
+        assert!(
+            t.ingest.lock().unwrap().is_none(),
+            "ingest stayed installed"
+        );
+        t.flush().unwrap();
+    }
+    assert_eq!(sealed_segment_files(&dir), 1, "a second segment on disk");
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    for (i, k) in keys.iter().enumerate() {
+        assert_eq!(create_fks(&t, k), vec![i as u64 + 1]);
+    }
+}
