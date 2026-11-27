@@ -76,6 +76,8 @@ pub(crate) fn write(
             None
         } else if committed <= header_len {
             Some("LEN_CREATE")
+        } else if crate::page_guard::probe_armed_covers(path, offset, len) {
+            Some("LEN_ARMED")
         } else if is_class_a(path) {
             Some("LEN_CLASS_A")
         } else if unsynced_in(path, committed, new) {
@@ -100,8 +102,18 @@ pub(crate) fn write(
         note_dirty(path, offset, end);
     }
     if let Some(class) = class {
+        let class = if in_store(path) { class } else { "FIXTURE" };
         log(class, path, committed, offset, len);
     }
+}
+
+/// A store has `meta` beside its files, or beside their directory.
+fn in_store(path: &Path) -> bool {
+    let dir = path.parent();
+    dir.is_some_and(|d| d.join("meta").is_file())
+        || dir
+            .and_then(Path::parent)
+            .is_some_and(|d| d.join("meta").is_file())
 }
 
 fn header_on_file(path: &Path) -> Option<u64> {
