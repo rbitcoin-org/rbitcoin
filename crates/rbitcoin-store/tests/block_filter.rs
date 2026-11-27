@@ -275,3 +275,33 @@ fn torn_blockfilter_page_restores_the_armed_image() {
     let raw = fs::read(&body).unwrap();
     assert_ne!(raw[FILE_HEADER_LEN], 0xA5);
 }
+
+/// A second put must not overwrite fresh pages while the first mark is armed.
+#[test]
+fn a_later_put_waits_until_the_forward_mark_is_gone() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    rbitcoin_store::page_guard::fail_next_forward_after_arm(&dir);
+    let err = t.put(&[BlockFilterRecord {
+        height: Height(1),
+        slot: slot(1),
+        filter: &[1, 1, 1, 1],
+    }]);
+    assert!(err.is_err());
+    let mark = dir.join("guard/blockfilter");
+    let armed = fs::read(&mark).unwrap();
+    let err = t.put(&[BlockFilterRecord {
+        height: Height(1),
+        slot: slot(1),
+        filter: &[9, 9, 9, 9],
+    }]);
+    match err {
+        Err(StoreError::Rejected(msg)) => {
+            assert!(msg.contains("blockfilter"), "{msg}");
+        }
+        other => panic!("a pending mark must refuse the next put, got {other:?}"),
+    }
+    assert_eq!(fs::read(&mark).unwrap(), armed);
+    assert_eq!(t.filter(Height(0)).unwrap().unwrap().0, vec![0u8; 3]);
+}

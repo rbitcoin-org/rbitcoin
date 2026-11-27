@@ -284,6 +284,14 @@ fn stamp_guarded(file: &TableFile, start: u64, bytes: &[u8]) -> Result<(), Store
     if bytes.is_empty() {
         return Ok(());
     }
+    let Some(dir) = file.path().parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Err(StoreError::Rejected("page guard mark has no directory"));
+    };
+    // Hold the mark before the read. A second stamp must not publish a page
+    // it sampled before the first stamp cleared, and a mark still armed from
+    // a failed stamp is the before-image of that torn page.
+    let _hold = page_guard::hold_marks();
+    page_guard::restore_store_group(dir, page_guard::TXSTAT_MARK)?;
     let logical = file.logical_len();
     let first = start & !(PAGE - 1);
     let last = (start + bytes.len() as u64 - 1) & !(PAGE - 1);
@@ -301,10 +309,6 @@ fn stamp_guarded(file: &TableFile, start: u64, bytes: &[u8]) -> Result<(), Store
         file.sync_data_only()?;
         return Ok(());
     }
-    let Some(dir) = file.path().parent().filter(|p| !p.as_os_str().is_empty()) else {
-        return Err(StoreError::Rejected("page guard mark has no directory"));
-    };
-    let _hold = page_guard::hold_marks();
     let name = page_guard::guard_file_name(file.path())?;
     let refs: Vec<(&str, u64, &[u8])> = images
         .iter()
@@ -366,6 +370,12 @@ impl TxStat {
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        // The page-guard mark replaced `*.ahead`. A journal left by the
+        // previous binary is not replayed, so opening would serve a torn page.
+        let ahead = dir.join("txstat.body.ahead");
+        if ahead.is_file() {
+            return Err(StoreError::Corrupt("txstat.body.ahead"));
+        }
         let leftover = dir.join("txfixed.body");
         if leftover.exists() {
             std::fs::remove_file(&leftover).map_err(|e| StoreError::io(&leftover, e))?;
