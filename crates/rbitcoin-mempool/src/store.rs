@@ -384,15 +384,6 @@ impl Mempool {
             .collect()
     }
 
-    /// `pwrite` LIVE rows whose payload starts at or past `old_persisted`.
-    ///
-    /// Adjacent new slots are one write. Does not rewrite the rest of the table.
-    #[doc(hidden)]
-    pub fn pwrite_live_slots_since(&mut self, old_persisted: u64) -> Result<(), MempoolError> {
-        let ranges = self.slot_ranges_since(old_persisted);
-        self.commit_guarded(false, &ranges, None, false)
-    }
-
     /// Append a packed live record; mark a FREE slot LIVE.
     ///
     /// Returns the slot index. RAM is updated immediately; sidecar write waits
@@ -910,16 +901,6 @@ impl Mempool {
         Ok(logical as u64)
     }
 
-    /// Write the dirty body tail and `sync_data` it before any LIVE slot names it.
-    ///
-    /// Append-safe: a crash after a grown body and before new slots loses admits;
-    /// old LIVE ranges stay a prefix of the new body. Packed compact must not
-    /// use this order (see [`Self::install_images`]).
-    #[doc(hidden)]
-    pub fn persist_body_tail(&mut self) -> Result<(), MempoolError> {
-        self.commit_guarded(true, &[], None, false)
-    }
-
     /// Slots + live_count. LIVE rows whose body is not yet durable are written
     /// as FREE so a slots-ahead-of-body crash cannot load offsets past EOF.
     #[doc(hidden)]
@@ -956,28 +937,6 @@ impl Mempool {
         if fs::rename(&slots_tmp, &slots_path).is_ok() {
             self.slots_pending = false;
         }
-    }
-
-    #[doc(hidden)]
-    pub fn write_slots_bytes(&mut self, path: &Path, bytes: &[u8]) -> Result<(), MempoolError> {
-        Self::write_slots_file(&mut self.slots_file, path, bytes)
-    }
-
-    #[doc(hidden)]
-    pub fn write_slots_file(
-        file: &mut File,
-        path: &Path,
-        bytes: &[u8],
-    ) -> Result<(), MempoolError> {
-        file.set_len(bytes.len() as u64)
-            .map_err(|e| MempoolError::io(path, e))?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| MempoolError::io(path, e))?;
-        file.write_all(bytes)
-            .map_err(|e| MempoolError::io(path, e))?;
-        file.durable_sync_data()
-            .map_err(|e| MempoolError::io(path, e))?;
-        Ok(())
     }
 
     #[doc(hidden)]
@@ -1041,7 +1000,6 @@ impl Mempool {
         full_slots: Option<&[u8]>,
         meta: bool,
     ) -> Result<(), MempoolError> {
-        let page = rbitcoin_store::page_guard::PAGE;
         let body_path = self.dir.join("tx.body");
         let slots_path = self.slots_path();
         let meta_path = self.dir.join("meta");
@@ -1051,77 +1009,117 @@ impl Mempool {
             .unwrap_or("slots")
             .to_string();
         let mut images: Vec<(String, u64, [u8; 4096])> = Vec::new();
+        let (logical, fresh_body) = self.collect_body_images(body, &body_path, &mut images)?;
+        self.collect_slot_images(
+            slot_ranges,
+            full_slots,
+            &slots_path,
+            &slots_name,
+            &mut images,
+        )?;
+        if meta {
+            self.collect_meta_image(&meta_path, &mut images)?;
+        }
+        self.publish_flush_mark(
+            &body_path,
+            &slots_path,
+            &meta_path,
+            logical,
+            fresh_body,
+            images,
+        )
+    }
+
+    /// Fresh body bytes are synced here, before the mark. Shared pages,
+    /// including page 0, are returned as the image.
+    fn collect_body_images(
+        &mut self,
+        body: bool,
+        body_path: &Path,
+        images: &mut Vec<(String, u64, [u8; 4096])>,
+    ) -> Result<(Option<u64>, bool), MempoolError> {
+        if !body {
+            return Ok((None, false));
+        }
+        let page = rbitcoin_store::page_guard::PAGE;
         let mut fresh_body = false;
-        let logical = if body {
-            let logical = body_logical_len(&self.body)? as u64;
-            let old = self.body_persisted_len.min(logical);
-            if logical > old {
-                let fresh_from = if old == 0 {
-                    page
-                } else {
-                    ((old - 1) & !(page - 1)).saturating_add(page)
-                };
-                let fresh_from = fresh_from.max(old);
-                if fresh_from < logical {
-                    pwrite_at(
-                        &mut self.body_file,
-                        &body_path,
-                        fresh_from,
-                        &self.body[fresh_from as usize..logical as usize],
-                    )?;
-                    self.body_file
-                        .durable_sync_data()
-                        .map_err(|e| MempoolError::io(&body_path, e))?;
-                    fresh_body = true;
-                }
-                // Page 0 carries the length. The tail block is shared only when
-                // the new bytes start inside it. Earlier full blocks stay put.
-                let mut shared = vec![0u64];
-                if old > 0 {
-                    let tail = (old - 1) & !(page - 1);
-                    if tail != 0 && old < tail.saturating_add(page) {
-                        shared.push(tail);
-                    }
-                }
-                for page_off in shared {
-                    let mut image = read_page(&mut self.body_file, &body_path, page_off)?;
-                    if page_off == 0 {
-                        image[8..16].copy_from_slice(&self.body[8..16]);
-                    }
-                    overlay_ram(
-                        &mut image,
-                        page_off,
-                        old,
-                        &self.body[old as usize..logical as usize],
-                    );
-                    images.push(("tx.body".to_string(), page_off, image));
+        let logical = body_logical_len(&self.body)? as u64;
+        let old = self.body_persisted_len.min(logical);
+        if logical > old {
+            let fresh_from = if old == 0 {
+                page
+            } else {
+                ((old - 1) & !(page - 1)).saturating_add(page)
+            };
+            let fresh_from = fresh_from.max(old);
+            if fresh_from < logical {
+                pwrite_at(
+                    &mut self.body_file,
+                    body_path,
+                    fresh_from,
+                    &self.body[fresh_from as usize..logical as usize],
+                )?;
+                self.body_file
+                    .durable_sync_data()
+                    .map_err(|e| MempoolError::io(body_path, e))?;
+                fresh_body = true;
+            }
+            // Page 0 carries the length. The tail block is shared only when
+            // the new bytes start inside it. Earlier full blocks stay put.
+            let mut shared = vec![0u64];
+            if old > 0 {
+                let tail = (old - 1) & !(page - 1);
+                if tail != 0 && old < tail.saturating_add(page) {
+                    shared.push(tail);
                 }
             }
-            Some(logical)
-        } else {
-            None
-        };
+            for page_off in shared {
+                let mut image = read_page(&mut self.body_file, body_path, page_off)?;
+                if page_off == 0 {
+                    image[8..16].copy_from_slice(&self.body[8..16]);
+                }
+                overlay_ram(
+                    &mut image,
+                    page_off,
+                    old,
+                    &self.body[old as usize..logical as usize],
+                );
+                images.push(("tx.body".to_string(), page_off, image));
+            }
+        }
+        Ok((Some(logical), fresh_body))
+    }
+
+    fn collect_slot_images(
+        &mut self,
+        slot_ranges: &[(usize, usize)],
+        full_slots: Option<&[u8]>,
+        slots_path: &Path,
+        slots_name: &str,
+        images: &mut Vec<(String, u64, [u8; 4096])>,
+    ) -> Result<(), MempoolError> {
+        let page = rbitcoin_store::page_guard::PAGE;
         if let Some(ram) = full_slots {
             let need = ram.len() as u64;
             let have = self
                 .slots_file
                 .metadata()
-                .map_err(|e| MempoolError::io(&slots_path, e))?
+                .map_err(|e| MempoolError::io(slots_path, e))?
                 .len();
             if need > have {
                 self.slots_file
                     .set_len(need)
-                    .map_err(|e| MempoolError::io(&slots_path, e))?;
+                    .map_err(|e| MempoolError::io(slots_path, e))?;
             }
             let mut page_off = 0u64;
             while (page_off as usize) < ram.len() {
-                let mut image = read_page(&mut self.slots_file, &slots_path, page_off)?;
+                let mut image = read_page(&mut self.slots_file, slots_path, page_off)?;
                 let before = image;
                 let lo = page_off as usize;
                 let hi = (lo + page as usize).min(ram.len());
                 image[..hi - lo].copy_from_slice(&ram[lo..hi]);
                 if image != before {
-                    images.push((slots_name.clone(), page_off, image));
+                    images.push((slots_name.to_string(), page_off, image));
                 }
                 page_off = page_off.saturating_add(page);
             }
@@ -1135,12 +1133,12 @@ impl Mempool {
                 let mut at = start;
                 while at < end {
                     let page_off = (at as u64) & !(page - 1);
-                    let image = if let Some(image) = pages.get_mut(&page_off) {
-                        image
-                    } else {
-                        let image = read_page(&mut self.slots_file, &slots_path, page_off)?;
-                        pages.insert(page_off, image);
-                        pages.get_mut(&page_off).unwrap()
+                    let image = match pages.entry(page_off) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            let image = read_page(&mut self.slots_file, slots_path, page_off)?;
+                            entry.insert(image)
+                        }
                     };
                     let hi = end.min((page_off as usize).saturating_add(page as usize));
                     let dst = at - page_off as usize;
@@ -1149,24 +1147,41 @@ impl Mempool {
                 }
             }
             for (off, image) in pages {
-                images.push((slots_name.clone(), off, image));
+                images.push((slots_name.to_string(), off, image));
             }
         }
-        if meta {
-            let mut image = read_page(&mut self.meta_file, &meta_path, 0)?;
-            let mut rec = [0u8; META_LEN];
-            write_meta_bytes(&mut rec, self.generation, self.slot_cap, self.live_count);
-            image[..META_LEN].copy_from_slice(&rec);
-            images.push(("meta".to_string(), 0, image));
-        }
+        Ok(())
+    }
+
+    fn collect_meta_image(
+        &mut self,
+        meta_path: &Path,
+        images: &mut Vec<(String, u64, [u8; 4096])>,
+    ) -> Result<(), MempoolError> {
+        let mut image = read_page(&mut self.meta_file, meta_path, 0)?;
+        let mut rec = [0u8; META_LEN];
+        write_meta_bytes(&mut rec, self.generation, self.slot_cap, self.live_count);
+        image[..META_LEN].copy_from_slice(&rec);
+        images.push(("meta".to_string(), 0, image));
+        Ok(())
+    }
+
+    fn publish_flush_mark(
+        &mut self,
+        body_path: &Path,
+        slots_path: &Path,
+        meta_path: &Path,
+        logical: Option<u64>,
+        fresh_body: bool,
+        images: Vec<(String, u64, [u8; 4096])>,
+    ) -> Result<(), MempoolError> {
         if images.is_empty() {
             if let Some(logical) = logical {
                 if fresh_body {
-                    self.body_file
-                        .set_len(logical)
-                        .map_err(|e| MempoolError::io(&body_path, e))?;
+                    self.adopt_body_len(body_path, logical)?;
+                } else {
+                    self.body_persisted_len = logical;
                 }
-                self.body_persisted_len = logical;
             }
             return Ok(());
         }
@@ -1186,9 +1201,9 @@ impl Mempool {
         }
         for (name, off, image) in &images {
             match name.as_str() {
-                "tx.body" => pwrite_at(&mut self.body_file, &body_path, *off, image)?,
-                "meta" => pwrite_at(&mut self.meta_file, &meta_path, *off, image)?,
-                _ => pwrite_at(&mut self.slots_file, &slots_path, *off, image)?,
+                "tx.body" => pwrite_at(&mut self.body_file, body_path, *off, image)?,
+                "meta" => pwrite_at(&mut self.meta_file, meta_path, *off, image)?,
+                _ => pwrite_at(&mut self.slots_file, slots_path, *off, image)?,
             }
         }
         let mut live: Vec<(&File, &Path)> = Vec::new();
@@ -1203,21 +1218,26 @@ impl Mempool {
             }
         }
         if saw_body {
-            live.push((&self.body_file, &body_path));
+            live.push((&self.body_file, body_path));
         }
         if saw_slots {
-            live.push((&self.slots_file, &slots_path));
+            live.push((&self.slots_file, slots_path));
         }
         if saw_meta {
-            live.push((&self.meta_file, &meta_path));
+            live.push((&self.meta_file, meta_path));
         }
         rbitcoin_store::page_guard::clear_page_guard_files(&mark, &live).map_err(map_store)?;
         if let Some(logical) = logical {
-            self.body_file
-                .set_len(logical)
-                .map_err(|e| MempoolError::io(&body_path, e))?;
-            self.body_persisted_len = logical;
+            self.adopt_body_len(body_path, logical)?;
         }
+        Ok(())
+    }
+
+    fn adopt_body_len(&mut self, path: &Path, logical: u64) -> Result<(), MempoolError> {
+        self.body_file
+            .set_len(logical)
+            .map_err(|e| MempoolError::io(path, e))?;
+        self.body_persisted_len = logical;
         Ok(())
     }
 
@@ -1377,11 +1397,19 @@ pub fn body_logical_len(body: &[u8]) -> Result<usize, MempoolError> {
 
 #[doc(hidden)]
 pub fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<File, MempoolError> {
-    let mut f = File::create(path).map_err(|e| MempoolError::io(path, e))?;
-    f.write_all(bytes).map_err(|e| MempoolError::io(path, e))?;
-    f.durable_sync_all()
-        .map_err(|e| MempoolError::io(path, e))?;
-    Ok(f)
+    {
+        // `File::create` is write-only. The flush mark reads the live page
+        // back, and a write-only fd returns EBADF on that read.
+        let mut f = File::create(path).map_err(|e| MempoolError::io(path, e))?;
+        f.write_all(bytes).map_err(|e| MempoolError::io(path, e))?;
+        f.durable_sync_all()
+            .map_err(|e| MempoolError::io(path, e))?;
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| MempoolError::io(path, e))
 }
 
 /// Finish a compact install interrupted after the body rename.
