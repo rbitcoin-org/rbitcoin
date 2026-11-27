@@ -2738,7 +2738,9 @@ impl ScriptHashTable {
     /// returned but whose meaning depends on a later step that failed: a
     /// disconnect's unlinks when the tip shrink did not reach the disk.
     pub fn hold_dirty(&self) -> Result<(), StoreError> {
-        drop(self.dirty.begin(&self.store_dir)?);
+        // Hold the write scope until `held` is set: a flush that samples
+        // the generation in between would otherwise clear the new mark.
+        let _scope = self.dirty.begin(&self.store_dir)?;
         self.dirty.hold();
         Ok(())
     }
