@@ -236,11 +236,14 @@ impl BlockFilterTable {
         let meta = TableFile::create(Self::meta_path(dir), TableKind::ArrayLink)?;
         meta.write_at_pwrite(HDR, &IDX_FMT.to_le_bytes())?;
         meta.flush()?;
-        Ok(Self::with_segs(
-            dir,
-            vec![Self::seg_dirs(dir).create(0, 0)?],
-            HDR,
-        ))
+        let seg = Self::seg_dirs(dir).create(0, 0)?;
+        // The first forward commit syncs only the segment files. `meta`, the
+        // segment names, and the two table directories have to be durable
+        // before a put can return.
+        for d in [Self::idx_dir(dir), Self::body_dir(dir), dir.to_path_buf()] {
+            crate::file::fsync_parent_dir(&d).map_err(|e| StoreError::io(&d, e))?;
+        }
+        Ok(Self::with_segs(dir, vec![seg], HDR))
     }
 
     #[doc(hidden)]
