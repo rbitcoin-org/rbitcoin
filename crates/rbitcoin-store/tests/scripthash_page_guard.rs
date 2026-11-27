@@ -693,3 +693,29 @@ fn gap_links_wait_for_the_arm() {
         }
     }
 }
+
+/// The deferred empty-head commit after a tip shrink writes the head word
+/// and the free-list links of the dropped chain. A crash before its clear
+/// restores the head and the chain together.
+#[test]
+fn deferred_empty_commit_restores_the_head_and_chain() {
+    let dir = tmp();
+    let sh = script_hash(&[0xe1]);
+    let n = 300u64;
+    {
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        put_create_batch(&t, (1..=n).map(|i| rec(sh, i)).collect::<Vec<_>>());
+        let fks: Vec<Fk> = (1..=n).map(Fk).collect();
+        t.unlink_creates_batch(&[(sh, fks)]).unwrap();
+        assert!(t.deferred_empty(&sh));
+        t.fail_next_sh_guard_clear();
+        assert!(t.commit_deferred_empty_heads().is_err());
+        assert!(!sh_marks(&dir).is_empty(), "the crash leaves the mark");
+    }
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert_eq!(
+        create_fks(&t, &sh),
+        (1..=n).collect::<Vec<_>>(),
+        "open did not restore the head and chain the empty commit wrote"
+    );
+}
