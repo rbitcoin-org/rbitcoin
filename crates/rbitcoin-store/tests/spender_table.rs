@@ -193,6 +193,22 @@ fn a_later_append_syncs_the_guard_directory() {
     t.append(Fk(2), 2, Fk::NULL).unwrap();
 }
 
+/// Flush before any spent.ovf append. `guard/` may not exist yet, and
+/// retiring a mark that was never armed must not fail looking for it.
+#[test]
+fn flush_before_any_spent_ovf_append_does_not_need_guard() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-no-guard").unwrap();
+    let path = dir.path().to_path_buf();
+    let s = Store::create_tiny(&path).unwrap();
+    let guard = path.join("guard");
+    if guard.exists() {
+        std::fs::remove_dir_all(&guard).unwrap();
+    }
+    let g = s.hold_utxo_view();
+    s.spenders.sync_data_only(&SpenderFreeze::new(&g)).unwrap();
+    assert!(!path.join("guard/spent.ovf").exists());
+}
+
 /// A checkpoint whose mark is already gone must still sync `guard/`.
 /// Unlink can land while that directory sync fails.
 #[test]
