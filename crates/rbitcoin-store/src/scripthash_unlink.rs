@@ -591,17 +591,25 @@ impl ScriptHashTable {
         }
     }
 
+    /// One backward mark covers the head word (until it is synced), page 0,
+    /// and each freed page's link. A crash before the clear restores the
+    /// head and the chain together.
     fn commit_one_empty(&self, job: &mut PendingEmpty) -> Result<(), StoreError> {
+        let _hold = page_guard::hold_marks();
+        if job.pages_left.is_none() {
+            job.pages_left = Some(self.deferred_page_list(job)?);
+        }
+        let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
+        let mut offs = vec![0u64];
+        offs.extend(job.pages_left.iter().flatten().map(|&(_, off)| off));
+        let armed =
+            self.arm_suffix_pages(body, &job.scripthash, job.home, &offs, !job.head_synced)?;
         if !job.head_synced {
             self.unlink_write_home(&job.scripthash, job.home, &ShHeadValue::Empty)?;
             self.sync_home(job.home, &job.scripthash)?;
             job.head_synced = true;
         }
-        if job.pages_left.is_none() {
-            job.pages_left = Some(self.deferred_page_list(job)?);
-        }
         let mut pages = job.pages_left.take().unwrap_or_default();
-        let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
         let alloc_mu = self.alloc_for(&job.scripthash, super::KeyHome::from(job.home));
         let mut alloc = alloc_mu.lock().unwrap();
         let mut next = 0;
@@ -622,6 +630,11 @@ impl ScriptHashTable {
             return Err(e);
         }
         if let Err(e) = write_alloc_header(body, &alloc) {
+            job.pages_left = Some(Vec::new());
+            return Err(e);
+        }
+        drop(alloc);
+        if let Err(e) = self.clear_armed_sh(&armed) {
             job.pages_left = Some(Vec::new());
             return Err(e);
         }
