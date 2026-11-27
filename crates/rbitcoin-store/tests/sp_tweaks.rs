@@ -67,6 +67,39 @@ fn put_get_len_tweak_no_txid() {
 }
 
 #[test]
+fn torn_sp_tweaks_page_restores_the_armed_image() {
+    let dir = tmp_dir();
+    let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    let mut tweak = [0u8; 33];
+    tweak[0] = 0x02;
+    tweak[32] = 0xab;
+    t.put_block(Height(0), &[Some(tweak)]).unwrap();
+    rbitcoin_store::page_guard::fail_next_forward_after_arm(&dir);
+    tweak[32] = 0xcd;
+    assert!(t.put_block(Height(1), &[Some(tweak)]).is_err());
+    assert!(dir.join("guard/sp_tweaks").is_file());
+    drop(t);
+    let body = SpTweaksTable::seg_dirs(&dir).body_path(0);
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&body)
+        .unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(&[0xA5; 4096]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    rbitcoin_store::store::restore_open_marks(&rbitcoin_store::StoreLayout::tiny(dir.path()))
+        .unwrap();
+    assert!(!dir.join("guard/sp_tweaks").exists());
+    let t = SpTweaksTable::open(&dir).unwrap();
+    let got = t.get_block(Height(1), 1).unwrap().expect("restored height");
+    assert_eq!(got, vec![Some(tweak)]);
+    let raw = fs::read(&body).unwrap();
+    assert_ne!(raw[FILE_HEADER_LEN], 0xA5);
+}
+
+#[test]
 fn put_syncs_body_then_idx() {
     let dir = tmp_dir();
     let t = SpTweaksTable::create(&dir, Height(0)).unwrap();

@@ -536,7 +536,7 @@ impl Store {
         let meta_ver = check_meta(&path)?;
         // A mark finishes a torn header.body page before the width probe in
         // open_layout_refuse_old reads its length.
-        restore_open_marks(&path)?;
+        restore_open_marks(&layout)?;
         open_layout_refuse_old(&path, meta_ver)?;
         drop_unread_store_leftovers(&path);
         let scripthash = if path.join("scripthash.body").exists() {
@@ -2768,7 +2768,22 @@ pub fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
 }
 
 /// Copy armed page images back before trim or the tip walk.
-fn restore_open_marks(path: &Path) -> Result<(), StoreError> {
+///
+/// Filter, tweak, and txstat marks live next to those files. A split store
+/// keeps txstat (and, once enabled, the filter and tweak dirs) on the cold
+/// directory, so both directories are restored here. This is the only open
+/// restore: table open does not arm another one.
+#[doc(hidden)]
+pub fn restore_open_marks(layout: &StoreLayout) -> Result<(), StoreError> {
+    restore_hot_marks(&layout.dir)?;
+    let cold = layout.seqsigwit_dir();
+    if cold != layout.dir.as_path() {
+        restore_side_marks(cold)?;
+    }
+    Ok(())
+}
+
+fn restore_hot_marks(path: &Path) -> Result<(), StoreError> {
     crate::page_guard::restore_store_group(path, crate::page_guard::CLASS_C_MARK)?;
     crate::page_guard::restore_store_group(path, crate::page_guard::HEADER_BODY_MARK)?;
     crate::page_guard::restore_store_group(path, crate::page_guard::HEADER_HEAD_MARK)?;
@@ -2778,6 +2793,13 @@ fn restore_open_marks(path: &Path) -> Result<(), StoreError> {
         crate::spender_table::SPENT_OVF_NAME,
     )?;
     restore_sh_marks_or_rebuild(path)?;
+    restore_side_marks(path)
+}
+
+fn restore_side_marks(path: &Path) -> Result<(), StoreError> {
+    crate::page_guard::restore_store_group(path, crate::page_guard::TXSTAT_MARK)?;
+    crate::page_guard::restore_store_group(path, crate::page_guard::BLOCKFILTER_MARK)?;
+    crate::page_guard::restore_store_group(path, crate::page_guard::SP_TWEAKS_MARK)?;
     Ok(())
 }
 

@@ -22,6 +22,7 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::page_guard::{self, ForwardAppend};
 use crate::seg_pair::{locate, SegDirs, SegPair as Seg};
 use rbitcoin_primitives::{le_u32, Height, TableKind};
 use std::path::{Path, PathBuf};
@@ -448,26 +449,45 @@ impl SpTweaksTable {
             expect = Height(expect.0.saturating_add(1));
         }
         let mut inner = self.lock();
+        let segs_before = inner.segs.len();
         let mut i = 0usize;
+        struct Plan {
+            si: usize,
+            body_at: u64,
+            body: Vec<u8>,
+            idx_at: u64,
+            idx: Vec<u8>,
+            n: u64,
+        }
+        let mut plans: Vec<Plan> = Vec::new();
         while i < items.len() {
             let start0 = inner
                 .segs
                 .last()
-                .map(|s| s.body.logical_len())
+                .map(|s| {
+                    plans
+                        .last()
+                        .filter(|p| p.si + 1 == inner.segs.len())
+                        .map(|p| p.body_at + p.body.len() as u64)
+                        .unwrap_or_else(|| s.body.logical_len())
+                })
                 .unwrap_or(FILE_HEADER_LEN as u64);
             if start0 > u32::MAX as u64 {
                 self.dirs.roll(&mut inner.segs)?;
             }
-            let tail = inner
-                .segs
-                .last_mut()
-                .ok_or(StoreError::Corrupt("sp_tweaks no segments"))?;
-            let start = tail.body.logical_len();
+            let si = inner.segs.len() - 1;
+            let start = if plans.last().is_some_and(|p| p.si == si) {
+                let p = plans.last().unwrap();
+                p.body_at + p.body.len() as u64
+            } else {
+                inner.segs[si].body.logical_len()
+            };
             if start > u32::MAX as u64 {
                 return Err(StoreError::Corrupt("sp_tweaks body exceeds u32 off"));
             }
             let mut body = Vec::new();
             let mut offs: Vec<u32> = Vec::new();
+            let start_i = i;
             while i < items.len() {
                 let rec_start = start.saturating_add(body.len() as u64);
                 if rec_start > u32::MAX as u64 {
@@ -477,25 +497,62 @@ impl SpTweaksTable {
                 body.extend_from_slice(&Self::encode_records(items[i].1));
                 i += 1;
             }
-            if offs.is_empty() {
+            if i == start_i {
                 return Err(StoreError::Corrupt("sp_tweaks body exceeds u32 off"));
             }
-            // Body before idx, each synced: an idx slot on disk never points
-            // at body bytes a power cut can lose.
-            if !body.is_empty() {
-                tail.body.write_at_pwrite(start, &body)?;
-                tail.body.flush()?;
-            }
-            let mut idx_blob = Vec::with_capacity(offs.len() * SLOT as usize);
+            let n_slots = inner.segs[si].n_slots
+                + plans
+                    .iter()
+                    .filter(|p| p.si == si)
+                    .map(|p| p.n)
+                    .sum::<u64>();
+            let mut idx = Vec::with_capacity(offs.len() * SLOT as usize);
             for o in &offs {
-                idx_blob.extend_from_slice(&o.to_le_bytes());
+                idx.extend_from_slice(&o.to_le_bytes());
             }
-            let idx_at = FILE_HEADER_LEN as u64 + tail.n_slots * SLOT;
-            if !idx_blob.is_empty() {
-                tail.idx.write_at_pwrite(idx_at, &idx_blob)?;
-                tail.idx.flush()?;
+            plans.push(Plan {
+                si,
+                body_at: start,
+                body,
+                idx_at: FILE_HEADER_LEN as u64 + n_slots * SLOT,
+                idx,
+                n: offs.len() as u64,
+            });
+        }
+        let mut writes: Vec<ForwardAppend<'_>> = Vec::new();
+        for p in &plans {
+            let seg = &inner.segs[p.si];
+            if !p.body.is_empty() {
+                writes.push(ForwardAppend {
+                    file: &seg.body,
+                    at: p.body_at,
+                    bytes: &p.body,
+                    new_logical: p.body_at + p.body.len() as u64,
+                });
             }
-            tail.n_slots = tail.n_slots.saturating_add(offs.len() as u64);
+            if !p.idx.is_empty() {
+                writes.push(ForwardAppend {
+                    file: &seg.idx,
+                    at: p.idx_at,
+                    bytes: &p.idx,
+                    new_logical: p.idx_at + p.idx.len() as u64,
+                });
+            }
+        }
+        let Some(dir) = self.dirs.idx.parent() else {
+            return Err(StoreError::Rejected("page guard mark has no directory"));
+        };
+        let committed =
+            page_guard::commit_forward_appends(dir, page_guard::SP_TWEAKS_MARK, &writes);
+        drop(writes);
+        if let Err(e) = committed {
+            if inner.segs.len() > segs_before && !dir.join(page_guard::SP_TWEAKS_MARK).is_file() {
+                self.dirs.drop_after(&mut inner.segs, segs_before);
+            }
+            return Err(e);
+        }
+        for p in &plans {
+            inner.segs[p.si].n_slots = inner.segs[p.si].n_slots.saturating_add(p.n);
         }
         Ok(())
     }

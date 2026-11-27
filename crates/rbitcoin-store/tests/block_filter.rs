@@ -207,3 +207,39 @@ fn block_filter_slot_roundtrip_keeps_the_row() {
     assert_eq!(row.len, 40);
     assert_eq!(row.slot, slot(3));
 }
+
+#[test]
+fn torn_blockfilter_page_restores_the_armed_image() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    rbitcoin_store::page_guard::fail_next_forward_after_arm(&dir);
+    let err = t.put(&[BlockFilterRecord {
+        height: Height(1),
+        slot: slot(1),
+        filter: &[1, 1, 1, 1],
+    }]);
+    assert!(err.is_err(), "the failpoint stops after the mark is armed");
+    assert!(dir.join("guard/blockfilter").is_file());
+    drop(t);
+    let body = BlockFilterTable::seg_dirs(&dir).body_path(0);
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&body)
+        .unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(&[0xA5; 4096]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    rbitcoin_store::store::restore_open_marks(&rbitcoin_store::StoreLayout::tiny(dir.path()))
+        .unwrap();
+    assert!(!dir.join("guard/blockfilter").exists());
+    let t = BlockFilterTable::open(&dir).unwrap();
+    assert_eq!(t.next_height(), Height(2));
+    let (bytes, got) = t.filter(Height(1)).unwrap().unwrap();
+    assert_eq!(bytes, vec![1, 1, 1, 1]);
+    assert_eq!(got, slot(1));
+    let raw = fs::read(&body).unwrap();
+    assert_ne!(raw[FILE_HEADER_LEN], 0xA5);
+}
