@@ -30,7 +30,7 @@ const GROUP_KIND: u16 = 1;
 pub const CLASS_C_MARK: &str = "guard/class_c";
 /// Forward images for `header.body`.
 pub const HEADER_BODY_MARK: &str = "guard/header.body";
-/// Forward images for one `header.head` generation and its `.mlt`.
+/// Forward images for one `header.head` generation.
 pub const HEADER_HEAD_MARK: &str = "guard/header.head";
 /// Backward image of `spent.ovf` page 0 and its tail block.
 pub const SPENT_OVF_MARK: &str = "guard/spent.ovf";
