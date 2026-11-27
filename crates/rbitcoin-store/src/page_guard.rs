@@ -141,6 +141,18 @@ pub fn restore_page_guard(mark: &Path, data: &File, data_path: &Path) -> Result<
 /// the live files are left alone.
 #[doc(hidden)]
 pub fn restore_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreError> {
+    if !replay_page_guard_group(mark, dir)? {
+        return Ok(false);
+    }
+    remove_mark(mark)?;
+    Ok(true)
+}
+
+/// [`restore_page_guard_group`] that leaves the mark in place.
+///
+/// The images are on the device when this returns. The caller removes the
+/// mark once the state the mark stands for is durable elsewhere.
+fn replay_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreError> {
     mark_parent(mark)?;
     let raw = match std::fs::read(mark) {
         Ok(raw) => raw,
@@ -172,7 +184,6 @@ pub fn restore_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreEr
     }
     // The created directory entry has to be durable before the mark is gone.
     fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
-    remove_mark(mark)?;
     Ok(true)
 }
 
@@ -251,6 +262,11 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
 #[doc(hidden)]
 pub fn restore_store_group(dir: &Path, mark: &str) -> Result<bool, StoreError> {
     restore_page_guard_group(&dir.join(mark), dir)
+}
+
+/// Copy `dir/<mark>` onto its files and keep the mark. Missing is `Ok(false)`.
+pub(crate) fn replay_store_group(dir: &Path, mark: &str) -> Result<bool, StoreError> {
+    replay_page_guard_group(&dir.join(mark), dir)
 }
 
 /// Promote `meta` to 31 when this directory is a datadir still on 30.

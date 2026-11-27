@@ -885,22 +885,48 @@ fn an_unreadable_mark_is_not_an_incomplete_creation() {
 /// mark, not refuse the store as one whose head was lost.
 #[test]
 fn open_indexes_a_first_header_row_the_head_does_not_name() {
+    let dir = tmp();
+    let first = arm_first_header_row_mark(&dir);
+    let s = Store::open_tiny(&dir).expect("the first unindexed row was refused");
+    assert_first_header_row_indexed(&s, &first);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An open that stops after the body mark replayed and before the head names
+/// the row must leave the mark. The next open then still indexes the row
+/// instead of refusing an empty head with no mark.
+#[test]
+fn open_keeps_the_header_body_mark_until_the_head_names_the_row() {
+    let dir = tmp();
+    let first = arm_first_header_row_mark(&dir);
+    let stop = dir.join("header.head.ahead");
+    std::fs::write(&stop, b"stop the open after the body replay").unwrap();
+    assert!(
+        Store::open_tiny(&dir).is_err(),
+        "the planted refusal did not stop open"
+    );
+    std::fs::remove_file(&stop).unwrap();
+    assert!(dir
+        .join(rbitcoin_store::page_guard::HEADER_BODY_MARK)
+        .exists());
+    let s = Store::open_tiny(&dir).expect("the second open refused the unindexed row");
+    assert_first_header_row_indexed(&s, &first);
+    drop(s);
+    assert!(!dir
+        .join(rbitcoin_store::page_guard::HEADER_BODY_MARK)
+        .exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An empty store whose `guard/header.body` mark holds one first row, as a
+/// crash during that append leaves it.
+fn arm_first_header_row_mark(dir: &Path) -> HeaderRecord {
     use rbitcoin_store::file::FILE_HEADER_LEN;
     use rbitcoin_store::header_table::HEADER_RECORD_LEN;
-    let first = HeaderRecord {
-        prev_fk: Fk::NULL,
-        version: 1,
-        timestamp: 1,
-        bits: 0x1d00ffff,
-        nonce: 1,
-        merkle_root: [1u8; 32],
-        hash: [0x66u8; 32],
-        size: 0,
-        weight: 0,
-    };
-    let dir = tmp();
+    let first = loose_header(0x66);
     {
-        let s = Store::create_tiny(&dir).unwrap();
+        let s = Store::create_tiny(dir).unwrap();
         s.flush().unwrap();
     }
     let body = dir.join("header.body");
@@ -915,13 +941,14 @@ fn open_indexes_a_first_header_row_the_head_does_not_name() {
         &[("header.body", 0, image.as_slice())],
     )
     .unwrap();
-    let s = Store::open_tiny(&dir).expect("the first unindexed row was refused");
+    first
+}
+
+fn assert_first_header_row_indexed(s: &Store, first: &HeaderRecord) {
     let found = s.get_header_by_hash(&first.hash).unwrap().map(|(fk, _)| fk);
     assert_eq!(found, Some(Fk(1)));
-    assert_eq!(s.put_header(&first).unwrap(), Fk(1));
+    assert_eq!(s.put_header(first).unwrap(), Fk(1));
     assert_eq!(s.header_count(), 1);
-    drop(s);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Meta 31 beside a 96-byte `header.body` is not a schema-24 store. Only
