@@ -21,8 +21,8 @@
 //!
 //! **Commit order:** one `guard/blockfilter` mark per `put`. Fresh blocks are
 //! synced first. The body tail, the idx tail, and page 0 are the mark, then
-//! those pages are written and the mark is cleared. Readers never wait on
-//! commit IO. After power loss the idx HWM may cover a torn slot and the body
+//! those pages are written and the mark is cleared. `put` holds its writer
+//! lock through that sync. After power loss the idx HWM may cover a torn slot and the body
 //! may hold bytes of an uncommitted record: open keeps the longest prefix of
 //! slots whose records run back to back inside the body, cuts the body to its
 //! end, and the caller checks `header_fk` against `confirmed[]`.
@@ -110,6 +110,8 @@ pub struct BlockFilterTable {
     pub inner: RwLock<Inner>,
     /// Serializes `put` and `truncate_through` (one writer at a time).
     pub writer: Mutex<()>,
+    /// A forward mark may still name the last failed put. Reopen restores it.
+    blocked: std::sync::atomic::AtomicBool,
 }
 
 /// A filter's bytes and idx facts.
@@ -207,7 +209,24 @@ impl BlockFilterTable {
             dirs: Self::seg_dirs(dir),
             inner: RwLock::new(Inner { segs, tail_end }),
             writer: Mutex::new(()),
+            blocked: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn refuse_pending_mark(&self) -> Result<(), StoreError> {
+        if self.blocked.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(StoreError::Rejected(
+                "blockfilter forward mark is still armed",
+            ));
+        }
+        if let Some(dir) = self.dirs.idx.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if dir.join(page_guard::BLOCKFILTER_MARK).is_file() {
+                return Err(StoreError::Rejected(
+                    "blockfilter forward mark is still armed",
+                ));
+            }
+        }
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -455,6 +474,7 @@ impl BlockFilterTable {
     /// Append consecutive heights starting at [`Self::next_height`], durably.
     pub fn put(&self, items: &[BlockFilterRecord<'_>]) -> Result<(), StoreError> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        self.refuse_pending_mark()?;
         let next = self.read().next();
         if items
             .iter()
@@ -556,12 +576,21 @@ impl BlockFilterTable {
         let committed =
             page_guard::commit_forward_appends(dir, page_guard::BLOCKFILTER_MARK, &writes);
         drop(writes);
-        if let Err(e) = committed {
-            undo_slot_plan(&mut inner.segs, &plans);
-            if inner.segs.len() > segs_before && !dir.join(page_guard::BLOCKFILTER_MARK).is_file() {
-                self.dirs.drop_after(&mut inner.segs, segs_before);
+        match committed {
+            page_guard::ForwardCommit::Done => {}
+            page_guard::ForwardCommit::Undo(e) => {
+                undo_slot_plan(&mut inner.segs, &plans);
+                if inner.segs.len() > segs_before {
+                    self.dirs.drop_after(&mut inner.segs, segs_before);
+                }
+                return Err(e);
             }
-            return Err(e);
+            page_guard::ForwardCommit::Keep(e) => {
+                // The mark may name these files. Do not undo counts or unlink.
+                self.blocked
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(e);
+            }
         }
         if let Some(last) = plans.last() {
             inner.tail_end = last.body_end;
@@ -572,6 +601,7 @@ impl BlockFilterTable {
     /// Drop heights above `tip` (`None` drops every slot).
     pub fn truncate_through(&self, tip: Option<Height>) -> Result<(), StoreError> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        self.refuse_pending_mark()?;
         let keep = tip.map_or(0, |h| u64::from(h.0) + 1);
         let mut inner = self.write();
         if keep >= inner.next() {
