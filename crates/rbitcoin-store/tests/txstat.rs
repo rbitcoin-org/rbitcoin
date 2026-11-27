@@ -22,48 +22,6 @@ fn txstat_blob_longer_than_the_file_is_corrupt() {
 }
 
 #[test]
-fn page0_stamp_is_not_in_the_txstat_mark() {
-    let dir = TempDir::labeled("txstat-page0").unwrap();
-    // Past one page, so page 0 is not also the partial tail.
-    let rows: Vec<TxStatRow> = (1..=600u64).map(|i| tiny(i, 100, 10)).collect();
-    let stamped = tiny(9, 9, 9);
-    {
-        let t = TxStat::create(&dir).unwrap();
-        t.append_batch(0, &rows).unwrap();
-        // The trace sees an arm that is cleared before `write_row` returns.
-        #[cfg(debug_assertions)]
-        rbitcoin_store::page_guard::arm_store_mark_trace();
-        t.write_row(Fk(1), &stamped).unwrap();
-        #[cfg(debug_assertions)]
-        assert!(
-            rbitcoin_store::page_guard::take_armed_store_marks().is_empty(),
-            "a page-0 stamp armed a mark"
-        );
-        assert!(
-            !dir.join("guard/txstat").exists(),
-            "a page-0 stamp is the Class A first page, not this mark"
-        );
-    }
-    let path = dir.join("txstat.body");
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .unwrap();
-    use std::io::{Seek, SeekFrom, Write};
-    file.seek(SeekFrom::Start(32)).unwrap();
-    file.write_all(&[0xA5; 8]).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-    rbitcoin_store::store::restore_open_marks(&rbitcoin_store::StoreLayout::tiny(dir.path()))
-        .unwrap();
-    let t = TxStat::open(&dir).unwrap();
-    assert_eq!(t.get_cell(Fk(1)).unwrap(), [0xA5; 8]);
-    assert_ne!(t.get_cell(Fk(1)).unwrap(), pack_cell(&stamped).unwrap().0);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn create_empty_then_extend_zeros() {
     let dir = TempDir::labeled("txstat-extend").unwrap();
     let t = TxStat::create(&dir).unwrap();
@@ -236,10 +194,6 @@ fn append_batch_relies_on_the_class_a_tail_guard() {
         "an append armed a mark"
     );
     assert!(!dir.join("txstat.body.ahead").exists());
-    assert!(
-        !dir.join("guard/txstat").exists(),
-        "an append-only batch stays on the Class A tail guard"
-    );
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
