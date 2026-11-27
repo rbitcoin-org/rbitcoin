@@ -826,6 +826,38 @@ fn a_removed_mark_forgets_its_pages_when_the_dir_sync_fails() {
         .expect("the removed mark still armed page 0");
 }
 
+/// A clear that rewrites the mark without one file and then fails its
+/// directory sync still drops that file's pages from the release check.
+/// The rename landed, so the mark no longer names it.
+#[cfg(debug_assertions)]
+#[test]
+fn a_rewritten_mark_forgets_dropped_pages_when_the_dir_sync_fails() {
+    let dir = TempDir::labeled("page-guard-retain-forget").unwrap();
+    let live = dir.path().join("live");
+    write_bytes(&live, 0, &fill(0x11));
+    write_bytes(&live, PAGE as u64, &fill(0x12));
+    let mark = dir.path().join("guard/live");
+    arm_page_guard_group(
+        &mark,
+        &[
+            ("live", 0, fill(0x11).as_slice()),
+            ("other", 0, fill(0x21).as_slice()),
+        ],
+    )
+    .unwrap();
+    let committed = 2 * PAGE as u64;
+    assert!(
+        rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64, 8).is_err(),
+        "page 1 is committed and not armed"
+    );
+    rbitcoin_store::page_guard::fail_next_mark_dir_sync(&dir.path().join("guard"));
+    let names = std::collections::HashSet::from(["live".to_string()]);
+    assert!(rbitcoin_store::page_guard::drop_page_guard_names(&mark, &names).is_err());
+    assert!(mark.exists(), "the mark still names `other`");
+    rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64, 8)
+        .expect("the rewritten mark still armed `live`");
+}
+
 /// Without hole punching, `zero_range` writes zeros in 1 MiB chunks. Each
 /// chunk publishes its end, and the next chunk must still be checked
 /// against the committed end the call started with. A committed page the

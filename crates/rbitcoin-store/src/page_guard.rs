@@ -19,7 +19,7 @@ use crate::durability::Durable;
 use crate::error::StoreError;
 use crate::file::{
     encode_leading_header, fsync_parent_dir, handle_pread_all, handle_pwrite_all,
-    write_synced_tmp_rename, TableFile, FILE_HEADER_LEN,
+    write_file_synced_tmp_rename, write_synced_tmp_rename, TableFile, FILE_HEADER_LEN,
 };
 
 pub const PAGE: u64 = crate::tx_table::BODY_PAGE_SIZE;
@@ -426,9 +426,11 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
     for (file, offset, image) in &keep {
         encode_group_record(&mut buf, file, *offset, image)?;
     }
-    write_synced_tmp_rename(path, &buf)?;
+    // The rename drops the names from the mark, so forget them before the
+    // directory sync. A failed sync must not leave them armed.
+    write_file_synced_tmp_rename(path, &buf)?;
     forget_armed_names(path, &dropped);
-    Ok(())
+    sync_mark_dir(mark_parent(path)?)
 }
 
 /// Restore `dir/<mark>` when it exists, then continue. Missing is `Ok`.
@@ -882,6 +884,11 @@ fn remove_mark(path: &Path, forget: impl FnOnce()) -> Result<(), StoreError> {
         Err(e) => return Err(StoreError::io(path, e)),
     }
     forget();
+    sync_mark_dir(parent)
+}
+
+/// Sync the guard directory after a mark was unlinked or renamed over.
+fn sync_mark_dir(parent: &Path) -> Result<(), StoreError> {
     #[cfg(debug_assertions)]
     if take_fail_mark_dir_sync(parent) {
         return Err(StoreError::io(
@@ -889,15 +896,14 @@ fn remove_mark(path: &Path, forget: impl FnOnce()) -> Result<(), StoreError> {
             std::io::Error::other("injected guard directory sync failure"),
         ));
     }
-    fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-    Ok(())
+    fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))
 }
 
 #[cfg(debug_assertions)]
 static FAIL_MARK_DIR_SYNC: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
-/// The next mark removal in guard directory `dir` unlinks the mark and then
-/// fails its directory sync.
+/// The next mark removal or rewrite in guard directory `dir` unlinks or
+/// renames the mark and then fails its directory sync.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn fail_next_mark_dir_sync(dir: &Path) {
