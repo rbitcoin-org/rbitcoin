@@ -551,6 +551,40 @@ fn a_retry_syncs_the_grown_slot_file_again() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A failed persist leaves `guard/flush` armed with the admit's LIVE slot.
+/// Removing that tx before the next persist must reach disk, or open
+/// replays the mark and loads the removed tx as LIVE.
+#[cfg(debug_assertions)]
+#[test]
+fn a_removal_supersedes_a_pending_admit_mark() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let gone = Txid::from_byte_array([0xD1; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let slot = put_live(&mut mp, &gone, 1, 400);
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        fail_next_mempool_guard_before_write(&dir);
+        assert!(mp.persist_due().is_err());
+        assert!(dir.join("guard/flush").is_file());
+        mp.mark_slot_dead(slot).unwrap();
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(
+        !ids.contains(&gone),
+        "open replayed the admit after its removal"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn reused_dead_slot_persist_due_publishes_the_new_tx() {
     let dir = tmp_dir();

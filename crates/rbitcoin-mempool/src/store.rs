@@ -152,6 +152,10 @@ pub struct Mempool {
     /// `slots` file length known durable. A `set_len` whose sync failed is
     /// visible in the file length but not counted here, so a retry syncs it.
     slots_len_synced: u64,
+    /// `guard/flush` is published and not cleared. It may hold a LIVE slot
+    /// image whose body never became durable, so a removal of that slot must
+    /// still publish its death.
+    flush_mark_armed: bool,
 }
 
 impl Mempool {
@@ -199,6 +203,7 @@ impl Mempool {
             death_slots: Vec::new(),
             slots_pending: false,
             slots_len_synced,
+            flush_mark_armed: false,
         };
         let mut body_hdr = [0u8; BODY_HEADER];
         body_hdr.copy_from_slice(&mp.body[..BODY_HEADER]);
@@ -473,7 +478,8 @@ impl Mempool {
         self.slots[off] = SLOT_DEAD;
         self.live_count = self.live_count.saturating_sub(1);
         self.live_body_bytes = self.live_body_bytes.saturating_sub(body_len);
-        if body_off.saturating_add(body_len) <= self.body_persisted_len {
+        // An armed flush mark may name this slot LIVE: open would replay it.
+        if body_off.saturating_add(body_len) <= self.body_persisted_len || self.flush_mark_armed {
             self.death_slots.push(slot);
             self.deaths_unsynced = true;
         }
@@ -1221,6 +1227,7 @@ impl Mempool {
             .collect();
         let mark = self.dir.join("guard/flush");
         rbitcoin_store::page_guard::arm_page_guard_group(&mark, &refs).map_err(map_store)?;
+        self.flush_mark_armed = true;
         #[cfg(debug_assertions)]
         if take_fail_mempool_guard(&self.dir) {
             return Err(MempoolError::io(
@@ -1256,6 +1263,7 @@ impl Mempool {
             live.push((&self.meta_file, meta_path));
         }
         rbitcoin_store::page_guard::clear_page_guard_files(&mark, &live).map_err(map_store)?;
+        self.flush_mark_armed = mark.exists();
         if retire_deaths {
             self.retire_deaths();
         }
