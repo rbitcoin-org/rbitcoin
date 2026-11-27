@@ -165,7 +165,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     env:
       # Keep uninstrumented artifacts out of the coverage tree (and vice versa).
       CARGO_TARGET_DIR: target/dev
@@ -188,7 +188,20 @@ jobs:
       - name: tmpfs headroom
         run: df -h /dev/shm && free -m
       - name: cargo test
-        run: cargo test --workspace --exclude rbitcoin-bench
+        # PROBE ONLY: collect unarmed committed-page writes.
+        env:
+          RBITCOIN_PAGE_GUARD_PROBE: ${{ runner.temp }}/pg-probe.log
+        run: cargo test --workspace --exclude rbitcoin-bench --no-fail-fast
+      - name: unarmed write probe log
+        if: always()
+        run: |
+          f="${{ runner.temp }}/pg-probe.log"
+          if [ -f "$f" ]; then
+            echo "distinct keys: $(grep -c '^UNARMED' "$f")"
+            cat "$f"
+          else
+            echo "no probe log"
+          fi
       # The workspace exclude stays (coverage.test.sh). This one lib test is
       # the address-corpus pin: sha256::Hash Display is internal order.
       - name: bench scripthash pin

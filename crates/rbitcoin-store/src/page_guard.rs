@@ -108,6 +108,9 @@ pub fn check_armed_write(
     }
     let map = armed_map().lock().unwrap_or_else(|e| e.into_inner());
     let Some(pages) = map.get(path) else {
+        drop(map);
+        #[cfg(debug_assertions)]
+        probe_unarmed(path, committed_end, offset, len);
         return Ok(());
     };
     let Some(end) = offset.checked_add(len) else {
@@ -1232,4 +1235,51 @@ fn mark_group_pages(raw: &[u8]) -> Result<Vec<(String, u64, usize)>, StoreError>
         return Err(StoreError::Corrupt("page guard mark length"));
     }
     Ok(pages)
+}
+
+/// PROBE ONLY (never merged): record each distinct unarmed write that shares
+/// a committed page, with its callers, to `$RBITCOIN_PAGE_GUARD_PROBE`.
+#[cfg(debug_assertions)]
+fn probe_unarmed(path: &Path, committed_end: u64, offset: u64, len: u64) {
+    use std::io::Write as _;
+    let Some(log) = std::env::var_os("RBITCOIN_PAGE_GUARD_PROBE") else {
+        return;
+    };
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let name: String = path
+        .file_name()
+        .map(|n| n.to_string_lossy().chars().filter(|c| !c.is_ascii_digit()).collect())
+        .unwrap_or_default();
+    let parent: String = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().chars().filter(|c| !c.is_ascii_digit()).collect())
+        .unwrap_or_default();
+    let key = format!("{parent}/{name} page0={} len={len}", offset < PAGE);
+    {
+        let mut seen = SEEN
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !seen.insert(key.clone()) {
+            return;
+        }
+    }
+    let bt = std::backtrace::Backtrace::force_capture().to_string();
+    let frames: Vec<&str> = bt
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("rbitcoin_"))
+        .filter(|l| !l.contains("page_guard::probe_unarmed") && !l.contains("page_guard::check_armed_write"))
+        .take(10)
+        .collect();
+    let mut out = format!("UNARMED {key} end={committed_end} off={offset}\n");
+    for f in frames {
+        out.push_str("    ");
+        out.push_str(f);
+        out.push('\n');
+    }
+    if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+        let _ = fh.write_all(out.as_bytes());
+    }
 }
