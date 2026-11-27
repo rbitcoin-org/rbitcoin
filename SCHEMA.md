@@ -242,7 +242,6 @@ itself changed.
     guard/header.head                # schema 31 sidecar: forward 4 KiB images for one header.head generation and its .mlt. Open copies both before any head read. Published after meta 31. No SCHEMA_VERSION bump
     guard/spent.ovf                  # schema 31 sidecar: backward 4 KiB images of spent.ovf page 0 and its tail block, taken before the first append after a spend sync. Open copies them onto the live file before annotate replay. Later appends in that window do not replace the mark. Published after meta 31. No SCHEMA_VERSION bump
     guard/sh-*                       # schema 31 sidecar: backward 4 KiB images for one scripthash commit (body pages, page 0, and head words). Open copies them before any scripthash read or sealed-overflow magic check. A mark that does not parse writes scripthash.rebuild and is removed instead of stopping open. Published after meta 31. No SCHEMA_VERSION bump
-    guard/txstat                     # schema 31 sidecar: backward 4 KiB images of interior txstat.body and txstat.blk pages, taken before an in-place stamp. Page 0 and the partial tail stay on the Class A tear guard. Open copies the mark before Class A restore. Published after meta 31. No SCHEMA_VERSION bump
     guard/blockfilter                # schema 31 sidecar: one forward mark per block-filter put (body tail, idx tail, page 0). Fresh blocks are synced before the mark. Open copies the images before the filter tables are read. Published after meta 31. No SCHEMA_VERSION bump
     guard/sp_tweaks                  # schema 31 sidecar: one forward mark per sp_tweaks put (body tail, idx tail, page 0). Fresh blocks are synced before the mark. Open copies the images before the tweak tables are read. Published after meta 31. No SCHEMA_VERSION bump
 
@@ -297,7 +296,7 @@ itself changed.
 files the IBD pin path does not read under `PATH/store/` and writes
 `seqsigwit.reloc` in the hot store: `seqsigwit.*`, `txstat.*`, `input.*`,
 and, once those indexes exist, `blockfilter.*` and `sp_tweaks.*`.
-`guard/txstat`, `guard/blockfilter`, and `guard/sp_tweaks` sit beside those
+`guard/blockfilter` and `guard/sp_tweaks` sit beside those
 files (cold store when the split is on, hot store otherwise). Pin / SH /
 spend-annotate stay on the hot volume. `--prune-seqsigwit` is separate: witness
 for the last 288 heights is only `seqsigwit.window/{height}.bin` on the hot
