@@ -781,3 +781,32 @@ fn ingest_unlink_restores_the_other_page_of_its_chunk() {
     assert_eq!(create_fks(&t, &b), vec![9]);
     assert_eq!(create_fks(&t, &a), vec![1, 2, 3]);
 }
+
+/// A deferred empty-head commit whose clear failed keeps its first mark.
+/// The retry clears every image that arm took, not only the body.
+#[test]
+fn deferred_empty_retry_clears_the_first_mark() {
+    let dir = tmp();
+    let sh = script_hash(&[0xe2]);
+    let n = 300u64;
+    {
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        put_create_batch(&t, (1..=n).map(|i| rec(sh, i)).collect::<Vec<_>>());
+        let fks: Vec<Fk> = (1..=n).map(Fk).collect();
+        t.unlink_creates_batch(&[(sh, fks)]).unwrap();
+        t.fail_next_sh_guard_clear();
+        assert!(t.commit_deferred_empty_heads().is_err());
+        assert!(
+            !sh_marks(&dir).is_empty(),
+            "the failed clear leaves the mark"
+        );
+        t.commit_deferred_empty_heads().unwrap();
+        assert!(!t.deferred_empty(&sh));
+        assert!(sh_marks(&dir).is_empty(), "the retry left an image armed");
+    }
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert!(
+        create_fks(&t, &sh).is_empty(),
+        "open restored a freed chain"
+    );
+}
