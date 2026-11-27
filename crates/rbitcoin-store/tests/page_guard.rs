@@ -879,9 +879,9 @@ fn zero_fill_fallback_keeps_one_committed_end() {
 }
 
 /// The sector rule for the release check: an append that starts at the
-/// committed end inside its tail block, and an in-place write inside one
-/// 512-byte sector, are allowed on a file with a live arm. A committed range
-/// that crosses a sector boundary and is not armed is still rejected.
+/// committed end inside its tail block is allowed on a file with a live arm.
+/// An in-place write outside the armed pages is rejected, even inside one
+/// sector: it may belong to the commit the mark protects.
 #[test]
 fn release_check_follows_the_sector_rule() {
     let dir = TempDir::labeled("page-guard-sector").unwrap();
@@ -891,7 +891,9 @@ fn release_check_follows_the_sector_rule() {
     arm_page0(&dir, "guard/mark");
     file.write_at(committed, &[0x55; 64])
         .expect("an append inside the committed tail block");
-    file.write_at(PAGE as u64 + 8, &[0x66; 8])
-        .expect("an in-place write inside one sector");
+    match file.write_at(PAGE as u64 + 8, &[0x66; 8]) {
+        Err(StoreError::Rejected(msg)) => assert_eq!(msg, "write is outside the armed pages"),
+        other => panic!("a one-sector write outside the arm went through: {other:?}"),
+    }
     page1_is_rejected(&file);
 }
