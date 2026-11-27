@@ -829,6 +829,38 @@ fn open_indexes_header_rows_the_head_does_not_name() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The schema-24 header conversion writes a temp file and renames it. It
+/// arms no mark: the live body is untouched until the rename, and meta may
+/// still be below 31.
+#[test]
+fn v24_header_conversion_publishes_no_mark() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let hdr = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x1d00ffff,
+            nonce: 1,
+            merkle_root: [1u8; 32],
+            hash: [0x65u8; 32],
+            size: 0,
+            weight: 0,
+        };
+        s.put_header(&hdr).unwrap();
+        s.flush().unwrap();
+    }
+    widen_header_body_to_96(&dir);
+    let _ = std::fs::remove_dir_all(dir.join("guard"));
+    rbitcoin_store::header_table::HeaderTable::rewrite_v24_body_to_88(&dir).unwrap();
+    assert!(
+        !dir.join("guard").exists(),
+        "the conversion armed a mark over its temp file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Meta 31 beside a still-96-byte `header.body` is the crash between the old
 /// promote and the rename. Open must convert the body without a schema-24 gate.
 #[test]

@@ -429,22 +429,11 @@ impl HeaderTable {
             blob.extend_from_slice(&raw[..HEADER_RECORD_LEN]);
         }
         let new_len = FILE_HEADER_LEN as u64 + n * HEADER_RECORD_LEN as u64;
-        let pages = compose_body_pages(&dst, FILE_HEADER_LEN as u64, &blob, new_len)?;
-        let _hold = page_guard::hold_marks();
-        let name = page_guard::guard_file_name(&grow)?;
-        let refs: Vec<(&str, u64, &[u8])> = pages
-            .iter()
-            .map(|(off, image)| (name, *off, image.as_slice()))
-            .collect();
-        page_guard::arm_page_guard_group(&dir.join(page_guard::HEADER_BODY_MARK), &refs)?;
+        // `header.body.grow` is not the live file. The live body stays as it
+        // is until the synced temp file is renamed over it, so no mark.
         dst.write_at(FILE_HEADER_LEN as u64, &blob)?;
         dst.set_logical_len(new_len)?;
         dst.flush()?;
-        page_guard::clear_page_guard(
-            &dir.join(page_guard::HEADER_BODY_MARK),
-            &dst.read_file,
-            dst.path(),
-        )?;
         drop(dst);
         drop(src);
         std::fs::rename(&grow, &path).map_err(|e| StoreError::io(&path, e))?;
