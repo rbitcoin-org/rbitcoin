@@ -236,3 +236,54 @@ fn a_failed_node_sync_publishes_no_length() {
     assert!(s.spenders.flush(&freeze).is_err(), "the latch holds");
     assert_eq!(SpenderTable::open(&path).unwrap().count(), 0);
 }
+
+/// An append that lands after the node sync and before the length write is
+/// not in that sync. The flush publishes only the length it synced; the
+/// later node waits for the next flush.
+#[cfg(debug_assertions)]
+#[test]
+fn an_append_during_a_flush_stays_out_of_its_length() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-race").unwrap();
+    let path = dir.path().to_path_buf();
+    let s = Store::create_tiny(&path).unwrap();
+    s.spenders.append(Fk(7), 1, Fk::NULL).unwrap();
+    rbitcoin_store::spender_table::set_after_node_sync(Some(Box::new(|t: &SpenderTable| {
+        t.append(Fk(8), 1, Fk::NULL).unwrap();
+    })));
+    {
+        let g = s.hold_utxo_view();
+        s.spenders.flush(&SpenderFreeze::new(&g)).unwrap();
+    }
+    assert_eq!(s.spenders.count(), 2);
+    let header_len = |p: &std::path::Path| {
+        let raw = std::fs::read(p.join("spent.ovf")).unwrap();
+        u64::from_le_bytes(raw[8..16].try_into().unwrap())
+    };
+    assert_eq!(
+        header_len(&path),
+        SpenderTable::offset(2),
+        "the flush published a node its sync did not cover"
+    );
+    {
+        let g = s.hold_utxo_view();
+        s.spenders.flush(&SpenderFreeze::new(&g)).unwrap();
+    }
+    assert_eq!(header_len(&path), SpenderTable::offset(3));
+}
+
+/// The length sync is the last step of a flush. When it fails, the flush
+/// errs and the latch refuses the next one.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_length_sync_latches_the_flush() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-len-sync").unwrap();
+    let path = dir.path().to_path_buf();
+    let s = Store::create_tiny(&path).unwrap();
+    s.spenders.append(Fk(7), 1, Fk::NULL).unwrap();
+    // The node sync passes; the length sync after it fails.
+    rbitcoin_store::io_handle::arm_fail_sync_after(s.spenders.body.io_handle(), 1, 1);
+    let g = s.hold_utxo_view();
+    let freeze = SpenderFreeze::new(&g);
+    assert!(s.spenders.flush(&freeze).is_err());
+    assert!(s.spenders.flush(&freeze).is_err(), "the latch holds");
+}

@@ -25,7 +25,9 @@ pub const SPENT_OVF_NAME: &str = "spent.ovf";
 pub const LEGACY_SPENDERS_BODY: &str = "spenders.body";
 
 /// The annotate freeze. [`Self::new`] borrows [`crate::store::UtxoViewGuard`]
-/// for the node sync, then the length write and its sync.
+/// for the node sync, then the length write and its sync. An annotate
+/// append does not wait for it: [`SpenderTable::flush`] publishes only the
+/// end it sampled before the sync.
 pub struct SpenderFreeze<'a> {
     _view: std::marker::PhantomData<&'a ()>,
 }
@@ -143,15 +145,16 @@ impl SpenderTable {
         self.finish_sync(self.publish_synced())
     }
 
+    /// The annotate path does not take the freeze, so an append can land
+    /// during a flush. The end is sampled before the sync: every append that
+    /// published it had already written its node. One that lands after the
+    /// sample stays past the header until the next flush.
     fn publish_synced(&self) -> Result<(), StoreError> {
+        let end = self.body.logical_len();
         self.body.sync_data_only()?;
-        if !self.body.catch_up_header() {
-            return Err(StoreError::io(
-                self.body.path(),
-                std::io::Error::other("spent.ovf length write failed"),
-            ));
-        }
-        self.body.flush()
+        #[cfg(debug_assertions)]
+        run_after_node_sync(self);
+        self.body.publish_synced_len(end)
     }
 
     fn refuse_if_sync_failed(&self) -> Result<(), StoreError> {
@@ -175,5 +178,29 @@ impl SpenderTable {
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.body.flush_async()
+    }
+}
+
+#[cfg(debug_assertions)]
+type AfterNodeSync = Box<dyn FnOnce(&SpenderTable)>;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static AFTER_NODE_SYNC: std::cell::RefCell<Option<AfterNodeSync>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` once on this thread, after a flush's node sync and before its
+/// length write.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_after_node_sync(hook: Option<AfterNodeSync>) {
+    AFTER_NODE_SYNC.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(debug_assertions)]
+fn run_after_node_sync(table: &SpenderTable) {
+    if let Some(hook) = AFTER_NODE_SYNC.with(|slot| slot.borrow_mut().take()) {
+        hook(table);
     }
 }
