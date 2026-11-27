@@ -653,3 +653,39 @@ fn flush_writes_only_the_pages_it_imaged() {
     assert_eq!(t.get(Height(600)).unwrap(), Some(Fk(9_002)));
     assert_eq!(t.get(Height(1500)).unwrap(), Some(Fk(9_001)));
 }
+
+/// An fd-only `header_txs` pair lands under one mark. A failure after the
+/// `first` column is written and before `count` is must not leave the pair
+/// split: reopen reads the old pair or the new one.
+#[cfg(debug_assertions)]
+#[test]
+fn fd_only_header_txs_pair_is_one_mark() {
+    use rbitcoin_store::chain::HeaderTxsTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-pair").unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    {
+        let t = HeaderTxsTable::create(&dir.path).unwrap();
+        t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+        t.flush().unwrap();
+    }
+    {
+        let t = rbitcoin_store::array_table::with_class_c_inram_max_bytes(0, || {
+            HeaderTxsTable::open(&dir.path).unwrap()
+        });
+        rbitcoin_store::chain::fail_next_fd_write_before_live(
+            &dir.path.join("header_txs_count.body"),
+        );
+        assert!(t.put_range(&write, Fk(1), Fk(5), 3).is_err());
+    }
+    rbitcoin_store::page_guard::restore_store_group(
+        &dir.path,
+        rbitcoin_store::page_guard::CLASS_C_MARK,
+    )
+    .unwrap();
+    let t = HeaderTxsTable::open(&dir.path).unwrap();
+    let got = t.get_range(Fk(1)).unwrap();
+    assert!(
+        got == Some((Fk(1), 1)) || got == Some((Fk(5), 3)),
+        "reopen read a split header_txs pair: {got:?}"
+    );
+}
