@@ -140,8 +140,7 @@ The scan is `crates/rbitcoin-store/src` and `crates/rbitcoin-mempool/src`,
 with the same `#[cfg(test)]` skip as the unwrap ratchet. A new write of
 a live page that already holds committed bytes goes through `page_guard`.
 The calls that still bypass the door are the baseline. `page_guard`
-(`append_past_end` and image restore) and the Class A `tear_guard/`
-image writes are the protocol bypasses on that list. A baseline edit
+(`append_past_end` and image restore) is the protocol bypass on that list. A baseline edit
 belongs in the commit that adds or removes the call.
 
 **Goal:** no `[workspace.lints.clippy]` `= "allow"`. A lint that is wrong

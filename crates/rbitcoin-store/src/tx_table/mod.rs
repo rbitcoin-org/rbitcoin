@@ -720,13 +720,8 @@ pub struct TxTable {
     /// returns 0 because another took the writeback error cannot commit
     /// after that failure.
     class_a_sync: std::sync::Mutex<()>,
-    /// `tear_guard/armed` generation plus one. Zero means this process has
-    /// not armed. The barrier stores the slot it sealed the same way.
-    class_a_mark: std::sync::atomic::AtomicU64,
-    class_a_slot: std::sync::atomic::AtomicU64,
-    /// Appends inside the armed window. The barrier clears the mark only
-    /// when this is zero: it is not the writer, and a write is still in
-    /// flight.
+    /// Appends inside a pwrite. A sync on another thread waits for zero
+    /// before it seals, so it sees a failure such an append latched.
     pub(crate) class_a_writes: std::sync::atomic::AtomicUsize,
     /// Set once a Class A sync or append write failed. The kernel may have
     /// dropped those dirty pages, and RAM may name rows the device does not
@@ -1303,7 +1298,7 @@ fn class_a_writer_depth(table: *const ()) -> usize {
 /// One counted Class A append. Drop latches a failure unless the append
 /// finished, then releases the count, on `Ok`, `Err`, and unwind alike.
 /// The latch comes first: a sync that samples the count inside the failure
-/// hook must not see zero and clear the mark over a write that failed.
+/// hook must not see zero and seal over a write that failed.
 struct ClassAInFlight<'a> {
     table: &'a TxTable,
     done: bool,
@@ -1337,6 +1332,37 @@ fn enter_class_a_writer_depth(table: *const ()) -> ClassAWriterDepth {
         slot.set((table, depth + 1));
         ClassAWriterDepth { prev }
     })
+}
+
+/// `tear_guard/` and `{stem}.kept` came from a build that imaged Class A
+/// pages. The sector rule leaves nothing for them to restore, and nothing
+/// reads them, so open removes them.
+fn drop_class_a_images(hot: &Path, seq: &Path) -> Result<(), StoreError> {
+    let guard = hot.join("tear_guard");
+    match std::fs::remove_dir_all(&guard) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(StoreError::io(&guard, e)),
+    }
+    for dir in [hot, seq] {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(StoreError::io(dir, e)),
+        };
+        for ent in entries {
+            let ent = ent.map_err(|e| StoreError::io(dir, e))?;
+            if ent.file_name().to_string_lossy().ends_with(".kept") {
+                let path = ent.path();
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(StoreError::io(&path, e)),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn publish_prepared_body(
@@ -1570,8 +1596,6 @@ impl TxTable {
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages: crate::spend_delta::SpendPageLog::create(dir)?,
             class_a_sync: std::sync::Mutex::new(()),
-            class_a_mark: std::sync::atomic::AtomicU64::new(0),
-            class_a_slot: std::sync::atomic::AtomicU64::new(0),
             class_a_writes: std::sync::atomic::AtomicUsize::new(0),
             class_a_failed: std::sync::atomic::AtomicBool::new(false),
             class_a_on_fail: std::sync::OnceLock::new(),
@@ -1651,7 +1675,7 @@ impl TxTable {
         opts: HeadOpenOpts,
         store: Option<OpenedFromStore>,
     ) -> Result<Self, StoreError> {
-        crate::class_a_pages::prepare_and_restore(dir, seqsigwit_dir)?;
+        drop_class_a_images(dir, seqsigwit_dir)?;
         crate::store::rename_legacy_inwit_files(dir)?;
         crate::store::rename_legacy_input_files(dir)?;
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
@@ -1861,8 +1885,6 @@ impl TxTable {
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages,
             class_a_sync: std::sync::Mutex::new(()),
-            class_a_mark: std::sync::atomic::AtomicU64::new(0),
-            class_a_slot: std::sync::atomic::AtomicU64::new(0),
             class_a_writes: std::sync::atomic::AtomicUsize::new(0),
             class_a_failed: std::sync::atomic::AtomicBool::new(false),
             class_a_on_fail: std::sync::OnceLock::new(),
@@ -4130,14 +4152,12 @@ impl TxTable {
         self.sync_class_a_quiescent(Some(named))
     }
 
-    /// Seal, then clear only when no append is in a pwrite.
+    /// Seal once no other append is in a pwrite.
     ///
     /// The append thread is already inside the pwrite, so it waits out every
-    /// other append and then seals without clearing. Waiting for its own
-    /// count would never finish. The synced sidecar still advances: open
-    /// keeps the creates this call named, and the mark still rolls the
-    /// half-written tail back. Any other thread waits until the count is
-    /// zero, then seals and clears before `Ok`.
+    /// other append and then seals. Waiting for its own count would never
+    /// finish. Any other thread waits until the count is zero, so a failure
+    /// an append latched is seen before the seal.
     fn sync_class_a_quiescent(&self, named: Option<u64>) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
         loop {
@@ -4235,19 +4255,12 @@ impl TxTable {
         written
     }
 
-    /// Arm before the pwrite, and count the write before releasing the
-    /// barrier latch so a sync cannot clear the mark in between.
+    /// Count the write before releasing the sync latch, so a sync on
+    /// another thread waits for it.
     fn enter_class_a_write(&self) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
         let _one = self.class_a_sync.lock().unwrap_or_else(|e| e.into_inner());
         self.refuse_if_class_a_failed()?;
-        let armed = self.class_a_mark.load(Ordering::Acquire);
-        let slot = self.class_a_slot.load(Ordering::Acquire);
-        if armed == 0 || slot > armed {
-            let generation = crate::class_a_pages::arm_for_appender(&self.hot_dir)?;
-            self.class_a_mark
-                .store(generation.saturating_add(1), Ordering::Release);
-        }
         self.class_a_writes.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -4272,31 +4285,12 @@ impl TxTable {
             &self.input.off,
             &self.input.body,
         ];
-        let mark = self.class_a_mark.load(Ordering::Acquire);
-        let protect = match mark {
-            0 => None,
-            generation => Some(generation - 1),
-        };
-        let generation =
-            crate::class_a_pages::write_barrier(&self.hot_dir, &files, named, protect)?;
-        self.class_a_slot
-            .store(generation.saturating_add(1), Ordering::Release);
-        // `write_barrier` does not clear. This caller does, after the seal,
-        // and only when no append is in a pwrite. The sync holds
-        // `class_a_sync` across that clear, so the next append cannot start
-        // until the mark is gone. The sidecar moves even when the mark stays:
-        // a spend commit or scripthash mark on this thread names `named`,
-        // and open keeps those creates.
-        if self.class_a_writes.load(Ordering::Acquire) == 0 {
-            crate::class_a_pages::clear_armed(&self.hot_dir)?;
-            self.class_a_mark.store(0, Ordering::Release);
-        } else {
-            // The append is still writing. Name the seal just taken so open
-            // restores these bytes, not an older slot that drops `named`.
-            crate::class_a_pages::retarget_armed(&self.hot_dir, generation)?;
-            self.class_a_mark
-                .store(generation.saturating_add(1), Ordering::Release);
-        }
+        // An append writes past the committed end, so the sectors it shares
+        // with committed rows land unchanged. The sync is the whole barrier.
+        crate::file::TableFile::sync_data_all_with(&files, &[])?;
+        // The sidecar moves even with an append in flight: a spend commit
+        // or scripthash mark on this thread names `named`, and open keeps
+        // those creates.
         if named > self.synced_named.load(Ordering::Acquire) {
             crate::file::write_synced_tmp_rename(
                 &self.hot_dir.join(CLASS_A_SYNCED_NAME),

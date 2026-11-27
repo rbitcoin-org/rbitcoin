@@ -1,9 +1,10 @@
 Changed
 
-- **Store meta 31 is the Class A arm.** A plain open of a schema 30
-  datadir leaves it at 30. The first arm syncs meta 31 and then publishes
-  `tear_guard/armed`, which names the slot generation open restores even
-  when the live page is not all zeros. A newer slot written by a barrier
-  that has not finished is ignored. With no `armed` file, a zero page
-  still restores and a nonzero page is left as it was. `spent.body` is
-  not part of that restore. An older binary refuses 31 `meta`.
+- **Class A keeps no page images.** Under the 512-byte sector rule an
+  append leaves the sectors it shares with committed rows unchanged, and
+  open keeps only the creates a durable `header_txs` range or
+  `class_a.synced` names. A barrier now syncs the stems and writes no
+  `tear_guard/` image. Open removes a leftover `tear_guard/` or
+  `{stem}.kept`, which no release wrote. Store meta 31 is published by the
+  first page-guard mark. A plain open of a schema 30 datadir leaves it at
+  30, and an older binary refuses 31 `meta`.

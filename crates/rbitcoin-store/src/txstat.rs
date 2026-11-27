@@ -504,7 +504,7 @@ impl TxStat {
                 tails.push((base_count + 1 + i as u64, t));
             }
         }
-        // Append-only. Class A tear_guard owns page 0 and the partial tail.
+        // Append-only: under the sector rule committed bytes land unchanged.
         self.body.write_at_pwrite(start, &blob)?;
         let new = base_count + rows.len() as u64;
         self.count.store(new, Ordering::Release);

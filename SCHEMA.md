@@ -233,10 +233,6 @@ itself changed.
     seqsigwit.window/                # prune window: one {height}.bin per kept height. The only witness payload while seqsigwit.prune exists
     seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
     class_a.synced                   # optional: u64 LE create count a spend commit or scripthash mark named after a Class A sync (missing = 0). Open keeps exactly max(this, the highest `header_txs` create). No SCHEMA_VERSION bump
-    tear_guard/first                 # one sealed 4 KiB image per Class A stem, written once after that page is full. No SCHEMA_VERSION bump
-    tear_guard/tail.0                # alternating partial-tail image and published lengths (generation 0 = unused). No SCHEMA_VERSION bump
-    tear_guard/tail.1                # the other tail slot. No SCHEMA_VERSION bump
-    tear_guard/armed                 # schema 31: the Class A slot generation open restores. Absent means no Class A tear is in flight. Published by the first arm, after meta 31 is synced
     guard/class_c                    # schema 31 sidecar: forward 4 KiB images for confirmed[], header_txs first+count, and strong_tx. One mark per flush group. Open copies every named image before any Class C read. Published after meta 31. No SCHEMA_VERSION bump
     guard/header.body                # schema 31 sidecar: empty flag armed only by the first header.body append. Open then takes an empty header.head beside body rows as that append, indexes the rows, and removes the flag once the head names them. Later appends sync rows, then length, with no mark. Published after meta 31. No SCHEMA_VERSION bump
     guard/header.head                # schema 31 sidecar: forward 4 KiB images for one header.head generation (its .mlt appends with no mark). Open copies them before any head read. Published after meta 31. No SCHEMA_VERSION bump

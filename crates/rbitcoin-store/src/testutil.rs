@@ -291,26 +291,6 @@ pub fn checkpoint_observed_spend_gap(
     store.checkpoint_observed_spend_gap(after_first_read, during_sync)
 }
 
-/// Count one Class A append in flight on `txs`, the way the confirm thread
-/// does while `rbtc-tip-flush` runs. A sync then keeps `tear_guard/armed`.
-pub fn hold_class_a_append(txs: &crate::tx_table::TxTable) {
-    txs.class_a_writes.fetch_add(1, Ordering::AcqRel);
-}
-
-/// Drop one [`hold_class_a_append`].
-pub fn release_class_a_append(txs: &crate::tx_table::TxTable) {
-    txs.class_a_writes.fetch_sub(1, Ordering::AcqRel);
-}
-
-/// Arm naming `generation` without promoting `meta`. Errors while meta is
-/// 30.
-pub fn arm_class_a_generation(
-    txs: &crate::tx_table::TxTable,
-    generation: u64,
-) -> Result<(), crate::StoreError> {
-    crate::class_a_pages::arm_named_generation(&txs.hot_dir, generation)
-}
-
 /// Class A writer count sampled when the failure hook last ran on this
 /// thread.
 pub fn class_a_writers_at_last_failure() -> usize {
