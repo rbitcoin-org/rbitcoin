@@ -497,6 +497,40 @@ fn truncated_flush_mark_is_quarantined_with_the_sidecar() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A full flush that commits B in A's reused slot retires A's queued death,
+/// even when the `tx.body` trim after the commit fails. A later death sync
+/// must not stamp DEAD over B.
+#[cfg(debug_assertions)]
+#[test]
+fn a_committed_full_flush_retires_queued_deaths() {
+    use rbitcoin_mempool::store::fail_next_mempool_body_adopt;
+    let dir = tmp_dir();
+    let old = Txid::from_byte_array([0xC1; 32]);
+    let new = Txid::from_byte_array([0xC2; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let slot = put_live(&mut mp, &old, 1, 400);
+        mp.flush().unwrap();
+        mp.mark_slot_dead(slot).unwrap();
+        let reused = put_live(&mut mp, &new, 2, 400);
+        assert_eq!(reused, slot);
+        fail_next_mempool_body_adopt(&dir);
+        assert!(mp.flush().is_err());
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(ids.contains(&new), "a queued death stamped the replacement");
+    assert!(!ids.contains(&old));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn reused_dead_slot_persist_due_publishes_the_new_tx() {
     let dir = tmp_dir();
