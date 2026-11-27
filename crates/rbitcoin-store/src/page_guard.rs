@@ -400,7 +400,8 @@ pub fn restore_sh_marks(dir: &Path) -> Result<(), StoreError> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !name.starts_with("sh-") {
+        // `sh-<shard>.tmp` is the rename leftover, not a published mark.
+        if !name.starts_with("sh-") || name.ends_with(".tmp") {
             continue;
         }
         let file = match ent.file_type() {

@@ -457,7 +457,7 @@ impl ScriptHashHead {
     pub fn probe_slot_off(&self, full: &[u8; 32]) -> Result<u64, StoreError> {
         let key = Self::to_key(full);
         let slots = self.state.lock().unwrap().slots;
-        let mut cache = SlotPageCache::new(self, slots);
+        let mut cache = SlotPageCache::new(self, slots).preview();
         let mut slot = Self::hash_slot(&key, slots);
         for _ in 0..slots {
             let (k, v) = cache.read_slot(slot)?;
@@ -666,19 +666,12 @@ impl ScriptHashHead {
         let enc = pack8_bytes(&val)?;
         let mut order: Vec<&[u8; 32]> = keys.iter().collect();
         order.sort_unstable_by_key(|full| Self::hash_slot(&Self::to_key(full), slots_now));
-        let mut cache = SlotPageCache::new(self, slots_now);
+        let mut cache = SlotPageCache::new(self, slots_now).preview();
         for full in order {
             let key = Self::to_key(full);
             let _ = cache.try_insert(&key, &enc, true)?;
         }
-        let mut spans = Vec::new();
-        for chunk in cache.chunks.values().filter(|chunk| chunk.dirty) {
-            spans.push((
-                Self::slot_file_off(chunk.base_slot),
-                chunk.data.len() as u64,
-            ));
-        }
-        Ok(spans)
+        Ok(cache.dirty_spans())
     }
 
     /// Sync the head, then drop its `*.ahead` image. No image means nothing to sync.
@@ -872,12 +865,22 @@ pub enum InsertResult {
 }
 
 #[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChunkSpill {
+    /// A full cache writes the wave, then drops it.
+    Durable,
+    /// A full cache keeps dirty chunks in RAM and never writes the head.
+    Preview,
+}
+
 pub struct SlotPageCache<'a> {
     pub head: &'a ScriptHashHead,
     pub slots: u64,
     pub chunks: BTreeMap<u64, CachedChunk>,
     /// Number of `read_at` chunk faults (for microbenches / diagnostics).
     pub chunk_loads: u64,
+    spill: ChunkSpill,
+    spilled: BTreeMap<u64, CachedChunk>,
 }
 
 #[doc(hidden)]
@@ -895,7 +898,74 @@ impl<'a> SlotPageCache<'a> {
             slots,
             chunks: BTreeMap::new(),
             chunk_loads: 0,
+            spill: ChunkSpill::Durable,
+            spilled: BTreeMap::new(),
         }
+    }
+
+    /// Plan a guard image. Dirty chunks stay in RAM, including past one wave.
+    pub fn preview(mut self) -> Self {
+        self.spill = ChunkSpill::Preview;
+        self
+    }
+
+    fn dirty_spans(&self) -> Vec<(u64, u64)> {
+        let mut spans = Vec::new();
+        for chunk in self
+            .chunks
+            .values()
+            .chain(self.spilled.values())
+            .filter(|chunk| chunk.dirty)
+        {
+            spans.push((
+                ScriptHashHead::slot_file_off(chunk.base_slot),
+                chunk.data.len() as u64,
+            ));
+        }
+        spans
+    }
+
+    fn make_preview_room(&mut self) {
+        if self.chunks.len() < CHUNK_CACHE_MAX {
+            return;
+        }
+        let taken = std::mem::take(&mut self.chunks);
+        for (idx, chunk) in taken {
+            if chunk.dirty {
+                self.spilled.insert(idx, chunk);
+            }
+        }
+    }
+
+    fn load_chunk(&mut self, chunk_idx: u64) -> Result<(), StoreError> {
+        if self.spill == ChunkSpill::Preview {
+            if let Some(chunk) = self.spilled.remove(&chunk_idx) {
+                self.make_preview_room();
+                self.chunks.insert(chunk_idx, chunk);
+                return Ok(());
+            }
+            self.make_preview_room();
+        } else if self.chunks.len() >= CHUNK_CACHE_MAX {
+            // This wave is durable before the next one starts, so a later
+            // flush does not rewrite pages the sidecar already retired.
+            self.flush_durable()?;
+        }
+        let base_slot = chunk_idx * SLOTS_PER_CHUNK;
+        let n = ((self.slots - base_slot) as usize).min(SLOTS_PER_CHUNK as usize);
+        let off = ScriptHashHead::slot_file_off(base_slot);
+        let len = n * SH_HEAD_SLOT_SIZE;
+        let mut data = vec![0u8; len];
+        self.head.file.read_at(off, &mut data)?;
+        self.chunk_loads = self.chunk_loads.saturating_add(1);
+        self.chunks.insert(
+            chunk_idx,
+            CachedChunk {
+                base_slot,
+                data,
+                dirty: false,
+            },
+        );
+        Ok(())
     }
 
     /// Probe-insert. When `allow_new` is false, only in-place updates of an
@@ -958,26 +1028,7 @@ impl<'a> SlotPageCache<'a> {
     pub fn ensure_chunk(&mut self, slot: u64) -> Result<&mut CachedChunk, StoreError> {
         let chunk_idx = slot / SLOTS_PER_CHUNK;
         if !self.chunks.contains_key(&chunk_idx) {
-            if self.chunks.len() >= CHUNK_CACHE_MAX {
-                // This wave is durable before the next one starts, so a later
-                // flush does not rewrite pages the sidecar already retired.
-                self.flush_durable()?;
-            }
-            let base_slot = chunk_idx * SLOTS_PER_CHUNK;
-            let n = ((self.slots - base_slot) as usize).min(SLOTS_PER_CHUNK as usize);
-            let off = ScriptHashHead::slot_file_off(base_slot);
-            let len = n * SH_HEAD_SLOT_SIZE;
-            let mut data = vec![0u8; len];
-            self.head.file.read_at(off, &mut data)?;
-            self.chunk_loads = self.chunk_loads.saturating_add(1);
-            self.chunks.insert(
-                chunk_idx,
-                CachedChunk {
-                    base_slot,
-                    data,
-                    dirty: false,
-                },
-            );
+            self.load_chunk(chunk_idx)?;
         }
         Ok(self.chunks.get_mut(&chunk_idx).unwrap())
     }
