@@ -227,8 +227,8 @@ fn a_header_append_after_the_first_arms_no_mark() {
 }
 
 /// A failed length flush may leave the new body length durable. The table
-/// refuses later header puts until reopen, so no retry rewrites rows below
-/// that length. Reopen indexes whatever the durable length names.
+/// refuses later header puts until reopen with its own error, so no retry
+/// rewrites rows below that length. Reopen indexes the row the length names.
 #[cfg(debug_assertions)]
 #[test]
 fn a_failed_length_flush_refuses_header_puts_until_reopen() {
@@ -242,21 +242,76 @@ fn a_failed_length_flush_refuses_header_puts_until_reopen() {
         "the failed length flush was not reported"
     );
     let next = sample([0x96; 32]);
-    assert!(
-        t.ensure(&next).is_err(),
-        "a put after a failed length flush was accepted"
-    );
+    match t.ensure(&next) {
+        Err(StoreError::Rejected(m)) => assert!(m.contains("reopen"), "{m}"),
+        other => panic!("a put after a failed length flush: {other:?}"),
+    }
     drop(t);
     let t = HeaderTable::open_tiny(&dir).expect("open after a failed length flush");
-    let n = t.count();
-    assert!(n == 1 || n == 2, "{n}");
-    if n == 2 {
-        assert_eq!(
-            t.get_by_hash(&g.hash).unwrap().map(|(fk, _)| fk),
-            Some(Fk(2))
-        );
+    // The length write reached the page cache before its flush failed.
+    assert_eq!(t.count(), 2);
+    assert_eq!(
+        t.get_by_hash(&g.hash).unwrap().map(|(fk, _)| fk),
+        Some(Fk(2))
+    );
+    assert_eq!(t.ensure(&next).unwrap(), Fk(3));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A crash inside a head insert can leave the head naming any subset of
+/// the last batch, not a suffix: a generation flushes its slot-ordered rows
+/// and then rolls. Open checks every row of the last chunk, so a lower row
+/// the head does not name is indexed even when a higher one is.
+#[test]
+fn open_indexes_an_unnamed_row_below_a_named_one() {
+    let dir = tmp();
+    let t = HeaderTable::create_tiny(&dir).unwrap();
+    t.ensure(&sample([0xA1; 32])).unwrap();
+    let (b, c) = (sample([0xA2; 32]), sample([0xA3; 32]));
+    let at = t.body.logical_len();
+    let rows = [b.encode(), c.encode()].concat();
+    rbitcoin_store::page_guard::commit_appends(&[rbitcoin_store::page_guard::Append {
+        file: &t.body,
+        at,
+        bytes: &rows,
+        new_logical: at + rows.len() as u64,
+    }])
+    .unwrap();
+    t.head.insert_many(&[(c.hash, Fk(3))]).unwrap();
+    drop(t);
+    let t = HeaderTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 3);
+    assert_eq!(
+        t.get_by_hash(&b.hash).unwrap().map(|(fk, _)| fk),
+        Some(Fk(2)),
+        "the unnamed row below a named one was not indexed"
+    );
+    assert_eq!(t.ensure(&b).unwrap(), Fk(2), "a second row for one hash");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A batch past one chunk commits as several appends. Every row is named,
+/// across the chunk boundary and after reopen.
+#[test]
+fn ensure_batch_past_one_chunk_names_every_row() {
+    let dir = tmp();
+    let t = HeaderTable::create_tiny(&dir).unwrap();
+    let recs: Vec<HeaderRecord> = (0..2_001u32)
+        .map(|i| {
+            let mut h = [0x5bu8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            sample(h)
+        })
+        .collect();
+    let fks = t.ensure_batch(&recs).unwrap();
+    assert_eq!(fks.last(), Some(&Fk(2_001)));
+    drop(t);
+    let t = HeaderTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2_001);
+    for i in [0usize, 1_999, 2_000] {
+        let found = t.get_by_hash(&recs[i].hash).unwrap().map(|(fk, _)| fk);
+        assert_eq!(found, Some(Fk(i as u64 + 1)), "row {i}");
     }
-    assert_eq!(t.ensure(&next).unwrap(), Fk(n + 1));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

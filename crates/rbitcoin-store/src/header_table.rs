@@ -55,6 +55,10 @@ fn legacy_ahead(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Most rows one body append and head insert carry. Open looks up this many
+/// tail rows, so a crash inside the last head insert loses none.
+const TAIL_CHUNK: u64 = 2_000;
+
 /// Live `header.body` record: consensus fields only. See SCHEMA.md.
 pub const HEADER_RECORD_LEN: usize = 88;
 /// Schema 24/25 record. Open strips the trailing `size`/`weight` back to 88.
@@ -296,8 +300,9 @@ pub struct HeaderTable {
     /// Serializes check-then-put so two threads cannot both miss and both append
     /// the same full hash (I1 + I4).
     pub put_lock: Mutex<()>,
-    /// A failed append may have made its length durable. Puts are refused
-    /// until reopen, so no retry rewrites rows below that length.
+    /// A failed append may have made its length durable, and a failed head
+    /// insert leaves rows a retry would append again. Puts are refused until
+    /// reopen, which indexes what the durable length names.
     blocked: std::sync::atomic::AtomicBool,
 }
 
@@ -362,25 +367,24 @@ impl HeaderTable {
 
     /// Insert the tail rows `header.head` does not name.
     ///
-    /// `ensure_batch` makes the body rows and their length durable before the
-    /// head insert, so a crash in between leaves rows the head does not name. They are a suffix: the walk stops at the first row
-    /// a lookup finds. A clean open does one lookup.
+    /// `ensure_batch` makes each chunk's rows and length durable before its
+    /// head insert, and starts a chunk only after the one before it is in
+    /// the head. A crash can leave only the last chunk partly unnamed, and in
+    /// any order: a head generation flushes its slot-ordered rows and then
+    /// rolls. So open looks up each of the last [`TAIL_CHUNK`] rows.
     fn index_unindexed_tail(&self) -> Result<(), StoreError> {
+        let count = self.count.load(std::sync::atomic::Ordering::Acquire);
         let mut missing: Vec<([u8; 32], Fk)> = Vec::new();
-        let mut id = self.count.load(std::sync::atomic::Ordering::Acquire);
-        while id > 0 {
+        for id in count.saturating_sub(TAIL_CHUNK) + 1..=count {
             let fk = Fk(id);
             let rec = self.get(fk)?;
-            if self.get_by_hash_unlocked(&rec.hash)?.is_some() {
-                break;
+            if self.get_by_hash_unlocked(&rec.hash)?.is_none() {
+                missing.push((rec.hash, fk));
             }
-            missing.push((rec.hash, fk));
-            id -= 1;
         }
         if missing.is_empty() {
             return Ok(());
         }
-        missing.reverse();
         rbitcoin_log::warn!(
             "store: indexing {} header rows header.head did not name",
             missing.len()
@@ -470,7 +474,8 @@ impl HeaderTable {
         fks.pop().ok_or(StoreError::Corrupt("ensure_batch empty"))
     }
 
-    /// Batch [`Self::ensure`]: one `put_lock`, one `header.body` write, chunked head insert.
+    /// Batch [`Self::ensure`]: one `put_lock`, then one `header.body` append and
+    /// head insert per [`TAIL_CHUNK`] fresh rows.
     ///
     /// Output fks align with `recs`. Duplicate hashes in the batch share one body row.
     pub fn ensure_batch(&self, recs: &[HeaderRecord]) -> Result<Vec<Fk>, StoreError> {
@@ -510,14 +515,20 @@ impl HeaderTable {
             seen.push((rec.hash, fk));
             out.push(fk);
         }
-        if fresh.is_empty() {
-            return Ok(out);
+        for chunk in fresh.chunks(TAIL_CHUNK as usize) {
+            self.append_chunk(chunk)?;
         }
+        Ok(out)
+    }
+
+    /// Append one chunk of fresh rows to the body, then name them in the head.
+    fn append_chunk(&self, fresh: &[(Fk, HeaderRecord)]) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
         let base = self.count.load(Ordering::Acquire);
         let offset = FILE_HEADER_LEN as u64 + base * HEADER_RECORD_LEN as u64;
         let mut blob = Vec::with_capacity(fresh.len().saturating_mul(HEADER_RECORD_LEN));
         let mut head_entries: Vec<([u8; 32], Fk)> = Vec::with_capacity(fresh.len());
-        for (fk, rec) in &fresh {
+        for (fk, rec) in fresh {
             blob.extend_from_slice(&rec.encode());
             head_entries.push((rec.hash, *fk));
         }
@@ -547,11 +558,14 @@ impl HeaderTable {
         }
         self.count
             .store(base.saturating_add(fresh.len() as u64), Ordering::Release);
-        self.head.insert_many(&head_entries)?;
+        if let Err(e) = self.head.insert_many(&head_entries) {
+            self.blocked.store(true, Ordering::Release);
+            return Err(e);
+        }
         if first {
             page_guard::clear_store_flag(dir, page_guard::HEADER_BODY_MARK)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     #[doc(hidden)]
