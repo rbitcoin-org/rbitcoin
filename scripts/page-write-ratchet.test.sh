@@ -40,6 +40,8 @@ assert_ok "handle_pwrite_all is not counted as pwrite_all" \
   python3 "$PY" --root "$FIX/match"
 assert_fail "a call split before its parenthesis fails an empty baseline" \
   python3 "$PY" --root "$FIX/split-call"
+assert_fail "a call split by comment-only and blank lines fails an empty baseline" \
+  python3 "$PY" --root "$FIX/split-comment"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "page-write-ratchet.test.sh: $PASS passed, $FAIL failed"

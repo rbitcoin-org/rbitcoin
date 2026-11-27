@@ -60,7 +60,8 @@ def scan(root: str) -> dict[str, int]:
     ratchet = load_unwrap()
     compiled = []
     for token, pattern, only in TOKENS:
-        # The name may end one line and its `(` or `{` open the next.
+        # The name may end one line and its `(` or `{` open the next code
+        # line. Blank and comment-only lines between them do not count.
         name, opener = re.match(r"(.*)\\s\*(\\\(|\\\{)$", pattern).groups()
         split = (re.compile(name + r"\s*$"), re.compile(r"^\s*" + opener))
         compiled.append((token, re.compile(pattern), only, split))
