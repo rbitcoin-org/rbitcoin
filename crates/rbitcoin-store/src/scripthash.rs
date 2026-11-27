@@ -43,6 +43,7 @@ use std::cell::Cell;
 #[cfg(debug_assertions)]
 thread_local! {
     static FAIL_CLEAR_SH_GUARD: Cell<bool> = const { Cell::new(false) };
+    static FAIL_INGEST_REL_DROP: Cell<bool> = const { Cell::new(false) };
 }
 
 #[path = "scripthash_unlink.rs"]
@@ -2883,14 +2884,33 @@ impl ScriptHashTable {
             ));
         }
         let sealed = SortedHead::write(&path, &recs)?;
+        // Until the drop returns, ingest stays the only copy of these keys.
+        if let Err(e) = self.drop_ingest_rel() {
+            drop(sealed);
+            crate::scripthash_sorted_head::remove_sorted_head_files(&path)?;
+            return Err(e);
+        }
         self.sealed_ovf.lock().unwrap().push(sealed);
         let p = ingest_path(&self.store_dir);
-        page_guard::drop_sh_rel(&self.store_dir, "scripthash.ovf/ingest")?;
         // Drop the fd before unlink so the name can go away on Windows.
         *self.ingest.lock().unwrap() = None;
         crate::scripthash_head::remove_ingest_files(&p)?;
         self.maybe_compact_sealed_ovf()?;
         Ok(())
+    }
+
+    fn drop_ingest_rel(&self) -> Result<(), StoreError> {
+        #[cfg(debug_assertions)]
+        if FAIL_INGEST_REL_DROP.with(|c| c.replace(false)) {
+            return Err(StoreError::Corrupt("scripthash ingest name drop failed"));
+        }
+        page_guard::drop_sh_rel(&self.store_dir, "scripthash.ovf/ingest")
+    }
+
+    /// Fail the next seal's drop of the ingest name from the sh marks.
+    #[cfg(debug_assertions)]
+    pub fn fail_next_ingest_rel_drop(&self) {
+        FAIL_INGEST_REL_DROP.with(|c| c.set(true));
     }
 
     #[doc(hidden)]
