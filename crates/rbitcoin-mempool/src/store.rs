@@ -1720,9 +1720,21 @@ pub fn open_or_init_slots(path: &Path, slot_cap: u32) -> Result<(File, Vec<u8>),
         buf[8..12].copy_from_slice(&slot_cap.to_le_bytes());
         file.write_all(&buf)
             .map_err(|e| MempoolError::io(path, e))?;
-        file.flush().map_err(|e| MempoolError::io(path, e))?;
+        sync_new_file(&file, path)?;
         Ok((file, buf))
     }
+}
+
+/// A new `slots` or `tx.body` is the base later marks patch in place, and
+/// its length is taken as durable. Sync its bytes and its directory entry.
+fn sync_new_file(file: &File, path: &Path) -> Result<(), MempoolError> {
+    file.durable_sync_all()
+        .map_err(|e| MempoolError::io(path, e))?;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = dir {
+        rbitcoin_store::file::fsync_parent_dir(dir).map_err(|e| MempoolError::io(dir, e))?;
+    }
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -1767,7 +1779,7 @@ pub fn open_or_init_body(path: &Path) -> Result<(File, Vec<u8>), MempoolError> {
         buf[8..16].copy_from_slice(&(BODY_HEADER as u64).to_le_bytes());
         file.write_all(&buf)
             .map_err(|e| MempoolError::io(path, e))?;
-        file.flush().map_err(|e| MempoolError::io(path, e))?;
+        sync_new_file(&file, path)?;
         Ok((file, buf))
     }
 }
