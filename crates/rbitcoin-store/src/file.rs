@@ -1368,6 +1368,18 @@ impl TableFile {
         Ok(())
     }
 
+    /// The leading header already names `logical`. RAM follows it.
+    ///
+    /// A later [`Self::flush`] must not pwrite those 8 length bytes again:
+    /// the page-0 image that published them is already cleared.
+    #[doc(hidden)]
+    pub fn adopt_durable_len(&self, logical: u64) {
+        self.published_len.store(logical, Ordering::Release);
+        self.header_cap.store(0, Ordering::Release);
+        self.hwm_behind.store(false, Ordering::Release);
+        self.needs_sync.store(false, Ordering::Release);
+    }
+
     #[cfg(debug_assertions)]
     pub fn pending_sync(&self) -> bool {
         self.needs_sync.load(Ordering::Acquire)

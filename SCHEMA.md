@@ -242,8 +242,11 @@ itself changed.
     guard/header.head                # schema 31 sidecar: forward 4 KiB images for one header.head generation and its .mlt. Open copies both before any head read. Published after meta 31. No SCHEMA_VERSION bump
     guard/spent.ovf                  # schema 31 sidecar: backward 4 KiB images of spent.ovf page 0 and its tail block, taken before the first append after a spend sync. Open copies them onto the live file before annotate replay. Later appends in that window do not replace the mark. Published after meta 31. No SCHEMA_VERSION bump
     guard/sh-*                       # schema 31 sidecar: backward 4 KiB images for one scripthash commit (body pages, page 0, and head words). Open copies them before any scripthash read or sealed-overflow magic check. A mark that does not parse writes scripthash.rebuild and is removed instead of stopping open. Published after meta 31. No SCHEMA_VERSION bump
+    guard/txstat                     # schema 31 sidecar: backward 4 KiB images of interior txstat.body and txstat.blk pages, taken before an in-place stamp. Page 0 and the partial tail stay on the Class A tear guard. Open copies the mark before Class A restore. Published after meta 31. No SCHEMA_VERSION bump
+    guard/blockfilter                # schema 31 sidecar: one forward mark per block-filter put (body tail, idx tail, page 0). Fresh blocks are synced before the mark. Open copies the images before the filter tables are read. Published after meta 31. No SCHEMA_VERSION bump
+    guard/sp_tweaks                  # schema 31 sidecar: one forward mark per sp_tweaks put (body tail, idx tail, page 0). Fresh blocks are synced before the mark. Open copies the images before the tweak tables are read. Published after meta 31. No SCHEMA_VERSION bump
 
-    *.ahead                          # transient write-ahead page image for txstat.body and scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. Open refuses a leftover confirmed.body.ahead, header_txs_first.body.ahead, header_txs_count.body.ahead, header.head.ahead, or header.head.gN.ahead instead of restoring it. No SCHEMA_VERSION bump
+    *.ahead                          # transient write-ahead page image for the scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. Open refuses a leftover confirmed.body.ahead, header_txs_first.body.ahead, header_txs_count.body.ahead, header.head.ahead, or header.head.gN.ahead instead of restoring it. No SCHEMA_VERSION bump
     scripthash.rebuild               # optional: one byte. The next start wipes and rebuilds the scripthash index; removed when that rebuild finishes. No SCHEMA_VERSION bump
     scripthash.dirty                 # optional: one byte while scripthash writes may be unsynced. A --sh-index start that finds it refuses; a wipe removes it. No SCHEMA_VERSION bump
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
@@ -277,7 +280,9 @@ itself changed.
     sp_tweaks.idx/  sp_tweaks.body/   # optional BIP-352 (schema 17 dirs; leftover files unlinked)
     blockfilter.idx/meta              # optional BIP158 basic (`--block-filter-index`): fmt:u32=1
     blockfilter.idx/NNNNNN            # 80 B slot per height from 0: off:u32 ‖ len:u32 ‖ header_fk:u64 ‖ filter_hash[32] ‖ filter_header[32]
-    blockfilter.body/NNNNNN           # filter bytes (Core `BlockFilter` content), records back to back, no prefix; new NNNNNN pair when the next start passes u32. Commit: body sync, then idx sync, then publish. Open keeps the slot prefix whose records run back to back inside the body, cuts the body to its end, and drops slots whose header_fk is not confirmed[h]. Missing dirs: index off / not built
+    blockfilter.body/NNNNNN           # filter bytes (Core `BlockFilter` content), records back to back, no prefix; new NNNNNN pair when the next start passes u32. Commit: one guard/blockfilter mark per put (fresh blocks synced first; body tail, idx tail, and page 0 in the image). Open keeps the slot prefix whose records run back to back inside the body, cuts the body to its end, and drops slots whose header_fk is not confirmed[h]. Missing dirs: index off / not built
+
+  mempool/guard/flush              # one forward 4 KiB mark for a mempool flush: body tail, new LIVE slots, durable DEAD bytes, and meta. tx.body is not renamed. No SCHEMA_VERSION bump
 
 <datadir-cold>/                  # only when --datadir-cold is set
   store/
@@ -291,7 +296,9 @@ itself changed.
 `--datadir` holds every file by default. `--datadir-cold PATH` places the
 files the IBD pin path does not read under `PATH/store/` and writes
 `seqsigwit.reloc` in the hot store: `seqsigwit.*`, `txstat.*`, `input.*`,
-and, once those indexes exist, `blockfilter.*` and `sp_tweaks.*`. Pin / SH /
+and, once those indexes exist, `blockfilter.*` and `sp_tweaks.*`.
+`guard/txstat`, `guard/blockfilter`, and `guard/sp_tweaks` sit beside those
+files (cold store when the split is on, hot store otherwise). Pin / SH /
 spend-annotate stay on the hot volume. `--prune-seqsigwit` is separate: witness
 for the last 288 heights is only `seqsigwit.window/{height}.bin` on the hot
 store, and the stem stays a header (an archive enable copies that window out
@@ -689,8 +696,9 @@ single-file, `header_fk` + absolute off) are unlinked on store open.
 
 Reorg: truncate slots above the new tip (same era as SH HWM).
 
-Durability: each put writes and syncs the body, then writes and syncs the
-idx, so an idx slot on disk never points at body bytes a power cut can lose.
+Durability: one `guard/sp_tweaks` mark per put. Fresh blocks are synced
+before the mark. The body tail, the idx tail, and page 0 are the image, so
+an idx slot on disk never points at body bytes a power cut can lose.
 Open (and first enable) repairs a crash tail: slots above the tip (a
 disconnect whose truncate never ran) are dropped, then the last record is fit
 to its `n_tx` — body bytes past it are cut, and a short record drops its slot.
@@ -705,11 +713,11 @@ bits-widen / shadow-resize path. Module map: [`docs/heads.md`](./docs/heads.md).
 
 | Property | Current |
 |----------|---------|
-| Files | `tx.head/meta` (**v2**: per-segment `sealed` and `tagged` flags) + shutdown snapshot `tx.head/NNNNNN` while that segment is unsealed; sealed `NNNNNN.mphf` + `.fuse8` |
+| Files | `tx.head/meta` (**v2**: per-segment `sealed`, `tagged`, and `mlt` flags) + shutdown snapshot `tx.head/NNNNNN` while that segment is unsealed; sealed `NNNNNN.mphf` + `.fuse8` + `.mlt` |
 | Default | **BITS=25**, **4 B** entries → **128 MiB** per segment (`2^25` slots) |
 | Bits | Tiny **16**, otherwise **25**. No process env. The entry is always 4 B; a footer that says 8 B **refuses** (`tx.head footer entry width`) |
 | Entry | LE u32 word `rel \| fp << bits`. Low `bits`: **relative** create id, **0 = empty**, `fk = first_fk + rel − 1`. Spare high bits: fingerprint of the mixed key, `1..=2^(32−bits)−1`; **0 = untagged**, matches every key. No fingerprint at bits 32 |
-| Meta v1 → v2 | A v1 meta **opens** (no refuse). Its unsealed slots carry fingerprint 0; open writes each slot's fingerprint from `txid.body` into the private table, writes the snapshot, then persists meta v2 with the segment `tagged`. A v1 binary refuses v2 meta (`tx.head.meta version`) and rebuilds `tx.head` from Class A |
+| Meta v1 → v2 | A v1 meta **opens** (no refuse). Its unsealed slots carry fingerprint 0; open writes each slot's fingerprint from `txid.body` into the private table, writes the snapshot, then persists meta v2 with the segment `tagged`. A v1 binary refuses v2 meta (`tx.head.meta version`) and rebuilds `tx.head` from Class A. The `mlt` flag (value 4) is set when seal renames `NNNNNN.mlt`, including an empty 4-byte image. A segment without the flag and no `.mlt` is an empty multi-list. The flag set with a missing or short file is unreadable (`tx.head mlt missing` / `tx.head mlt short`) and is not an index refuse: open wipes `tx.head` and rebuilds it from `txid.body`. No meta version bump |
 | Capacity | Segment ends at **80% of head slots** (`max_keys`) → open the next private table, seal the previous on a sidecar. Class A loc/body size does **not** cut `tx.head`. |
 | Seal filter | **Binary fuse8** (~9 bits/key, no false negatives, FP ≈ 0.39%) built **once on seal**; open segment has **no** filter |
 | Fuse file | `BF8R` + **version** + body. **v2** = in-tree LE layout (current). **v1** = historical xorf+bincode — **refused** (wipe `store/tx.head` and `store/scripthash*`; Class A kept) |

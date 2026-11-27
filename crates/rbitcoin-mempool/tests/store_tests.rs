@@ -553,6 +553,59 @@ fn persist_deaths_writes_slots_not_body() {
 }
 
 #[test]
+fn torn_mempool_page_restores_the_armed_image() {
+    let dir = tmp_dir();
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    mp.set_now_ms(0);
+    let raw = tiny_tx();
+    let t1 = Txid::from_byte_array([0x01; 32]);
+    mp.append_live_tx(
+        &raw,
+        &t1,
+        &raw.compute_wtxid(),
+        1,
+        400,
+        0,
+        1_700_000_000,
+        &[],
+    )
+    .unwrap();
+    mp.set_now_ms(PERSIST_INTERVAL_MS);
+    mp.persist_due().unwrap();
+    let t2 = Txid::from_byte_array([0x02; 32]);
+    mp.append_live_tx(
+        &raw,
+        &t2,
+        &raw.compute_wtxid(),
+        2,
+        400,
+        0,
+        1_700_000_000,
+        &[],
+    )
+    .unwrap();
+    mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
+    fail_next_mempool_guard_before_write(&dir);
+    assert!(mp.persist_due().is_err());
+    assert!(dir.join("guard/flush").is_file());
+    drop(mp);
+    let mut body = OpenOptions::new()
+        .write(true)
+        .open(dir.join("tx.body"))
+        .unwrap();
+    body.seek(SeekFrom::Start(0)).unwrap();
+    body.write_all(&[0xA5; 4096]).unwrap();
+    body.sync_all().unwrap();
+    drop(body);
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    assert_eq!(live.len(), 2, "open copies the armed body and slots");
+    assert!(live.iter().any(|row| row.packed.txid == t2));
+    assert!(!dir.join("guard/flush").exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn incremental_body_persist_writes_only_dirty_tail() {
     let dir = tmp_dir();
     let mut mp = Mempool::open_or_create(&dir).unwrap();
