@@ -718,6 +718,45 @@ fn a_persist_appends_the_body_before_the_mark() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A persist whose arm fails before the mark is visible has already made
+/// the body durable. The retry must still publish the admit's LIVE slot:
+/// a crash after it reopens with the admit.
+#[cfg(debug_assertions)]
+#[test]
+fn a_retry_after_an_invisible_arm_failure_publishes_the_slot() {
+    let dir = tmp_dir();
+    let first = Txid::from_byte_array([0xE0; 32]);
+    let second = Txid::from_byte_array([0xE1; 32]);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    mp.set_now_ms(0);
+    put_live(&mut mp, &first, 1, 400);
+    mp.set_now_ms(PERSIST_INTERVAL_MS);
+    mp.persist_due().unwrap();
+    put_live(&mut mp, &second, 2, 400);
+    // A file where `guard/` should be: the arm fails before any rename.
+    let guard = dir.join("guard");
+    let _ = fs::remove_dir_all(&guard);
+    fs::write(&guard, b"x").unwrap();
+    mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
+    assert!(mp.persist_due().is_err());
+    assert!(!dir.join("guard/flush").exists());
+    fs::remove_file(&guard).unwrap();
+    mp.set_now_ms(PERSIST_INTERVAL_MS * 3);
+    mp.persist_due().unwrap();
+    // The process dies here: nothing flushes on the way out.
+    std::mem::forget(mp);
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(live.contains(&first));
+    assert!(live.contains(&second), "the retry dropped the admit's slot");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A failed persist leaves `guard/flush` armed with the admit's LIVE slot.
 /// Removing that tx before the next persist must reach disk, or open
 /// replays the mark and loads the removed tx as LIVE.
@@ -1876,12 +1915,12 @@ fn live_slot_accept_secs_and_txid_roundtrip() {
     assert_eq!(live[0].slot, slot);
 }
 
-/// A persist that failed after its arm already wrote and synced the fresh
-/// body blocks. The retry writes that range again, and the stale armed
-/// entry for `tx.body` must not reject it.
+/// A persist that failed after its arm already appended and synced the
+/// body. The retry applies the armed mark, appends nothing more, and still
+/// publishes every admit across two body pages.
 #[cfg(debug_assertions)]
 #[test]
-fn a_retried_body_persist_rewrites_its_fresh_range() {
+fn a_retried_persist_after_a_failed_mark_keeps_every_admit() {
     use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
     let dir = tmp_dir();
     let mut ids = Vec::new();
@@ -1905,8 +1944,7 @@ fn a_retried_body_persist_rewrites_its_fresh_range() {
         mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
         fail_next_mempool_guard_before_write(&dir);
         assert!(mp.persist_due().is_err());
-        mp.persist_due()
-            .expect("the retry rewrites the fresh body range");
+        mp.persist_due().expect("the retry publishes the admits");
     }
     let mp = Mempool::open_or_create(&dir).unwrap();
     let live: Vec<_> = mp
