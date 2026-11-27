@@ -693,6 +693,11 @@ impl TxStat {
                 n_ovf,
             )
         };
+        if !blob.is_empty() {
+            // The slot below is synced. The blob and the txstat.ovf length it
+            // names go first, as in `flush`.
+            self.ovf.sync_data_only()?;
+        }
         let slot_off = BLK_HEADER + (hfk - 1) * BLK_SLOT;
         let mut slot = [0u8; 16];
         slot[0..8].copy_from_slice(&off.to_le_bytes());

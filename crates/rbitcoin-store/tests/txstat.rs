@@ -282,3 +282,23 @@ fn append_batch_relies_on_the_class_a_tail_guard() {
     );
     let _ = std::fs::remove_dir_all(dir.path());
 }
+
+/// The slot sync in `put_header_blob` must not publish a slot whose blob
+/// bytes and `txstat.ovf` length are still unsynced. A failed overflow sync
+/// stops the put before the slot is stamped.
+#[cfg(debug_assertions)]
+#[test]
+fn header_blob_syncs_the_overflow_before_its_slot() {
+    let dir = TempDir::labeled("txstat-ovf-order").unwrap();
+    let t = TxStat::create(&dir).unwrap();
+    t.flush().unwrap();
+    let blob = encode_ovf_blob(&[(1, vec![0x5Au8; 32])]).unwrap();
+    rbitcoin_store::io_handle::arm_fail_sync(t.ovf.io_handle(), 1);
+    assert!(
+        t.put_header_blob(Fk(1), &blob).is_err(),
+        "the slot was stamped without syncing txstat.ovf"
+    );
+    assert!(t.header_blob(Fk(1)).unwrap().is_empty());
+    t.put_header_blob(Fk(1), &blob).unwrap();
+    assert_eq!(t.header_blob(Fk(1)).unwrap(), blob);
+}
