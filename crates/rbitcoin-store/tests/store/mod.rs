@@ -709,6 +709,27 @@ fn open_refuses_legacy_ahead_sidecars() {
     }
 }
 
+/// The base binary wrote one `.ahead` per `header.head` generation. Open
+/// refuses a leftover generation sidecar the way it refuses the base one.
+#[test]
+fn open_refuses_a_legacy_generation_ahead_sidecar() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::copy(dir.join("header.head"), dir.join("header.head.g1")).unwrap();
+    let ahead = dir.join("header.head.g1.ahead");
+    std::fs::write(&ahead, b"legacy").unwrap();
+    match Store::open_tiny(&dir) {
+        Err(StoreError::Corrupt(m)) => assert!(m.contains("header.head.gN.ahead"), "{m}"),
+        Ok(_) => panic!("header.head.g1.ahead opened"),
+        Err(other) => panic!("header.head.g1.ahead: {other}"),
+    }
+    assert!(ahead.is_file(), "header.head.g1.ahead must stay");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Meta 31 beside a still-96-byte `header.body` is the crash between the old
 /// promote and the rename. Open must convert the body without a schema-24 gate.
 #[test]
