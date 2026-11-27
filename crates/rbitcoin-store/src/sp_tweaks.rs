@@ -460,6 +460,17 @@ impl SpTweaksTable {
             n: u64,
         }
         let mut plans: Vec<Plan> = Vec::new();
+        // `roll` stamps `first_slot` from `n_slots` already on the pairs.
+        // Count a plan when it is pushed so a later roll in this batch does
+        // not overlap the segment it just left. A failed commit subtracts
+        // those counts again.
+        fn undo_slot_plan(segs: &mut [Seg], plans: &[Plan]) {
+            for p in plans {
+                if p.si < segs.len() {
+                    segs[p.si].n_slots = segs[p.si].n_slots.saturating_sub(p.n);
+                }
+            }
+        }
         while i < items.len() {
             let start0 = inner
                 .segs
@@ -473,16 +484,19 @@ impl SpTweaksTable {
                 })
                 .unwrap_or(FILE_HEADER_LEN as u64);
             if start0 > u32::MAX as u64 {
-                self.dirs.roll(&mut inner.segs)?;
+                if let Err(e) = self.dirs.roll(&mut inner.segs) {
+                    undo_slot_plan(&mut inner.segs, &plans);
+                    return Err(e);
+                }
             }
             let si = inner.segs.len() - 1;
-            let start = if plans.last().is_some_and(|p| p.si == si) {
-                let p = plans.last().unwrap();
+            let start = if let Some(p) = plans.last().filter(|p| p.si == si) {
                 p.body_at + p.body.len() as u64
             } else {
                 inner.segs[si].body.logical_len()
             };
             if start > u32::MAX as u64 {
+                undo_slot_plan(&mut inner.segs, &plans);
                 return Err(StoreError::Corrupt("sp_tweaks body exceeds u32 off"));
             }
             let mut body = Vec::new();
@@ -498,14 +512,11 @@ impl SpTweaksTable {
                 i += 1;
             }
             if i == start_i {
+                undo_slot_plan(&mut inner.segs, &plans);
                 return Err(StoreError::Corrupt("sp_tweaks body exceeds u32 off"));
             }
-            let n_slots = inner.segs[si].n_slots
-                + plans
-                    .iter()
-                    .filter(|p| p.si == si)
-                    .map(|p| p.n)
-                    .sum::<u64>();
+            let n = offs.len() as u64;
+            let n_slots = inner.segs[si].n_slots;
             let mut idx = Vec::with_capacity(offs.len() * SLOT as usize);
             for o in &offs {
                 idx.extend_from_slice(&o.to_le_bytes());
@@ -516,8 +527,9 @@ impl SpTweaksTable {
                 body,
                 idx_at: FILE_HEADER_LEN as u64 + n_slots * SLOT,
                 idx,
-                n: offs.len() as u64,
+                n,
             });
+            inner.segs[si].n_slots = inner.segs[si].n_slots.saturating_add(n);
         }
         let mut writes: Vec<ForwardAppend<'_>> = Vec::new();
         for p in &plans {
@@ -540,19 +552,18 @@ impl SpTweaksTable {
             }
         }
         let Some(dir) = self.dirs.idx.parent() else {
+            undo_slot_plan(&mut inner.segs, &plans);
             return Err(StoreError::Rejected("page guard mark has no directory"));
         };
         let committed =
             page_guard::commit_forward_appends(dir, page_guard::SP_TWEAKS_MARK, &writes);
         drop(writes);
         if let Err(e) = committed {
+            undo_slot_plan(&mut inner.segs, &plans);
             if inner.segs.len() > segs_before && !dir.join(page_guard::SP_TWEAKS_MARK).is_file() {
                 self.dirs.drop_after(&mut inner.segs, segs_before);
             }
             return Err(e);
-        }
-        for p in &plans {
-            inner.segs[p.si].n_slots = inner.segs[p.si].n_slots.saturating_add(p.n);
         }
         Ok(())
     }
