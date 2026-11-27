@@ -687,6 +687,37 @@ fn a_retry_syncs_the_grown_slot_file_again() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The body only appends. A persist syncs the new records, then writes and
+/// syncs the body length, before it arms `guard/flush` for slots and meta.
+/// The mark names no `tx.body` page.
+#[cfg(debug_assertions)]
+#[test]
+fn a_persist_appends_the_body_before_the_mark() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let id = Txid::from_byte_array([0xB7; 32]);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    mp.set_now_ms(0);
+    put_live(&mut mp, &id, 1, 400);
+    let logical = u64::from_le_bytes(mp.body[8..16].try_into().unwrap());
+    mp.set_now_ms(PERSIST_INTERVAL_MS);
+    fail_next_mempool_guard_before_write(&dir);
+    assert!(mp.persist_due().is_err());
+    let mark = fs::read(dir.join("guard/flush")).unwrap();
+    assert!(
+        !mark.windows(7).any(|w| w == b"tx.body"),
+        "the flush mark must not image tx.body"
+    );
+    let body = fs::read(dir.join("tx.body")).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+        logical,
+        "the body length must land before the mark"
+    );
+    drop(mp);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A failed persist leaves `guard/flush` armed with the admit's LIVE slot.
 /// Removing that tx before the next persist must reach disk, or open
 /// replays the mark and loads the removed tx as LIVE.
@@ -1128,17 +1159,18 @@ fn torn_mempool_page_restores_the_armed_image() {
     assert!(mp.persist_due().is_err());
     assert!(dir.join("guard/flush").is_file());
     drop(mp);
-    let mut body = OpenOptions::new()
+    // The body only appends and is not imaged. The slots page is.
+    let mut slots = OpenOptions::new()
         .write(true)
-        .open(dir.join("tx.body"))
+        .open(dir.join("slots"))
         .unwrap();
-    body.seek(SeekFrom::Start(0)).unwrap();
-    body.write_all(&[0xA5; 4096]).unwrap();
-    body.sync_all().unwrap();
-    drop(body);
+    slots.seek(SeekFrom::Start(0)).unwrap();
+    slots.write_all(&[0xA5; 4096]).unwrap();
+    slots.sync_all().unwrap();
+    drop(slots);
     let mp = Mempool::open_or_create(&dir).unwrap();
     let live = mp.load_live_txs().unwrap();
-    assert_eq!(live.len(), 2, "open copies the armed body and slots");
+    assert_eq!(live.len(), 2, "open copies the armed slots page");
     assert!(live.iter().any(|row| row.packed.txid == t2));
     assert!(!dir.join("guard/flush").exists());
     let _ = fs::remove_dir_all(&dir);
