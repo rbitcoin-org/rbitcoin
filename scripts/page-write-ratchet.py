@@ -60,7 +60,10 @@ def scan(root: str) -> dict[str, int]:
     ratchet = load_unwrap()
     compiled = []
     for token, pattern, only in TOKENS:
-        compiled.append((token, re.compile(pattern), only))
+        # The name may end one line and its `(` or `{` open the next.
+        name, opener = re.match(r"(.*)\\s\*(\\\(|\\\{)$", pattern).groups()
+        split = (re.compile(name + r"\s*$"), re.compile(r"^\s*" + opener))
+        compiled.append((token, re.compile(pattern), only, split))
     counts: dict[str, int] = {}
     for crate in CRATES:
         src = os.path.join(root, "crates", crate, "src")
@@ -77,12 +80,13 @@ def scan(root: str) -> dict[str, int]:
                     continue
                 rel = f"{rel_dir}/{name}"
                 full = os.path.join(dirpath, name)
-                for token, rx, only in compiled:
+                for token, rx, only, (tail, head) in compiled:
                     if only is not None and crate not in only:
                         continue
 
-                    def line_fn(code, _prev, rx=rx):
-                        return len(rx.findall(code))
+                    def line_fn(code, prev, rx=rx, tail=tail, head=head):
+                        split = 1 if tail.search(prev) and head.search(code) else 0
+                        return len(rx.findall(code)) + split
 
                     got = ratchet.file_count(full, line_fn)
                     if got:
