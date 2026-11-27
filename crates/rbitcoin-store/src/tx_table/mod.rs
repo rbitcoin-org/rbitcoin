@@ -727,7 +727,7 @@ pub struct TxTable {
     /// Appends inside the armed window. The barrier clears the mark only
     /// when this is zero: it is not the writer, and a write is still in
     /// flight.
-    class_a_writes: std::sync::atomic::AtomicUsize,
+    pub(crate) class_a_writes: std::sync::atomic::AtomicUsize,
     /// Set once a Class A sync or append write failed. The kernel may have
     /// dropped those dirty pages, and RAM may name rows the device does not
     /// hold, so a retry that succeeds proves nothing: every later sync and
@@ -736,7 +736,7 @@ pub struct TxTable {
     /// Told once when [`Self::class_a_failed`] latches.
     class_a_on_fail: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Hot store directory, where [`CLASS_A_SYNCED_NAME`] lives.
-    hot_dir: PathBuf,
+    pub(crate) hot_dir: PathBuf,
     /// The value in [`CLASS_A_SYNCED_NAME`]. Written under the latch.
     synced_named: std::sync::atomic::AtomicU64,
     /// Creates whose every Class A row is written. [`Self::count`] moves
@@ -1241,7 +1241,7 @@ thread_local! {
 }
 
 thread_local! {
-    static WRITERS_AT_LATCH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static WRITERS_AT_LATCH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One-shot hook run inside the next Class A append on this thread, after
@@ -4116,34 +4116,6 @@ impl TxTable {
                 return Ok(());
             }
         }
-    }
-
-    /// Keep `tear_guard/armed` across a Class A sync. The test holds an
-    /// append the way the confirm thread does while `rbtc-tip-flush` runs.
-    #[doc(hidden)]
-    pub fn hold_class_a_append_for_test(&self) {
-        self.class_a_writes
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
-
-    /// Drop [`Self::hold_class_a_append_for_test`].
-    #[doc(hidden)]
-    pub fn release_class_a_append_for_test(&self) {
-        self.class_a_writes
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    }
-
-    /// Arm naming `generation` without promoting `meta`. Errors while meta
-    /// is 30.
-    #[doc(hidden)]
-    pub fn arm_class_a_generation_for_test(&self, generation: u64) -> Result<(), StoreError> {
-        crate::class_a_pages::arm_named_generation(&self.hot_dir, generation)
-    }
-
-    /// Writer count sampled when the failure hook last ran on this thread.
-    #[doc(hidden)]
-    pub fn class_a_writers_at_last_failure_for_test() -> usize {
-        WRITERS_AT_LATCH.with(|slot| slot.get())
     }
 
     /// Run `sync` on Class A fds under the latch: refuse once one failed,
