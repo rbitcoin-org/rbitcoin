@@ -653,3 +653,43 @@ fn seal_refuses_while_a_commit_guard_is_armed() {
         .collect();
     assert_eq!(before, after, "the seal changed the armed mark");
 }
+
+/// A page extent after an unaligned bump carves the gap into the free list.
+/// Those links share a block with the slab below the bump, so they are
+/// written only inside the armed commit. An arm that fails leaves the body
+/// unwritten.
+#[test]
+fn gap_links_wait_for_the_arm() {
+    use rbitcoin_store::file::TracedWrite;
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let key = script_hash(&[0xd1]);
+    put_create_batch(&t, (1..=3u64).map(|i| rec(key, i)).collect::<Vec<_>>());
+    let bodies: Vec<std::path::PathBuf> = t
+        .bodies
+        .iter()
+        .chain(t.ovf_body.iter())
+        .map(|b| b.path().to_path_buf())
+        .collect();
+    // A file where guard/ belongs makes the next arm fail.
+    let guard = dir.join("guard");
+    let _ = std::fs::remove_dir_all(&guard);
+    std::fs::write(&guard, b"not a directory").unwrap();
+    let many: Vec<ScriptHashRecord> = (4..=600u64).map(|i| rec(key, i)).collect();
+    rbitcoin_store::file::arm_write_trace();
+    let err = t.put_create_batch_append(&many).unwrap_err();
+    let trace = rbitcoin_store::file::take_write_trace();
+    eprintln!(
+        "DEBUG err={err} trace={trace:?} bump={}",
+        t.allocs[0].lock().unwrap().bump
+    );
+    for w in trace {
+        if let TracedWrite::Write { path, offset, len } = w {
+            assert!(
+                !bodies.contains(&path),
+                "a body write before the arm: {}@{offset}+{len}",
+                path.display()
+            );
+        }
+    }
+}
