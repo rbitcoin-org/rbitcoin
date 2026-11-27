@@ -315,6 +315,7 @@ fn ingest_syncs_the_alloc_header_before_the_head() {
     let dir = tmp();
     let t = ScriptHashTable::create_tiny(&dir).unwrap();
     let sh = script_hash(&[0xc2]);
+    let before_live = read_alloc_header(t.ovf_file()).unwrap().0.live_count;
     rbitcoin_store::io_handle::arm_fail_sync_after(t.ovf_file().io_handle(), 1, 1);
     let err = t.put_create_batch_append(&[rec(sh, 1, 0)]).unwrap_err();
     assert!(matches!(err, StoreError::Io { .. }), "{err}");
@@ -322,8 +323,8 @@ fn ingest_syncs_the_alloc_header_before_the_head() {
     let t = ScriptHashTable::open_tiny(&dir).unwrap();
     let live = read_alloc_header(t.ovf_file()).unwrap().0.live_count;
     assert_eq!(
-        live, 1,
-        "the alloc header must be stored before the second sync"
+        live, before_live,
+        "a crash before clear restores the pre-commit alloc header"
     );
     assert!(
         t.head_value(&sh).unwrap().is_none(),
@@ -2821,7 +2822,7 @@ fn extent_whole_page_drop_stays_readable() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A failed undo clear must put the tail back. The next unlink then drops it.
+/// A failed page-guard clear leaves the mark. Open restores the old tail.
 #[test]
 fn extent_undo_clear_failure_keeps_the_old_tail() {
     let dir = tmp();
@@ -2833,12 +2834,16 @@ fn extent_undo_clear_failure_keeps_the_old_tail() {
     let mut session = t.pack_shard_session(0).unwrap();
     push_chain(&mut session, sh, &ents);
     seal_session(&t, 0, session);
-    t.fail_next_undo_clear();
+    t.fail_next_sh_guard_clear();
     let err = t.unlink_create(&sh, Fk(n), 0).unwrap_err();
     assert!(
-        err.to_string().contains("scripthash undo clear failed"),
+        err.to_string()
+            .contains("scripthash page guard clear failed"),
         "{err}"
     );
+    assert_eq!(t.entries(&sh).unwrap().len(), (n - 1) as usize);
+    drop(t);
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
     assert_eq!(t.entries(&sh).unwrap().len(), n as usize);
     assert!(t.unlink_create(&sh, Fk(n), 0).unwrap());
     assert_eq!(t.entries(&sh).unwrap().len(), (n - 1) as usize);
@@ -3126,9 +3131,9 @@ fn unlink_batch_syncs_one_body_once() {
         }
     }
     let _disarm = Disarm(handle);
-    // The batch syncs the overflow body once before the frees. One more
-    // barrier covers both free lists. A third sync is the per-key loop.
-    rbitcoin_store::io_handle::arm_fail_sync_after(handle, 2, 1);
+    // Header-drop, payload, then one free-list barrier for both keys. A
+    // fourth sync is the per-key loop.
+    rbitcoin_store::io_handle::arm_fail_sync_after(handle, 3, 1);
     t.unlink_creates_batch(&[(a, vec![Fk(2)]), (b, vec![Fk(12)])])
         .unwrap();
     assert_eq!(t.entries(&a).unwrap().len(), 2);
