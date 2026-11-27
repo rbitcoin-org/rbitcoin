@@ -1050,9 +1050,7 @@ fn arm_errors_while_meta_is_30_and_plain_open_does_not_promote() {
     let dir = tmp();
     let s = Store::create_tiny(&dir).unwrap();
     write_meta_ver(&dir, 30);
-    let err = s
-        .txs
-        .arm_class_a_generation_for_test(1)
+    let err = rbitcoin_store::testutil::arm_class_a_generation(&s.txs, 1)
         .expect_err("arm while meta is 30");
     assert!(matches!(err, StoreError::Rejected(_)));
     assert!(!dir.join("tear_guard/armed").exists());
@@ -1081,7 +1079,7 @@ fn write_barrier_does_not_clear_armed_while_an_append_is_in_flight() {
         .unwrap();
     let armed = dir.join("tear_guard/armed");
     assert!(armed.is_file());
-    s.txs.hold_class_a_append_for_test();
+    rbitcoin_store::testutil::hold_class_a_append(&s.txs);
     std::thread::scope(|scope| {
         let handle = scope.spawn(|| s.txs.sync_class_a_named(1));
         let start = std::time::Instant::now();
@@ -1096,7 +1094,7 @@ fn write_barrier_does_not_clear_armed_while_an_append_is_in_flight() {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        s.txs.release_class_a_append_for_test();
+        rbitcoin_store::testutil::release_class_a_append(&s.txs);
         handle.join().unwrap().unwrap();
     });
     assert!(
