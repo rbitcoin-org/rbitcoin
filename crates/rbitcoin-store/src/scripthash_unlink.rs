@@ -93,8 +93,8 @@ pub(super) struct PendingEmpty {
     pages_left: Option<Vec<(u8, u64)>>,
     /// `live_count` already dropped `removed`. A header retry must not do it again.
     live_applied: bool,
-    /// The first arm's mark. A retry lands under it and clears it whole; a
-    /// second arm would replace its pre-images with this attempt's bytes.
+    /// The earlier attempt's arm. A retry keeps the pre-images its mark still
+    /// holds, re-images only pages a later clear dropped, and clears both sets.
     armed: Option<super::ArmedSh>,
 }
 
@@ -612,15 +612,18 @@ impl ScriptHashTable {
         if job.pages_left.is_none() {
             job.pages_left = Some(self.deferred_page_list(job)?);
         }
-        let armed = match job.armed.take() {
-            Some(armed) => armed,
-            None => {
-                let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
-                let mut offs = vec![0u64];
-                offs.extend(job.pages_left.iter().flatten().map(|&(_, off)| off));
-                self.arm_suffix_pages(body, &job.scripthash, job.home, &offs, !job.head_synced)?
-            }
-        };
+        let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
+        let mut offs = vec![0u64];
+        offs.extend(job.pages_left.iter().flatten().map(|&(_, off)| off));
+        let armed = self.arm_suffix_pages(
+            body,
+            &job.scripthash,
+            job.home,
+            &offs,
+            !job.head_synced,
+            job.armed.as_ref(),
+        )?;
+        job.armed = None;
         let landed = self.land_one_empty(job);
         let cleared = landed.and_then(|()| self.clear_armed_sh(&armed));
         if cleared.is_err() {
@@ -749,8 +752,14 @@ impl ScriptHashTable {
                 }
                 dirty.extend_from_slice(&drop_pages);
                 dirty.extend(gaps.iter().map(|&(_, off)| off));
-                let armed =
-                    self.arm_suffix_pages(body, scripthash, home, &dirty, new_head.is_some())?;
+                let armed = self.arm_suffix_pages(
+                    body,
+                    scripthash,
+                    home,
+                    &dirty,
+                    new_head.is_some(),
+                    None,
+                )?;
                 super::publish_bump(body, &alloc)?;
                 if boundary != old_last {
                     self.retire_head_page(body, &mut alloc, scripthash, home, old_last, &pack)?;

@@ -617,6 +617,19 @@ fn load_group_leftover(
     Ok(leftover)
 }
 
+/// The (file, page offset) records `mark` holds. A missing mark holds none.
+pub(crate) fn armed_group_pages(mark: &Path) -> Result<HashSet<(String, u64)>, StoreError> {
+    let raw = match std::fs::read(mark) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) => return Err(StoreError::io(mark, e)),
+    };
+    Ok(mark_group_pages(&raw)?
+        .into_iter()
+        .map(|(name, offset, _)| (name, offset))
+        .collect())
+}
+
 fn valid_guard_name(name: &str) -> bool {
     if name.is_empty()
         || name.len() > u16::MAX as usize
