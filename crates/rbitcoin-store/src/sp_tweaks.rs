@@ -113,6 +113,12 @@ impl SpTweaksTable {
         Self::write_meta(&dir, origin.0)?;
         let dirs = Self::seg_dirs(&dir);
         let seg = dirs.create(0, 0)?;
+        // The first forward commit syncs only the segment files and their own
+        // directories. `meta`, the segment names, and the two table
+        // directories have to be durable before a put can return.
+        for d in [Self::idx_dir(&dir), Self::body_dir(&dir), dir.clone()] {
+            crate::file::fsync_parent_dir(&d).map_err(|e| StoreError::io(&d, e))?;
+        }
         Ok(Self {
             dirs,
             origin: origin.0,
@@ -127,7 +133,8 @@ impl SpTweaksTable {
         let mut prefix = [0u8; 8];
         prefix[..4].copy_from_slice(&origin.to_le_bytes());
         prefix[4..8].copy_from_slice(&IDX_FMT_SEG_TIP.to_le_bytes());
-        meta.write_at_pwrite(FILE_HEADER_LEN as u64, &prefix)
+        meta.write_at_pwrite(FILE_HEADER_LEN as u64, &prefix)?;
+        meta.flush()
     }
 
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
