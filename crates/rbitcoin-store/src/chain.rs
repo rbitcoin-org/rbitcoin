@@ -594,6 +594,29 @@ pub fn fail_next_header_txs_flush_after_first(path: &Path) {
         .insert(path.to_path_buf());
 }
 
+#[cfg(debug_assertions)]
+static FAIL_FD_BEFORE_LIVE: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Fail the next fd-only write of `path` after its mark is armed and just
+/// before its live bytes, as a power cut would.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_fd_write_before_live(path: &Path) {
+    FAIL_FD_BEFORE_LIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn take_fail_fd_before_live(path: &Path) -> bool {
+    FAIL_FD_BEFORE_LIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
+}
+
 /// Fail after the payload flush of `path`, before the sidecars are removed.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
@@ -701,6 +724,15 @@ impl HeaderTxsTable {
         }
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
+        if self.fd_pair() {
+            return ArrayTable::write_fd_pair(
+                &self.first,
+                &[(id - 1, first_tx_fk.0)],
+                &self.count,
+                &[(id - 1, u64::from(n))],
+                true,
+            );
+        }
         self.first.set_zero_gap(write, id - 1, first_tx_fk.0)?;
         self.count.set_zero_gap(write, id - 1, u64::from(n))?;
         Ok(())
@@ -725,6 +757,15 @@ impl HeaderTxsTable {
         }
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
+        if self.fd_pair() {
+            return ArrayTable::write_fd_pair(
+                &self.first,
+                &first_pairs,
+                &self.count,
+                &count_pairs,
+                true,
+            );
+        }
         self.first.set_many_zero_gap(write, &first_pairs)?;
         self.count.set_many_zero_gap(write, &count_pairs)?;
         Ok(())
@@ -751,9 +792,23 @@ impl HeaderTxsTable {
         }
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
+        if self.fd_pair() {
+            return ArrayTable::write_fd_pair(
+                &self.first,
+                &first_pairs,
+                &self.count,
+                &count_pairs,
+                true,
+            );
+        }
         self.first.set_many_zero_gap(write, &first_pairs)?;
         self.count.set_many_zero_gap(write, &count_pairs)?;
         Ok(())
+    }
+
+    /// Both columns are fd-only, so a pair write needs one mark for both.
+    fn fd_pair(&self) -> bool {
+        self.first.is_fd_only() && self.count.is_fd_only()
     }
 
     pub fn get_range(&self, header_fk: Fk) -> Result<Option<(Fk, u32)>, StoreError> {
@@ -837,6 +892,10 @@ impl HeaderTxsTable {
         }
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
+        if self.fd_pair() {
+            ArrayTable::write_fd_pair(&self.first, &[(idx, 0)], &self.count, &[(idx, 0)], false)?;
+            return Ok(true);
+        }
         self.first.set(write, idx, 0)?;
         self.count.set(write, idx, 0)?;
         Ok(true)
