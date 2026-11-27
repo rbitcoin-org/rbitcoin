@@ -666,7 +666,7 @@ fn flush_writes_only_the_pages_it_imaged() {
 
 /// An fd-only `header_txs` pair lands under one mark. A failure after the
 /// `first` column is written and before `count` is must not leave the pair
-/// split: reopen reads the old pair or the new one.
+/// split: both forward images are armed by then, so reopen reads the new pair.
 #[cfg(debug_assertions)]
 #[test]
 fn fd_only_header_txs_pair_is_one_mark() {
@@ -687,17 +687,13 @@ fn fd_only_header_txs_pair_is_one_mark() {
         );
         assert!(t.put_range(&write, Fk(1), Fk(5), 3).is_err());
     }
-    rbitcoin_store::page_guard::restore_store_group(
+    assert!(rbitcoin_store::page_guard::restore_store_group(
         &dir.path,
         rbitcoin_store::page_guard::CLASS_C_MARK,
     )
-    .unwrap();
+    .unwrap());
     let t = HeaderTxsTable::open(&dir.path).unwrap();
-    let got = t.get_range(Fk(1)).unwrap();
-    assert!(
-        got == Some((Fk(1), 1)) || got == Some((Fk(5), 3)),
-        "reopen read a split header_txs pair: {got:?}"
-    );
+    assert_eq!(t.get_range(Fk(1)).unwrap(), Some((Fk(5), 3)));
 }
 
 /// Each `header_txs` column picks RAM or fd from its own length. A pair whose
