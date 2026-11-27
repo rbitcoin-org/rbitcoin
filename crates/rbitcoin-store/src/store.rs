@@ -539,12 +539,7 @@ impl Store {
         let header_body_replayed = restore_open_marks(&path)?;
         open_layout_refuse_old(&path, meta_ver)?;
         drop_unread_store_leftovers(&path);
-        crate::scripthash::discard_index_for_rebuild(&path)?;
-        let scripthash = if path.join("scripthash.body").exists() {
-            ScriptHashTable::open_with_scale(&path, layout.head_scale)?
-        } else {
-            ScriptHashTable::create_with_scale(&path, layout.head_scale)?
-        };
+        let scripthash = open_scripthash(&path, layout.head_scale)?;
         let header_txs = if path.join("header_txs_first.body").exists() {
             HeaderTxsTable::open(&path)?
         } else {
@@ -2800,6 +2795,17 @@ fn restore_open_marks(path: &Path) -> Result<bool, StoreError> {
     )?;
     restore_sh_marks_or_rebuild(path)?;
     Ok(header_body)
+}
+
+/// Open the scripthash table, or create it. A rebuild a restore asked for
+/// discards the index first.
+fn open_scripthash(path: &Path, scale: HeadScale) -> Result<ScriptHashTable, StoreError> {
+    crate::scripthash::discard_index_for_rebuild(path)?;
+    if path.join("scripthash.body").exists() {
+        ScriptHashTable::open_with_scale(path, scale)
+    } else {
+        ScriptHashTable::create_with_scale(path, scale)
+    }
 }
 
 /// A `guard/sh-*` mark that does not parse is scripthash damage, which
