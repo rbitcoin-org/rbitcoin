@@ -2196,9 +2196,12 @@ impl ScriptHashTable {
         for stage in batch.stages.values() {
             self.image_body_stage(&mut pages, stage)?;
         }
-        for (key, _, kh) in &batch.head_final {
-            self.image_head_key(&mut pages, key, *kh)?;
-        }
+        let heads: Vec<(&[u8; 32], KeyHome)> = batch
+            .head_final
+            .iter()
+            .map(|(key, _, kh)| (key, *kh))
+            .collect();
+        self.image_head_keys(&mut pages, &heads)?;
         self.publish_sh_pages(&pages)
     }
 
@@ -2246,48 +2249,57 @@ impl ScriptHashTable {
         Ok(())
     }
 
-    fn image_head_key(
+    /// Image every head this batch will write. Ingest keys, and main or sealed
+    /// keys that fall through to ingest, are one probe pass: a second key that
+    /// loses the first empty slot lands on a later page.
+    fn image_head_keys(
         &self,
         pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
-        key: &[u8; 32],
-        kh: KeyHome,
+        keys: &[(&[u8; 32], KeyHome)],
     ) -> Result<(), StoreError> {
-        match kh {
-            KeyHome::Main => self.image_main_head(pages, key),
-            KeyHome::SealedOvf => self.image_sealed_head(pages, key),
-            KeyHome::Ingest | KeyHome::Absent => self.image_ingest_head(pages, key),
+        let mut ingest = Vec::with_capacity(keys.len());
+        for &(key, kh) in keys {
+            let resident = match kh {
+                KeyHome::Main => self.image_main_resident(pages, key)?,
+                KeyHome::SealedOvf => self.image_sealed_resident(pages, key)?,
+                KeyHome::Ingest | KeyHome::Absent => false,
+            };
+            if !resident {
+                ingest.push(*key);
+            }
         }
+        self.image_ingest_keys(pages, &ingest)
     }
 
-    fn image_main_head(
+    fn image_main_resident(
         &self,
         pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
         key: &[u8; 32],
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let hk = head_key_from_full(key);
         let si = self.shard_index(key);
         let Some(slot) = self.sorted_main.get(si) else {
-            return self.image_ingest_head(pages, key);
+            return Ok(false);
         };
         let g = slot.read().unwrap();
         let Some(h) = g.as_ref() else {
-            return self.image_ingest_head(pages, key);
+            return Ok(false);
         };
         let Some(off) = h.value_word_offset(&hk)? else {
-            drop(g);
-            return self.image_ingest_head(pages, key);
+            return Ok(false);
         };
         let vp = crate::scripthash_mphf::val_path(&h.base);
         let rel = page_guard::guard_rel_name(&self.store_dir, &vp)?;
         let mark = page_guard::sh_mark(&format!("{si:02x}"));
-        image_range(pages, &mark, &rel, &vp, &h.val_file, off, 8)
+        image_range(pages, &mark, &rel, &vp, &h.val_file, off, 8)?;
+        Ok(true)
     }
 
-    fn image_sealed_head(
+    fn image_sealed_resident(
         &self,
         pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
         key: &[u8; 32],
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let hk = head_key_from_full(key);
         let mark = page_guard::sh_mark("ovf");
         {
@@ -2296,7 +2308,7 @@ impl ScriptHashTable {
                 if let Some(off) = h.value_word_offset(&hk)? {
                     let rel = page_guard::guard_rel_name(&self.store_dir, h.path())?;
                     image_range(pages, &mark, &rel, h.path(), &h.file, off, 8)?;
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
@@ -2305,10 +2317,10 @@ impl ScriptHashTable {
                 let vp = crate::scripthash_mphf::val_path(&l1.head.base);
                 let rel = page_guard::guard_rel_name(&self.store_dir, &vp)?;
                 image_range(pages, &mark, &rel, &vp, &l1.head.val_file, off, 8)?;
-                return Ok(());
+                return Ok(true);
             }
         }
-        self.image_ingest_head(pages, key)
+        Ok(false)
     }
 
     fn rearm_ingest_pages(&self, keys: &[[u8; 32]]) -> Result<(), StoreError> {
@@ -2317,6 +2329,22 @@ impl ScriptHashTable {
             return Ok(());
         }
         let mut pages: BTreeMap<(String, String, u64), [u8; PAGE as usize]> = BTreeMap::new();
+        self.image_ingest_keys(&mut pages, keys)?;
+        self.publish_sh_pages(&pages).map(|_| ())
+    }
+
+    /// One image for the whole ingest batch. Empty tables bulk-fill slots.
+    /// A live table flushes each dirty chunk, including a key displaced past
+    /// its first empty slot.
+    fn image_ingest_keys(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        keys: &[[u8; 32]],
+    ) -> Result<(), StoreError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.ensure_ingest()?;
         let empty = self
             .ingest
             .lock()
@@ -2324,11 +2352,10 @@ impl ScriptHashTable {
             .as_ref()
             .is_some_and(|h| h.is_known_empty());
         if empty {
-            self.image_empty_ingest(&mut pages, keys)?;
+            self.image_empty_ingest(pages, keys)
         } else {
-            self.image_live_ingest(&mut pages, keys)?;
+            self.image_live_ingest(pages, keys)
         }
-        self.publish_sh_pages(&pages).map(|_| ())
     }
 
     /// An empty ingest table places later keys past the first probe. Image
@@ -2398,18 +2425,6 @@ impl ScriptHashTable {
         self.image_occ_sidecar(pages, &mark, &path)
     }
 
-    /// The ingest write for one key rewrites the whole chunk that holds its
-    /// slot, which can cross a 4 KiB boundary. Image that chunk.
-    fn image_ingest_head(
-        &self,
-        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
-        key: &[u8; 32],
-    ) -> Result<(), StoreError> {
-        self.ensure_ingest()?;
-        // Flush writes the whole dirty chunk, not the one slot the key occupies.
-        self.image_live_ingest(pages, std::slice::from_ref(key))
-    }
-
     /// Page 0 of `{head}.occ`. Restore writes only the bytes the sidecar has.
     fn image_occ_sidecar(
         &self,
@@ -2459,7 +2474,7 @@ impl ScriptHashTable {
             )?;
         }
         if image_head {
-            self.image_head_key(&mut pages, scripthash, KeyHome::from(home))?;
+            self.image_head_keys(&mut pages, &[(scripthash, KeyHome::from(home))])?;
         }
         let Some(prev) = prev else {
             return self.publish_sh_pages(&pages);
@@ -2499,6 +2514,7 @@ impl ScriptHashTable {
         {
             self.ensure_ingest()?;
         }
+        let mut heads = Vec::with_capacity(batch.rewrites.len());
         for job in &batch.rewrites {
             let kh = KeyHome::from(job.home);
             let body = self.body_for(&job.scripthash, kh);
@@ -2560,8 +2576,9 @@ impl ScriptHashTable {
                     _ => {}
                 }
             }
-            self.image_head_key(&mut pages, &job.scripthash, kh)?;
+            heads.push((&job.scripthash, kh));
         }
+        self.image_head_keys(&mut pages, &heads)?;
         self.publish_sh_pages(&pages)
     }
 
