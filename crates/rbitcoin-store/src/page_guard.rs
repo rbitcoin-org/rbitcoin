@@ -107,13 +107,14 @@ fn remove_mark(path: &Path) -> Result<(), StoreError> {
 /// Create `path`'s directory and sync that directory's parent.
 ///
 /// The mark rename syncs the guard directory. The store directory still has
-/// to name `guard/` before a crash, or the mark never comes back.
+/// to name `guard/` before a crash, or the mark never comes back. A
+/// `guard/` that already exists is synced again, because an earlier arm may
+/// have created it and then failed that sync.
 fn ensure_mark_parent(path: &Path) -> Result<(), StoreError> {
     let parent = mark_parent(path)?;
-    if parent.is_dir() {
-        return Ok(());
+    if !parent.is_dir() {
+        std::fs::create_dir_all(parent).map_err(|e| StoreError::io(parent, e))?;
     }
-    std::fs::create_dir_all(parent).map_err(|e| StoreError::io(parent, e))?;
     if let Some(grand) = parent.parent().filter(|p| !p.as_os_str().is_empty()) {
         fsync_parent_dir(grand).map_err(|e| StoreError::io(grand, e))?;
     }
