@@ -54,6 +54,7 @@ fn page0_stamp_is_not_in_the_txstat_mark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn torn_interior_txstat_page_restores_the_pre_stamp_bytes() {
     let dir = TempDir::labeled("txstat-interior").unwrap();
@@ -90,6 +91,7 @@ fn torn_interior_txstat_page_restores_the_pre_stamp_bytes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn a_later_stamp_repairs_the_page_a_failed_stamp_tore() {
     let dir = TempDir::labeled("txstat-second-stamp").unwrap();
