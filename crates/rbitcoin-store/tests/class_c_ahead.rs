@@ -139,11 +139,18 @@ fn header_txs_flush_dirsyncs_the_pair_once() {
     t.flush().unwrap();
     let dirs = rbitcoin_store::file::take_fsynced_dirs();
     #[cfg(unix)]
-    assert_eq!(
-        dirs.len(),
-        2,
-        "the pair should sync the directory once after the sidecars and once after the unlinks, got {dirs:?}"
-    );
+    {
+        let guard = dir.join("guard");
+        assert_eq!(
+            dirs.iter().filter(|p| p.as_path() == guard).count(),
+            2,
+            "the pair should sync guard/ once after the sidecars and once after the unlinks, got {dirs:?}"
+        );
+        assert!(
+            dirs.iter().any(|p| p == &dir),
+            "creating guard/ must sync the store directory, got {dirs:?}"
+        );
+    }
     // Windows `fsync_parent_dir` is a no-op, so the trace stays empty.
     #[cfg(not(unix))]
     drop(dirs);
@@ -312,13 +319,17 @@ fn confirmed_flush_dirsyncs_the_sidecar_before_the_payload() {
     let full = rbitcoin_store::file::take_fsynced_dirs();
     #[cfg(unix)]
     {
-        assert_eq!(
-            before_payload.len(),
-            1,
-            "the sidecar rename must reach the directory before the payload, got {before_payload:?}"
+        let guard = dir.path.join("guard");
+        assert!(
+            before_payload.iter().any(|p| p == &guard),
+            "the sidecar rename must reach guard/ before the payload, got {before_payload:?}"
+        );
+        assert!(
+            before_payload.iter().any(|p| p == dir.path()),
+            "creating guard/ must sync the store directory, got {before_payload:?}"
         );
         assert_eq!(
-            full.len(),
+            full.iter().filter(|p| p.as_path() == guard).count(),
             2,
             "one sync after the sidecar and one after the unlink, got {full:?}"
         );
@@ -527,4 +538,51 @@ fn flush_from_first_slot_restores_a_mixed_committed_slot() {
     assert_eq!(t.get(Height(1)).unwrap(), Some(Fk(2)));
     assert_eq!(t.get(Height(599)).unwrap(), Some(Fk(600)));
     assert_eq!(t.tip_height(), Some(Height(599)));
+}
+
+/// `HeaderTxsTable::flush` takes the write lock itself. This pause is inside
+/// the grouped flush `flush_header_archive` used to call without that lock.
+#[cfg(debug_assertions)]
+#[test]
+fn header_txs_grouped_flush_holds_the_write_lock() {
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    let dir = tmp();
+    let store = Arc::new(Store::create_tiny(&dir).unwrap());
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    store.header_txs.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            rbitcoin_store::chain::release_class_c_group_pause();
+        }
+    }
+    rbitcoin_store::chain::arm_class_c_group_pause(&dir);
+    let _release = Release;
+    let flushing = Arc::clone(&store);
+    let flush = std::thread::spawn(move || flushing.flush_header_archive());
+    assert!(
+        rbitcoin_store::chain::wait_class_c_group_paused(Duration::from_secs(5)),
+        "flush_header_archive did not pause between header_txs columns"
+    );
+    let (tx, rx) = mpsc::channel();
+    let putting = Arc::clone(&store);
+    let put = std::thread::spawn(move || {
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        putting
+            .header_txs
+            .put_range(&write, Fk(2), Fk(2), 1)
+            .unwrap();
+        tx.send(()).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(400)).is_err(),
+        "put_range finished while flush_header_archive was between columns"
+    );
+    rbitcoin_store::chain::release_class_c_group_pause();
+    flush.join().unwrap().unwrap();
+    put.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

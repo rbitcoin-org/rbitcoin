@@ -14,6 +14,13 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Mutex;
 
+const CONFIRMED_BODY_AHEAD: &str =
+    "confirmed.body.ahead is a legacy page image; this open does not restore it";
+const HEADER_TXS_FIRST_AHEAD: &str =
+    "header_txs_first.body.ahead is a legacy page image; this open does not restore it";
+const HEADER_TXS_COUNT_AHEAD: &str =
+    "header_txs_count.body.ahead is a legacy page image; this open does not restore it";
+
 /// Best-chain height → header fk. Length = tip_height + 1 when non-empty.
 pub struct ConfirmedTable {
     pub arr: ArrayTable,
@@ -28,6 +35,7 @@ impl ConfirmedTable {
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let path = dir.join("confirmed.body");
+        crate::file::refuse_if_present(&dir.join("confirmed.body.ahead"), CONFIRMED_BODY_AHEAD)?;
         // Every flush rewrites page 0 (the length) and the block that holds
         // the previous tip. A torn one comes back from the synced image.
         page_guard::restore_store_group(dir, page_guard::CLASS_C_MARK)?;
@@ -631,6 +639,14 @@ impl HeaderTxsTable {
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        crate::file::refuse_if_present(
+            &dir.join("header_txs_first.body.ahead"),
+            HEADER_TXS_FIRST_AHEAD,
+        )?;
+        crate::file::refuse_if_present(
+            &dir.join("header_txs_count.body.ahead"),
+            HEADER_TXS_COUNT_AHEAD,
+        )?;
         // One mark images first and count together, so a crash cannot leave
         // the pair split. Restore before any slot read.
         page_guard::restore_store_group(dir, page_guard::CLASS_C_MARK)?;
@@ -834,10 +850,116 @@ impl HeaderTxsTable {
         })
     }
 
+    /// Held across a grouped flush of `first` and `count`. Not reentrant.
+    pub(crate) fn write_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
-        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let _write = self.write_guard();
         flush_class_c_tables(&[&self.first, &self.count])
     }
+}
+
+/// Test pause after the first table's page images and before the next table's.
+///
+/// Armed for one store directory. A flush of another directory does not wait.
+#[cfg(debug_assertions)]
+mod class_c_pause {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::time::Duration;
+
+    struct Inner {
+        dir: Option<PathBuf>,
+        entered: bool,
+    }
+
+    struct Pause {
+        inner: Mutex<Inner>,
+        cv: Condvar,
+    }
+
+    fn pause() -> &'static Pause {
+        static PAUSE: OnceLock<Pause> = OnceLock::new();
+        PAUSE.get_or_init(|| Pause {
+            inner: Mutex::new(Inner {
+                dir: None,
+                entered: false,
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    pub(super) fn between(dir: &Path) {
+        let pause = pause();
+        let mut inner = pause.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.dir.as_deref() != Some(dir) {
+            return;
+        }
+        inner.entered = true;
+        pause.cv.notify_all();
+        while inner.dir.as_deref() == Some(dir) {
+            inner = pause.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn arm(dir: &Path) {
+        let pause = pause();
+        let mut inner = pause.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.dir = Some(dir.to_path_buf());
+        inner.entered = false;
+    }
+
+    #[doc(hidden)]
+    pub fn wait_until_entered(limit: Duration) -> bool {
+        let pause = pause();
+        let mut inner = pause.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + limit;
+        while !inner.entered {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, timeout) = pause
+                .cv
+                .wait_timeout(inner, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            inner = next;
+            if timeout.timed_out() && !inner.entered {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[doc(hidden)]
+    pub fn release() {
+        let pause = pause();
+        let mut inner = pause.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.dir = None;
+        inner.entered = false;
+        pause.cv.notify_all();
+    }
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_class_c_group_pause(dir: &Path) {
+    class_c_pause::arm(dir);
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn wait_class_c_group_paused(limit: std::time::Duration) -> bool {
+    class_c_pause::wait_until_entered(limit)
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn release_class_c_group_pause() {
+    class_c_pause::release();
 }
 
 /// One `store/guard/class_c` mark for every table in the group, then the live
@@ -847,6 +969,8 @@ pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreEr
     let _hold = page_guard::hold_marks();
     let mut owned: Vec<(String, u64, [u8; PAGE as usize])> = Vec::new();
     let mut dirty: Vec<&ArrayTable> = Vec::new();
+    #[cfg(debug_assertions)]
+    let mut imaged = false;
     for t in tables {
         if !t.has_unstored() {
             t.file.flush()?;
@@ -857,6 +981,13 @@ pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreEr
             owned.push((name.clone(), off, image));
         }
         dirty.push(*t);
+        #[cfg(debug_assertions)]
+        if !imaged {
+            imaged = true;
+            if let Some(dir) = t.file.path().parent() {
+                class_c_pause::between(dir);
+            }
+        }
     }
     if owned.is_empty() {
         return Ok(());

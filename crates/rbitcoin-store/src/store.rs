@@ -908,6 +908,7 @@ impl Store {
         // A durable body association must name durable creates.
         self.txs.sync_class_a_data()?;
         self.headers.flush()?;
+        let _write = self.header_txs.write_guard();
         flush_class_c_tables(&[&self.header_txs.first, &self.header_txs.count])?;
         Ok(())
     }
@@ -2068,6 +2069,7 @@ impl Store {
         self.txs.sync_class_a_data()?;
         // Headers first so conf tip cannot reference a non-durable header_fk.
         self.headers.flush()?;
+        let _write = self.header_txs.write_guard();
         flush_class_c_tables(&[
             &self.strong_tx.table,
             &self.header_txs.first,
@@ -2480,12 +2482,15 @@ impl Store {
         self.headers.flush()?;
         // One mark for the four Class C files, then tip_seal. Confirmed is
         // last in the persist order so a kill cannot advance tip first.
-        flush_class_c_tables(&[
-            &self.strong_tx.table,
-            &self.header_txs.first,
-            &self.header_txs.count,
-            &self.confirmed.arr,
-        ])?;
+        {
+            let _write = self.header_txs.write_guard();
+            flush_class_c_tables(&[
+                &self.strong_tx.table,
+                &self.header_txs.first,
+                &self.header_txs.count,
+                &self.confirmed.arr,
+            ])?;
+        }
         self.publish_tip_seal()?;
         Ok(self.confirmed.tip_height())
     }
@@ -2767,7 +2772,9 @@ fn restore_open_marks(path: &Path) -> Result<(), StoreError> {
 
 #[doc(hidden)]
 pub fn open_layout_refuse_old(path: &Path, meta_ver: u16) -> Result<(), StoreError> {
-    if (24..=25).contains(&meta_ver) {
+    // Schema 24/25 always rewrites. A crash that left meta at 31 beside a
+    // 96-byte body is not a multiple of 88, so the same conversion still runs.
+    if (24..=25).contains(&meta_ver) || HeaderTable::header_body_needs_v24_rewrite(path)? {
         HeaderTable::rewrite_v24_body_to_88(path)?;
     }
     unlink_leftover_spent_off(path)?;
