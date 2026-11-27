@@ -21,7 +21,7 @@ const RECORD: usize = 8 + PAGE as usize;
 
 #[doc(hidden)]
 pub fn arm_page_guard(path: &Path, pages: &[(u64, &[u8])]) -> Result<(), StoreError> {
-    mark_parent(path)?;
+    ensure_mark_parent(path)?;
     if path.try_exists().map_err(|e| StoreError::io(path, e))? {
         return Err(StoreError::Rejected("page guard mark is already armed"));
     }
@@ -97,10 +97,26 @@ fn remove_mark(path: &Path) -> Result<(), StoreError> {
     let parent = mark_parent(path)?;
     match std::fs::remove_file(path) {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(StoreError::io(path, e)),
     }
     fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+    Ok(())
+}
+
+/// Create `path`'s directory and sync that directory's parent.
+///
+/// The mark rename syncs the guard directory. The store directory still has
+/// to name `guard/` before a crash, or the mark never comes back.
+fn ensure_mark_parent(path: &Path) -> Result<(), StoreError> {
+    let parent = mark_parent(path)?;
+    if parent.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent).map_err(|e| StoreError::io(parent, e))?;
+    if let Some(grand) = parent.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fsync_parent_dir(grand).map_err(|e| StoreError::io(grand, e))?;
+    }
     Ok(())
 }
 
