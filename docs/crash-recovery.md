@@ -106,8 +106,9 @@ absent, open restores only a tail that is still all zeros.
 `spent.ovf` uses `store/guard/spent.ovf`. A scripthash commit, including an
 in-place slab and a head word, uses `store/guard/sh-*`. A `txstat` stamp
 needs no mark: each cell and block slot sits inside one sector, and the stamp
-is synced. Block filters use `store/guard/blockfilter`. Silent-payment
-tweaks use `store/guard/sp_tweaks`. The mempool flush uses `mempool/guard/flush`.
+is synced. Block-filter and silent-payment tweak puts are appends: bytes,
+then lengths, body before idx, each synced, with no mark. The mempool flush
+uses `mempool/guard/flush`.
 `tx.head` `*.mlt` is renamed into place, and the segment meta bit says the
 file must exist. A strong bit a fence run names is set again by
 `restore_strong_from_fence`.

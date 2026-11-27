@@ -240,59 +240,20 @@ fn block_filter_slot_roundtrip_keeps_the_row() {
     assert_eq!(row.slot, slot(3));
 }
 
-#[cfg(debug_assertions)]
+/// A put that fails partway may leave one length durable and not the other.
+/// The next put waits for reopen, which fits the files.
 #[test]
-fn torn_blockfilter_page_restores_the_armed_image() {
+fn a_later_put_waits_for_reopen_after_a_failed_put() {
     let dir = tmp_dir();
     let t = BlockFilterTable::open_or_create(&dir).unwrap();
     put_range(&t, 0, 0);
-    rbitcoin_store::page_guard::fail_next_forward_after_arm(&dir);
-    let err = t.put(&[BlockFilterRecord {
-        height: Height(1),
-        slot: slot(1),
-        filter: &[1, 1, 1, 1],
-    }]);
-    assert!(err.is_err(), "the failpoint stops after the mark is armed");
-    assert!(dir.join("guard/blockfilter").is_file());
-    drop(t);
-    let body = BlockFilterTable::seg_dirs(&dir).body_path(0);
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&body)
-        .unwrap();
-    file.seek(SeekFrom::Start(0)).unwrap();
-    file.write_all(&[0xA5; 4096]).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-    rbitcoin_store::store::restore_open_marks(&rbitcoin_store::StoreLayout::tiny(dir.path()))
-        .unwrap();
-    assert!(!dir.join("guard/blockfilter").exists());
-    let t = BlockFilterTable::open(&dir).unwrap();
-    assert_eq!(t.next_height(), Height(2));
-    let (bytes, got) = t.filter(Height(1)).unwrap().unwrap();
-    assert_eq!(bytes, vec![1, 1, 1, 1]);
-    assert_eq!(got, slot(1));
-    let raw = fs::read(&body).unwrap();
-    assert_ne!(raw[FILE_HEADER_LEN], 0xA5);
-}
-
-/// A second put must not overwrite fresh pages while the first mark is armed.
-#[cfg(debug_assertions)]
-#[test]
-fn a_later_put_waits_until_the_forward_mark_is_gone() {
-    let dir = tmp_dir();
-    let t = BlockFilterTable::open_or_create(&dir).unwrap();
-    put_range(&t, 0, 0);
-    rbitcoin_store::page_guard::fail_next_forward_after_arm(&dir);
+    fail_next_idx_sync(&t);
     let err = t.put(&[BlockFilterRecord {
         height: Height(1),
         slot: slot(1),
         filter: &[1, 1, 1, 1],
     }]);
     assert!(err.is_err());
-    let mark = dir.join("guard/blockfilter");
-    let armed = fs::read(&mark).unwrap();
     let err = t.put(&[BlockFilterRecord {
         height: Height(1),
         slot: slot(1),
@@ -302,21 +263,28 @@ fn a_later_put_waits_until_the_forward_mark_is_gone() {
         Err(StoreError::Rejected(msg)) => {
             assert!(msg.contains("blockfilter"), "{msg}");
         }
-        other => panic!("a pending mark must refuse the next put, got {other:?}"),
+        other => panic!("a failed put must refuse the next put, got {other:?}"),
     }
-    assert_eq!(fs::read(&mark).unwrap(), armed);
     assert_eq!(t.filter(Height(0)).unwrap().unwrap().0, vec![0u8; 3]);
+    drop(t);
+    let t = BlockFilterTable::open(&dir).unwrap();
+    assert_eq!(t.next_height(), Height(1));
 }
 
-/// A put that fails with its mark still armed keeps the files for reopen.
-/// Readers keep the old prefix: the failed height is not readable.
-#[cfg(debug_assertions)]
+fn fail_next_idx_sync(t: &BlockFilterTable) {
+    let inner = t.inner.read().unwrap();
+    let idx = &inner.segs.last().unwrap().idx;
+    rbitcoin_store::io_handle::arm_fail_sync(idx.io_handle(), 1);
+}
+
+/// A failed put publishes nothing to readers: the failed height is not
+/// readable, and the old prefix is.
 #[test]
-fn a_kept_failed_put_stays_out_of_the_read_watermark() {
+fn a_failed_put_stays_out_of_the_read_watermark() {
     let dir = tmp_dir();
     let t = BlockFilterTable::open_or_create(&dir).unwrap();
     put_range(&t, 0, 0);
-    rbitcoin_store::page_guard::fail_next_forward_after_arm(&dir);
+    fail_next_idx_sync(&t);
     assert!(t
         .put(&[BlockFilterRecord {
             height: Height(1),
@@ -362,17 +330,15 @@ fn a_committed_filter_reads_during_a_put() {
     assert_eq!(t.next_height(), Height(2));
 }
 
-/// A repair of a committed filter waits for reopen while a failed put's
-/// mark is armed. That mark can name the same body page, and open would put
-/// the old bytes back over the repair.
-#[cfg(debug_assertions)]
+/// A repair of a committed filter waits for reopen after a failed put, like
+/// the next put does.
 #[test]
-fn repair_refuses_while_a_forward_mark_is_armed() {
+fn repair_refuses_after_a_failed_put() {
     let dir = tmp_dir();
     let t = BlockFilterTable::open_or_create(&dir).unwrap();
     put_range(&t, 0, 0);
     let (bytes, got) = t.filter(Height(0)).unwrap().unwrap();
-    rbitcoin_store::page_guard::fail_next_forward_after_arm(&dir);
+    fail_next_idx_sync(&t);
     assert!(t
         .put(&[BlockFilterRecord {
             height: Height(1),
@@ -407,4 +373,33 @@ fn create_syncs_the_new_table_directories() {
             want.display()
         );
     }
+}
+
+/// A put is an append under the sector rule: bytes past the committed end,
+/// synced, then the length. It arms no mark.
+#[test]
+fn a_put_arms_no_mark() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 3);
+    assert!(!dir.join("guard").exists(), "a put armed a mark");
+    assert_eq!(t.next_height(), Height(4));
+}
+
+/// A rolled segment pair is named by its directories before any put lands
+/// in it: create syncs both directory entries.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn a_new_segment_pair_syncs_its_directories() {
+    let dir = tmp_dir();
+    let _t = BlockFilterTable::open_or_create(&dir).unwrap();
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let _pair = dirs.create(1, 0).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(synced.contains(&dirs.idx), "idx dir not synced: {synced:?}");
+    assert!(
+        synced.contains(&dirs.body),
+        "body dir not synced: {synced:?}"
+    );
 }

@@ -2775,19 +2775,12 @@ pub fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Copy armed page images back before trim or the tip walk.
-///
-/// Filter and tweak marks live next to those files. A split store keeps
-/// those dirs, once enabled, on the cold directory, so both directories are
-/// restored here. The header marks are replayed by the header table open.
+/// Copy armed page images back before trim or the tip walk. Every mark lives
+/// in the hot store directory: the cold directory holds only appends, which
+/// need none. The header marks are replayed by the header table open.
 #[doc(hidden)]
 pub fn restore_open_marks(layout: &StoreLayout) -> Result<(), StoreError> {
-    restore_hot_marks(&layout.dir)?;
-    let cold = layout.seqsigwit_dir();
-    if cold != layout.dir.as_path() {
-        restore_side_marks(cold)?;
-    }
-    Ok(())
+    restore_hot_marks(&layout.dir)
 }
 
 fn restore_hot_marks(path: &Path) -> Result<(), StoreError> {
@@ -2798,13 +2791,6 @@ fn restore_hot_marks(path: &Path) -> Result<(), StoreError> {
         crate::spender_table::SPENT_OVF_NAME,
     )?;
     restore_sh_marks_or_rebuild(path)?;
-    restore_side_marks(path)?;
-    Ok(())
-}
-
-fn restore_side_marks(path: &Path) -> Result<(), StoreError> {
-    crate::page_guard::restore_store_group(path, crate::page_guard::BLOCKFILTER_MARK)?;
-    crate::page_guard::restore_store_group(path, crate::page_guard::SP_TWEAKS_MARK)?;
     Ok(())
 }
 

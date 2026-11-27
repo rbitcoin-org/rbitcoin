@@ -66,40 +66,6 @@ fn put_get_len_tweak_no_txid() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[cfg(debug_assertions)]
-#[test]
-fn torn_sp_tweaks_page_restores_the_armed_image() {
-    let dir = tmp_dir();
-    let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
-    let mut tweak = [0u8; 33];
-    tweak[0] = 0x02;
-    tweak[32] = 0xab;
-    t.put_block(Height(0), &[Some(tweak)]).unwrap();
-    rbitcoin_store::page_guard::fail_next_forward_after_arm(&dir);
-    tweak[32] = 0xcd;
-    assert!(t.put_block(Height(1), &[Some(tweak)]).is_err());
-    assert!(dir.join("guard/sp_tweaks").is_file());
-    drop(t);
-    let body = SpTweaksTable::seg_dirs(&dir).body_path(0);
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&body)
-        .unwrap();
-    file.seek(SeekFrom::Start(0)).unwrap();
-    file.write_all(&[0xA5; 4096]).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-    rbitcoin_store::store::restore_open_marks(&rbitcoin_store::StoreLayout::tiny(dir.path()))
-        .unwrap();
-    assert!(!dir.join("guard/sp_tweaks").exists());
-    let t = SpTweaksTable::open(&dir).unwrap();
-    let got = t.get_block(Height(1), 1).unwrap().expect("restored height");
-    assert_eq!(got, vec![Some(tweak)]);
-    let raw = fs::read(&body).unwrap();
-    assert_ne!(raw[FILE_HEADER_LEN], 0xA5);
-}
-
 #[test]
 fn put_syncs_body_then_idx() {
     let dir = tmp_dir();
@@ -579,18 +545,21 @@ fn read_offs_run_reads_the_next_slot() {
     );
 }
 
-/// A put that fails with its mark armed keeps the files for reopen, and
-/// readers keep the old prefix. Truncate and trim wait for reopen too: they
-/// would change a file the mark still names.
-#[cfg(debug_assertions)]
+/// A failed put publishes nothing to readers, and readers keep the old
+/// prefix. Truncate and trim wait for reopen too, as the next put does: one
+/// length may be durable and the other not.
 #[test]
-fn a_kept_failed_put_stays_out_of_reads_and_blocks_cuts() {
+fn a_failed_put_stays_out_of_reads_and_blocks_cuts() {
     let dir = tmp_dir();
     let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
     let mut tweak = [0u8; 33];
     tweak[0] = 0x02;
     t.put_block(Height(0), &[Some(tweak)]).unwrap();
-    rbitcoin_store::page_guard::fail_next_forward_after_arm(&dir);
+    {
+        let inner = t.inner.lock().unwrap();
+        let idx = &inner.segs.last().unwrap().idx;
+        rbitcoin_store::io_handle::arm_fail_sync(idx.io_handle(), 1);
+    }
     assert!(t.put_block(Height(1), &[Some(tweak)]).is_err());
     assert_eq!(t.next_height(), Height(1));
     assert!(t.get_block(Height(1), 1).unwrap().is_none());
@@ -627,4 +596,20 @@ fn create_syncs_the_new_table_directories() {
             want.display()
         );
     }
+}
+
+/// A tweak put is an append under the sector rule. It arms no mark.
+#[test]
+fn a_tweak_put_arms_no_mark() {
+    let dir = tmp_dir();
+    let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    let mut tweak = [0u8; 33];
+    tweak[0] = 0x02;
+    t.put_block(Height(0), &[Some(tweak)]).unwrap();
+    t.put_block(Height(1), &[None, Some(tweak)]).unwrap();
+    assert!(!dir.join("guard").exists(), "a tweak put armed a mark");
+    assert_eq!(
+        t.get_block(Height(1), 2).unwrap(),
+        Some(vec![None, Some(tweak)])
+    );
 }

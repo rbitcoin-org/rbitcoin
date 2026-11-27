@@ -19,10 +19,10 @@
 //! When the next record's **start** would exceed `u32::MAX`, a new `NNNNNN`
 //! pair starts (the sp_tweaks rule).
 //!
-//! **Commit order:** one `guard/blockfilter` mark per `put`. Fresh blocks are
-//! synced first. The body tail, the idx tail, and page 0 are the mark, then
-//! those pages are written and the mark is cleared. `put` holds its writer
-//! lock through that sync. After power loss the idx HWM may cover a torn slot and the body
+//! **Commit order:** a `put` is an append with no mark (crash-recovery.md,
+//! the sector rule). Body and idx bytes are written past their ends and
+//! synced, then the body length, then the idx length, each synced. `put`
+//! holds its writer lock through those syncs. After power loss the idx HWM may cover a torn slot and the body
 //! may hold bytes of an uncommitted record: open keeps the longest prefix of
 //! slots whose records run back to back inside the body, cuts the body to its
 //! end, and the caller checks `header_fk` against `confirmed[]`.
@@ -30,7 +30,7 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use crate::page_guard::{self, ForwardAppend};
+use crate::page_guard::{self, Append};
 use crate::seg_pair::{locate, SegDirs, SegPair};
 use rbitcoin_primitives::{bytes, le_u32, le_u64, Fk, Height, TableKind};
 use std::path::{Path, PathBuf};
@@ -110,7 +110,8 @@ pub struct BlockFilterTable {
     pub inner: RwLock<Inner>,
     /// Serializes `put` and `truncate_through` (one writer at a time).
     pub writer: Mutex<()>,
-    /// A forward mark may still name the last failed put. Reopen restores it.
+    /// A put failed after a length may have become durable. Reopen fits the
+    /// files, so writers wait for it.
     blocked: std::sync::atomic::AtomicBool,
 }
 
@@ -213,18 +214,13 @@ impl BlockFilterTable {
         }
     }
 
-    fn refuse_pending_mark(&self) -> Result<(), StoreError> {
+    /// A failed put may have made one length durable and not the other.
+    /// Reopen fits the files to each other, so writers wait for it.
+    fn refuse_after_failed_put(&self) -> Result<(), StoreError> {
         if self.blocked.load(std::sync::atomic::Ordering::Acquire) {
             return Err(StoreError::Rejected(
-                "blockfilter forward mark is still armed",
+                "an earlier blockfilter put failed; reopen fits the files",
             ));
-        }
-        if let Some(dir) = self.dirs.idx.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if dir.join(page_guard::BLOCKFILTER_MARK).is_file() {
-                return Err(StoreError::Rejected(
-                    "blockfilter forward mark is still armed",
-                ));
-            }
         }
         Ok(())
     }
@@ -451,7 +447,7 @@ impl BlockFilterTable {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         // A failed put's mark can name this body page. Open would copy the
         // old bytes back over the repair.
-        self.refuse_pending_mark()?;
+        self.refuse_after_failed_put()?;
         let inner = self.read();
         let Some((si, local)) = inner.locate(height) else {
             return Err(StoreError::NotFound);
@@ -486,7 +482,7 @@ impl BlockFilterTable {
     /// slot counts, and tail. A failed put leaves readers on the old prefix.
     pub fn put(&self, items: &[BlockFilterRecord<'_>]) -> Result<(), StoreError> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        self.refuse_pending_mark()?;
+        self.refuse_after_failed_put()?;
         struct Plan {
             si: usize,
             body_at: u64,
@@ -566,46 +562,34 @@ impl BlockFilterTable {
                     &rolled[si - inner.segs.len()]
                 }
             };
-            let mut writes: Vec<ForwardAppend<'_>> = Vec::new();
+            let mut writes: Vec<Append<'_>> = Vec::new();
             for p in &plans {
                 let seg = pair(p.si);
                 if !p.body.is_empty() {
-                    writes.push(ForwardAppend {
+                    writes.push(Append {
                         file: &seg.body,
                         at: p.body_at,
                         bytes: &p.body,
                         new_logical: p.body_end,
                     });
                 }
-                writes.push(ForwardAppend {
+                writes.push(Append {
                     file: &seg.idx,
                     at: p.idx_at,
                     bytes: &p.idx,
                     new_logical: p.idx_at + p.idx.len() as u64,
                 });
             }
-            let committed = match self.dirs.idx.parent() {
-                Some(dir) => {
-                    page_guard::commit_forward_appends(dir, page_guard::BLOCKFILTER_MARK, &writes)
-                }
-                None => page_guard::ForwardCommit::Undo(StoreError::Rejected(
-                    "page guard mark has no directory",
-                )),
-            };
+            // Body before idx in each plan, so a body length is durable
+            // before the idx length that names its records.
+            let committed = page_guard::commit_appends(&writes);
             drop(writes);
-            match committed {
-                page_guard::ForwardCommit::Done => {}
-                page_guard::ForwardCommit::Undo(e) => {
-                    self.dirs.drop_after(&mut rolled, 0);
-                    return Err(e);
-                }
-                page_guard::ForwardCommit::Keep(e) => {
-                    // The mark may name these files, including a rolled pair.
-                    // Leave them for reopen and publish nothing.
-                    self.blocked
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    return Err(e);
-                }
+            if let Err(e) = committed {
+                // A length may be durable already, including a rolled pair's.
+                // Leave the files for reopen and publish nothing.
+                self.blocked
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(e);
             }
             let tail_end = plans.last().map(|p| p.body_end);
             (counts, rolled, tail_end)
@@ -624,7 +608,7 @@ impl BlockFilterTable {
     /// Drop heights above `tip` (`None` drops every slot).
     pub fn truncate_through(&self, tip: Option<Height>) -> Result<(), StoreError> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        self.refuse_pending_mark()?;
+        self.refuse_after_failed_put()?;
         let keep = tip.map_or(0, |h| u64::from(h.0) + 1);
         let mut inner = self.write();
         if keep >= inner.next() {
