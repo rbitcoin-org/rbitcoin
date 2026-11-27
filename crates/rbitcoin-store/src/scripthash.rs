@@ -108,6 +108,20 @@ pub fn sh_rebuild_marked(store_dir: &Path) -> bool {
     store_dir.join(SH_REBUILD_NAME).is_file()
 }
 
+/// A requested rebuild drops the index files before open decodes them, so a
+/// torn file cannot stop the open that would rebuild it. Open then creates
+/// an empty index.
+pub(crate) fn discard_index_for_rebuild(store_dir: &Path) -> Result<(), StoreError> {
+    if !sh_rebuild_marked(store_dir) {
+        return Ok(());
+    }
+    page_guard::clear_sh_marks(store_dir)?;
+    for name in ["scripthash.body", "scripthash.ovf", "scripthash.head"] {
+        remove_store_path(&store_dir.join(name))?;
+    }
+    crate::file::fsync_parent_dir(store_dir).map_err(|e| StoreError::io(store_dir, e))
+}
+
 /// A finished rebuild drops the mark. A crash before this rebuilds again.
 pub fn clear_sh_rebuild(store_dir: &Path) -> Result<(), StoreError> {
     let path = store_dir.join(SH_REBUILD_NAME);

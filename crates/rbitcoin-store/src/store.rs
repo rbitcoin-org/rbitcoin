@@ -539,6 +539,7 @@ impl Store {
         let header_body_replayed = restore_open_marks(&path)?;
         open_layout_refuse_old(&path, meta_ver)?;
         drop_unread_store_leftovers(&path);
+        crate::scripthash::discard_index_for_rebuild(&path)?;
         let scripthash = if path.join("scripthash.body").exists() {
             ScriptHashTable::open_with_scale(&path, layout.head_scale)?
         } else {
