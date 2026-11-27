@@ -8,4 +8,9 @@ Changed
   those files, then removes the mark. A crash between the two `header_txs`
   columns, or between `header.head` and `header.head.mlt`, cannot leave the
   pair split. Marks publish only after store `meta` is 31. A table fixture
-  with no `meta` still arms.
+  with no `meta` still arms. Creating `store/guard/` syncs the store
+  directory. A schema-24 `header.body` left beside `meta` 31 is still
+  rewritten to 88-byte records. Open refuses a leftover
+  `confirmed.body.ahead`, `header_txs_first.body.ahead`,
+  `header_txs_count.body.ahead`, or `header.head.ahead`.
+  `txstat.body.ahead` and scripthash `ingest.ahead` still replay.

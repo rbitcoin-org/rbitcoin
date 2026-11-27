@@ -686,6 +686,92 @@ fn store_create_open_archive_spend_and_meta_errors() {
 }
 
 #[test]
+fn open_refuses_legacy_ahead_sidecars() {
+    for name in [
+        "confirmed.body.ahead",
+        "header_txs_first.body.ahead",
+        "header_txs_count.body.ahead",
+        "header.head.ahead",
+    ] {
+        let dir = tmp();
+        {
+            let s = Store::create_tiny(&dir).unwrap();
+            s.flush().unwrap();
+        }
+        let ahead = dir.join(name);
+        std::fs::write(&ahead, b"legacy").unwrap();
+        match Store::open_tiny(&dir) {
+            Err(StoreError::Corrupt(m)) => assert!(m.contains(name), "{name}: {m}"),
+            Ok(_) => panic!("{name} opened"),
+            Err(other) => panic!("{name}: {other}"),
+        }
+        assert!(ahead.is_file(), "{name} must stay");
+    }
+}
+
+/// Meta 31 beside a still-96-byte `header.body` is the crash between the old
+/// promote and the rename. Open must convert the body without a schema-24 gate.
+#[test]
+fn open_heals_v24_header_body_when_meta_is_already_31() {
+    use rbitcoin_store::file::FILE_HEADER_LEN;
+    use rbitcoin_store::header_table::{HEADER_RECORD_LEN, HEADER_RECORD_LEN_V24};
+    let dir = tmp();
+    let hash = [0x61u8; 32];
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let hdr = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x1d00ffff,
+            nonce: 1,
+            merkle_root: [1u8; 32],
+            hash,
+            size: 0,
+            weight: 0,
+        };
+        s.put_header(&hdr).unwrap();
+        s.flush().unwrap();
+    }
+    widen_header_body_to_96(&dir);
+    write_store_meta_ver(&dir, 31);
+    let s = Store::open_tiny(&dir).unwrap();
+    let got = s.get_header(Fk(1)).unwrap();
+    assert_eq!(got.hash, hash);
+    assert_eq!(s.header_count(), 1);
+    drop(s);
+    let bytes = std::fs::read(dir.join("header.body")).unwrap();
+    let logical = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    assert_eq!(logical, FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN as u64);
+    assert_ne!(
+        logical,
+        FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN_V24 as u64
+    );
+    assert_eq!(read_store_meta_ver(&dir), 31);
+}
+
+fn widen_header_body_to_96(dir: &Path) {
+    use rbitcoin_store::file::FILE_HEADER_LEN;
+    use rbitcoin_store::header_table::{HEADER_RECORD_LEN, HEADER_RECORD_LEN_V24};
+    let path = dir.join("header.body");
+    let bytes = std::fs::read(&path).unwrap();
+    let logical = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    assert!(logical <= bytes.len() && logical >= FILE_HEADER_LEN);
+    let body = &bytes[FILE_HEADER_LEN..logical];
+    assert_eq!(body.len() % HEADER_RECORD_LEN, 0);
+    let n = body.len() / HEADER_RECORD_LEN;
+    let mut out = bytes[..FILE_HEADER_LEN].to_vec();
+    for i in 0..n {
+        let start = i * HEADER_RECORD_LEN;
+        out.extend_from_slice(&body[start..start + HEADER_RECORD_LEN]);
+        out.extend_from_slice(&[0u8; HEADER_RECORD_LEN_V24 - HEADER_RECORD_LEN]);
+    }
+    let new_logical = (FILE_HEADER_LEN + n * HEADER_RECORD_LEN_V24) as u64;
+    out[8..16].copy_from_slice(&new_logical.to_le_bytes());
+    std::fs::write(&path, &out).unwrap();
+}
+
+#[test]
 fn open_schema24_occupied_creates_zero_txstat() {
     let dir = tmp();
     {

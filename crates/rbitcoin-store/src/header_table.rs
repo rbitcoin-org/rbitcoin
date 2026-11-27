@@ -45,6 +45,15 @@ pub const HEADER_HEAD_DIR_REFUSE: &str =
 pub const HEADER_HEAD_EMPTY_REFUSE: &str =
     "header.head is empty at target slots; wipe header.head, header.head.mlt, and header.body and reindex";
 
+const HEADER_HEAD_AHEAD: &str =
+    "header.head.ahead is a legacy page image; this open does not restore it";
+
+fn legacy_ahead(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".ahead");
+    path.with_file_name(name)
+}
+
 /// Live `header.body` record: consensus fields only. See SCHEMA.md.
 pub const HEADER_RECORD_LEN: usize = 88;
 /// Schema 24/25 record. Open strips the trailing `size`/`weight` back to 88.
@@ -171,6 +180,7 @@ impl HeaderHead {
 
     #[doc(hidden)]
     pub fn open(base: PathBuf, body_count: u64, scale: HeadScale) -> Result<Self, StoreError> {
+        crate::file::refuse_if_present(&legacy_ahead(&base), HEADER_HEAD_AHEAD)?;
         if base.is_dir() {
             return Err(StoreError::Layout(HEADER_HEAD_DIR_REFUSE.to_string()));
         }
@@ -392,7 +402,7 @@ impl HeaderTable {
             .iter()
             .map(|(off, image)| (name, *off, image.as_slice()))
             .collect();
-        page_guard::arm_store_group(dir, page_guard::HEADER_BODY_MARK, &refs)?;
+        page_guard::arm_page_guard_group(&dir.join(page_guard::HEADER_BODY_MARK), &refs)?;
         dst.write_at(FILE_HEADER_LEN as u64, &blob)?;
         dst.set_logical_len(new_len)?;
         dst.flush()?;
@@ -404,7 +414,34 @@ impl HeaderTable {
         drop(dst);
         drop(src);
         std::fs::rename(&grow, &path).map_err(|e| StoreError::io(&path, e))?;
+        file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
         Ok(())
+    }
+
+    /// `true` when `header.body` is still schema-24 rows (96 B, not also 88 B).
+    ///
+    /// A length that divides both widths is left to [`Self::rewrite_v24_body_to_88`]
+    /// on a schema 24/25 open. Calling that scan on every later open would read
+    /// `header.head` again whenever the row count is a multiple of 12.
+    pub(crate) fn header_body_needs_v24_rewrite(dir: &Path) -> Result<bool, StoreError> {
+        let path = dir.join("header.body");
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(StoreError::io(&path, e)),
+        };
+        let mut hdr = [0u8; FILE_HEADER_LEN];
+        match std::io::Read::read(&mut file, &mut hdr) {
+            Ok(n) if n == FILE_HEADER_LEN => {}
+            Ok(_) => return Ok(false),
+            Err(e) => return Err(StoreError::io(&path, e)),
+        }
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&hdr[8..16]);
+        let body_len = u64::from_le_bytes(raw).saturating_sub(FILE_HEADER_LEN as u64);
+        Ok(body_len > 0
+            && body_len % HEADER_RECORD_LEN_V24 as u64 == 0
+            && body_len % HEADER_RECORD_LEN as u64 != 0)
     }
 
     pub fn head_target_slots(&self) -> u64 {

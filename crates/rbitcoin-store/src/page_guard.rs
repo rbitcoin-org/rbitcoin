@@ -80,7 +80,7 @@ pub fn hold_marks() -> MutexGuard<'static, ()> {
 /// set names.
 #[doc(hidden)]
 pub fn arm_page_guard_group(path: &Path, pages: &[(&str, u64, &[u8])]) -> Result<(), StoreError> {
-    mark_parent(path)?;
+    ensure_mark_parent(path)?;
     if pages.is_empty() {
         return Err(StoreError::Corrupt("page guard arm is empty"));
     }
@@ -170,6 +170,8 @@ pub fn restore_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreEr
         data.durable_sync_data()
             .map_err(|e| StoreError::io(data_path, e))?;
     }
+    // The created directory entry has to be durable before the mark is gone.
+    fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
     remove_mark(mark)?;
     Ok(true)
 }
@@ -205,7 +207,11 @@ pub fn clear_page_guard_files(path: &Path, files: &[(&File, &Path)]) -> Result<(
 fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreError> {
     let raw = match std::fs::read(path) {
         Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let parent = mark_parent(path)?;
+            fsync_parent_dir(parent).map_err(|err| StoreError::io(parent, err))?;
+            return Ok(());
+        }
         Err(e) => return Err(StoreError::io(path, e)),
     };
     let pages = match mark_group_pages(&raw) {
@@ -333,6 +339,20 @@ fn mark_parent(path: &Path) -> Result<&Path, StoreError> {
     }
 }
 
+/// Create `path`'s parent when it is missing, and sync the directory that
+/// gained that entry. An existing parent is left alone.
+fn ensure_mark_parent(path: &Path) -> Result<(), StoreError> {
+    let parent = mark_parent(path)?;
+    if parent.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent).map_err(|e| StoreError::io(parent, e))?;
+    if let Some(grand) = parent.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fsync_parent_dir(grand).map_err(|e| StoreError::io(grand, e))?;
+    }
+    Ok(())
+}
+
 fn remove_mark(path: &Path) -> Result<(), StoreError> {
     let parent = mark_parent(path)?;
     match std::fs::remove_file(path) {
@@ -434,6 +454,12 @@ fn mark_group_pages(raw: &[u8]) -> Result<Vec<(String, u64, usize)>, StoreError>
     }
     let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
     if count == 0 {
+        return Err(StoreError::Corrupt("page guard mark length"));
+    }
+    // One record is at least a 1-byte name, its length, the offset, and a page.
+    const MIN_RECORD: usize = 2 + 1 + 8 + PAGE as usize;
+    let rest = raw.len().saturating_sub(HEAD);
+    if rest / MIN_RECORD < count {
         return Err(StoreError::Corrupt("page guard mark length"));
     }
     let mut pages = Vec::with_capacity(count);
