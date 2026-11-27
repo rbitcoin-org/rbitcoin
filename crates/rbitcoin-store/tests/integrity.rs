@@ -1314,6 +1314,12 @@ fn a_failed_shutdown_step_still_syncs_a_dirty_scripthash_index() {
         let marker = dir.join(rbitcoin_store::scripthash::SH_DIRTY_NAME);
         assert!(marker.exists(), "{name}");
         if seal {
+            if name == "headers.body" {
+                // A put leaves the body synced. Republish its length so the
+                // shutdown flush has a sync to fail, as after a failed put.
+                let body = &s.headers.body;
+                body.set_logical_len(body.logical_len()).unwrap();
+            }
             arm(pick(&s), 1);
         }
         rbitcoin_log::capture_logs(true);
