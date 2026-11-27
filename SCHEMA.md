@@ -242,8 +242,6 @@ itself changed.
     guard/header.head                # schema 31 sidecar: forward 4 KiB images for one header.head generation and its .mlt. Open copies both before any head read. Published after meta 31. No SCHEMA_VERSION bump
     guard/spent.ovf                  # schema 31 sidecar: backward 4 KiB images of spent.ovf page 0 and its tail block, taken before the first append after a spend sync. Open copies them onto the live file before annotate replay. Later appends in that window do not replace the mark. Published after meta 31. No SCHEMA_VERSION bump
     guard/sh-*                       # schema 31 sidecar: backward 4 KiB images for one scripthash commit (body pages, page 0, and head words). Open copies them before any scripthash read or sealed-overflow magic check. A mark that does not parse writes scripthash.rebuild and is removed instead of stopping open. Published after meta 31. No SCHEMA_VERSION bump
-    guard/blockfilter                # schema 31 sidecar: one forward mark per block-filter put (body tail, idx tail, page 0). Fresh blocks are synced before the mark. Open copies the images before the filter tables are read. Published after meta 31. No SCHEMA_VERSION bump
-    guard/sp_tweaks                  # schema 31 sidecar: one forward mark per sp_tweaks put (body tail, idx tail, page 0). Fresh blocks are synced before the mark. Open copies the images before the tweak tables are read. Published after meta 31. No SCHEMA_VERSION bump
 
     *.ahead                          # transient write-ahead page image for the scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. Open refuses a leftover confirmed.body.ahead, header_txs_first.body.ahead, header_txs_count.body.ahead, header.head.ahead, header.head.gN.ahead, or txstat.body.ahead instead of restoring it. No SCHEMA_VERSION bump
     scripthash.rebuild               # optional: one byte. The next start wipes and rebuilds the scripthash index; removed when that rebuild finishes. No SCHEMA_VERSION bump
@@ -279,7 +277,7 @@ itself changed.
     sp_tweaks.idx/  sp_tweaks.body/   # optional BIP-352 (schema 17 dirs; leftover files unlinked)
     blockfilter.idx/meta              # optional BIP158 basic (`--block-filter-index`): fmt:u32=1
     blockfilter.idx/NNNNNN            # 80 B slot per height from 0: off:u32 ‖ len:u32 ‖ header_fk:u64 ‖ filter_hash[32] ‖ filter_header[32]
-    blockfilter.body/NNNNNN           # filter bytes (Core `BlockFilter` content), records back to back, no prefix; new NNNNNN pair when the next start passes u32. Commit: one guard/blockfilter mark per put (fresh blocks synced first; body tail, idx tail, and page 0 in the image). Open keeps the slot prefix whose records run back to back inside the body, cuts the body to its end, and drops slots whose header_fk is not confirmed[h]. Missing dirs: index off / not built
+    blockfilter.body/NNNNNN           # filter bytes (Core `BlockFilter` content), records back to back, no prefix; new NNNNNN pair when the next start passes u32. Commit: an append with no mark (body bytes, then idx bytes, synced; then the body length, then the idx length, each synced). Open keeps the slot prefix whose records run back to back inside the body, cuts the body to its end, and drops slots whose header_fk is not confirmed[h]. Missing dirs: index off / not built
 
   mempool/guard/flush              # one forward 4 KiB mark for a mempool flush: body tail, new LIVE slots, durable DEAD bytes, and meta. tx.body is not renamed. No SCHEMA_VERSION bump
 
@@ -295,9 +293,8 @@ itself changed.
 `--datadir` holds every file by default. `--datadir-cold PATH` places the
 files the IBD pin path does not read under `PATH/store/` and writes
 `seqsigwit.reloc` in the hot store: `seqsigwit.*`, `txstat.*`, `input.*`,
-and, once those indexes exist, `blockfilter.*` and `sp_tweaks.*`.
-`guard/blockfilter` and `guard/sp_tweaks` sit beside those
-files (cold store when the split is on, hot store otherwise). Pin / SH /
+and, once those indexes exist, `blockfilter.*` and `sp_tweaks.*`. Those
+are appends and keep no guard mark. Pin / SH /
 spend-annotate stay on the hot volume. `--prune-seqsigwit` is separate: witness
 for the last 288 heights is only `seqsigwit.window/{height}.bin` on the hot
 store, and the stem stays a header (an archive enable copies that window out
@@ -695,9 +692,10 @@ single-file, `header_fk` + absolute off) are unlinked on store open.
 
 Reorg: truncate slots above the new tip (same era as SH HWM).
 
-Durability: one `guard/sp_tweaks` mark per put. Fresh blocks are synced
-before the mark. The body tail, the idx tail, and page 0 are the image, so
-an idx slot on disk never points at body bytes a power cut can lose.
+Durability: a put is an append with no mark (crash-recovery.md, the sector
+rule). Body and idx bytes are synced, then the body length, then the idx
+length, so an idx slot on disk never points at body bytes a power cut can
+lose.
 Open (and first enable) repairs a crash tail: slots above the tip (a
 disconnect whose truncate never ran) are dropped, then the last record is fit
 to its `n_tx` — body bytes past it are cut, and a short record drops its slot.

@@ -43,6 +43,11 @@ impl SegDirs {
         let idx = TableFile::create(self.idx_path(file_id), TableKind::ArrayLink)?;
         idx.set_grow_tight(true);
         let body = TableFile::create(self.body_path(file_id), self.body_kind)?;
+        // A put appends with no mark, so the new names have to be durable
+        // before a length in either file can be.
+        for d in [&self.idx, &self.body] {
+            crate::file::fsync_parent_dir(d).map_err(|e| StoreError::io(d, e))?;
+        }
         Ok(SegPair {
             file_id,
             first_slot,

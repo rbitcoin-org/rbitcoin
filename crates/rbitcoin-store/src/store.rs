@@ -2781,21 +2781,13 @@ pub fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Copy armed page images back before trim or the tip walk.
-///
-/// Filter and tweak marks live next to those files. A split store keeps
-/// those dirs, once enabled, on the cold directory, so both directories are
-/// restored here. This is the only open
-/// restore: table open does not arm another one. `Ok(true)` when a
-/// `guard/header.body` mark was replayed.
+/// Copy armed page images back before trim or the tip walk. Every mark lives
+/// in the hot store directory: the cold directory holds only appends, which
+/// need none. This is the only open restore: table open does not arm
+/// another one. `Ok(true)` when a `guard/header.body` mark was replayed.
 #[doc(hidden)]
 pub fn restore_open_marks(layout: &StoreLayout) -> Result<bool, StoreError> {
-    let header_body = restore_hot_marks(&layout.dir)?;
-    let cold = layout.seqsigwit_dir();
-    if cold != layout.dir.as_path() {
-        restore_side_marks(cold)?;
-    }
-    Ok(header_body)
+    restore_hot_marks(&layout.dir)
 }
 
 fn restore_hot_marks(path: &Path) -> Result<bool, StoreError> {
@@ -2809,14 +2801,7 @@ fn restore_hot_marks(path: &Path) -> Result<bool, StoreError> {
         crate::spender_table::SPENT_OVF_NAME,
     )?;
     restore_sh_marks_or_rebuild(path)?;
-    restore_side_marks(path)?;
     Ok(header_body)
-}
-
-fn restore_side_marks(path: &Path) -> Result<(), StoreError> {
-    crate::page_guard::restore_store_group(path, crate::page_guard::BLOCKFILTER_MARK)?;
-    crate::page_guard::restore_store_group(path, crate::page_guard::SP_TWEAKS_MARK)?;
-    Ok(())
 }
 
 /// Open the scripthash table, or create it. A rebuild a restore asked for
