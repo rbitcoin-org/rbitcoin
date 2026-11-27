@@ -161,7 +161,19 @@ fn log(class: &str, path: &Path, committed: u64, offset: u64, len: u64) {
         .map(|l| l.split_once(": ").map_or(l, |(_, f)| f).to_string())
         .take(8)
         .collect();
-    let caller = frames.first().cloned().unwrap_or_else(|| "?".into());
+    // A write straight from a test body has no rbitcoin_ frame above it.
+    let test_frame = bt
+        .lines()
+        .map(str::trim)
+        .find(|l| l.contains("suite::") || l.contains("tests::"))
+        .map(|l| l.split_once(": ").map_or(l, |(_, f)| f).to_string());
+    let caller = frames
+        .first()
+        .cloned()
+        .or_else(|| test_frame.map(|t| format!("test-body:{t}")))
+        .unwrap_or_else(|| {
+            format!("?thread={}", std::thread::current().name().unwrap_or("?"))
+        });
     let key = format!("{class} {parent}/{name} {caller}");
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     if !SEEN
