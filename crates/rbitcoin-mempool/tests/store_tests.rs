@@ -234,6 +234,28 @@ fn new_meta_is_published_through_a_synced_rename() {
     );
 }
 
+/// A new `slots` or `tx.body` is the durable base later marks patch, so its
+/// bytes and its directory entry are synced before open returns it.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn new_slots_and_body_names_are_synced() {
+    let dir = tmp_dir();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let _ = open_or_init_slots(&dir.join("slots"), 4).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(
+        synced.iter().any(|d| d == dir.path()),
+        "mempool slots name not synced: {synced:?}"
+    );
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let _ = open_or_init_body(&dir.join("tx.body")).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(
+        synced.iter().any(|d| d == dir.path()),
+        "mempool tx.body name not synced: {synced:?}"
+    );
+}
+
 fn tiny_tx() -> bitcoin::Transaction {
     bitcoin::Transaction {
         version: bitcoin::transaction::Version::TWO,
