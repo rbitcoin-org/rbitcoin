@@ -730,6 +730,54 @@ fn open_refuses_a_legacy_generation_ahead_sidecar() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A torn `header.body` page 0 whose bytes 8..16 read as a 96-byte body
+/// must not reach the schema-24 width probe. Open restores the mark first,
+/// then decides from the restored header.
+#[test]
+fn open_restores_the_header_body_mark_before_the_width_probe() {
+    use rbitcoin_store::file::FILE_HEADER_LEN;
+    use rbitcoin_store::header_table::HEADER_RECORD_LEN_V24;
+    let dir = tmp();
+    let hash = [0x62u8; 32];
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let hdr = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x1d00ffff,
+            nonce: 1,
+            merkle_root: [1u8; 32],
+            hash,
+            size: 0,
+            weight: 0,
+        };
+        s.put_header(&hdr).unwrap();
+        s.flush().unwrap();
+    }
+    let body = dir.join("header.body");
+    let live = std::fs::read(&body).unwrap();
+    let mut image = vec![0u8; 4096];
+    let keep = live.len().min(4096);
+    image[..keep].copy_from_slice(&live[..keep]);
+    rbitcoin_store::page_guard::arm_page_guard_group(
+        &dir.join(rbitcoin_store::page_guard::HEADER_BODY_MARK),
+        &[("header.body", 0, image.as_slice())],
+    )
+    .unwrap();
+    let mut torn = live.clone();
+    torn[..4].copy_from_slice(b"TORN");
+    let v24_len = FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN_V24 as u64;
+    torn[8..16].copy_from_slice(&v24_len.to_le_bytes());
+    std::fs::write(&body, &torn).unwrap();
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.get_header(Fk(1)).unwrap().hash, hash);
+    assert_eq!(s.header_count(), 1);
+    drop(s);
+    assert!(!dir.join(rbitcoin_store::page_guard::HEADER_BODY_MARK).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Meta 31 beside a still-96-byte `header.body` is the crash between the old
 /// promote and the rename. Open must convert the body without a schema-24 gate.
 #[test]
