@@ -1,10 +1,10 @@
 //! Full-page images published by rename.
 //!
-//! [`arm_page_guard`] writes every 4 KiB image the next live write will dirty,
-//! then syncs and renames the mark. [`restore_page_guard`] copies those images
-//! onto the live file and removes the mark. It does not read the live bytes.
-//! [`arm_page_guard_group`] is the same publish for several files: each record
-//! names the file, because each file has its own page 0.
+//! [`arm_page_guard_group`] writes every 4 KiB image the next live writes will
+//! dirty, then syncs and renames the mark. Each record names its file,
+//! because each file has its own page 0. [`restore_page_guard_group`] copies
+//! those images onto the live files and removes the mark. It does not read the
+//! live bytes.
 //! [`append_past_end`] writes only bytes at or past `committed_end`, which may
 //! share the committed tail block (crash-recovery.md, the sector rule).
 
@@ -121,39 +121,6 @@ pub fn check_armed_write(
     Ok(())
 }
 
-#[doc(hidden)]
-pub fn arm_page_guard(path: &Path, pages: &[(u64, &[u8])]) -> Result<(), StoreError> {
-    ensure_mark_parent(path)?;
-    if path.try_exists().map_err(|e| StoreError::io(path, e))? {
-        return Err(StoreError::Rejected("page guard mark is already armed"));
-    }
-    if pages.is_empty() {
-        return Err(StoreError::Corrupt("page guard arm is empty"));
-    }
-    let count = u32::try_from(pages.len())
-        .map_err(|_| StoreError::Corrupt("page guard arm is too large"))?;
-    let mut seen = Vec::with_capacity(pages.len());
-    for &(offset, image) in pages {
-        if !offset.is_multiple_of(PAGE) || image.len() != PAGE as usize {
-            return Err(StoreError::Corrupt("page guard image is not one page"));
-        }
-        if seen.contains(&offset) {
-            return Err(StoreError::Corrupt("page guard names one page twice"));
-        }
-        seen.push(offset);
-    }
-    let mut buf = Vec::with_capacity(HEAD + pages.len() * RECORD);
-    buf.extend_from_slice(&STORE_MAGIC);
-    buf.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    buf.extend_from_slice(&count.to_le_bytes());
-    for &(offset, image) in pages {
-        buf.extend_from_slice(&offset.to_le_bytes());
-        buf.extend_from_slice(image);
-    }
-    write_synced_tmp_rename(path, &buf)
-}
-
 /// One process-wide hold for every mark. Arm and clear of the same path must
 /// sit inside one hold, or a second flusher can rename the file between them.
 #[doc(hidden)]
@@ -203,28 +170,6 @@ pub fn arm_page_guard_group(path: &Path, pages: &[(&str, u64, &[u8])]) -> Result
     write_synced_tmp_rename(path, &buf)?;
     remember_group(path, pages, &leftover);
     Ok(())
-}
-
-/// Copies every image onto `data` when `mark` exists.
-///
-/// `Ok(false)` is a missing mark: `data` is left alone. A mark that does not
-/// parse is an error, and the live file is left alone.
-#[doc(hidden)]
-pub fn restore_page_guard(mark: &Path, data: &File, data_path: &Path) -> Result<bool, StoreError> {
-    mark_parent(mark)?;
-    let raw = match std::fs::read(mark) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(StoreError::io(mark, e)),
-    };
-    let pages = mark_pages(&raw)?;
-    for (offset, at) in pages {
-        write_restored_page(data, data_path, offset, &raw[at..at + PAGE as usize], None)?;
-    }
-    data.durable_sync_data()
-        .map_err(|e| StoreError::io(data_path, e))?;
-    remove_mark(mark, || {})?;
-    Ok(true)
 }
 
 /// Copies every named image onto its file under `dir`. Does not read live bytes.
@@ -378,16 +323,9 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
         }
         Err(e) => return Err(StoreError::io(path, e)),
     };
-    let pages = match mark_group_pages(&raw) {
-        Ok(pages) => pages,
-        Err(StoreError::Corrupt("page guard mark reserved")) => {
-            // Only a single-file mark that parses is removed. A kind this
-            // binary does not know stays for the restore to refuse.
-            mark_pages(&raw)?;
-            return remove_mark(path, || {});
-        }
-        Err(e) => return Err(e),
-    };
+    // A mark of a kind this binary does not know stays for the restore to
+    // refuse.
+    let pages = mark_group_pages(&raw)?;
     let mut keep = Vec::new();
     let mut dropped = HashSet::new();
     for (name, offset, at) in pages {
@@ -419,34 +357,6 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
 #[doc(hidden)]
 pub fn restore_store_group(dir: &Path, mark: &str) -> Result<bool, StoreError> {
     restore_page_guard_group(&dir.join(mark), dir)
-}
-
-/// Copy `dir/<mark>` onto `dir/<data_name>` when the mark exists.
-///
-/// `Ok(false)` is a missing mark. A present mark is copied without reading
-/// the live bytes. The data file is created when the mark names one that
-/// is not there yet.
-#[doc(hidden)]
-pub fn restore_store_file(dir: &Path, mark: &str, data_name: &str) -> Result<bool, StoreError> {
-    let mark_path = dir.join(mark);
-    match mark_path.try_exists() {
-        Ok(false) => return Ok(false),
-        Ok(true) => {}
-        Err(e) => return Err(StoreError::io(&mark_path, e)),
-    }
-    let data_path = dir.join(data_name);
-    // Default is truncate-false. Naming it adds a ratchet-counted truncate(.
-    #[allow(clippy::suspicious_open_options)]
-    let data = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&data_path)
-        .map_err(|e| StoreError::io(&data_path, e))?;
-    // The open may have just created the file. Its name must be durable in
-    // `dir` before the mark that rebuilds it goes away.
-    fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
-    restore_page_guard(&mark_path, &data, &data_path)
 }
 
 /// Promote `meta` to 31 when this directory is a datadir still on 30.
@@ -963,35 +873,6 @@ pub fn commit_appends(writes: &[Append<'_>]) -> Result<(), StoreError> {
         file.flush()?;
     }
     Ok(())
-}
-
-fn mark_pages(raw: &[u8]) -> Result<Vec<(u64, usize)>, StoreError> {
-    if raw.len() < HEAD || raw[..4] != STORE_MAGIC {
-        return Err(StoreError::Corrupt("page guard mark is not a guard file"));
-    }
-    let schema = u16::from_le_bytes([raw[4], raw[5]]);
-    if !schema_file_openable(schema) {
-        return Err(StoreError::Corrupt("page guard mark schema"));
-    }
-    if raw[6] != 0 || raw[7] != 0 {
-        return Err(StoreError::Corrupt("page guard mark reserved"));
-    }
-    let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
-    if count == 0 || raw.len() != HEAD + count * RECORD {
-        return Err(StoreError::Corrupt("page guard mark length"));
-    }
-    let mut pages = Vec::with_capacity(count);
-    for i in 0..count {
-        let at = HEAD + i * RECORD;
-        let mut off = [0u8; 8];
-        off.copy_from_slice(&raw[at..at + 8]);
-        let offset = u64::from_le_bytes(off);
-        if !offset.is_multiple_of(PAGE) || pages.iter().any(|&(have, _)| have == offset) {
-            return Err(StoreError::Corrupt("page guard names a torn page"));
-        }
-        pages.push((offset, at + 8));
-    }
-    Ok(pages)
 }
 
 fn mark_group_pages(raw: &[u8]) -> Result<Vec<(String, u64, usize)>, StoreError> {
