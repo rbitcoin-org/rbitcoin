@@ -18,8 +18,8 @@ use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
 use crate::durability::Durable;
 use crate::error::StoreError;
 use crate::file::{
-    encode_leading_header, fsync_parent_dir, handle_pread_all, handle_pwrite_all,
-    write_file_synced_tmp_rename, write_synced_tmp_rename, TableFile, FILE_HEADER_LEN,
+    fsync_parent_dir, handle_pread_all, handle_pwrite_all, write_file_synced_tmp_rename,
+    write_synced_tmp_rename, TableFile,
 };
 
 pub const PAGE: u64 = crate::tx_table::BODY_PAGE_SIZE;
@@ -37,10 +37,6 @@ pub const HEADER_HEAD_MARK: &str = "guard/header.head";
 pub const SPENT_OVF_MARK: &str = "guard/spent.ovf";
 /// Prefix of one scripthash-commit mark (`guard/sh-00`, `guard/sh-ovf`).
 pub const SH_MARK_PREFIX: &str = "guard/sh-";
-/// Forward images for one `blockfilter` put (body tail, idx tail, page 0).
-pub const BLOCKFILTER_MARK: &str = "guard/blockfilter";
-/// Forward images for one `sp_tweaks` put (body tail, idx tail, page 0).
-pub const SP_TWEAKS_MARK: &str = "guard/sp_tweaks";
 
 fn armed_map() -> &'static Mutex<HashMap<PathBuf, HashSet<u64>>> {
     static ARMED: OnceLock<Mutex<HashMap<PathBuf, HashSet<u64>>>> = OnceLock::new();
@@ -945,272 +941,51 @@ pub fn append_past_end(
     handle_pwrite_all(file, path, offset, bytes)
 }
 
-/// One file's append inside [`commit_forward_appends`].
+/// One file's part of [`commit_appends`].
 ///
-/// `new_logical` is the length the leading header names after this write.
+/// `bytes` go at `at`, which is at or past the file's committed end.
+/// `new_logical` is the length the leading header names afterwards.
 #[doc(hidden)]
-pub struct ForwardAppend<'a> {
+pub struct Append<'a> {
     pub file: &'a TableFile,
     pub at: u64,
     pub bytes: &'a [u8],
     pub new_logical: u64,
 }
 
-#[cfg(debug_assertions)]
-static FAIL_FORWARD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-
-/// The next [`commit_forward_appends`] in `dir` arms, then returns before
-/// the shared pages are written. The mark stays.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn fail_next_forward_after_arm(dir: &Path) {
-    FAIL_FORWARD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(dir.to_path_buf());
-}
-
-#[cfg(debug_assertions)]
-fn take_fail_forward(dir: &Path) -> bool {
-    let mut armed = FAIL_FORWARD.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(i) = armed.iter().position(|p| p == dir) else {
-        return false;
-    };
-    armed.remove(i);
-    true
-}
-
-/// Result of [`commit_forward_appends`].
+/// Publish a group of appends with no mark, under the sector rule.
 ///
-/// `Undo` means no mark was published, so the caller can drop the RAM plan.
-/// `Keep` means a mark may still name this commit. The caller must not undo
-/// slot counts or delete segment files. A later put has to wait for reopen.
+/// Every file's bytes are written past its published end, then every file
+/// is synced, then each new length is published and synced in the order the
+/// files first appear. A body listed before its index is therefore durable,
+/// bytes and length, before the index length that names it. A crash leaves
+/// each file at its old length or its new one, and bytes past a length are
+/// not read. On an error the caller must not write these files again until
+/// reopen: a length may already be durable.
 #[doc(hidden)]
-pub enum ForwardCommit {
-    Done,
-    Undo(StoreError),
-    Keep(StoreError),
-}
-
-/// Publish one forward append group.
-///
-/// Fresh 4 KiB blocks (strictly past the committed tail block) are synced
-/// before the mark. Page 0 and the tail block are the mark: open copies
-/// those images and the append completes. `new_logical` is adopted in RAM
-/// only after the mark is cleared, so a later `flush` does not rewrite page 0.
-#[doc(hidden)]
-pub fn commit_forward_appends(
-    dir: &Path,
-    mark: &str,
-    writes: &[ForwardAppend<'_>],
-) -> ForwardCommit {
-    if writes.is_empty() {
-        return ForwardCommit::Done;
-    }
-    let _hold = hold_marks();
-    let mut files: Vec<&TableFile> = Vec::new();
+pub fn commit_appends(writes: &[Append<'_>]) -> Result<(), StoreError> {
+    let mut files: Vec<(&TableFile, u64)> = Vec::new();
     for w in writes {
         if w.file.trailing_header {
-            return ForwardCommit::Undo(StoreError::Corrupt(
-                "forward append is a leading-header file",
-            ));
+            return Err(StoreError::Corrupt("an append needs a leading-header file"));
         }
-        if !files.iter().any(|f| f.path() == w.file.path()) {
-            files.push(w.file);
+        if w.at < w.file.logical_len() {
+            return Err(StoreError::Rejected("append overwrites committed bytes"));
         }
-    }
-    let mut logical: Vec<u64> = files.iter().map(|f| f.logical_len()).collect();
-    for w in writes {
-        let Some(i) = files.iter().position(|f| f.path() == w.file.path()) else {
-            return ForwardCommit::Undo(StoreError::Corrupt("page guard file name"));
-        };
-        let end = w.at.saturating_add(w.bytes.len() as u64);
-        logical[i] = logical[i].max(w.new_logical).max(end);
-    }
-    let planned = match plan_forward_pages(&files, writes, &logical) {
-        Ok(planned) => planned,
-        Err(e) => return ForwardCommit::Undo(e),
-    };
-    if let Err(e) = sync_fresh_spans(&files, writes, &planned.fresh) {
-        return ForwardCommit::Undo(e);
-    }
-    let names = match files
-        .iter()
-        .map(|f| guard_rel_name(dir, f.path()))
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(names) => names,
-        Err(e) => return ForwardCommit::Undo(e),
-    };
-    if let Err(e) = publish_forward_images(dir, mark, &files, &names, &planned.images) {
-        // The mark rename can land, or unlink can land without its directory
-        // sync. Either way the segment files have to stay.
-        return ForwardCommit::Keep(e);
-    }
-    for (fi, file) in files.iter().enumerate() {
-        file.adopt_durable_len(logical[fi]);
-    }
-    ForwardCommit::Done
-}
-
-struct ForwardPages {
-    fresh: Vec<(usize, usize, u64, std::ops::Range<usize>)>,
-    images: Vec<(usize, u64, [u8; PAGE as usize])>,
-}
-
-/// Shared pages (page 0 and the committed tail block) become the image.
-/// Bytes strictly past that tail are fresh spans, synced before the mark.
-fn plan_forward_pages(
-    files: &[&TableFile],
-    writes: &[ForwardAppend<'_>],
-    logical: &[u64],
-) -> Result<ForwardPages, StoreError> {
-    let mut fresh = Vec::new();
-    let mut images = Vec::new();
-    for (fi, file) in files.iter().enumerate() {
-        let old = file.logical_len();
-        let new_logical = logical[fi];
-        let mut pages = std::collections::BTreeSet::new();
-        if new_logical != old {
-            pages.insert(0u64);
-        }
-        collect_forward_spans(fi, file, writes, old, &mut pages, &mut fresh);
-        for page in pages {
-            let mut image = read_live_page(file.path(), &file.read_file, page)?;
-            if page == 0 {
-                image[..FILE_HEADER_LEN]
-                    .copy_from_slice(&encode_leading_header(file.kind, new_logical));
-            }
-            for w in writes.iter().filter(|w| w.file.path() == file.path()) {
-                if shared_page(page, old) {
-                    overlay_page(&mut image, page, w.at, w.bytes);
-                }
-            }
-            images.push((fi, page, image));
+        w.file.write_uncommitted(w.at, w.bytes)?;
+        match files.iter_mut().find(|(f, _)| f.path() == w.file.path()) {
+            Some((_, end)) => *end = (*end).max(w.new_logical),
+            None => files.push((w.file, w.new_logical)),
         }
     }
-    Ok(ForwardPages { fresh, images })
-}
-
-fn collect_forward_spans(
-    fi: usize,
-    file: &TableFile,
-    writes: &[ForwardAppend<'_>],
-    old: u64,
-    pages: &mut std::collections::BTreeSet<u64>,
-    fresh: &mut Vec<(usize, usize, u64, std::ops::Range<usize>)>,
-) {
-    for (wi, w) in writes.iter().enumerate() {
-        if w.file.path() != file.path() || w.bytes.is_empty() {
-            continue;
-        }
-        let mut i = 0usize;
-        while i < w.bytes.len() {
-            let off = w.at + i as u64;
-            let page = off & !(PAGE - 1);
-            let page_hi = (page + PAGE - off) as usize;
-            let end = i.saturating_add(page_hi).min(w.bytes.len());
-            if shared_page(page, old) {
-                pages.insert(page);
-            } else if let Some(last) = fresh
-                .last_mut()
-                .filter(|last| last.0 == fi && last.1 == wi && last.3.end == i)
-            {
-                // Fresh pages of one write are its suffix: one pwrite.
-                last.3.end = end;
-            } else {
-                fresh.push((fi, wi, off, i..end));
-            }
-            i = end;
-        }
+    for (file, _) in &files {
+        file.sync_data_only()?;
     }
-}
-
-fn sync_fresh_spans(
-    files: &[&TableFile],
-    writes: &[ForwardAppend<'_>],
-    fresh: &[(usize, usize, u64, std::ops::Range<usize>)],
-) -> Result<(), StoreError> {
-    let mut synced = std::collections::HashSet::new();
-    for (fi, wi, at, range) in fresh {
-        let file = files[*fi];
-        let bytes = &writes[*wi].bytes[range.clone()];
-        let end = at.saturating_add(bytes.len() as u64);
-        file.ensure_capacity(end)?;
-        append_past_end(&file.read_file, file.path(), file.logical_len(), *at, bytes)?;
-        synced.insert(*fi);
-    }
-    for fi in &synced {
-        files[*fi].sync_data_only()?;
-        // A roll creates the segment files just before this sync. The mark
-        // names those bytes, so the directory entry has to be durable first.
-        if let Some(parent) = files[*fi]
-            .path()
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-        }
+    for (file, end) in &files {
+        file.set_logical_len(*end)?;
+        file.flush()?;
     }
     Ok(())
-}
-
-fn publish_forward_images(
-    dir: &Path,
-    mark: &str,
-    files: &[&TableFile],
-    names: &[String],
-    images: &[(usize, u64, [u8; PAGE as usize])],
-) -> Result<(), StoreError> {
-    if images.is_empty() {
-        return Ok(());
-    }
-    let refs: Vec<(&str, u64, &[u8])> = images
-        .iter()
-        .map(|(fi, off, image)| (names[*fi].as_str(), *off, image.as_slice()))
-        .collect();
-    arm_store_group(dir, mark, &refs)?;
-    #[cfg(debug_assertions)]
-    if take_fail_forward(dir) {
-        return Err(StoreError::io(
-            dir.join(mark),
-            std::io::Error::other("injected forward guard failure"),
-        ));
-    }
-    for (fi, off, image) in images {
-        let file = files[*fi];
-        file.ensure_capacity(off.saturating_add(PAGE))?;
-        write_restored_page(&file.read_file, file.path(), *off, image, None)?;
-    }
-    let live: Vec<(&File, &Path)> = images
-        .iter()
-        .map(|(fi, _, _)| *fi)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .map(|fi| (&files[fi].read_file, files[fi].path()))
-        .collect();
-    clear_page_guard_rel(&dir.join(mark), dir, &live)
-}
-
-fn shared_page(page: u64, old: u64) -> bool {
-    if old == 0 {
-        return page == 0;
-    }
-    let tail = (old - 1) & !(PAGE - 1);
-    page == 0 || page <= tail
-}
-
-fn overlay_page(image: &mut [u8; PAGE as usize], page: u64, off: u64, bytes: &[u8]) {
-    let end = off.saturating_add(bytes.len() as u64);
-    let lo = off.max(page);
-    let hi = end.min(page + PAGE);
-    if lo >= hi {
-        return;
-    }
-    let src = (lo - off) as usize;
-    let dst = (lo - page) as usize;
-    let n = (hi - lo) as usize;
-    image[dst..dst + n].copy_from_slice(&bytes[src..src + n]);
 }
 
 fn mark_pages(raw: &[u8]) -> Result<Vec<(u64, usize)>, StoreError> {

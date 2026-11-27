@@ -22,7 +22,7 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use crate::page_guard::{self, ForwardAppend};
+use crate::page_guard::{self, Append};
 use crate::seg_pair::{locate, SegDirs, SegPair as Seg};
 use rbitcoin_primitives::{le_u32, Height, TableKind};
 use std::path::{Path, PathBuf};
@@ -56,7 +56,8 @@ pub struct SpTweaksTable {
     pub dirs: SegDirs,
     pub origin: u32,
     pub inner: Mutex<Inner>,
-    /// A forward mark may still name the last failed put. Reopen restores it.
+    /// A put failed after a length may have become durable. Reopen fits the
+    /// files, so writers wait for it.
     blocked: std::sync::atomic::AtomicBool,
 }
 
@@ -173,18 +174,13 @@ impl SpTweaksTable {
         })
     }
 
-    fn refuse_pending_mark(&self) -> Result<(), StoreError> {
+    /// A failed put may have made one length durable and not the other.
+    /// Reopen fits the files to each other, so writers wait for it.
+    fn refuse_after_failed_put(&self) -> Result<(), StoreError> {
         if self.blocked.load(std::sync::atomic::Ordering::Acquire) {
             return Err(StoreError::Rejected(
-                "sp_tweaks forward mark is still armed",
+                "an earlier sp_tweaks put failed; reopen fits the files",
             ));
-        }
-        if let Some(dir) = self.dirs.idx.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if dir.join(page_guard::SP_TWEAKS_MARK).is_file() {
-                return Err(StoreError::Rejected(
-                    "sp_tweaks forward mark is still armed",
-                ));
-            }
         }
         Ok(())
     }
@@ -475,9 +471,8 @@ impl SpTweaksTable {
             }
             expect = Height(expect.0.saturating_add(1));
         }
-        self.refuse_pending_mark()?;
+        self.refuse_after_failed_put()?;
         let mut inner = self.lock();
-        let segs_before = inner.segs.len();
         let mut i = 0usize;
         struct Plan {
             si: usize,
@@ -559,11 +554,11 @@ impl SpTweaksTable {
             });
             inner.segs[si].n_slots = inner.segs[si].n_slots.saturating_add(n);
         }
-        let mut writes: Vec<ForwardAppend<'_>> = Vec::new();
+        let mut writes: Vec<Append<'_>> = Vec::new();
         for p in &plans {
             let seg = &inner.segs[p.si];
             if !p.body.is_empty() {
-                writes.push(ForwardAppend {
+                writes.push(Append {
                     file: &seg.body,
                     at: p.body_at,
                     bytes: &p.body,
@@ -571,7 +566,7 @@ impl SpTweaksTable {
                 });
             }
             if !p.idx.is_empty() {
-                writes.push(ForwardAppend {
+                writes.push(Append {
                     file: &seg.idx,
                     at: p.idx_at,
                     bytes: &p.idx,
@@ -579,31 +574,18 @@ impl SpTweaksTable {
                 });
             }
         }
-        let Some(dir) = self.dirs.idx.parent() else {
-            undo_slot_plan(&mut inner.segs, &plans);
-            return Err(StoreError::Rejected("page guard mark has no directory"));
-        };
-        let committed =
-            page_guard::commit_forward_appends(dir, page_guard::SP_TWEAKS_MARK, &writes);
+        // Body before idx in each plan, so a body length is durable before
+        // the idx length that names its records.
+        let committed = page_guard::commit_appends(&writes);
         drop(writes);
-        match committed {
-            page_guard::ForwardCommit::Done => {}
-            page_guard::ForwardCommit::Undo(e) => {
-                undo_slot_plan(&mut inner.segs, &plans);
-                if inner.segs.len() > segs_before {
-                    self.dirs.drop_after(&mut inner.segs, segs_before);
-                }
-                return Err(e);
-            }
-            page_guard::ForwardCommit::Keep(e) => {
-                // The mark may name these files, including a rolled pair, so
-                // they stay for reopen. Readers keep the old prefix: take the
-                // planned slots back out of the counts.
-                undo_slot_plan(&mut inner.segs, &plans);
-                self.blocked
-                    .store(true, std::sync::atomic::Ordering::Release);
-                return Err(e);
-            }
+        if let Err(e) = committed {
+            // A length may be durable already, including a rolled pair's, so
+            // the files stay for reopen. Readers keep the old prefix: take
+            // the planned slots back out of the counts.
+            undo_slot_plan(&mut inner.segs, &plans);
+            self.blocked
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(e);
         }
         Ok(())
     }
@@ -671,7 +653,7 @@ impl SpTweaksTable {
     /// then checks the new last record.
     pub fn trim_last_record(&self, n_tx: u32) -> Result<TrimLast, StoreError> {
         let mut inner = self.lock();
-        self.refuse_pending_mark()?;
+        self.refuse_after_failed_put()?;
         let Some(seg) = inner.segs.iter_mut().rev().find(|s| s.n_slots > 0) else {
             return Ok(TrimLast::Clean);
         };
@@ -720,7 +702,7 @@ impl SpTweaksTable {
         let mut inner = self.lock();
         // A failed put's mark can name the files a cut would change. Open
         // would then put those bytes back.
-        self.refuse_pending_mark()?;
+        self.refuse_after_failed_put()?;
         let total: u64 = inner.segs.iter().map(|s| s.n_slots).sum();
         if keep >= total {
             return Ok(());
