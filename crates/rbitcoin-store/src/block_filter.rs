@@ -19,16 +19,18 @@
 //! When the next record's **start** would exceed `u32::MAX`, a new `NNNNNN`
 //! pair starts (the sp_tweaks rule).
 //!
-//! **Commit order:** body pwrite → body `sync_data` → idx pwrite → idx
-//! `sync_data`, all past the visible end, then the slot count is published.
-//! Readers never wait on commit IO. After power loss the idx HWM may cover a
-//! torn slot and the body may hold bytes of an uncommitted record: open keeps
-//! the longest prefix of slots whose records run back to back inside the body,
-//! cuts the body to its end, and the caller checks `header_fk` against
-//! `confirmed[]`.
+//! **Commit order:** one `guard/blockfilter` mark per `put`. Fresh blocks are
+//! synced first. The body tail, the idx tail, and page 0 are the mark, then
+//! those pages are written and the mark is cleared. Readers never wait on
+//! commit IO. After power loss the idx HWM may cover a torn slot and the body
+//! may hold bytes of an uncommitted record: open keeps the longest prefix of
+//! slots whose records run back to back inside the body, cuts the body to its
+//! end, and the caller checks `header_fk` against `confirmed[]`.
+//! `clamp_torn_tail` is that stream trim.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::page_guard::{self, ForwardAppend};
 use crate::seg_pair::{locate, SegDirs, SegPair};
 use rbitcoin_primitives::{bytes, le_u32, le_u64, Fk, Height, TableKind};
 use std::path::{Path, PathBuf};
@@ -463,50 +465,90 @@ impl BlockFilterTable {
                 "invariant: blockfilter put not next height",
             ));
         }
+        let mut inner = self.write();
+        let segs_before = inner.segs.len();
+        let mut tail_end = inner.tail_end;
         let mut i = 0usize;
+        struct Plan {
+            si: usize,
+            body_at: u64,
+            body: Vec<u8>,
+            idx_at: u64,
+            idx: Vec<u8>,
+            n: u64,
+            body_end: u64,
+        }
+        let mut plans: Vec<Plan> = Vec::new();
         while i < items.len() {
-            if self.read().tail_end > u64::from(u32::MAX) {
-                let mut inner = self.write();
+            if tail_end > u64::from(u32::MAX) {
                 self.dirs.roll(&mut inner.segs)?;
-                inner.tail_end = HDR;
+                tail_end = HDR;
             }
-            let (n, end) = {
-                let inner = self.read();
-                let tail = inner
-                    .segs
-                    .last()
-                    .ok_or(StoreError::Corrupt("blockfilter no segments"))?;
-                let mut body = Vec::new();
-                let mut idx_blob = Vec::new();
-                let mut at = inner.tail_end;
-                while i < items.len() {
-                    let (Ok(off), Ok(len)) =
-                        (u32::try_from(at), u32::try_from(items[i].filter.len()))
-                    else {
-                        break;
-                    };
-                    idx_blob.extend_from_slice(&encode_slot(off, len, &items[i].slot));
-                    body.extend_from_slice(items[i].filter);
-                    at += u64::from(len);
-                    i += 1;
-                }
-                if idx_blob.is_empty() {
-                    return Err(StoreError::Corrupt("blockfilter body exceeds u32 off"));
-                }
-                tail.body.write_at_pwrite(inner.tail_end, &body)?;
-                tail.body.flush()?;
-                tail.idx
-                    .write_at_pwrite(HDR + tail.n_slots * SLOT, &idx_blob)?;
-                tail.idx.flush()?;
-                (idx_blob.len() as u64 / SLOT, at)
-            };
-            let mut inner = self.write();
-            let tail = inner
-                .segs
-                .last_mut()
-                .ok_or(StoreError::Corrupt("blockfilter no segments"))?;
-            tail.n_slots += n;
-            inner.tail_end = end;
+            let si = inner.segs.len() - 1;
+            let n_slots = inner.segs[si].n_slots;
+            let mut body = Vec::new();
+            let mut idx_blob = Vec::new();
+            let mut at = tail_end;
+            let start_i = i;
+            while i < items.len() {
+                let (Ok(off), Ok(len)) = (u32::try_from(at), u32::try_from(items[i].filter.len()))
+                else {
+                    break;
+                };
+                idx_blob.extend_from_slice(&encode_slot(off, len, &items[i].slot));
+                body.extend_from_slice(items[i].filter);
+                at += u64::from(len);
+                i += 1;
+            }
+            if i == start_i {
+                return Err(StoreError::Corrupt("blockfilter body exceeds u32 off"));
+            }
+            plans.push(Plan {
+                si,
+                body_at: tail_end,
+                body,
+                idx_at: HDR + n_slots * SLOT,
+                idx: idx_blob,
+                n: (i - start_i) as u64,
+                body_end: at,
+            });
+            tail_end = at;
+        }
+        let mut writes: Vec<ForwardAppend<'_>> = Vec::new();
+        for p in &plans {
+            let seg = &inner.segs[p.si];
+            if !p.body.is_empty() {
+                writes.push(ForwardAppend {
+                    file: &seg.body,
+                    at: p.body_at,
+                    bytes: &p.body,
+                    new_logical: p.body_end,
+                });
+            }
+            writes.push(ForwardAppend {
+                file: &seg.idx,
+                at: p.idx_at,
+                bytes: &p.idx,
+                new_logical: p.idx_at + p.idx.len() as u64,
+            });
+        }
+        let Some(dir) = self.dirs.idx.parent() else {
+            return Err(StoreError::Rejected("page guard mark has no directory"));
+        };
+        let committed =
+            page_guard::commit_forward_appends(dir, page_guard::BLOCKFILTER_MARK, &writes);
+        drop(writes);
+        if let Err(e) = committed {
+            if inner.segs.len() > segs_before && !dir.join(page_guard::BLOCKFILTER_MARK).is_file() {
+                self.dirs.drop_after(&mut inner.segs, segs_before);
+            }
+            return Err(e);
+        }
+        for p in &plans {
+            inner.segs[p.si].n_slots += p.n;
+        }
+        if let Some(last) = plans.last() {
+            inner.tail_end = last.body_end;
         }
         Ok(())
     }
