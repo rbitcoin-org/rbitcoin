@@ -61,7 +61,9 @@ fn a_note_during_the_grouped_publish_stays_dirty() {
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_store::chain::ConfirmedTable;
     // Page images are 4 KiB on the stack. The model coroutine stack is 8 KiB.
-    fn big<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> loom::thread::JoinHandle<T> {
+    fn big<T: Send + 'static>(
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> loom::thread::JoinHandle<T> {
         loom::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(f)

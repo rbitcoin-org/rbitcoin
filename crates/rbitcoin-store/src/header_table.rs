@@ -328,7 +328,21 @@ impl HeaderTable {
     }
 
     pub fn open_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
-        page_guard::restore_store_group(dir, page_guard::HEADER_BODY_MARK)?;
+        Self::open_after_restore(dir, scale, false)
+    }
+
+    /// Open after the store may have replayed `guard/header.body` already.
+    ///
+    /// A replayed body mark is an append that may not have reached the head,
+    /// so an empty head beside those rows is that append, not a lost index.
+    /// Open then indexes the rows the head does not name.
+    pub(crate) fn open_after_restore(
+        dir: &std::path::Path,
+        scale: HeadScale,
+        body_replayed: bool,
+    ) -> Result<Self, StoreError> {
+        let body_replayed =
+            page_guard::restore_store_group(dir, page_guard::HEADER_BODY_MARK)? || body_replayed;
         page_guard::restore_store_group(dir, page_guard::HEADER_HEAD_MARK)?;
         let body = TableFile::open(dir.join("header.body"), TableKind::Header)?;
         let body_len = body.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
@@ -336,7 +350,8 @@ impl HeaderTable {
             return Err(StoreError::Corrupt("header body size"));
         }
         let count = body_len / HEADER_RECORD_LEN as u64;
-        let head = HeaderHead::open(dir.join("header.head"), count, scale)?;
+        let named = if body_replayed { 0 } else { count };
+        let head = HeaderHead::open(dir.join("header.head"), named, scale)?;
         let table = Self {
             body,
             head,
@@ -548,15 +563,18 @@ impl HeaderTable {
             // Head insert fdatasyncs. The body must be durable first so a crash
             // cannot leave header.head naming an fk above the durable row count.
             self.body.sync_data_only()?;
-            page_guard::clear_page_guard(
-                &dir.join(page_guard::HEADER_BODY_MARK),
-                &self.body.read_file,
-                self.body.path(),
-            )?;
         }
         self.count
             .store(base.saturating_add(fresh.len() as u64), Ordering::Release);
         self.head.insert_many(&head_entries)?;
+        // The body mark stays until the head names these rows, so a crash in
+        // between always leaves a mark that open replays and then indexes.
+        let _hold = page_guard::hold_marks();
+        page_guard::clear_page_guard(
+            &dir.join(page_guard::HEADER_BODY_MARK),
+            &self.body.read_file,
+            self.body.path(),
+        )?;
         Ok(out)
     }
 
