@@ -321,6 +321,10 @@ pub struct StagedSlabs {
     bytes: Vec<u8>,
     writes: Vec<(u64, usize)>,
     frees: Vec<(u8, u64)>,
+    /// Alignment-gap chunks the allocator carved. Their free-list links
+    /// share a block with the slab below the old bump, so they are imaged
+    /// and pushed with the frees, inside the armed commit.
+    pub(crate) gaps: Vec<(u8, u64)>,
 }
 
 impl StagedSlabs {
@@ -483,15 +487,32 @@ pub fn carve_gap_into_freelist(
     from: u64,
     to: u64,
 ) -> Result<(), StoreError> {
+    for (c, off) in gap_chunks(from, to) {
+        push_free_head(body, free_head, c, off)?;
+    }
+    Ok(())
+}
+
+/// Free slabs that cover `[from, to)`, largest class first.
+#[doc(hidden)]
+pub fn gap_chunks(from: u64, to: u64) -> Vec<(u8, u64)> {
+    let mut out = Vec::new();
     let mut off = from;
     while off < to {
-        let rem = to - off;
-        let Some(c) = largest_reloc_class_le(rem) else {
+        let Some(c) = largest_reloc_class_le(to - off) else {
             break;
         };
-        let sz = slab_bytes(c);
-        push_free_head(body, free_head, c, off)?;
-        off = off.saturating_add(sz);
+        out.push((c, off));
+        off = off.saturating_add(slab_bytes(c));
+    }
+    out
+}
+
+/// Publish the allocator bump as the body length. An armed commit calls
+/// this before its writes, so page 0 is imaged first.
+pub(crate) fn publish_bump(body: &TableFile, alloc: &AllocState) -> Result<(), StoreError> {
+    if alloc.bump > body.logical_len() {
+        body.set_logical_len(alloc.bump)?;
     }
     Ok(())
 }
@@ -2131,6 +2152,9 @@ impl ScriptHashTable {
         batch: &IngestBatch<'_>,
         flush_each: bool,
     ) -> Result<(), StoreError> {
+        for stage in batch.stages.values() {
+            publish_bump(stage.body, &stage.alloc.lock().unwrap())?;
+        }
         for stage in batch.stages.values().filter(|s| !s.popped) {
             stage.slabs.write_to(stage.body)?;
         }
@@ -2193,7 +2217,7 @@ impl ScriptHashTable {
             at = at.saturating_add(len);
         }
         let _ = at;
-        for &(_, off) in &stage.slabs.frees {
+        for &(_, off) in stage.slabs.frees.iter().chain(&stage.slabs.gaps) {
             image_range(
                 pages,
                 &mark,
@@ -2467,6 +2491,17 @@ impl ScriptHashTable {
                 at = at.saturating_add(len);
             }
             let _ = at;
+            for &(_, off) in &job.staged.gaps {
+                image_range(
+                    &mut pages,
+                    &mark,
+                    &rel,
+                    body.path(),
+                    &body.read_file,
+                    off,
+                    8,
+                )?;
+            }
             if unlink::frees_old_pages(&job.old) {
                 match &job.old {
                     ShHeadValue::Slab { off, .. } => {
@@ -2583,9 +2618,12 @@ impl ScriptHashTable {
                 }
             }
         }
-        for stage in stages.values().filter(|s| !s.slabs.frees.is_empty()) {
+        for stage in stages
+            .values()
+            .filter(|s| !s.slabs.frees.is_empty() || !s.slabs.gaps.is_empty())
+        {
             let mut alloc = stage.alloc.lock().unwrap();
-            for &(class, off) in &stage.slabs.frees {
+            for &(class, off) in stage.slabs.frees.iter().chain(&stage.slabs.gaps) {
                 self.free_slab(stage.body, &mut alloc, class, off)?;
             }
             stage.body.sync_data_only()?;
@@ -3147,10 +3185,10 @@ impl ScriptHashTable {
             if rc == class {
                 ro
             } else {
-                self.alloc_slab(body, alloc, class)?
+                self.alloc_slab(body, alloc, class, &mut staged.gaps)?
             }
         } else {
-            self.alloc_slab(body, alloc, class)?
+            self.alloc_slab(body, alloc, class, &mut staged.gaps)?
         };
         let mut buf = [0u8; 2048];
         buf[..packed_len].copy_from_slice(&payload[..packed_len]);
@@ -3197,7 +3235,7 @@ impl ScriptHashTable {
         }
         let chunks = sh_page_chunk_ranges(live)?;
         let n_pages = chunks.len();
-        let base = self.alloc_extent(body, alloc, n_pages)?;
+        let base = self.alloc_extent(body, alloc, n_pages, &mut staged.gaps)?;
         let mut page = [0u8; SH_PAGE_SIZE];
         for (pi, &(start, end)) in chunks.iter().enumerate() {
             let off = base.saturating_add((pi as u64).saturating_mul(SH_PAGE_SIZE as u64));
@@ -3251,7 +3289,7 @@ impl ScriptHashTable {
         }
         for fk in tail {
             if !sh_page_try_append(&mut page, *fk)? {
-                let new_off = self.alloc_page(body, alloc)?;
+                let new_off = self.alloc_page(body, alloc, &mut staged.gaps)?;
                 sh_page_set_next(&mut page, new_off)?;
                 staged.write(last, &page);
                 let glued = new_off == base.saturating_add(u64::from(n) * SH_PAGE_SIZE as u64);
@@ -3274,16 +3312,25 @@ impl ScriptHashTable {
     }
 
     #[doc(hidden)]
-    pub fn alloc_page(&self, body: &TableFile, alloc: &mut AllocState) -> Result<u64, StoreError> {
-        self.alloc_slab(body, alloc, SH_PAGE_SLAB_CLASS)
+    pub fn alloc_page(
+        &self,
+        body: &TableFile,
+        alloc: &mut AllocState,
+        gaps: &mut Vec<(u8, u64)>,
+    ) -> Result<u64, StoreError> {
+        self.alloc_slab(body, alloc, SH_PAGE_SLAB_CLASS, gaps)
     }
 
     #[doc(hidden)]
+    ///
+    /// An alignment gap goes to `gaps`, not the file. The caller pushes those
+    /// links and publishes the bump inside its armed commit.
     pub fn alloc_extent(
         &self,
         body: &TableFile,
         alloc: &mut AllocState,
         n_pages: usize,
+        gaps: &mut Vec<(u8, u64)>,
     ) -> Result<u64, StoreError> {
         if n_pages == 0 {
             return Err(StoreError::Corrupt("scripthash empty extent"));
@@ -3291,25 +3338,26 @@ impl ScriptHashTable {
         let mut off = alloc.bump;
         let aligned = (off + 4095) & !4095;
         if aligned != off {
-            carve_gap_into_freelist(body, &mut alloc.free_head, off, aligned)?;
+            gaps.extend(gap_chunks(off, aligned));
             alloc.bump = aligned;
             off = aligned;
         }
         let need = (n_pages as u64).saturating_mul(SH_PAGE_SIZE as u64);
         alloc.bump = alloc.bump.saturating_add(need);
         body.ensure_capacity(alloc.bump)?;
-        if alloc.bump > body.logical_len() {
-            body.set_logical_len(alloc.bump)?;
-        }
         Ok(off)
     }
 
     #[doc(hidden)]
+    ///
+    /// An alignment gap goes to `gaps`, not the file, as in
+    /// [`Self::alloc_extent`].
     pub fn alloc_slab(
         &self,
         body: &TableFile,
         alloc: &mut AllocState,
         class: u8,
+        gaps: &mut Vec<(u8, u64)>,
     ) -> Result<u64, StoreError> {
         if class > SH_MAX_CLASS {
             return Err(StoreError::Corrupt("scripthash page class overflow"));
@@ -3322,16 +3370,13 @@ impl ScriptHashTable {
         if class >= SH_PAGE_SLAB_CLASS {
             let aligned = (off + 4095) & !4095;
             if aligned != off {
-                carve_gap_into_freelist(body, &mut alloc.free_head, off, aligned)?;
+                gaps.extend(gap_chunks(off, aligned));
                 alloc.bump = aligned;
                 off = aligned;
             }
         }
         alloc.bump = alloc.bump.saturating_add(need);
         body.ensure_capacity(alloc.bump)?;
-        if alloc.bump > body.logical_len() {
-            body.set_logical_len(alloc.bump)?;
-        }
         Ok(off)
     }
 
