@@ -586,3 +586,70 @@ fn header_txs_grouped_flush_holds_the_write_lock() {
     put.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A slot set after the page images and before the live write dirties a page
+/// the mark does not hold. The flush writes only the span it imaged, and the
+/// late slot stays dirty for the next flush.
+#[cfg(debug_assertions)]
+#[test]
+fn flush_writes_only_the_pages_it_imaged() {
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::chain::ConfirmedTable;
+    use rbitcoin_store::file::TracedWrite;
+    use std::time::Duration;
+
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-late-slot").unwrap();
+    let path = dir.path.join("confirmed.body");
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    {
+        let t = ConfirmedTable::create(&dir.path).unwrap();
+        for h in 0..2000u32 {
+            t.set(&write, Height(h), Fk(u64::from(h) + 1)).unwrap();
+        }
+        t.flush().unwrap();
+        // Slot 1500 sits on page 2. Page 1 holds slots 510..1021.
+        t.set(&write, Height(1500), Fk(9_001)).unwrap();
+
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                rbitcoin_store::chain::release_class_c_group_pause();
+            }
+        }
+        rbitcoin_store::chain::arm_class_c_group_pause(&dir.path);
+        let _release = Release;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                assert!(
+                    rbitcoin_store::chain::wait_class_c_group_paused(Duration::from_secs(5)),
+                    "the flush did not pause after its page images"
+                );
+                let write = rbitcoin_store::ClassCWrite::for_test();
+                t.set(&write, Height(600), Fk(9_002)).unwrap();
+                rbitcoin_store::chain::release_class_c_group_pause();
+            });
+            rbitcoin_store::file::arm_write_trace();
+            t.flush().unwrap();
+            let trace = rbitcoin_store::file::take_write_trace();
+            for w in trace {
+                if let TracedWrite::Write {
+                    path: p,
+                    offset,
+                    len,
+                } = w
+                {
+                    if p == path {
+                        assert!(
+                            offset + len <= 4096 || offset >= 8192,
+                            "the flush wrote page 1, which its mark does not hold: {offset}+{len}"
+                        );
+                    }
+                }
+            }
+        });
+        t.flush().unwrap();
+    }
+    let t = ConfirmedTable::open(&dir.path).unwrap();
+    assert_eq!(t.get(Height(600)).unwrap(), Some(Fk(9_002)));
+    assert_eq!(t.get(Height(1500)).unwrap(), Some(Fk(9_001)));
+}
