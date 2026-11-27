@@ -116,6 +116,25 @@ fn repair_body_leaves_a_replaced_slot_unchanged() {
     assert_eq!(slot_now, live);
 }
 
+/// A repair rewrites a whole filter in place, across sectors at real sizes.
+/// It writes only the live slot's length, and the reader gets the new bytes.
+/// The write probe sees this one as the multi-sector repair it is.
+#[test]
+fn repair_body_rewrites_a_filter_across_sectors() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    let big = vec![0x31u8; 1_500];
+    t.put(&[BlockFilterRecord {
+        height: Height(0),
+        slot: slot(0),
+        filter: &big,
+    }])
+    .unwrap();
+    let fixed = vec![0x32u8; big.len()];
+    assert!(t.repair_body(Height(0), &slot(0), &fixed).unwrap());
+    assert_eq!(t.filter(Height(0)).unwrap().unwrap(), (fixed, slot(0)));
+}
+
 /// Checkpoint headers are heights 1000, 2000, … and nothing in between.
 #[test]
 fn checkpoint_headers_are_every_thousandth_slot() {
