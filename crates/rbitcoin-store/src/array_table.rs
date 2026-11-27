@@ -794,8 +794,10 @@ impl ArrayTable {
     /// The generation moves first, then the index. A flush that already sampled
     /// the old generation cannot publish clean over this note.
     pub(crate) fn note_unstored(&self, index: u64) {
-        self.unstored_gen.fetch_add(1, Ordering::Release);
-        let _ = self.unstored_from.fetch_min(index, Ordering::AcqRel);
+        // SeqCst with `publish_clean`: its second generation load must see
+        // this increment whenever its CLEAN store can overwrite the index.
+        self.unstored_gen.fetch_add(1, Ordering::SeqCst);
+        let _ = self.unstored_from.fetch_min(index, Ordering::SeqCst);
     }
 
     pub fn get(&self, index: u64) -> Result<u64, StoreError> {
@@ -1403,13 +1405,16 @@ impl ArrayTable {
     /// covers a note that passed the first load and stored its index after
     /// the clean write.
     pub(crate) fn publish_clean(&self, n: u64, gen: u64) {
-        if self.unstored_gen.load(Ordering::Acquire) != gen {
+        if self.unstored_gen.load(Ordering::SeqCst) != gen {
             return;
         }
         self.disk_len.store(n, Ordering::Release);
-        self.unstored_from.store(CLEAN, Ordering::Release);
-        if self.unstored_gen.load(Ordering::Acquire) != gen {
-            self.unstored_from.store(0, Ordering::Release);
+        // SeqCst with `note_unstored`. With Release/Acquire the CLEAN store
+        // can sit behind the second load, and a note that lands between them
+        // is overwritten while that load still reads the old generation.
+        self.unstored_from.store(CLEAN, Ordering::SeqCst);
+        if self.unstored_gen.load(Ordering::SeqCst) != gen {
+            self.unstored_from.store(0, Ordering::SeqCst);
         }
     }
 
