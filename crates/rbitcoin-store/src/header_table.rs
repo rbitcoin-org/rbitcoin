@@ -327,22 +327,13 @@ impl HeaderTable {
         Self::open_with_scale(dir, HeadScale::Tiny)
     }
 
+    /// A `guard/header.body` mark is an append that may not have reached the
+    /// head, so an empty head beside those rows is that append, not a lost
+    /// index. Open replays the mark, indexes the rows the head does not name,
+    /// and removes the mark only once the head insert is durable. An open that
+    /// stops in between leaves the mark for the next one.
     pub fn open_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
-        Self::open_after_restore(dir, scale, false)
-    }
-
-    /// Open after the store may have replayed `guard/header.body` already.
-    ///
-    /// A replayed body mark is an append that may not have reached the head,
-    /// so an empty head beside those rows is that append, not a lost index.
-    /// Open then indexes the rows the head does not name.
-    pub(crate) fn open_after_restore(
-        dir: &std::path::Path,
-        scale: HeadScale,
-        body_replayed: bool,
-    ) -> Result<Self, StoreError> {
-        let body_replayed =
-            page_guard::restore_store_group(dir, page_guard::HEADER_BODY_MARK)? || body_replayed;
+        let body_marked = page_guard::replay_store_group(dir, page_guard::HEADER_BODY_MARK)?;
         page_guard::restore_store_group(dir, page_guard::HEADER_HEAD_MARK)?;
         let body = TableFile::open(dir.join("header.body"), TableKind::Header)?;
         let body_len = body.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
@@ -350,7 +341,7 @@ impl HeaderTable {
             return Err(StoreError::Corrupt("header body size"));
         }
         let count = body_len / HEADER_RECORD_LEN as u64;
-        let named = if body_replayed { 0 } else { count };
+        let named = if body_marked { 0 } else { count };
         let head = HeaderHead::open(dir.join("header.head"), named, scale)?;
         let table = Self {
             body,
@@ -359,6 +350,14 @@ impl HeaderTable {
             put_lock: Mutex::new(()),
         };
         table.index_unindexed_tail()?;
+        if body_marked {
+            let _hold = page_guard::hold_marks();
+            page_guard::clear_page_guard(
+                &dir.join(page_guard::HEADER_BODY_MARK),
+                &table.body.read_file,
+                table.body.path(),
+            )?;
+        }
         Ok(table)
     }
 
