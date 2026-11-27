@@ -479,9 +479,23 @@ impl BlockFilterTable {
             body_end: u64,
         }
         let mut plans: Vec<Plan> = Vec::new();
+        // `roll` stamps `first_slot` from `n_slots` already on the pairs.
+        // Count a plan when it is pushed so a later roll in this batch does
+        // not overlap the segment it just left. A failed commit subtracts
+        // those counts again.
+        fn undo_slot_plan(segs: &mut [SegPair], plans: &[Plan]) {
+            for p in plans {
+                if p.si < segs.len() {
+                    segs[p.si].n_slots = segs[p.si].n_slots.saturating_sub(p.n);
+                }
+            }
+        }
         while i < items.len() {
             if tail_end > u64::from(u32::MAX) {
-                self.dirs.roll(&mut inner.segs)?;
+                if let Err(e) = self.dirs.roll(&mut inner.segs) {
+                    undo_slot_plan(&mut inner.segs, &plans);
+                    return Err(e);
+                }
                 tail_end = HDR;
             }
             let si = inner.segs.len() - 1;
@@ -501,17 +515,20 @@ impl BlockFilterTable {
                 i += 1;
             }
             if i == start_i {
+                undo_slot_plan(&mut inner.segs, &plans);
                 return Err(StoreError::Corrupt("blockfilter body exceeds u32 off"));
             }
+            let n = (i - start_i) as u64;
             plans.push(Plan {
                 si,
                 body_at: tail_end,
                 body,
                 idx_at: HDR + n_slots * SLOT,
                 idx: idx_blob,
-                n: (i - start_i) as u64,
+                n,
                 body_end: at,
             });
+            inner.segs[si].n_slots = inner.segs[si].n_slots.saturating_add(n);
             tail_end = at;
         }
         let mut writes: Vec<ForwardAppend<'_>> = Vec::new();
@@ -533,19 +550,18 @@ impl BlockFilterTable {
             });
         }
         let Some(dir) = self.dirs.idx.parent() else {
+            undo_slot_plan(&mut inner.segs, &plans);
             return Err(StoreError::Rejected("page guard mark has no directory"));
         };
         let committed =
             page_guard::commit_forward_appends(dir, page_guard::BLOCKFILTER_MARK, &writes);
         drop(writes);
         if let Err(e) = committed {
+            undo_slot_plan(&mut inner.segs, &plans);
             if inner.segs.len() > segs_before && !dir.join(page_guard::BLOCKFILTER_MARK).is_file() {
                 self.dirs.drop_after(&mut inner.segs, segs_before);
             }
             return Err(e);
-        }
-        for p in &plans {
-            inner.segs[p.si].n_slots += p.n;
         }
         if let Some(last) = plans.last() {
             inner.tail_end = last.body_end;
