@@ -200,6 +200,60 @@ fn rolls_a_segment_when_the_next_start_passes_u32() {
     assert_eq!(t.next_height(), Height(1));
 }
 
+/// A crash inside a segment-pair create can keep one name of the newest
+/// pair and lose the other. That pair holds no row, so open removes it and
+/// keeps the pairs before it.
+#[test]
+fn open_drops_a_half_created_newest_pair() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 2);
+    drop(t);
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    drop(dirs.create(1, 3).unwrap());
+    fs::remove_file(dirs.body_path(1)).unwrap();
+    let t = BlockFilterTable::open_or_create(&dir).expect("a half-created newest pair");
+    assert_eq!(t.next_height(), Height(3));
+    assert!(!dirs.idx_path(1).exists(), "the orphan idx stayed");
+    assert_eq!(
+        t.filters(Height(2), Height(2)).unwrap().unwrap(),
+        vec![(vec![2u8; 5], slot(2))]
+    );
+}
+
+/// One missing file in a pair before the newest is still corruption.
+#[test]
+fn open_refuses_a_missing_file_below_the_newest_pair() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    drop(t);
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    drop(dirs.create(1, 1).unwrap());
+    drop(dirs.create(2, 1).unwrap());
+    fs::remove_file(dirs.body_path(1)).unwrap();
+    assert!(matches!(
+        BlockFilterTable::open_or_create(&dir),
+        Err(StoreError::Corrupt(m)) if m.contains("incomplete")
+    ));
+}
+
+/// A pair create that fails leaves neither file, so the next roll can make
+/// the same pair again.
+#[test]
+fn a_failed_pair_create_leaves_no_file() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    drop(t);
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    // A directory where the body file goes: the idx is made, the body is not.
+    fs::create_dir_all(dirs.body_path(1)).unwrap();
+    assert!(dirs.create(1, 0).is_err());
+    assert!(!dirs.idx_path(1).exists(), "the failed create left its idx");
+    fs::remove_dir(dirs.body_path(1)).unwrap();
+    drop(dirs.create(1, 0).expect("the next create of the same pair"));
+}
+
 #[test]
 fn put_rolls_mid_batch_when_the_next_start_passes_u32() {
     let dir = tmp_dir();
@@ -243,6 +297,7 @@ fn block_filter_slot_roundtrip_keeps_the_row() {
 /// A put that fails partway may leave one length durable and not the other.
 /// The next put waits for reopen, which fits the files.
 #[test]
+#[cfg(debug_assertions)]
 fn a_later_put_waits_for_reopen_after_a_failed_put() {
     let dir = tmp_dir();
     let t = BlockFilterTable::open_or_create(&dir).unwrap();
@@ -271,6 +326,7 @@ fn a_later_put_waits_for_reopen_after_a_failed_put() {
     assert_eq!(t.next_height(), Height(1));
 }
 
+#[cfg(debug_assertions)]
 fn fail_next_idx_sync(t: &BlockFilterTable) {
     let inner = t.inner.read().unwrap();
     let idx = &inner.segs.last().unwrap().idx;
@@ -280,6 +336,7 @@ fn fail_next_idx_sync(t: &BlockFilterTable) {
 /// A failed put publishes nothing to readers: the failed height is not
 /// readable, and the old prefix is.
 #[test]
+#[cfg(debug_assertions)]
 fn a_failed_put_stays_out_of_the_read_watermark() {
     let dir = tmp_dir();
     let t = BlockFilterTable::open_or_create(&dir).unwrap();
@@ -300,6 +357,7 @@ fn a_failed_put_stays_out_of_the_read_watermark() {
 /// A crash can leave the body length durable and the idx length old. Open
 /// cuts the body back to the idx, and the next put lands at the cut.
 #[test]
+#[cfg(debug_assertions)]
 fn open_cuts_a_body_length_published_before_its_idx() {
     let dir = tmp_dir();
     let t = BlockFilterTable::open_or_create(&dir).unwrap();
@@ -377,6 +435,7 @@ fn a_committed_filter_reads_during_a_put() {
 /// A repair of a committed filter waits for reopen after a failed put, like
 /// the next put does.
 #[test]
+#[cfg(debug_assertions)]
 fn repair_refuses_after_a_failed_put() {
     let dir = tmp_dir();
     let t = BlockFilterTable::open_or_create(&dir).unwrap();

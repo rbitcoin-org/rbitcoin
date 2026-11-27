@@ -549,6 +549,7 @@ fn read_offs_run_reads_the_next_slot() {
 /// prefix. Truncate and trim wait for reopen too, as the next put does: one
 /// length may be durable and the other not.
 #[test]
+#[cfg(debug_assertions)]
 fn a_failed_put_stays_out_of_reads_and_blocks_cuts() {
     let dir = tmp_dir();
     let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
@@ -622,12 +623,14 @@ fn the_fit_cuts_a_body_length_published_before_its_idx() {
 /// A put that fails after its body length is published still leaves the old
 /// last record readable: its end is the body length.
 #[test]
+#[cfg(debug_assertions)]
 fn a_put_failing_after_the_body_length_keeps_the_old_tip_readable() {
     let dir = tmp_dir();
     let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
     let mut tweak = [0u8; 33];
     tweak[0] = 0x02;
     t.put_block(Height(0), &[Some(tweak)]).unwrap();
+    let old_len = t.body_logical_len();
     {
         let inner = t.inner.lock().unwrap();
         let idx = &inner.segs.last().unwrap().idx;
@@ -636,6 +639,12 @@ fn a_put_failing_after_the_body_length_keeps_the_old_tip_readable() {
     assert!(t.put_block(Height(1), &[Some(tweak)]).is_err());
     assert_eq!(t.next_height(), Height(1));
     assert_eq!(t.get_block(Height(0), 1).unwrap(), Some(vec![Some(tweak)]));
+    // The rollback is RAM-only. The body header keeps the length the commit
+    // published, so it cannot fall below an idx length that landed.
+    t.flush().unwrap();
+    let raw = std::fs::read(SpTweaksTable::body_dir(&dir).join("000000")).unwrap();
+    let on_disk = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    assert!(on_disk > old_len, "the rollback shortened the body header");
 }
 
 /// A new table's `meta` and its two directories are durable before the

@@ -290,7 +290,7 @@ impl SpTweaksTable {
         let end = if need_next {
             u64::from(le_u32!(raw[n_rows], 0))
         } else {
-            seg.body.logical_len()
+            seg.last_record_end()
         };
         Ok((starts, end))
     }
@@ -584,21 +584,21 @@ impl SpTweaksTable {
         let committed = page_guard::commit_appends(&writes);
         drop(writes);
         if let Err(e) = committed {
-            // A length may be durable already, including a rolled pair's, so
-            // the files stay for reopen. Readers keep the old prefix: take
-            // the planned slots back out of the counts.
-            undo_slot_plan(&mut inner.segs, &plans);
-            // The old last record ends at the body length. A body length
-            // already published would make it read the new bytes, so put the
-            // old one back. Reopen and the last-record fit settle the disk.
-            for p in &plans {
-                let body = &inner.segs[p.si].body;
-                if body.logical_len() > p.body_at {
-                    body.set_logical_len(p.body_at)?;
-                }
-            }
             self.blocked
                 .store(true, std::sync::atomic::Ordering::Release);
+            // A length may be durable already, including a rolled pair's, so
+            // the files stay as the commit left them for reopen and its
+            // last-record fit. Readers keep the old prefix: take the planned
+            // slots back out of the counts. The old last record ends at the
+            // body length, which may now name the put's bytes, so readers end
+            // it at the old length in RAM only.
+            undo_slot_plan(&mut inner.segs, &plans);
+            for p in &plans {
+                let seg = &mut inner.segs[p.si];
+                if seg.body.logical_len() > p.body_at {
+                    seg.read_end = Some(p.body_at);
+                }
+            }
             return Err(e);
         }
         Ok(())

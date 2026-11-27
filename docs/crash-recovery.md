@@ -107,7 +107,10 @@ absent, open restores only a tail that is still all zeros.
 in-place slab and a head word, uses `store/guard/sh-*`. A `txstat` stamp
 needs no mark: each cell and block slot sits inside one sector, and the stamp
 is synced. Block-filter and silent-payment tweak puts are appends: bytes,
-then lengths, body before idx, each synced, with no mark. The mempool flush
+then lengths, body before idx, each synced, with no mark. A new segment
+pair's names are synced before any length; Windows cannot sync a directory,
+so there NTFS metadata journaling carries them. Open drops a newest pair
+missing one file, and the index re-derives those heights. The mempool flush
 uses `mempool/guard/flush`.
 `tx.head` `*.mlt` is renamed into place, and the segment meta bit says the
 file must exist. A strong bit a fence run names is set again by
