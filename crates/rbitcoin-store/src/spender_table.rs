@@ -10,7 +10,7 @@
 //! Sync removes it.
 
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::file::{fsync_parent_dir, TableFile, FILE_HEADER_LEN};
 use crate::tx_table::{pack_spent_field, unpack_spent_field};
 use rbitcoin_primitives::{le_u64, Fk, TableKind};
 use std::path::Path;
@@ -174,6 +174,14 @@ impl SpenderTable {
         let dir = self.store_dir()?;
         let mark = dir.join(crate::page_guard::SPENT_OVF_MARK);
         if mark.try_exists().map_err(|e| StoreError::io(&mark, e))? {
+            // The rename can land and the directory sync can fail. A retry
+            // must finish that sync before it writes the body. It must not
+            // replace the image this mark already holds.
+            let parent = mark
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .ok_or(StoreError::Corrupt("spent.ovf mark has no directory"))?;
+            fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
             return Ok(());
         }
         let logical = self.body.logical_len();
@@ -217,6 +225,13 @@ impl SpenderTable {
         let dir = self.store_dir()?;
         let mark = dir.join(crate::page_guard::SPENT_OVF_MARK);
         if !mark.try_exists().map_err(|e| StoreError::io(&mark, e))? {
+            // Unlink can land and the directory sync can fail. The checkpoint
+            // must not publish until that sync has been retried.
+            let parent = mark
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .ok_or(StoreError::Corrupt("spent.ovf mark has no directory"))?;
+            fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
             return Ok(());
         }
         crate::page_guard::clear_page_guard(&mark, &self.body.read_file, self.body.path())

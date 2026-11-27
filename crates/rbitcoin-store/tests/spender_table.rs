@@ -170,6 +170,59 @@ fn page_at(path: &std::path::Path, off: u64) -> Vec<u8> {
     buf
 }
 
+/// A later append must finish the guard directory sync when the mark is
+/// already present. The first arm's rename can land while that sync fails.
+#[test]
+fn a_later_append_syncs_the_guard_directory() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-arm-retry").unwrap();
+    let t = SpenderTable::create(dir.path()).unwrap();
+    t.append(Fk(1), 1, Fk::NULL).unwrap();
+    let guard = dir.path().join("guard");
+    assert!(guard.join("spent.ovf").is_file());
+    #[cfg(unix)]
+    {
+        rbitcoin_store::file::arm_fsync_dir_trace();
+        t.append(Fk(2), 2, Fk::NULL).unwrap();
+        let dirs = rbitcoin_store::file::take_fsynced_dirs();
+        assert!(
+            dirs.iter().any(|d| d == &guard),
+            "a retry must sync guard/ before it writes, got {dirs:?}"
+        );
+    }
+    #[cfg(not(unix))]
+    t.append(Fk(2), 2, Fk::NULL).unwrap();
+}
+
+/// A checkpoint whose mark is already gone must still sync `guard/`.
+/// Unlink can land while that directory sync fails.
+#[test]
+fn clear_of_a_missing_spent_ovf_mark_syncs_the_guard_directory() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-clear-retry").unwrap();
+    let path = dir.path().to_path_buf();
+    let s = Store::create_tiny(&path).unwrap();
+    s.spenders.append(Fk(1), 1, Fk::NULL).unwrap();
+    let mark = path.join("guard/spent.ovf");
+    std::fs::remove_file(&mark).unwrap();
+    #[cfg(unix)]
+    {
+        rbitcoin_store::file::arm_fsync_dir_trace();
+        let g = s.hold_utxo_view();
+        s.spenders.sync_data_only(&SpenderFreeze::new(&g)).unwrap();
+        let dirs = rbitcoin_store::file::take_fsynced_dirs();
+        let guard = path.join("guard");
+        assert!(
+            dirs.iter().any(|d| d == &guard),
+            "a missing mark must still sync guard/, got {dirs:?}"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let g = s.hold_utxo_view();
+        s.spenders.sync_data_only(&SpenderFreeze::new(&g)).unwrap();
+    }
+    assert!(!mark.exists());
+}
+
 /// A fixture with no `meta` still arms. The mark is the pre-append pages.
 #[test]
 fn fixture_without_meta_arms_spent_ovf_once() {
