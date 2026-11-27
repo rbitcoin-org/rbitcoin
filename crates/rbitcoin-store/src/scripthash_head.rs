@@ -864,7 +864,6 @@ pub enum InsertResult {
     NeedSlot,
 }
 
-#[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ChunkSpill {
     /// A full cache writes the wave, then drops it.
@@ -873,6 +872,7 @@ enum ChunkSpill {
     Preview,
 }
 
+#[doc(hidden)]
 pub struct SlotPageCache<'a> {
     pub head: &'a ScriptHashHead,
     pub slots: u64,
