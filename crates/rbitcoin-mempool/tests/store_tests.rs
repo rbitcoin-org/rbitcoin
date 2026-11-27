@@ -642,6 +642,39 @@ fn a_removal_supersedes_a_pending_admit_mark() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The arm can rename `guard/flush` into place and then fail its directory
+/// sync. That mark is visible, so a removal of its admit must still publish.
+#[cfg(debug_assertions)]
+#[test]
+fn a_removal_supersedes_a_mark_whose_arm_failed_after_the_rename() {
+    use rbitcoin_mempool::store::fail_next_mempool_arm_after_rename;
+    let dir = tmp_dir();
+    let gone = Txid::from_byte_array([0xD5; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let slot = put_live(&mut mp, &gone, 1, 400);
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        fail_next_mempool_arm_after_rename(&dir);
+        assert!(mp.persist_due().is_err());
+        assert!(dir.join("guard/flush").is_file());
+        mp.mark_slot_dead(slot).unwrap();
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(
+        !ids.contains(&gone),
+        "open replayed the admit after its removal"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn reused_dead_slot_persist_due_publishes_the_new_tx() {
     let dir = tmp_dir();
