@@ -17,6 +17,11 @@
 //! sp_tweaks.body/NNNNNN   u8 len ‖ [u8; len]
 //! ```
 //!
+//! **Crash.** A put appends with no mark: bytes, then the body length, then
+//! the idx length. The last record ends at the body length, so a body length
+//! that landed without its idx length lengthens it. Query open calls
+//! [`SpTweaksTable::trim_last_record`] with the block's `n_tx` to cut it back.
+//!
 //! Leftover **files** `sp_tweaks.idx` / `sp_tweaks.body` (pre-17 single-file)
 //! are unlinked on store open; `--sptweaks` backfill regenerates.
 
@@ -583,6 +588,15 @@ impl SpTweaksTable {
             // the files stay for reopen. Readers keep the old prefix: take
             // the planned slots back out of the counts.
             undo_slot_plan(&mut inner.segs, &plans);
+            // The old last record ends at the body length. A body length
+            // already published would make it read the new bytes, so put the
+            // old one back. Reopen and the last-record fit settle the disk.
+            for p in &plans {
+                let body = &inner.segs[p.si].body;
+                if body.logical_len() > p.body_at {
+                    body.set_logical_len(p.body_at)?;
+                }
+            }
             self.blocked
                 .store(true, std::sync::atomic::Ordering::Release);
             return Err(e);
@@ -700,8 +714,8 @@ impl SpTweaksTable {
     #[doc(hidden)]
     pub fn truncate_keep_slots(&self, keep: u64) -> Result<(), StoreError> {
         let mut inner = self.lock();
-        // A failed put's mark can name the files a cut would change. Open
-        // would then put those bytes back.
+        // A failed put may have made one length durable and not the other.
+        // Reopen and the last-record fit settle the pair before a cut.
         self.refuse_after_failed_put()?;
         let total: u64 = inner.segs.iter().map(|s| s.n_slots).sum();
         if keep >= total {
