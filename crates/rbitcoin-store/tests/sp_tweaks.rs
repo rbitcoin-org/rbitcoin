@@ -66,6 +66,7 @@ fn put_get_len_tweak_no_txid() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn torn_sp_tweaks_page_restores_the_armed_image() {
     let dir = tmp_dir();
