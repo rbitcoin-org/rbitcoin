@@ -293,6 +293,9 @@ pub fn restore_store_file(dir: &Path, mark: &str, data_name: &str) -> Result<boo
         .create(true)
         .open(&data_path)
         .map_err(|e| StoreError::io(&data_path, e))?;
+    // The open may have just created the file. Its name must be durable in
+    // `dir` before the mark that rebuilds it goes away.
+    fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
     restore_page_guard(&mark_path, &data, &data_path)
 }
 
