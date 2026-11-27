@@ -1,8 +1,9 @@
 //! A mark of whole 4 KiB images, and an append that stays off those pages.
 use rbitcoin_primitives::{SCHEMA_VERSION, STORE_MAGIC};
 use rbitcoin_store::page_guard::{
-    append_past_end, arm_page_guard, arm_page_guard_group, clear_page_guard, guard_rel_name,
-    restore_page_guard, restore_page_guard_group, restore_page_guard_group_fit,
+    append_past_end, arm_page_guard, arm_page_guard_group, clear_page_guard, clear_page_guard_rel,
+    clear_sh_marks, guard_rel_name, restore_page_guard, restore_page_guard_group,
+    restore_page_guard_group_fit,
 };
 use rbitcoin_store::testutil::TempDir;
 use rbitcoin_store::StoreError;
@@ -685,4 +686,69 @@ fn write_outside_the_armed_pages_is_rejected() {
         other => panic!("expected reject, got {other:?}"),
     }
     file.write_at(64, &[0x44; 8]).unwrap();
+}
+
+fn committed_body(dir: &TempDir) -> (rbitcoin_store::file::TableFile, std::path::PathBuf) {
+    let path = dir.path().join("body");
+    let file =
+        rbitcoin_store::file::TableFile::create(&path, rbitcoin_primitives::TableKind::ScriptHash)
+            .unwrap();
+    let payload = vec![0x11u8; PAGE * 2];
+    file.write_at(rbitcoin_store::file::FILE_HEADER_LEN as u64, &payload)
+        .unwrap();
+    (file, path)
+}
+
+fn arm_page0(dir: &TempDir, mark: &str) {
+    let image = vec![0u8; PAGE];
+    arm_page_guard_group(&dir.path().join(mark), &[("body", 0, image.as_slice())]).unwrap();
+}
+
+fn page1_is_rejected(file: &rbitcoin_store::file::TableFile) {
+    let err = file
+        .write_at(PAGE as u64, &[0x33; 16])
+        .expect_err("page 1 is committed and still armed");
+    match err {
+        StoreError::Rejected(msg) => assert_eq!(msg, "write is outside the armed pages"),
+        other => panic!("expected reject, got {other:?}"),
+    }
+}
+
+/// `clear_page_guard_rel` drops the mark. The release check must drop the
+/// in-memory pages with it, or the next committed write is rejected.
+#[test]
+fn clear_rel_forgets_the_armed_pages() {
+    let dir = TempDir::labeled("page-guard-clear-rel").unwrap();
+    let (file, path) = committed_body(&dir);
+    let mark = dir.path().join("guard/mark");
+    arm_page0(&dir, "guard/mark");
+    page1_is_rejected(&file);
+    clear_page_guard_rel(&mark, dir.path(), &[(&file.read_file, path.as_path())]).unwrap();
+    assert!(!mark.exists(), "clear removes the mark");
+    file.write_at(PAGE as u64, &[0x55; 16]).unwrap();
+}
+
+/// A fit restore deletes the mark outright. The armed-page record goes with it.
+#[test]
+fn fit_restore_forgets_the_armed_pages() {
+    let dir = TempDir::labeled("page-guard-fit-forget").unwrap();
+    let (file, _path) = committed_body(&dir);
+    let mark = dir.path().join("guard/mark");
+    arm_page0(&dir, "guard/mark");
+    page1_is_rejected(&file);
+    assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
+    assert!(!mark.exists(), "restore removes the mark");
+    file.write_at(PAGE as u64, &[0x66; 16]).unwrap();
+}
+
+/// `clear_sh_marks` deletes `guard/sh-*` without a retain rewrite.
+#[test]
+fn clear_sh_marks_forgets_the_armed_pages() {
+    let dir = TempDir::labeled("page-guard-sh-forget").unwrap();
+    let (file, _path) = committed_body(&dir);
+    arm_page0(&dir, "guard/sh-ovf");
+    page1_is_rejected(&file);
+    clear_sh_marks(dir.path()).unwrap();
+    assert!(!dir.path().join("guard/sh-ovf").exists());
+    file.write_at(PAGE as u64, &[0x77; 16]).unwrap();
 }

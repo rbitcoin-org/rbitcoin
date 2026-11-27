@@ -49,13 +49,15 @@ fn armed_map() -> &'static Mutex<HashMap<PathBuf, HashSet<u64>>> {
     ARMED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn remember_group(mark: &Path, pages: &[(&str, u64, &[u8])], leftover: &[(String, u64, Vec<u8>)]) {
-    let Some(dir) = mark
-        .parent()
+fn guard_live_dir(mark: &Path) -> Option<&Path> {
+    mark.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .and_then(|parent| parent.parent())
         .filter(|dir| !dir.as_os_str().is_empty())
-    else {
+}
+
+fn remember_group(mark: &Path, pages: &[(&str, u64, &[u8])], leftover: &[(String, u64, Vec<u8>)]) {
+    let Some(dir) = guard_live_dir(mark) else {
         return;
     };
     let mut by_file: HashMap<String, HashSet<u64>> = HashMap::new();
@@ -76,6 +78,16 @@ fn forget_armed(path: &Path) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(path);
+}
+
+/// A file dropped from a mark is not armed. The release check reads this map.
+fn forget_armed_names(mark: &Path, names: &HashSet<String>) {
+    let Some(dir) = guard_live_dir(mark) else {
+        return;
+    };
+    for name in names {
+        forget_armed(&dir.join(name));
+    }
 }
 
 /// Reject a range that shares a committed page when `path` has a live arm
@@ -310,6 +322,11 @@ pub fn restore_page_guard_group_fit(mark: &Path, dir: &Path) -> Result<bool, Sto
             .map_err(|e| StoreError::io(data_path, e))?;
     }
     remove_mark(mark)?;
+    let mut names = HashSet::new();
+    for (name, _, _) in &pages {
+        names.insert(name.clone());
+    }
+    forget_armed_names(mark, &names);
     Ok(true)
 }
 
@@ -366,14 +383,18 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
         Err(e) => return Err(e),
     };
     let mut keep = Vec::new();
+    let mut dropped = HashSet::new();
     for (name, offset, at) in pages {
         if synced.contains(&name) {
+            dropped.insert(name);
             continue;
         }
         keep.push((name, offset, raw[at..at + PAGE as usize].to_vec()));
     }
     if keep.is_empty() {
-        return remove_mark(path);
+        remove_mark(path)?;
+        forget_armed_names(path, &dropped);
+        return Ok(());
     }
     let count = u32::try_from(keep.len())
         .map_err(|_| StoreError::Corrupt("page guard arm is too large"))?;
@@ -385,7 +406,9 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
     for (file, offset, image) in &keep {
         encode_group_record(&mut buf, file, *offset, image)?;
     }
-    write_synced_tmp_rename(path, &buf)
+    write_synced_tmp_rename(path, &buf)?;
+    forget_armed_names(path, &dropped);
+    Ok(())
 }
 
 /// Restore `dir/<mark>` when it exists, then continue. Missing is `Ok`.
@@ -512,8 +535,21 @@ pub fn clear_sh_marks(dir: &Path) -> Result<(), StoreError> {
             continue;
         }
         let path = ent.path();
+        let mut named = HashSet::new();
+        if !name.ends_with(".tmp") {
+            if let Ok(raw) = std::fs::read(&path) {
+                if let Ok(pages) = mark_group_pages(&raw) {
+                    for (file, _, _) in pages {
+                        named.insert(file);
+                    }
+                }
+            }
+        }
         match std::fs::remove_file(&path) {
-            Ok(()) => any = true,
+            Ok(()) => {
+                any = true;
+                forget_armed_names(&path, &named);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(StoreError::io(&path, e)),
         }
