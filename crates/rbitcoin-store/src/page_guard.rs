@@ -5,8 +5,8 @@
 //! onto the live file and removes the mark. It does not read the live bytes.
 //! [`arm_page_guard_group`] is the same publish for several files: each record
 //! names the file, because each file has its own page 0.
-//! [`append_past_end`] writes only when the range shares no 4 KiB block with a
-//! byte below `committed_end`.
+//! [`append_past_end`] writes only bytes at or past `committed_end`, which may
+//! share the committed tail block (crash-recovery.md, the sector rule).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -91,10 +91,12 @@ fn forget_armed_names(mark: &Path, names: &HashSet<String>) {
 /// Reject a range that shares a committed page when `path` has a live arm
 /// and the range is not inside the pages that arm names.
 ///
-/// A range the sector rule already makes crash-safe is allowed: an append
-/// (every byte at or past the committed end) and a write inside one sector.
-/// A path with no live arm is not checked. `committed_end` is the durable
-/// header length, not a RAM high-water.
+/// An append (every byte at or past the committed end) is allowed. Any other
+/// write to a file with a live arm must be inside the pages that arm names:
+/// even a one-sector write that lands whole may belong to the commit the
+/// mark protects, and open would roll the mark back around it. A path with
+/// no live arm is not checked. `committed_end` is the durable header length,
+/// not a RAM high-water.
 #[doc(hidden)]
 pub fn check_armed_write(
     path: &Path,
@@ -102,7 +104,7 @@ pub fn check_armed_write(
     offset: u64,
     len: u64,
 ) -> Result<(), StoreError> {
-    if len == 0 || offset >= committed_end || within_one_sector(offset, len) {
+    if len == 0 || offset >= committed_end {
         return Ok(());
     }
     let map = armed_map().lock().unwrap_or_else(|e| e.into_inner());
@@ -1188,18 +1190,6 @@ fn overlay_page(image: &mut [u8; PAGE as usize], page: u64, off: u64, bytes: &[u
     let dst = (lo - page) as usize;
     let n = (hi - lo) as usize;
     image[dst..dst + n].copy_from_slice(&bytes[src..src + n]);
-}
-
-/// The device writes a 512-byte sector whole or not at all. A range inside
-/// one sector therefore lands as the old bytes or the new ones.
-pub const SECTOR: u64 = 512;
-
-/// `offset..offset + len` lies inside one 512-byte sector.
-pub fn within_one_sector(offset: u64, len: u64) -> bool {
-    len != 0
-        && offset
-            .checked_add(len - 1)
-            .is_some_and(|last| offset / SECTOR == last / SECTOR)
 }
 
 fn mark_pages(raw: &[u8]) -> Result<Vec<(u64, usize)>, StoreError> {
