@@ -152,9 +152,9 @@ pub struct Mempool {
     /// `slots` file length known durable. A `set_len` whose sync failed is
     /// visible in the file length but not counted here, so a retry syncs it.
     slots_len_synced: u64,
-    /// `guard/flush` is published and not cleared. It may hold a LIVE slot
-    /// image whose body never became durable, so a removal of that slot must
-    /// still publish its death.
+    /// `guard/flush` may be published and not cleared. It may hold a LIVE
+    /// slot image whose body never became durable, so a removal of that slot
+    /// must still publish its death. The next commit applies it first.
     flush_mark_armed: bool,
 }
 
@@ -914,6 +914,10 @@ impl Mempool {
     /// as FREE so a slots-ahead-of-body crash cannot load offsets past EOF.
     #[doc(hidden)]
     pub fn persist_slots_and_meta(&mut self) -> Result<(), MempoolError> {
+        // A leftover mark's admits become durable here. Apply it before the
+        // demoted image samples `body_persisted_len`.
+        let body_path = self.dir.join("tx.body");
+        self.settle_flush_mark(&body_path)?;
         let demoted = self.demoted_slots_image();
         let mut stashed = None;
         if demoted.is_none() {
@@ -1025,6 +1029,7 @@ impl Mempool {
             .and_then(|n| n.to_str())
             .unwrap_or("slots")
             .to_string();
+        self.settle_flush_mark(&body_path)?;
         let mut images: Vec<(String, u64, [u8; 4096])> = Vec::new();
         let (logical, fresh_body) = self.collect_body_images(body, &body_path, &mut images)?;
         self.collect_slot_images(
@@ -1039,6 +1044,28 @@ impl Mempool {
             self.collect_meta_image(&meta_path, &mut images)?;
         }
         self.publish_flush_mark(logical, fresh_body, images, retire_deaths)
+    }
+
+    /// Apply a `guard/flush` an earlier flush left armed, before this flush
+    /// reads any live page. A failed flush can have written some of its
+    /// pages, and this flush's clear drops every record of a file it syncs.
+    /// Once applied, that mark's admits are on disk, so its body length is
+    /// the durable one.
+    fn settle_flush_mark(&mut self, body_path: &Path) -> Result<(), MempoolError> {
+        if !self.flush_mark_armed {
+            return Ok(());
+        }
+        {
+            let _hold = rbitcoin_store::page_guard::hold_marks();
+            restore_mempool_mark(&self.dir)?;
+        }
+        let page0 = read_page(&mut self.body_file, body_path, 0)?;
+        let disk = le_u64!(page0, 8);
+        if disk > self.body_persisted_len && disk <= body_logical_len(&self.body)? as u64 {
+            self.body_persisted_len = disk;
+        }
+        self.flush_mark_armed = false;
+        Ok(())
     }
 
     /// Fresh body bytes are synced here, before the mark. Shared pages,

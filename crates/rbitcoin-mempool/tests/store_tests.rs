@@ -675,6 +675,124 @@ fn a_removal_supersedes_a_mark_whose_arm_failed_after_the_rename() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Slot 170 starts 16 bytes before the 8 KiB page edge. A failed persist
+/// wrote its status and body range on page 4096 but not its txid on page
+/// 8192. A later death-only flush of slot 0 must not drop the armed image
+/// of page 8192, or open finds a LIVE row with the wrong txid.
+#[cfg(debug_assertions)]
+#[test]
+fn a_death_flush_keeps_the_pending_admit_images() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let first = Txid::from_byte_array([0xE0; 32]);
+    let late = Txid::from_byte_array([0xEF; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        assert_eq!(put_live(&mut mp, &first, 1, 400), 0);
+        for i in 1..170u32 {
+            let mut id = [0xE1; 32];
+            id[..4].copy_from_slice(&i.to_le_bytes());
+            put_live(&mut mp, &Txid::from_byte_array(id), 1, 400);
+        }
+        mp.flush().unwrap();
+        let slot = put_live(&mut mp, &late, 1, 400);
+        assert_eq!(slot, 170);
+        let at = SLOTS_HEADER + 170 * SLOT_REC;
+        assert_eq!(at, 8176, "the record crosses the page at 8192");
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        fail_next_mempool_guard_before_write(&dir);
+        assert!(mp.persist_due().is_err());
+        // The first page of the record reached the live file, the second did not.
+        let mut slots = OpenOptions::new()
+            .write(true)
+            .open(dir.join("slots"))
+            .unwrap();
+        slots.seek(SeekFrom::Start(at as u64)).unwrap();
+        slots.write_all(&mp.slots[at..8192]).unwrap();
+        drop(slots);
+        mp.mark_slot_dead(0).unwrap();
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).expect("open after the death flush");
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(!ids.contains(&first), "slot 0 is dead");
+    assert!(ids.contains(&late), "the armed admit is applied whole");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A slot-table write after a failed persist applies that mark first. Its
+/// admit is then durable, so the table must not write it FREE.
+#[cfg(debug_assertions)]
+#[test]
+fn a_slot_table_write_keeps_the_settled_admit() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let kept = Txid::from_byte_array([0xF7; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        put_live(&mut mp, &kept, 1, 400);
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        fail_next_mempool_guard_before_write(&dir);
+        assert!(mp.persist_due().is_err());
+        mp.persist_slots_without_body().unwrap();
+        mp.persist_due().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(ids.contains(&kept), "the settled admit was written FREE");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Once a later commit has applied an earlier failed persist, its admit is
+/// on disk. A removal of that admit must still reach disk.
+#[cfg(debug_assertions)]
+#[test]
+fn a_removal_after_a_settled_mark_stays_dead() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let durable = Txid::from_byte_array([0xF5; 32]);
+    let gone = Txid::from_byte_array([0xF6; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let first = put_live(&mut mp, &durable, 1, 400);
+        mp.flush().unwrap();
+        let slot = put_live(&mut mp, &gone, 1, 400);
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        fail_next_mempool_guard_before_write(&dir);
+        assert!(mp.persist_due().is_err());
+        mp.mark_slot_dead(first).unwrap();
+        mp.sync_deaths().unwrap();
+        mp.mark_slot_dead(slot).unwrap();
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(!ids.contains(&durable));
+    assert!(
+        !ids.contains(&gone),
+        "open loaded the admit after its removal"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn reused_dead_slot_persist_due_publishes_the_new_tx() {
     let dir = tmp_dir();
