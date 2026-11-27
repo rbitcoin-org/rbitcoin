@@ -625,3 +625,28 @@ fn drop_sh_rel_skips_an_unpublished_temp() {
     assert!(tmp.is_file());
 }
 
+/// A restore whose `.ahead` sidecar is already gone still syncs the
+/// directory that held it. An earlier unlink may have landed without that
+/// sync, and the mark goes away next.
+#[test]
+fn fit_restore_syncs_the_sidecar_directory_when_it_is_gone() {
+    let dir = TempDir::labeled("page-guard-ahead-gone").unwrap();
+    let live = dir.path().join("scripthash.ovf").join("ingest");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    let mark = dir.path().join("guard/sh-ovf");
+    let image = fill(0x45);
+    write_bytes(&live, 0, &image);
+    arm_page_guard_group(&mark, &[("scripthash.ovf/ingest", 0, image.as_slice())]).unwrap();
+    #[cfg(unix)]
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
+    #[cfg(unix)]
+    {
+        let dirs = rbitcoin_store::file::take_fsynced_dirs();
+        let side_dir = live.parent().unwrap();
+        assert!(
+            dirs.iter().any(|d| d == side_dir),
+            "the sidecar directory was not synced, got {dirs:?}"
+        );
+    }
+}
