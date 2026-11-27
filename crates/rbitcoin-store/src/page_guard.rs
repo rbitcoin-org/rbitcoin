@@ -400,8 +400,7 @@ pub fn restore_sh_marks(dir: &Path) -> Result<(), StoreError> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        // `sh-<shard>.tmp` is the rename leftover, not a published mark.
-        if !name.starts_with("sh-") || name.ends_with(".tmp") {
+        if !published_sh_mark(name) {
             continue;
         }
         let file = match ent.file_type() {
@@ -481,6 +480,12 @@ pub fn drop_page_guard_names(mark: &Path, names: &HashSet<String>) -> Result<(),
 
 /// Drop `rel` from every `guard/sh-*` mark, then sync `dir`.
 #[doc(hidden)]
+/// A renamed `guard/sh-*` mark. `sh-<shard>.tmp` is a rename leftover that
+/// may be partial; restore and drop skip it, and reset removes it.
+fn published_sh_mark(name: &str) -> bool {
+    name.starts_with("sh-") && !name.ends_with(".tmp")
+}
+
 pub fn drop_sh_rel(dir: &Path, rel: &str) -> Result<(), StoreError> {
     let guard = dir.join("guard");
     let rd = match std::fs::read_dir(&guard) {
@@ -496,7 +501,7 @@ pub fn drop_sh_rel(dir: &Path, rel: &str) -> Result<(), StoreError> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.starts_with("sh-") {
+        if published_sh_mark(name) {
             drop_page_guard_names(&ent.path(), &names)?;
         }
     }
