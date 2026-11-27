@@ -18,7 +18,7 @@ use crate::scripthash_pages::{
 use rbitcoin_primitives::{le_u16, le_u64, Fk};
 #[cfg(debug_assertions)]
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(debug_assertions)]
 thread_local! {
@@ -143,14 +143,22 @@ impl ScriptHashTable {
 
     /// Unlink every group, then sync the new chains and heads once before any
     /// replaced page is freed. A full-list drop stays in memory until
-    /// [`Self::commit_deferred_empty_heads`].
+    /// [`Self::commit_deferred_empty_heads`]. Groups that name one scripthash
+    /// are merged, so each head is rewritten once with every removal.
     pub fn unlink_creates_batch(&self, groups: &[([u8; 32], Vec<Fk>)]) -> Result<(), StoreError> {
         if groups.is_empty() {
             return Ok(());
         }
+        let mut merged: BTreeMap<[u8; 32], Vec<Fk>> = BTreeMap::new();
+        for (scripthash, fks) in groups {
+            merged
+                .entry(*scripthash)
+                .or_default()
+                .extend_from_slice(fks);
+        }
         self.dirty_write(|| {
             let mut batch = UnlinkBatch::default();
-            for (scripthash, fks) in groups {
+            for (scripthash, fks) in &merged {
                 self.unlink_one(scripthash, fks, &mut batch)?;
             }
             self.finish_unlink_batch(batch)
