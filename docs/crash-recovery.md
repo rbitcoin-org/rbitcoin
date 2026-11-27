@@ -87,7 +87,9 @@ when every such subset is a state open accepts. Two shapes always pass:
   share the committed tail block. It is synced before the length that names
   it is published, so a torn append is bytes open does not read.
 - A write inside one sector, such as the 8-byte length at offset 8 or a
-  `txstat` cell. It lands old or new.
+  `txstat` cell. It lands old or new. On a file whose commit a mark is
+  protecting, it still has to be inside that mark's pages: it may belong to
+  that commit, and open would roll the mark back around it.
 
 Any other write that changes committed bytes in more than one sector goes
 through `page_guard`. The writer stores the pre-image of every page that
