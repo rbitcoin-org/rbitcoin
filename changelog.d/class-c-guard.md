@@ -10,7 +10,9 @@ Changed
   pair split. Marks publish only after store `meta` is 31. A table fixture
   with no `meta` still arms. Creating `store/guard/` syncs the store
   directory. Only `meta` 24/25 converts a 96-byte `header.body`; a later
-  `meta` beside that length refuses to open. Open refuses a leftover
+  `meta` beside that length refuses to open. A `header_txs` pair whose
+  two column lengths straddle the in-RAM cap refuses to open, since only a
+  both-fd pair writes under one mark. Open refuses a leftover
   `confirmed.body.ahead`, `header_txs_first.body.ahead`,
   `header_txs_count.body.ahead`, or `header.head.ahead`.
   `txstat.body.ahead` and scripthash `ingest.ahead` still replay.

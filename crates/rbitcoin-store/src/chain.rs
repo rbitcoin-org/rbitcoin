@@ -20,6 +20,8 @@ const HEADER_TXS_FIRST_AHEAD: &str =
     "header_txs_first.body.ahead is a legacy page image; this open does not restore it";
 const HEADER_TXS_COUNT_AHEAD: &str =
     "header_txs_count.body.ahead is a legacy page image; this open does not restore it";
+const HEADER_TXS_SPLIT_TIERS: &str =
+    "header_txs_first and header_txs_count lengths straddle the in-RAM cap; reindex";
 
 /// Best-chain height → header fk. Length = tip_height + 1 when non-empty.
 pub struct ConfirmedTable {
@@ -673,9 +675,16 @@ impl HeaderTxsTable {
         // One mark images first and count together, so a crash cannot leave
         // the pair split. Restore before any slot read.
         page_guard::restore_store_group(dir, page_guard::CLASS_C_MARK)?;
+        let first = ArrayTable::open(dir.join("header_txs_first.body"), TableKind::ArrayLink)?;
+        let count = ArrayTable::open(dir.join("header_txs_count.body"), TableKind::ArrayLink)?;
+        // Each column picks its tier from its own length. Only a both-fd pair
+        // writes under one mark, so a pair on two tiers could tear a row.
+        if first.is_fd_only() != count.is_fd_only() {
+            return Err(StoreError::Corrupt(HEADER_TXS_SPLIT_TIERS));
+        }
         Ok(Self {
-            first: ArrayTable::open(dir.join("header_txs_first.body"), TableKind::ArrayLink)?,
-            count: ArrayTable::open(dir.join("header_txs_count.body"), TableKind::ArrayLink)?,
+            first,
+            count,
             seq: AtomicU64::new(0),
             write: Mutex::new(()),
         })

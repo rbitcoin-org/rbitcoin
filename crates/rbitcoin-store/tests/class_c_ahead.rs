@@ -699,3 +699,30 @@ fn fd_only_header_txs_pair_is_one_mark() {
         "reopen read a split header_txs pair: {got:?}"
     );
 }
+
+/// Each `header_txs` column picks RAM or fd from its own length. A pair whose
+/// lengths straddle the RAM cap would open as one fd column and one RAM
+/// column, and no single mark covers a write to that pair. Open refuses it.
+#[test]
+fn header_txs_pair_on_two_tiers_refuses_open() {
+    use rbitcoin_store::chain::HeaderTxsTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-mixed-pair").unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    {
+        let t = HeaderTxsTable::create(&dir.path).unwrap();
+        t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+        t.first.set_zero_gap(&write, 1, 2).unwrap();
+        t.flush().unwrap();
+        assert_eq!((t.first.len(), t.count.len()), (2, 1));
+    }
+    let opened = rbitcoin_store::array_table::with_class_c_inram_max_bytes(8, || {
+        HeaderTxsTable::open(&dir.path)
+    });
+    match opened {
+        Err(rbitcoin_store::error::StoreError::Corrupt(m)) => {
+            assert!(m.contains("header_txs"), "{m}")
+        }
+        Err(other) => panic!("wrong refusal: {other}"),
+        Ok(_) => panic!("open accepted a header_txs pair split across tiers"),
+    }
+}
