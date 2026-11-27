@@ -531,6 +531,40 @@ fn a_committed_full_flush_retires_queued_deaths() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The timed persist that commits B in A's reused slot retires A's queued
+/// death, even when the `tx.body` trim after the commit fails.
+#[cfg(debug_assertions)]
+#[test]
+fn a_committed_timed_persist_retires_queued_deaths() {
+    use rbitcoin_mempool::store::fail_next_mempool_body_adopt;
+    let dir = tmp_dir();
+    let old = Txid::from_byte_array([0xC5; 32]);
+    let new = Txid::from_byte_array([0xC6; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let slot = put_live(&mut mp, &old, 1, 400);
+        mp.flush().unwrap();
+        mp.mark_slot_dead(slot).unwrap();
+        let reused = put_live(&mut mp, &new, 2, 400);
+        assert_eq!(reused, slot);
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        fail_next_mempool_body_adopt(&dir);
+        assert!(mp.persist_due().is_err());
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(ids.contains(&new), "a queued death stamped the replacement");
+    assert!(!ids.contains(&old));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A slot table that grew on disk but whose sync failed is still not
 /// durable. A retry syncs it again before any mark publishes the larger
 /// `slot_cap`.

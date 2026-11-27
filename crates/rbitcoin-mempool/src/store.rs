@@ -291,9 +291,7 @@ impl Mempool {
         let old_persisted = self.body_persisted_len;
         let mut ranges = self.slot_ranges_since(old_persisted);
         ranges.extend(self.death_ranges());
-        self.commit_guarded(true, &ranges, None, true, &[], false)?;
-        self.deaths_unsynced = false;
-        self.death_slots.clear();
+        self.commit_guarded(true, &ranges, None, true, &[], true)?;
         self.clear_dirty();
         self.last_persist_ms = self.now_ms();
         Ok(())
@@ -1006,10 +1004,10 @@ impl Mempool {
     /// replaces whole pages that differ.
     ///
     /// `retire_deaths` drops the queued deaths once this commit is durable:
-    /// a full slot image published each row's current status, and a death
-    /// sync published those deaths. A failure after that point, such as the
-    /// `tx.body` trim, does not bring them back, or a later death sync could
-    /// stamp a slot an admit reused.
+    /// a full slot image or a timed persist's death ranges published each
+    /// row's current status, and a death sync published those deaths. A
+    /// failure after that point, such as the `tx.body` trim, does not bring
+    /// them back, or a later death sync could stamp a slot an admit reused.
     fn commit_guarded(
         &mut self,
         body: bool,
