@@ -531,6 +531,26 @@ fn a_committed_full_flush_retires_queued_deaths() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A slot table that grew on disk but whose sync failed is still not
+/// durable. A retry syncs it again before any mark publishes the larger
+/// `slot_cap`.
+#[cfg(debug_assertions)]
+#[test]
+fn a_retry_syncs_the_grown_slot_file_again() {
+    use rbitcoin_mempool::store::set_mempool_grow_sync_fails;
+    let dir = tmp_dir();
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    set_mempool_grow_sync_fails(&dir, true);
+    assert!(mp.grow_slots().is_err());
+    assert!(
+        mp.flush().is_err(),
+        "a retry skipped the sync of the longer slots file"
+    );
+    set_mempool_grow_sync_fails(&dir, false);
+    mp.flush().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn reused_dead_slot_persist_due_publishes_the_new_tx() {
     let dir = tmp_dir();
