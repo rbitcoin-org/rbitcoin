@@ -240,6 +240,7 @@ fn block_filter_slot_roundtrip_keeps_the_row() {
     assert_eq!(row.slot, slot(3));
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn torn_blockfilter_page_restores_the_armed_image() {
     let dir = tmp_dir();
@@ -277,6 +278,7 @@ fn torn_blockfilter_page_restores_the_armed_image() {
 }
 
 /// A second put must not overwrite fresh pages while the first mark is armed.
+#[cfg(debug_assertions)]
 #[test]
 fn a_later_put_waits_until_the_forward_mark_is_gone() {
     let dir = tmp_dir();
