@@ -65,7 +65,10 @@ impl SegDirs {
         idx.set_grow_tight(true);
         let body = TableFile::create(self.body_path(file_id), self.body_kind)?;
         // A put appends with no mark, so the new names have to be durable
-        // before a length in either file can be.
+        // before a length in either file can be, and a name that survives
+        // must find its header.
+        idx.sync_data_only()?;
+        body.sync_data_only()?;
         for d in [&self.idx, &self.body] {
             crate::file::fsync_parent_dir(d).map_err(|e| StoreError::io(d, e))?;
         }

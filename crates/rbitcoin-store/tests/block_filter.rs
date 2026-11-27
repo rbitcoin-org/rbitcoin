@@ -520,6 +520,19 @@ fn a_new_segment_pair_syncs_its_directories() {
     let _pair = dirs.create(1, 0).unwrap();
     let synced = rbitcoin_store::file::take_fsynced_dirs();
     assert!(synced.contains(&dirs.idx), "idx dir not synced: {synced:?}");
+    // Each header is synced before its name, so a surviving name opens.
+    for (file, dir) in [
+        (dirs.idx_path(1), &dirs.idx),
+        (dirs.body_path(1), &dirs.body),
+    ] {
+        let file_at = synced.iter().position(|p| p == &file);
+        let dir_at = synced.iter().position(|p| p == dir);
+        assert!(
+            matches!((file_at, dir_at), (Some(f), Some(d)) if f < d),
+            "{} was not synced before its directory: {synced:?}",
+            file.display()
+        );
+    }
     assert!(
         synced.contains(&dirs.body),
         "body dir not synced: {synced:?}"

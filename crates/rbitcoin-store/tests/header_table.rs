@@ -182,7 +182,8 @@ fn ensure_batch_linked_headers_roundtrip() {
 fn a_failed_first_append_leaves_an_empty_flag_and_no_row() {
     let dir = tmp();
     let t = HeaderTable::create_tiny(&dir).unwrap();
-    rbitcoin_store::io_handle::arm_fail_sync(t.body.io_handle(), 1);
+    // The header sync before the flag passes; the row data sync fails.
+    rbitcoin_store::io_handle::arm_fail_sync_after(t.body.io_handle(), 1, 1);
     let g = sample([0x91; 32]);
     let err = t.ensure_batch(std::slice::from_ref(&g)).unwrap_err();
     assert!(matches!(err, StoreError::Io { .. }), "{err}");
@@ -198,6 +199,26 @@ fn a_failed_first_append_leaves_an_empty_flag_and_no_row() {
     assert_eq!(t.get_by_hash(&g.hash).unwrap(), None);
     assert!(!flag.exists(), "open left the flag");
     assert_eq!(t.ensure(&g).unwrap(), Fk(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Store creation leaves the body header unsynced. The first append syncs
+/// it before the flag, so open never meets a flag over a header that is not
+/// on the device.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn the_first_header_append_syncs_the_body_before_its_flag() {
+    let dir = tmp();
+    let t = HeaderTable::create_tiny(&dir).unwrap();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    t.ensure(&sample([0x97; 32])).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    let body_at = synced.iter().position(|p| p == &dir.join("header.body"));
+    let guard_at = synced.iter().position(|p| p == &dir.join("guard"));
+    assert!(
+        matches!((body_at, guard_at), (Some(b), Some(g)) if b < g),
+        "header.body was not synced before the flag: {synced:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -305,8 +326,9 @@ fn a_failure_past_the_first_chunk_keeps_that_chunk_named() {
             sample(h)
         })
         .collect();
-    // The first chunk's data sync passes; the second chunk's fails.
-    rbitcoin_store::io_handle::arm_fail_sync_after(t.body.io_handle(), 1, 1);
+    // The header sync before the flag and the first chunk's data sync
+    // pass; the second chunk's data sync fails.
+    rbitcoin_store::io_handle::arm_fail_sync_after(t.body.io_handle(), 2, 1);
     assert!(
         t.ensure_batch(&recs).is_err(),
         "the second chunk did not fail"

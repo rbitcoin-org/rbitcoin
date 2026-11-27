@@ -245,10 +245,12 @@ pub fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Record directories passed to [`fsync_parent_dir`] on this thread.
+/// Record directories passed to [`fsync_parent_dir`] on this thread, and
+/// table files [`TableFile::sync_data_only`] synced, in order.
 ///
 /// Debug tests use this to check that `store/` is synced after
-/// `seqsigwit.window` exists. A release build does not record.
+/// `seqsigwit.window` exists, or that a header is synced before its name.
+/// A release build does not record.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn arm_fsync_dir_trace() {
@@ -1496,6 +1498,8 @@ impl TableFile {
         self.read_file
             .durable_sync_data()
             .map_err(|e| StoreError::io(&self.path, e))?;
+        #[cfg(debug_assertions)]
+        note_fsynced_dir(&self.path);
         #[cfg(feature = "write-probe")]
         crate::write_probe::synced(&self.path);
         Ok(())

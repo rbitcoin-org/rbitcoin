@@ -535,6 +535,10 @@ impl HeaderTable {
         // head does not name.
         let first = base == 0;
         if first {
+            // Store creation does not sync table headers. A flag over an
+            // unsynced header would keep open from replacing the store as an
+            // incomplete creation, so the header is durable first.
+            self.body.sync_data_only()?;
             page_guard::arm_store_flag(dir, page_guard::HEADER_BODY_MARK)?;
         }
         // Rows, sync, then length, sync: the head insert below never names
