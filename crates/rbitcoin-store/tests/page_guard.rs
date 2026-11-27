@@ -362,13 +362,17 @@ fn clear_drops_only_the_synced_file() {
         ],
     )
     .unwrap();
-    write_bytes(&head, 0, &head_image);
+    // The head moves past its marked image, so a restore that still held
+    // the head record would show up here.
+    let head_written = fill(0x51);
+    write_bytes(&head, 0, &head_written);
     write_bytes(&mlt, 0, &fill(0x00));
     let head_file = open_rw(&head);
     clear_page_guard(&mark, &head_file, &head).unwrap();
     drop(head_file);
     write_bytes(&mlt, 0, &fill(0x00));
     assert!(restore_page_guard_group(&mark, dir.path()).unwrap());
+    assert_eq!(read_bytes(&head, 0, PAGE), head_written);
     assert_eq!(read_bytes(&mlt, 0, PAGE), mlt_image);
     assert!(!mark.exists());
 }
