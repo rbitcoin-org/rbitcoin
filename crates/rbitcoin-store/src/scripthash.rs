@@ -2431,6 +2431,9 @@ impl ScriptHashTable {
         Ok(())
     }
 
+    /// `prev` is an earlier arm this write still lands under. A page its mark
+    /// still holds keeps that pre-image. A page a later clear dropped is
+    /// imaged again, and the result names both arms' files.
     pub(super) fn arm_suffix_pages(
         &self,
         body: &TableFile,
@@ -2438,6 +2441,7 @@ impl ScriptHashTable {
         home: LocatedHome,
         offs: &[u64],
         image_head: bool,
+        prev: Option<&ArmedSh>,
     ) -> Result<ArmedSh, StoreError> {
         let mut pages: BTreeMap<(String, String, u64), [u8; PAGE as usize]> = BTreeMap::new();
         let mark = body_sh_mark(&self.store_dir, body)?;
@@ -2456,7 +2460,30 @@ impl ScriptHashTable {
         if image_head {
             self.image_head_key(&mut pages, scripthash, KeyHome::from(home))?;
         }
-        self.publish_sh_pages(&pages)
+        let Some(prev) = prev else {
+            return self.publish_sh_pages(&pages);
+        };
+        let mut held: BTreeMap<String, HashSet<(String, u64)>> = BTreeMap::new();
+        for (mark, _, _) in pages.keys() {
+            if !held.contains_key(mark) {
+                let pages_held = page_guard::armed_group_pages(&self.store_dir.join(mark))?;
+                held.insert(mark.clone(), pages_held);
+            }
+        }
+        pages.retain(|(mark, rel, off), _| {
+            !held
+                .get(mark)
+                .is_some_and(|h| h.contains(&(rel.clone(), *off)))
+        });
+        let mut armed = self.publish_sh_pages(&pages)?;
+        for (mark, rels) in &prev.files {
+            armed
+                .files
+                .entry(mark.clone())
+                .or_default()
+                .extend(rels.iter().cloned());
+        }
+        Ok(armed)
     }
 
     pub(super) fn arm_unlink_rewrites(
