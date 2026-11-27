@@ -825,3 +825,24 @@ fn a_removed_mark_forgets_its_pages_when_the_dir_sync_fails() {
     rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64, 8)
         .expect("the removed mark still armed page 0");
 }
+
+/// Without hole punching, `zero_range` writes zeros in 1 MiB chunks. Each
+/// chunk publishes its end, and the next chunk must still be checked
+/// against the committed end the call started with. A committed page the
+/// arm does not name stays rejected.
+#[cfg(debug_assertions)]
+#[test]
+fn zero_fill_fallback_keeps_one_committed_end() {
+    let dir = TempDir::labeled("page-guard-zero-fill").unwrap();
+    let (file, path) = committed_body(&dir);
+    arm_page0(&dir, "guard/mark");
+    let committed = file.logical_len();
+    let past = ((committed - 1) & !(PAGE as u64 - 1)) + PAGE as u64;
+    rbitcoin_store::file::skip_next_punch_hole(&path);
+    file.zero_range(past + 1, 1024 * 1024 + 1)
+        .expect("the whole range shares no committed page");
+    match file.zero_range(PAGE as u64, 16) {
+        Err(StoreError::Rejected(msg)) => assert_eq!(msg, "write is outside the armed pages"),
+        other => panic!("expected reject, got {other:?}"),
+    }
+}
