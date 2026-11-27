@@ -72,6 +72,25 @@ fn zero_header_and_block(path: &Path) {
     assert_eq!(check, [0u8; 4096]);
 }
 
+/// The Class C group pause is one process-wide slot. Tests that arm it hold
+/// this lock from arm to release, so two of them cannot share the slot.
+#[cfg(debug_assertions)]
+fn pause_slot() -> std::sync::MutexGuard<'static, ()> {
+    static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SLOT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Releases the group pause on drop, including on unwind.
+#[cfg(debug_assertions)]
+struct ReleasePause;
+
+#[cfg(debug_assertions)]
+impl Drop for ReleasePause {
+    fn drop(&mut self) {
+        rbitcoin_store::chain::release_class_c_group_pause();
+    }
+}
+
 fn class_c_mark(dir: &Path) -> PathBuf {
     dir.join(rbitcoin_store::page_guard::CLASS_C_MARK)
 }
@@ -553,14 +572,9 @@ fn header_txs_grouped_flush_holds_the_write_lock() {
     let write = rbitcoin_store::ClassCWrite::for_test();
     store.header_txs.put_range(&write, Fk(1), Fk(1), 1).unwrap();
 
-    struct Release;
-    impl Drop for Release {
-        fn drop(&mut self) {
-            rbitcoin_store::chain::release_class_c_group_pause();
-        }
-    }
+    let _slot = pause_slot();
     rbitcoin_store::chain::arm_class_c_group_pause(&dir);
-    let _release = Release;
+    let _release = ReleasePause;
     let flushing = Arc::clone(&store);
     let flush = std::thread::spawn(move || flushing.flush_header_archive());
     assert!(
@@ -610,23 +624,19 @@ fn flush_writes_only_the_pages_it_imaged() {
         // Slot 1500 sits on page 2. Page 1 holds slots 510..1021.
         t.set(&write, Height(1500), Fk(9_001)).unwrap();
 
-        struct Release;
-        impl Drop for Release {
-            fn drop(&mut self) {
-                rbitcoin_store::chain::release_class_c_group_pause();
-            }
-        }
+        let _slot = pause_slot();
         rbitcoin_store::chain::arm_class_c_group_pause(&dir.path);
-        let _release = Release;
+        let _release = ReleasePause;
         std::thread::scope(|scope| {
             scope.spawn(|| {
+                // Releases the paused flush even if an assert below panics.
+                let _release = ReleasePause;
                 assert!(
                     rbitcoin_store::chain::wait_class_c_group_paused(Duration::from_secs(5)),
                     "the flush did not pause after its page images"
                 );
                 let write = rbitcoin_store::ClassCWrite::for_test();
                 t.set(&write, Height(600), Fk(9_002)).unwrap();
-                rbitcoin_store::chain::release_class_c_group_pause();
             });
             rbitcoin_store::file::arm_write_trace();
             t.flush().unwrap();
