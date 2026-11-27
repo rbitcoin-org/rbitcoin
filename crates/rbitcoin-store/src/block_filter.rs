@@ -472,128 +472,145 @@ impl BlockFilterTable {
     }
 
     /// Append consecutive heights starting at [`Self::next_height`], durably.
+    ///
+    /// The plan, the writes, and the syncs run under the read lock, so a
+    /// reader of a committed height does not wait for them. The writer mutex
+    /// keeps every other change out. A rolled pair stays local until the
+    /// commit is done. Only then does the write lock publish the new pairs,
+    /// slot counts, and tail. A failed put leaves readers on the old prefix.
     pub fn put(&self, items: &[BlockFilterRecord<'_>]) -> Result<(), StoreError> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         self.refuse_pending_mark()?;
-        let next = self.read().next();
-        if items
-            .iter()
-            .zip(next..)
-            .any(|(it, want)| u64::from(it.height.0) != want)
-        {
-            return Err(StoreError::Corrupt(
-                "invariant: blockfilter put not next height",
-            ));
-        }
-        let mut inner = self.write();
-        let segs_before = inner.segs.len();
-        let mut tail_end = inner.tail_end;
-        let mut i = 0usize;
         struct Plan {
             si: usize,
             body_at: u64,
             body: Vec<u8>,
             idx_at: u64,
             idx: Vec<u8>,
-            n: u64,
             body_end: u64,
         }
-        let mut plans: Vec<Plan> = Vec::new();
-        // `roll` stamps `first_slot` from `n_slots` already on the pairs.
-        // Count a plan when it is pushed so a later roll in this batch does
-        // not overlap the segment it just left. A failed commit subtracts
-        // those counts again.
-        fn undo_slot_plan(segs: &mut [SegPair], plans: &[Plan]) {
-            for p in plans {
-                if p.si < segs.len() {
-                    segs[p.si].n_slots = segs[p.si].n_slots.saturating_sub(p.n);
-                }
+        let (counts, mut rolled, tail_end) = {
+            let inner = self.read();
+            let next = inner.next();
+            if items
+                .iter()
+                .zip(next..)
+                .any(|(it, want)| u64::from(it.height.0) != want)
+            {
+                return Err(StoreError::Corrupt(
+                    "invariant: blockfilter put not next height",
+                ));
             }
-        }
-        while i < items.len() {
-            if tail_end > u64::from(u32::MAX) {
-                if let Err(e) = self.dirs.roll(&mut inner.segs) {
-                    undo_slot_plan(&mut inner.segs, &plans);
-                    return Err(e);
-                }
-                tail_end = HDR;
-            }
-            let si = inner.segs.len() - 1;
-            let n_slots = inner.segs[si].n_slots;
-            let mut body = Vec::new();
-            let mut idx_blob = Vec::new();
-            let mut at = tail_end;
-            let start_i = i;
+            let mut counts: Vec<u64> = inner.segs.iter().map(|s| s.n_slots).collect();
+            let mut rolled: Vec<SegPair> = Vec::new();
+            let mut tail_end = inner.tail_end;
+            let mut plans: Vec<Plan> = Vec::new();
+            let mut i = 0usize;
             while i < items.len() {
-                let (Ok(off), Ok(len)) = (u32::try_from(at), u32::try_from(items[i].filter.len()))
-                else {
-                    break;
-                };
-                idx_blob.extend_from_slice(&encode_slot(off, len, &items[i].slot));
-                body.extend_from_slice(items[i].filter);
-                at += u64::from(len);
-                i += 1;
+                if tail_end > u64::from(u32::MAX) {
+                    let file_id = u32::try_from(counts.len())
+                        .map_err(|_| StoreError::Corrupt("too many segment pairs"));
+                    let pair = file_id.and_then(|id| self.dirs.create(id, counts.iter().sum()));
+                    match pair {
+                        Ok(pair) => rolled.push(pair),
+                        Err(e) => {
+                            self.dirs.drop_after(&mut rolled, 0);
+                            return Err(e);
+                        }
+                    }
+                    counts.push(0);
+                    tail_end = HDR;
+                }
+                let si = counts.len() - 1;
+                let mut body = Vec::new();
+                let mut idx_blob = Vec::new();
+                let mut at = tail_end;
+                let start_i = i;
+                while i < items.len() {
+                    let (Ok(off), Ok(len)) =
+                        (u32::try_from(at), u32::try_from(items[i].filter.len()))
+                    else {
+                        break;
+                    };
+                    idx_blob.extend_from_slice(&encode_slot(off, len, &items[i].slot));
+                    body.extend_from_slice(items[i].filter);
+                    at += u64::from(len);
+                    i += 1;
+                }
+                if i == start_i {
+                    self.dirs.drop_after(&mut rolled, 0);
+                    return Err(StoreError::Corrupt("blockfilter body exceeds u32 off"));
+                }
+                let n = (i - start_i) as u64;
+                plans.push(Plan {
+                    si,
+                    body_at: tail_end,
+                    body,
+                    idx_at: HDR + counts[si] * SLOT,
+                    idx: idx_blob,
+                    body_end: at,
+                });
+                counts[si] += n;
+                tail_end = at;
             }
-            if i == start_i {
-                undo_slot_plan(&mut inner.segs, &plans);
-                return Err(StoreError::Corrupt("blockfilter body exceeds u32 off"));
-            }
-            let n = (i - start_i) as u64;
-            plans.push(Plan {
-                si,
-                body_at: tail_end,
-                body,
-                idx_at: HDR + n_slots * SLOT,
-                idx: idx_blob,
-                n,
-                body_end: at,
-            });
-            inner.segs[si].n_slots = inner.segs[si].n_slots.saturating_add(n);
-            tail_end = at;
-        }
-        let mut writes: Vec<ForwardAppend<'_>> = Vec::new();
-        for p in &plans {
-            let seg = &inner.segs[p.si];
-            if !p.body.is_empty() {
+            let pair = |si: usize| -> &SegPair {
+                if si < inner.segs.len() {
+                    &inner.segs[si]
+                } else {
+                    &rolled[si - inner.segs.len()]
+                }
+            };
+            let mut writes: Vec<ForwardAppend<'_>> = Vec::new();
+            for p in &plans {
+                let seg = pair(p.si);
+                if !p.body.is_empty() {
+                    writes.push(ForwardAppend {
+                        file: &seg.body,
+                        at: p.body_at,
+                        bytes: &p.body,
+                        new_logical: p.body_end,
+                    });
+                }
                 writes.push(ForwardAppend {
-                    file: &seg.body,
-                    at: p.body_at,
-                    bytes: &p.body,
-                    new_logical: p.body_end,
+                    file: &seg.idx,
+                    at: p.idx_at,
+                    bytes: &p.idx,
+                    new_logical: p.idx_at + p.idx.len() as u64,
                 });
             }
-            writes.push(ForwardAppend {
-                file: &seg.idx,
-                at: p.idx_at,
-                bytes: &p.idx,
-                new_logical: p.idx_at + p.idx.len() as u64,
-            });
-        }
-        let Some(dir) = self.dirs.idx.parent() else {
-            undo_slot_plan(&mut inner.segs, &plans);
-            return Err(StoreError::Rejected("page guard mark has no directory"));
-        };
-        let committed =
-            page_guard::commit_forward_appends(dir, page_guard::BLOCKFILTER_MARK, &writes);
-        drop(writes);
-        match committed {
-            page_guard::ForwardCommit::Done => {}
-            page_guard::ForwardCommit::Undo(e) => {
-                undo_slot_plan(&mut inner.segs, &plans);
-                if inner.segs.len() > segs_before {
-                    self.dirs.drop_after(&mut inner.segs, segs_before);
+            let committed = match self.dirs.idx.parent() {
+                Some(dir) => {
+                    page_guard::commit_forward_appends(dir, page_guard::BLOCKFILTER_MARK, &writes)
                 }
-                return Err(e);
+                None => page_guard::ForwardCommit::Undo(StoreError::Rejected(
+                    "page guard mark has no directory",
+                )),
+            };
+            drop(writes);
+            match committed {
+                page_guard::ForwardCommit::Done => {}
+                page_guard::ForwardCommit::Undo(e) => {
+                    self.dirs.drop_after(&mut rolled, 0);
+                    return Err(e);
+                }
+                page_guard::ForwardCommit::Keep(e) => {
+                    // The mark may name these files, including a rolled pair.
+                    // Leave them for reopen and publish nothing.
+                    self.blocked
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return Err(e);
+                }
             }
-            page_guard::ForwardCommit::Keep(e) => {
-                // The mark may name these files. Do not undo counts or unlink.
-                self.blocked
-                    .store(true, std::sync::atomic::Ordering::Release);
-                return Err(e);
-            }
+            let tail_end = plans.last().map(|p| p.body_end);
+            (counts, rolled, tail_end)
+        };
+        let mut inner = self.write();
+        inner.segs.append(&mut rolled);
+        for (seg, n) in inner.segs.iter_mut().zip(counts) {
+            seg.n_slots = n;
         }
-        if let Some(last) = plans.last() {
-            inner.tail_end = last.body_end;
+        if let Some(end) = tail_end {
+            inner.tail_end = end;
         }
         Ok(())
     }

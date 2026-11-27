@@ -307,3 +307,57 @@ fn a_later_put_waits_until_the_forward_mark_is_gone() {
     assert_eq!(fs::read(&mark).unwrap(), armed);
     assert_eq!(t.filter(Height(0)).unwrap().unwrap().0, vec![0u8; 3]);
 }
+
+/// A put that fails with its mark still armed keeps the files for reopen.
+/// Readers keep the old prefix: the failed height is not readable.
+#[cfg(debug_assertions)]
+#[test]
+fn a_kept_failed_put_stays_out_of_the_read_watermark() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    rbitcoin_store::page_guard::fail_next_forward_after_arm(&dir);
+    assert!(t
+        .put(&[BlockFilterRecord {
+            height: Height(1),
+            slot: slot(1),
+            filter: &[1, 1, 1, 1],
+        }])
+        .is_err());
+    assert_eq!(t.next_height(), Height(1));
+    assert!(t.slot(Height(1)).unwrap().is_none());
+    assert_eq!(t.slot(Height(0)).unwrap(), Some(slot(0)));
+}
+
+/// A reader of a committed height does not wait for a put's syncs and mark.
+#[test]
+fn a_committed_filter_reads_during_a_put() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    let held = rbitcoin_store::page_guard::hold_marks();
+    std::thread::scope(|scope| {
+        let putting = scope.spawn(|| {
+            t.put(&[BlockFilterRecord {
+                height: Height(1),
+                slot: slot(1),
+                filter: &[1, 1, 1, 1],
+            }])
+        });
+        // Let the put reach the mark hold inside its commit.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = &t;
+        scope.spawn(move || {
+            let _ = tx.send(t.slot(Height(0)).map(|s| s.is_some()));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        assert!(
+            matches!(got, Ok(Ok(true))),
+            "a committed read waited for the put's commit: {got:?}"
+        );
+        putting.join().unwrap().unwrap();
+    });
+    assert_eq!(t.next_height(), Height(2));
+}
