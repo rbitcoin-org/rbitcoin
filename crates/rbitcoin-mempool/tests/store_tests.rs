@@ -436,6 +436,64 @@ fn reused_dead_slot_sync_does_not_resurrect_the_old_tx() {
 }
 
 #[test]
+fn slot_growth_commit_does_not_stamp_the_replacement_dead() {
+    let dir = tmp_dir();
+    let old = Txid::from_byte_array([0xE1; 32]);
+    let new = Txid::from_byte_array([0xE2; 32]);
+    let extra = Txid::from_byte_array([0xE3; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.testing_set_slot_cap(1);
+        let slot = put_live(&mut mp, &old, 1, 400);
+        mp.flush().unwrap();
+        mp.mark_slot_dead(slot).unwrap();
+        let reused = put_live(&mut mp, &new, 2, 400);
+        assert_eq!(reused, slot, "the dead slot is reused");
+        let grown = put_live(&mut mp, &extra, 3, 400);
+        assert_ne!(grown, slot, "a full live table grows a new slot");
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(
+        ids.contains(&new),
+        "the growth commit must not leave a death on the reused slot"
+    );
+    assert!(!ids.contains(&old));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn truncated_flush_mark_is_quarantined_with_the_sidecar() {
+    let dir = tmp_dir();
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        put_live(&mut mp, &Txid::from_byte_array([0xF1; 32]), 1, 400);
+        mp.flush().unwrap();
+    }
+    fs::write(dir.join("fee_history"), b"keep").unwrap();
+    fs::create_dir_all(dir.join("guard")).unwrap();
+    fs::write(dir.join("guard/flush"), b"torn").unwrap();
+    rbitcoin_mempool::ActiveMempool::open_or_create(&dir)
+        .expect("a torn flush mark is quarantined with the sidecar");
+    assert!(!dir.join("guard/flush").exists());
+    assert!(dir.join("fee_history").is_file());
+    assert!(
+        fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|ent| ent.ok())
+            .any(|ent| ent.file_name().to_string_lossy().starts_with("torn-")),
+        "the unreadable mark moves aside with the sidecar"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn reused_dead_slot_persist_due_publishes_the_new_tx() {
     let dir = tmp_dir();
     let old = Txid::from_byte_array([0xB1; 32]);
