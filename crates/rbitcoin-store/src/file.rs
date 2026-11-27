@@ -931,6 +931,19 @@ impl TableFile {
 
     /// [`Self::pwrite_all`] against a `committed` end the caller sampled.
     fn pwrite_checked(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        #[cfg(debug_assertions)]
+        crate::write_probe::write(
+            &self.path,
+            committed,
+            offset,
+            bytes,
+            self.trailing_header,
+            if self.trailing_header {
+                0
+            } else {
+                FILE_HEADER_LEN as u64
+            },
+        );
         if !bytes.is_empty() {
             // Committed end is the durable header, not a RAM high-water.
             // A shared page has to be one this file's current arm names.
@@ -1426,9 +1439,15 @@ impl TableFile {
                 std::io::Error::from_raw_os_error(5),
             ));
         }
-        self.read_file
+        let r = self
+            .read_file
             .durable_sync_data()
-            .map_err(|e| StoreError::io(&self.path, e))
+            .map_err(|e| StoreError::io(&self.path, e));
+        #[cfg(debug_assertions)]
+        if r.is_ok() {
+            crate::write_probe::synced(&self.path);
+        }
+        r
     }
 
     /// [`Self::sync_data_only`] on every file, with the waits overlapped.
@@ -1501,6 +1520,10 @@ impl TableFile {
                 r => return Err(StoreError::io(*path, std::io::Error::from_raw_os_error(-r))),
             }
         }
+        #[cfg(debug_assertions)]
+        for f in files {
+            crate::write_probe::synced(&f.path);
+        }
         Ok(())
     }
 
@@ -1539,11 +1562,17 @@ impl TableFile {
                 std::io::Error::from_raw_os_error(5),
             ));
         }
-        self.file
+        let r = self
+            .file
             .lock()
             .unwrap()
             .durable_sync_data()
-            .map_err(|e| StoreError::io(&self.path, e))
+            .map_err(|e| StoreError::io(&self.path, e));
+        #[cfg(debug_assertions)]
+        if r.is_ok() {
+            crate::write_probe::synced(&self.path);
+        }
+        r
     }
 
     /// Persist HWM / trailer without waiting on `sync_data`.

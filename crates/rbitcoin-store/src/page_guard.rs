@@ -300,6 +300,8 @@ pub fn clear_page_guard_files(path: &Path, files: &[(&File, &Path)]) -> Result<(
     for (data, data_path) in files {
         data.durable_sync_data()
             .map_err(|e| StoreError::io(*data_path, e))?;
+        #[cfg(debug_assertions)]
+        crate::write_probe::synced(data_path);
     }
     let mut synced = HashSet::with_capacity(files.len());
     for (_, data_path) in files {
@@ -513,6 +515,8 @@ pub fn clear_page_guard_rel(
     for (data, data_path) in files {
         data.durable_sync_data()
             .map_err(|e| StoreError::io(*data_path, e))?;
+        #[cfg(debug_assertions)]
+        crate::write_probe::synced(data_path);
     }
     let mut synced = HashSet::with_capacity(files.len());
     for (_, data_path) in files {
@@ -929,4 +933,21 @@ fn mark_group_pages(raw: &[u8]) -> Result<Vec<(String, u64, usize)>, StoreError>
         return Err(StoreError::Corrupt("page guard mark length"));
     }
     Ok(pages)
+}
+
+/// PROBE v4 ONLY: `path` has an arm whose pages cover the whole write.
+#[cfg(debug_assertions)]
+pub(crate) fn probe_armed_covers(path: &Path, offset: u64, len: u64) -> bool {
+    let map = armed_map().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pages) = map.get(path) else {
+        return false;
+    };
+    let mut page = offset & !(PAGE - 1);
+    while page < offset + len {
+        if !pages.contains(&page) {
+            return false;
+        }
+        page += PAGE;
+    }
+    true
 }
