@@ -219,6 +219,37 @@ fn an_mlt_append_is_durable_before_a_head_mark_that_names_only_the_head() {
     cleanup_hh(&path);
 }
 
+/// A head flush whose `.mlt` length flush fails leaves that length in RAM.
+/// The next flush finishes it instead of refusing the rows as an overwrite.
+#[test]
+fn a_failed_mlt_length_flush_is_finished_by_the_next_insert() {
+    let path = tmp_path();
+    let mut k1 = [0u8; 32];
+    k1[0] = 0xab;
+    k1[15] = 1;
+    k1[16] = 1;
+    let mut k2 = k1;
+    k2[16] = 2;
+    let mut k3 = k1;
+    k3[16] = 3;
+    {
+        let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
+        h.insert(&k1, Fk(10)).unwrap();
+        h.flush().unwrap();
+        rbitcoin_store::io_handle::arm_fail_flush(h.multi.file.io_handle(), 1);
+        assert!(h.insert(&k2, Fk(20)).is_err());
+        h.insert(&k3, Fk(30)).unwrap();
+        h.flush().unwrap();
+    }
+    let h = HashHead::open(&path).unwrap();
+    let all = h.get_all(&k1).unwrap();
+    assert!(
+        all.contains(&Fk(10)) && all.contains(&Fk(30)),
+        "the insert after a failed .mlt flush must land, got {all:?}"
+    );
+    cleanup_hh(&path);
+}
+
 #[test]
 fn persist_survives_reopen() {
     let path = tmp_path();
