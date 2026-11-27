@@ -282,6 +282,18 @@ pub fn fuse_key16(key: &ShHeadKey) -> u64 {
     fuse_key_from_mixed(&pad)
 }
 
+/// Remove a segment [`SortedHead::write`] left unpublished: data, index, fuse.
+pub(crate) fn remove_sorted_head_files(data: &Path) -> Result<(), StoreError> {
+    for path in [data.to_path_buf(), idx_path(data), fuse_path(data)] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StoreError::io(&path, e)),
+        }
+    }
+    Ok(())
+}
+
 #[doc(hidden)]
 pub fn idx_path(data: &Path) -> PathBuf {
     let mut s = data.as_os_str().to_os_string();
