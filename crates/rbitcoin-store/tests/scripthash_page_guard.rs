@@ -412,6 +412,10 @@ fn sh_page_guard_kept_tmp_open() {
     let torn = guard.join("sh-ovf.tmp");
     std::fs::write(&torn, b"torn").unwrap();
     let s = Store::open_tiny(&path).unwrap();
+    assert!(
+        !path.join(SH_REBUILD_NAME).exists(),
+        "open read the unpublished temp as a mark"
+    );
     std::fs::create_dir_all(&guard).unwrap();
     std::fs::write(&torn, b"torn").unwrap();
     s.scripthash.reset_all_bodies().unwrap();
