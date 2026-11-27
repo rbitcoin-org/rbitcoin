@@ -578,3 +578,30 @@ fn read_offs_run_reads_the_next_slot() {
         "{err:?}"
     );
 }
+
+/// A put that fails with its mark armed keeps the files for reopen, and
+/// readers keep the old prefix. Truncate and trim wait for reopen too: they
+/// would change a file the mark still names.
+#[cfg(debug_assertions)]
+#[test]
+fn a_kept_failed_put_stays_out_of_reads_and_blocks_cuts() {
+    let dir = tmp_dir();
+    let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    let mut tweak = [0u8; 33];
+    tweak[0] = 0x02;
+    t.put_block(Height(0), &[Some(tweak)]).unwrap();
+    rbitcoin_store::page_guard::fail_next_forward_after_arm(&dir);
+    assert!(t.put_block(Height(1), &[Some(tweak)]).is_err());
+    assert_eq!(t.next_height(), Height(1));
+    assert!(t.get_block(Height(1), 1).unwrap().is_none());
+    assert_eq!(t.get_block(Height(0), 1).unwrap(), Some(vec![Some(tweak)]));
+    assert!(matches!(
+        t.truncate_keep_slots(0),
+        Err(rbitcoin_store::StoreError::Rejected(_))
+    ));
+    assert!(matches!(
+        t.trim_last_record(1),
+        Err(rbitcoin_store::StoreError::Rejected(_))
+    ));
+    assert_eq!(t.get_block(Height(0), 1).unwrap(), Some(vec![Some(tweak)]));
+}
