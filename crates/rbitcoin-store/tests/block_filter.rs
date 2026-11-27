@@ -201,6 +201,38 @@ fn rolls_a_segment_when_the_next_start_passes_u32() {
 }
 
 #[test]
+fn put_rolls_mid_batch_when_the_next_start_passes_u32() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    drop(t);
+    // Height 0 now ends 3 bytes before the u32 offset limit, so the next
+    // put's first record still fits and the one after it must roll.
+    let end = u32::MAX - 3;
+    let len = end - FILE_HEADER_LEN as u32;
+    let idx = BlockFilterTable::seg_dirs(&dir).idx_path(0);
+    let mut raw = fs::read(&idx).unwrap();
+    raw[FILE_HEADER_LEN + 4..FILE_HEADER_LEN + 8].copy_from_slice(&len.to_le_bytes());
+    fs::write(&idx, &raw).unwrap();
+    let body = BlockFilterTable::seg_dirs(&dir).body_path(0);
+    set_file_hwm(&body, u64::from(end));
+    // Sparse room past the logical end: a write near u32::MAX must not
+    // fallocate the hole from offset 0.
+    let f = fs::OpenOptions::new().write(true).open(&body).unwrap();
+    f.set_len(u64::from(end) + (1 << 20)).unwrap();
+    drop(f);
+
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    assert_eq!(t.next_height(), Height(1));
+    put_range(&t, 1, 3);
+    assert!(BlockFilterTable::seg_dirs(&dir).body_path(1).is_file());
+    assert_eq!(t.filter(Height(1)).unwrap().unwrap().0, vec![1u8; 4]);
+    assert_eq!(t.filter(Height(2)).unwrap().unwrap().0, vec![2u8; 5]);
+    assert_eq!(t.filter(Height(3)).unwrap().unwrap().0, vec![3u8; 6]);
+    assert_eq!(t.next_height(), Height(4));
+}
+
+#[test]
 fn block_filter_slot_roundtrip_keeps_the_row() {
     let row = decode_slot(&encode_slot(9, 40, &slot(3)));
     assert_eq!(row.off, 9);

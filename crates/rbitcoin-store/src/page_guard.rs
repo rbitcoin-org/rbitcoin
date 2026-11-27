@@ -881,14 +881,14 @@ pub fn commit_forward_appends(
         #[cfg(debug_assertions)]
         if take_fail_forward(dir) {
             return Err(StoreError::io(
-                &dir.join(mark),
+                dir.join(mark),
                 std::io::Error::other("injected forward guard failure"),
             ));
         }
         for (fi, off, image) in &images {
             let file = files[*fi];
             file.ensure_capacity(off.saturating_add(PAGE))?;
-            file.pwrite_all(*off, image)?;
+            write_restored_page(&file.read_file, file.path(), *off, image, false)?;
         }
         let live: Vec<(&File, &Path)> = images
             .iter()
