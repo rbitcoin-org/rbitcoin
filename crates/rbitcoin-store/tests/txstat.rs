@@ -24,12 +24,23 @@ fn txstat_blob_longer_than_the_file_is_corrupt() {
 #[test]
 fn page0_stamp_is_not_in_the_txstat_mark() {
     let dir = TempDir::labeled("txstat-page0").unwrap();
-    let rows: Vec<TxStatRow> = (1..=4u64).map(|i| tiny(i, 100, 10)).collect();
+    // Past one page, so page 0 is not also the partial tail.
+    let rows: Vec<TxStatRow> = (1..=600u64).map(|i| tiny(i, 100, 10)).collect();
     let stamped = tiny(9, 9, 9);
     {
         let t = TxStat::create(&dir).unwrap();
         t.append_batch(0, &rows).unwrap();
+        // The trace sees an arm that is cleared before `write_row` returns.
+        #[cfg(debug_assertions)]
+        rbitcoin_store::page_guard::arm_store_mark_trace();
         t.write_row(Fk(1), &stamped).unwrap();
+        #[cfg(debug_assertions)]
+        assert!(
+            !rbitcoin_store::page_guard::take_armed_store_marks()
+                .iter()
+                .any(|m| m == rbitcoin_store::page_guard::TXSTAT_MARK),
+            "a page-0 stamp armed guard/txstat"
+        );
         assert!(
             !dir.join("guard/txstat").exists(),
             "a page-0 stamp is the Class A first page, not this mark"
@@ -275,11 +286,32 @@ fn append_batch_relies_on_the_class_a_tail_guard() {
     let t = TxStat::create(&dir).unwrap();
     t.append_batch(0, &[tiny(1, 2, 3)]).unwrap();
     assert_eq!(t.count(), 1);
+    // The trace sees an arm that is cleared before the append returns.
+    #[cfg(debug_assertions)]
+    rbitcoin_store::page_guard::arm_store_mark_trace();
+    let rows: Vec<TxStatRow> = (2..=1200u64).map(|i| tiny(i, 100, 10)).collect();
+    t.append_batch(1, &rows).unwrap();
+    #[cfg(debug_assertions)]
+    assert!(
+        !rbitcoin_store::page_guard::take_armed_store_marks()
+            .iter()
+            .any(|m| m == rbitcoin_store::page_guard::TXSTAT_MARK),
+        "an append armed guard/txstat"
+    );
     assert!(!dir.join("txstat.body.ahead").exists());
     assert!(
         !dir.join("guard/txstat").exists(),
         "an append-only batch stays on the Class A tail guard"
     );
+    // An interior stamp does arm it, so the trace is live.
+    #[cfg(debug_assertions)]
+    {
+        rbitcoin_store::page_guard::arm_store_mark_trace();
+        t.write_row(Fk(600), &tiny(9, 9, 9)).unwrap();
+        assert!(rbitcoin_store::page_guard::take_armed_store_marks()
+            .iter()
+            .any(|m| m == rbitcoin_store::page_guard::TXSTAT_MARK));
+    }
     let _ = std::fs::remove_dir_all(dir.path());
 }
 

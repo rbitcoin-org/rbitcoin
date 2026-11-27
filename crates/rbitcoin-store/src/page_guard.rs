@@ -380,7 +380,35 @@ pub fn arm_store_group(
         return Ok(());
     }
     promote_meta_31(dir)?;
-    arm_page_guard_group(&dir.join(mark), pages)
+    arm_page_guard_group(&dir.join(mark), pages)?;
+    #[cfg(debug_assertions)]
+    ARM_TRACE.with(|trace| {
+        if let Some(marks) = trace.borrow_mut().as_mut() {
+            marks.push(mark.to_string());
+        }
+    });
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static ARM_TRACE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record the marks [`arm_store_group`] publishes on this thread, including
+/// one a later clear removes before the call returns.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_store_mark_trace() {
+    ARM_TRACE.with(|trace| *trace.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop recording and return the marks armed since [`arm_store_mark_trace`].
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_armed_store_marks() -> Vec<String> {
+    ARM_TRACE.with(|trace| trace.borrow_mut().take().unwrap_or_default())
 }
 
 /// `guard/sh-<shard>` for one scripthash body (`00` or `ovf`).
