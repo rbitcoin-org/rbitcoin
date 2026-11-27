@@ -12,9 +12,10 @@
 //! **Commit model:** body tail complete → slot LIVE → RAM graph. No fsync per
 //! tx. Admits persist on a 5 s timer ([`ActiveMempool::persist_due`]); that path
 //! is one `mempool/guard/flush` mark covering the body tail, the new LIVE slot
-//! records, any durable DEAD bytes, and `meta`. Tip-follow drives it from the
-//! perf tick. Confirm/RBF DEAD of an already-durable slot waits for that same
-//! flush (not a one-byte pwrite, not a full slot dump, not one sync per tx).
+//! records, any durable DEAD bytes, and `meta`. Tip-follow drives admits from
+//! the perf tick. A removal (`remove_block_txids`, RBF, expiry, `remove_txid`)
+//! publishes its DEAD bytes on that same mark immediately, without waiting for
+//! the tick (not a one-byte pwrite, not a full slot dump, not one sync per tx).
 //! [`ActiveMempool::flush`] bumps `G` and publishes the body, the slot table,
 //! and `meta` in that mark. `tx.body` is not renamed. Crash may lose ≤5 s of
 //! admits; never LIVE slots past durable `tx.body`. Leftover schema 1–3
