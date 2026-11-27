@@ -256,7 +256,20 @@ fn a_budget_pass_syncs_its_deaths_once() {
     let meta = dir.path().join("meta");
 
     mp.max_weight = 0;
+    #[cfg(all(unix, debug_assertions))]
+    rbitcoin_store::file::arm_fsync_dir_trace();
     assert_eq!(mp.evict_to_budget(None).unwrap().len(), 4, "four chunks");
+    // One mark publish and one clear each sync guard/. Four evictions that
+    // each flushed would sync it eight times.
+    #[cfg(all(unix, debug_assertions))]
+    {
+        let guard = dir.path().join("guard");
+        let syncs = rbitcoin_store::file::take_fsynced_dirs()
+            .into_iter()
+            .filter(|d| *d == guard)
+            .count();
+        assert_eq!(syncs, 2, "one guard/flush publish and one clear per pass");
+    }
 
     let raw = std::fs::read(&meta).unwrap();
     let mut got = [0u8; META_LEN];
