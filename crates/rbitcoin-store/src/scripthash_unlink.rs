@@ -346,6 +346,10 @@ impl ScriptHashTable {
             let first = &batch.rewrites[jobs[0]];
             let body = self.body_for(&first.scripthash, super::KeyHome::from(first.home));
             let popped = jobs.iter().any(|&i| batch.rewrites[i].popped);
+            {
+                let alloc_mu = self.alloc_for(&first.scripthash, super::KeyHome::from(first.home));
+                super::publish_bump(body, &alloc_mu.lock().unwrap())?;
+            }
             if popped {
                 let alloc_mu = self.alloc_for(&first.scripthash, super::KeyHome::from(first.home));
                 let alloc = alloc_mu.lock().unwrap();
@@ -411,6 +415,9 @@ impl ScriptHashTable {
             for &i in jobs {
                 let job = &batch.rewrites[i];
                 alloc.live_count = alloc.live_count.saturating_sub(job.removed);
+                for &(class, off) in &job.staged.gaps {
+                    self.free_slab(body, &mut alloc, class, off)?;
+                }
                 if let Err(e) = self.free_if_paged(body, &mut alloc, &job.old) {
                     if body.sync_data_only().is_ok() {
                         let _ = write_alloc_header(body, &alloc);
@@ -697,7 +704,8 @@ impl ScriptHashTable {
                     boundary,
                     creates,
                 };
-                let prepared = prepare_boundary(self, body, &mut alloc, &pack, &keep)?;
+                let mut gaps = Vec::new();
+                let prepared = prepare_boundary(self, body, &mut alloc, &pack, &keep, &mut gaps)?;
                 let new_head = if prepared.new_last == old_last && drop_pages.is_empty() {
                     None
                 } else {
@@ -711,8 +719,10 @@ impl ScriptHashTable {
                     dirty.push(off);
                 }
                 dirty.extend_from_slice(&drop_pages);
+                dirty.extend(gaps.iter().map(|&(_, off)| off));
                 let armed =
                     self.arm_suffix_pages(body, scripthash, home, &dirty, new_head.is_some())?;
+                super::publish_bump(body, &alloc)?;
                 if boundary != old_last {
                     self.retire_head_page(body, &mut alloc, scripthash, home, old_last, &pack)?;
                 }
@@ -735,6 +745,9 @@ impl ScriptHashTable {
                 )?;
                 for off in drop_pages {
                     self.free_slab(body, &mut alloc, SH_PAGE_SLAB_CLASS, off)?;
+                }
+                for (class, off) in gaps {
+                    self.free_slab(body, &mut alloc, class, off)?;
                 }
                 body.sync_data_only()?;
                 write_alloc_header(body, &alloc)?;
@@ -1025,6 +1038,7 @@ pub fn prepare_boundary(
     alloc: &mut AllocState,
     pack: &BoundaryPack,
     keep: &[u64],
+    gaps: &mut Vec<(u8, u64)>,
 ) -> Result<PreparedTail, StoreError> {
     if keep.is_empty() {
         return Err(StoreError::Corrupt("scripthash suffix keep is empty"));
@@ -1049,7 +1063,7 @@ pub fn prepare_boundary(
     }
     let (s0, e0) = chunks[0];
     let (s1, e1) = chunks[1];
-    let tail_off = table.alloc_page(body, alloc)?;
+    let tail_off = table.alloc_page(body, alloc, gaps)?;
     let mut tail = [0u8; SH_PAGE_SIZE];
     sh_page_pack_extent_last_fks(&mut tail, &keep[s1..e1], pack.base, pack.extent_n, 0)?;
     sh_page_set_extent_creates(&mut tail, pack.creates);
@@ -1278,7 +1292,12 @@ pub fn arm_undo(
     word: Option<HeadWord>,
 ) -> Result<UndoRec, StoreError> {
     let old_page = read_page(body, target)?;
-    let image = table.alloc_page(body, alloc)?;
+    let mut gaps = Vec::new();
+    let image = table.alloc_page(body, alloc, &mut gaps)?;
+    super::publish_bump(body, alloc)?;
+    for (class, off) in gaps {
+        table.free_slab(body, alloc, class, off)?;
+    }
     body.write_at(image, &old_page)?;
     // The image and the header are different blocks. Publish SHUN only after
     // the image is durable, or recovery copies an unwritten page onto the tail.
