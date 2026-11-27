@@ -239,6 +239,28 @@ fn arm_syncs_the_store_directory_when_guard_is_new() {
 }
 
 #[test]
+fn arm_syncs_the_store_directory_when_guard_already_exists() {
+    let dir = TempDir::labeled("page-guard-old-dir").unwrap();
+    let guard = dir.path().join("guard");
+    std::fs::create_dir(&guard).unwrap();
+    let mark = guard.join("mark");
+    let page = fill(0x01);
+    #[cfg(unix)]
+    {
+        rbitcoin_store::file::arm_fsync_dir_trace();
+        arm_page_guard(&mark, &[(0, &page)]).unwrap();
+        let dirs = rbitcoin_store::file::take_fsynced_dirs();
+        assert!(
+            dirs.iter().any(|d| d == dir.path()),
+            "a guard directory left by a failed sync must still be synced, got {dirs:?}"
+        );
+    }
+    #[cfg(not(unix))]
+    arm_page_guard(&mark, &[(0, &page)]).unwrap();
+    assert!(mark.is_file());
+}
+
+#[test]
 fn append_past_end_writes_only_a_fresh_page() {
     let dir = TempDir::labeled("page-guard-append").unwrap();
     let path = dir.path().join("live");
