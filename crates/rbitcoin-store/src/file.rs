@@ -972,17 +972,18 @@ impl TableFile {
         self.pread_at(offset, buf)
     }
 
-    /// Publish bytes that share a 4 KiB block with a committed byte only when
-    /// those pages are the ones the current `page_guard` arm names. The
-    /// committed end is the durable header length, not a RAM high-water.
+    /// Publish bytes below the committed end only when this file has no live
+    /// `page_guard` arm or those pages are the ones it names. Bytes at or past
+    /// the committed end are an append. The committed end is the durable
+    /// header length, not a RAM high-water.
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         self.write_at_pwrite(offset, bytes)
     }
 
-    /// Bytes strictly past the committed end, sharing no 4 KiB block with it.
+    /// Bytes at or past the committed end, including the committed tail block.
     ///
-    /// That is the append door. A range that still shares a committed page
-    /// has to be inside the current `page_guard` arm. `published_len` stays
+    /// That is the append door (crash-recovery.md, the sector rule).
+    /// `published_len` stays
     /// put until the caller commits, so a later failed write does not move
     /// readers.
     pub fn write_uncommitted(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
@@ -1351,8 +1352,9 @@ impl TableFile {
 
     /// Punch a hole over `[offset, offset+len)`.
     ///
-    /// A range that shares a committed 4 KiB block has to be one the current
-    /// `page_guard` arm names. The committed end is the durable header length.
+    /// A range below the committed end of a file with a live `page_guard` arm
+    /// has to be inside the pages that arm names. The committed end is the
+    /// durable header length.
     pub fn zero_range(&self, offset: u64, len: u64) -> Result<(), StoreError> {
         if len == 0 {
             return Ok(());
