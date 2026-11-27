@@ -185,12 +185,10 @@ fn ensure_batch_syncs_the_body_before_the_head() {
     assert!(matches!(err, StoreError::Io { .. }), "{err}");
     drop(t);
     // The forward body mark finishes the append on open, and open indexes the
-    // row. The head may name it only as a row that is on disk.
+    // row.
     let t = HeaderTable::open_tiny(&dir).expect("open after a failed body sync");
-    if let Some((fk, rec)) = t.get_by_hash(&g.hash).unwrap() {
-        assert_eq!(rec.hash, g.hash);
-        assert_eq!(t.get(fk).unwrap().hash, g.hash);
-    }
+    assert_eq!(t.get_by_hash(&g.hash).unwrap(), Some((Fk(1), g.clone())));
+    assert_eq!(t.get(Fk(1)).unwrap().hash, g.hash);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
