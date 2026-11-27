@@ -785,6 +785,54 @@ fn a_retry_after_an_invisible_arm_failure_publishes_the_slot() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// An admit's body is synced but its arm fails before the mark is visible.
+/// A death-only flush then arms and fails. Settling that mark must not move
+/// the slot watermark past the admit: its slot is in no mark, so the next
+/// persist has to write it, and a crash after that reopens with the admit.
+#[cfg(debug_assertions)]
+#[test]
+fn settling_a_death_mark_keeps_an_unpublished_admit_slot() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let first = Txid::from_byte_array([0xE4; 32]);
+    let second = Txid::from_byte_array([0xE5; 32]);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    mp.set_now_ms(0);
+    let first_slot = put_live(&mut mp, &first, 1, 400);
+    mp.set_now_ms(PERSIST_INTERVAL_MS);
+    mp.persist_due().unwrap();
+    put_live(&mut mp, &second, 2, 400);
+    // A file where `guard/` should be: the arm fails before any rename.
+    let guard = dir.join("guard");
+    let _ = fs::remove_dir_all(&guard);
+    fs::write(&guard, b"x").unwrap();
+    mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
+    assert!(mp.persist_due().is_err());
+    fs::remove_file(&guard).unwrap();
+    // A death-only flush arms its mark, then fails before its writes.
+    mp.mark_slot_dead(first_slot).unwrap();
+    fail_next_mempool_guard_before_write(&dir);
+    assert!(mp.sync_deaths().is_err());
+    assert!(dir.join("guard/flush").is_file());
+    mp.set_now_ms(PERSIST_INTERVAL_MS * 3);
+    mp.persist_due().unwrap();
+    // The process dies here: nothing flushes on the way out.
+    std::mem::forget(mp);
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(!live.contains(&first));
+    assert!(
+        live.contains(&second),
+        "settling the death mark dropped the admit's slot"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A failed persist leaves `guard/flush` armed with the admit's LIVE slot.
 /// Removing that tx before the next persist must reach disk, or open
 /// replays the mark and loads the removed tx as LIVE.

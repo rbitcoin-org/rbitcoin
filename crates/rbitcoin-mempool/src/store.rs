@@ -137,9 +137,10 @@ pub struct Mempool {
     pub body_dirty: bool,
     /// On-disk body length that slots may legally index (header + durable payloads).
     pub body_persisted_len: u64,
-    /// Durable body length, synced and published. It runs ahead of
-    /// `body_persisted_len` between a body append and the mark that
-    /// publishes the slots naming those records.
+    /// Durable body length, synced and published. The next append starts
+    /// here. It runs ahead of `body_persisted_len` while the slots naming
+    /// those records are unpublished, and it bounds the deaths a removal
+    /// queues: any slot naming a durable record may be LIVE on disk.
     body_synced_len: u64,
     pub opened: Instant,
     pub mock_now_ms: Option<u64>,
@@ -484,8 +485,10 @@ impl Mempool {
         self.slots[off] = SLOT_DEAD;
         self.live_count = self.live_count.saturating_sub(1);
         self.live_body_bytes = self.live_body_bytes.saturating_sub(body_len);
-        // An armed flush mark may name this slot LIVE: open would replay it.
-        if body_off.saturating_add(body_len) <= self.body_persisted_len || self.flush_mark_armed {
+        // A slot whose record is durable may be LIVE on disk: a persist, or
+        // a mark open or a retry restored, can have published it. An armed
+        // flush mark may name it LIVE too: open would replay it.
+        if body_off.saturating_add(body_len) <= self.body_synced_len || self.flush_mark_armed {
             self.death_slots.push(slot);
             self.deaths_unsynced = true;
         }
@@ -1096,12 +1099,15 @@ impl Mempool {
             let _hold = rbitcoin_store::page_guard::hold_marks();
             restore_mempool_mark(&self.dir)?;
         }
+        // The disk body length is durable, so the next append starts there.
+        // It is not the slot watermark: the mark just restored may not hold
+        // the slots that name those records, and the next persist must write
+        // them. The watermark moves only when a mark publishes those slots.
         let page0 = read_page(&mut self.body_file, body_path, 0)?;
         let disk = le_u64!(page0, 8);
-        if disk > self.body_persisted_len && disk <= body_logical_len(&self.body)? as u64 {
-            self.body_persisted_len = disk;
+        if disk <= body_logical_len(&self.body)? as u64 {
+            self.body_synced_len = self.body_synced_len.max(disk);
         }
-        self.body_synced_len = self.body_synced_len.max(self.body_persisted_len);
         self.flush_mark_armed = false;
         Ok(())
     }
