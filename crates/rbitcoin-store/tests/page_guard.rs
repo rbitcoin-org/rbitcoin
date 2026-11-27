@@ -675,3 +675,26 @@ fn group_restore_syncs_a_nested_file_parent_before_the_mark_is_gone() {
     );
     assert_eq!(read_bytes(&live, 0, PAGE), image);
 }
+
+/// An empty live file takes every image in full, whatever the record order.
+#[test]
+fn fit_restore_fills_an_empty_file_with_every_page() {
+    let dir = TempDir::labeled("page-guard-fit-empty").unwrap();
+    let live = dir.path().join("scripthash.ovf").join("ingest");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::fs::File::create(&live).unwrap();
+    let mark = dir.path().join("guard/sh-ovf");
+    let (low, high) = (fill(0x61), fill(0x62));
+    arm_page_guard_group(
+        &mark,
+        &[
+            ("scripthash.ovf/ingest", 0, low.as_slice()),
+            ("scripthash.ovf/ingest", PAGE as u64, high.as_slice()),
+        ],
+    )
+    .unwrap();
+    assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
+    assert_eq!(std::fs::metadata(&live).unwrap().len(), 2 * PAGE as u64);
+    assert_eq!(read_bytes(&live, 0, PAGE), low);
+    assert_eq!(read_bytes(&live, PAGE as u64, PAGE), high);
+}
