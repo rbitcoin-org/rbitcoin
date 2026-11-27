@@ -278,7 +278,7 @@ itself changed.
     blockfilter.idx/NNNNNN            # 80 B slot per height from 0: off:u32 ‖ len:u32 ‖ header_fk:u64 ‖ filter_hash[32] ‖ filter_header[32]
     blockfilter.body/NNNNNN           # filter bytes (Core `BlockFilter` content), records back to back, no prefix; new NNNNNN pair when the next start passes u32. Commit: an append with no mark (body bytes, then idx bytes, synced; then the body length, then the idx length, each synced). Open keeps the slot prefix whose records run back to back inside the body, cuts the body to its end, and drops slots whose header_fk is not confirmed[h]. Missing dirs: index off / not built
 
-  mempool/guard/flush              # one forward 4 KiB mark for a mempool flush: body tail, new LIVE slots, durable DEAD bytes, and meta. tx.body is not renamed. No SCHEMA_VERSION bump
+  mempool/guard/flush              # one forward 4 KiB mark for a mempool flush: new LIVE slots, durable DEAD bytes, and meta (tx.body appends and publishes its length before the mark). tx.body is not renamed. No SCHEMA_VERSION bump
 
 <datadir-cold>/                  # only when --datadir-cold is set
   store/
