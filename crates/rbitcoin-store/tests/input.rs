@@ -337,3 +337,33 @@ fn append_rejects_n_in_past_u16() {
     assert!(matches!(err, StoreError::Corrupt("input n_in")));
     assert_eq!(t.count(), 0);
 }
+
+/// Staged rows move only the RAM lengths: a reader sees them, and the
+/// durable lengths stay put until `publish_staged` syncs the rows first.
+/// Enough creates to cross a checkpoint window, so `input.off` is staged too.
+#[test]
+fn staged_rows_publish_only_after_their_sync() {
+    let dir = TempDir::labeled("input-staged").unwrap();
+    let t = Input::create(dir.path()).unwrap();
+    t.append(&[vec![InputEdge::coinbase()]]).unwrap();
+    let staged: Vec<Vec<InputEdge>> = (0..1100).map(|i| vec![edge(1, i)]).collect();
+    t.append_staged(&staged).unwrap();
+    assert_eq!(t.count(), 1101);
+    assert_eq!(t.edges(Fk(1101)).unwrap().unwrap(), vec![edge(1, 1099)]);
+    assert_eq!(
+        Input::open(dir.path()).unwrap().count(),
+        1,
+        "nothing durable yet"
+    );
+    t.publish_staged().unwrap();
+    let reopened = Input::open(dir.path()).unwrap();
+    assert_eq!(reopened.count(), 1101);
+    assert_eq!(
+        reopened.edges(Fk(1101)).unwrap().unwrap(),
+        vec![edge(1, 1099)]
+    );
+    assert_eq!(
+        reopened.edges(Fk(1)).unwrap().unwrap(),
+        vec![InputEdge::coinbase()]
+    );
+}
