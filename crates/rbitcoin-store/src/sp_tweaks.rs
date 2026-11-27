@@ -56,6 +56,8 @@ pub struct SpTweaksTable {
     pub dirs: SegDirs,
     pub origin: u32,
     pub inner: Mutex<Inner>,
+    /// A forward mark may still name the last failed put. Reopen restores it.
+    blocked: std::sync::atomic::AtomicBool,
 }
 
 impl SpTweaksTable {
@@ -115,6 +117,7 @@ impl SpTweaksTable {
             dirs,
             origin: origin.0,
             inner: Mutex::new(Inner { segs: vec![seg] }),
+            blocked: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -159,7 +162,24 @@ impl SpTweaksTable {
             dirs,
             origin,
             inner: Mutex::new(Inner { segs }),
+            blocked: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    fn refuse_pending_mark(&self) -> Result<(), StoreError> {
+        if self.blocked.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(StoreError::Rejected(
+                "sp_tweaks forward mark is still armed",
+            ));
+        }
+        if let Some(dir) = self.dirs.idx.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if dir.join(page_guard::SP_TWEAKS_MARK).is_file() {
+                return Err(StoreError::Rejected(
+                    "sp_tweaks forward mark is still armed",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Open existing dirs, or create empty ones. Leftover single files are dropped.
@@ -448,6 +468,7 @@ impl SpTweaksTable {
             }
             expect = Height(expect.0.saturating_add(1));
         }
+        self.refuse_pending_mark()?;
         let mut inner = self.lock();
         let segs_before = inner.segs.len();
         let mut i = 0usize;
@@ -558,12 +579,20 @@ impl SpTweaksTable {
         let committed =
             page_guard::commit_forward_appends(dir, page_guard::SP_TWEAKS_MARK, &writes);
         drop(writes);
-        if let Err(e) = committed {
-            undo_slot_plan(&mut inner.segs, &plans);
-            if inner.segs.len() > segs_before && !dir.join(page_guard::SP_TWEAKS_MARK).is_file() {
-                self.dirs.drop_after(&mut inner.segs, segs_before);
+        match committed {
+            page_guard::ForwardCommit::Done => {}
+            page_guard::ForwardCommit::Undo(e) => {
+                undo_slot_plan(&mut inner.segs, &plans);
+                if inner.segs.len() > segs_before {
+                    self.dirs.drop_after(&mut inner.segs, segs_before);
+                }
+                return Err(e);
             }
-            return Err(e);
+            page_guard::ForwardCommit::Keep(e) => {
+                self.blocked
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(e);
+            }
         }
         Ok(())
     }

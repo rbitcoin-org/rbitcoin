@@ -779,6 +779,18 @@ fn take_fail_forward(dir: &Path) -> bool {
     true
 }
 
+/// Result of [`commit_forward_appends`].
+///
+/// `Undo` means no mark was published, so the caller can drop the RAM plan.
+/// `Keep` means a mark may still name this commit. The caller must not undo
+/// slot counts or delete segment files. A later put has to wait for reopen.
+#[doc(hidden)]
+pub enum ForwardCommit {
+    Done,
+    Undo(StoreError),
+    Keep(StoreError),
+}
+
 /// Publish one forward append group.
 ///
 /// Fresh 4 KiB blocks (strictly past the committed tail block) are synced
@@ -790,15 +802,15 @@ pub fn commit_forward_appends(
     dir: &Path,
     mark: &str,
     writes: &[ForwardAppend<'_>],
-) -> Result<(), StoreError> {
+) -> ForwardCommit {
     if writes.is_empty() {
-        return Ok(());
+        return ForwardCommit::Done;
     }
     let _hold = hold_marks();
     let mut files: Vec<&TableFile> = Vec::new();
     for w in writes {
         if w.file.trailing_header {
-            return Err(StoreError::Corrupt(
+            return ForwardCommit::Undo(StoreError::Corrupt(
                 "forward append is a leading-header file",
             ));
         }
@@ -808,24 +820,36 @@ pub fn commit_forward_appends(
     }
     let mut logical: Vec<u64> = files.iter().map(|f| f.logical_len()).collect();
     for w in writes {
-        let i = files
-            .iter()
-            .position(|f| f.path() == w.file.path())
-            .ok_or(StoreError::Corrupt("page guard file name"))?;
+        let Some(i) = files.iter().position(|f| f.path() == w.file.path()) else {
+            return ForwardCommit::Undo(StoreError::Corrupt("page guard file name"));
+        };
         let end = w.at.saturating_add(w.bytes.len() as u64);
         logical[i] = logical[i].max(w.new_logical).max(end);
     }
-    let planned = plan_forward_pages(&files, writes, &logical)?;
-    sync_fresh_spans(&files, writes, &planned.fresh)?;
-    let names: Vec<String> = files
+    let planned = match plan_forward_pages(&files, writes, &logical) {
+        Ok(planned) => planned,
+        Err(e) => return ForwardCommit::Undo(e),
+    };
+    if let Err(e) = sync_fresh_spans(&files, writes, &planned.fresh) {
+        return ForwardCommit::Undo(e);
+    }
+    let names = match files
         .iter()
         .map(|f| guard_rel_name(dir, f.path()))
-        .collect::<Result<_, _>>()?;
-    publish_forward_images(dir, mark, &files, &names, &planned.images)?;
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(names) => names,
+        Err(e) => return ForwardCommit::Undo(e),
+    };
+    if let Err(e) = publish_forward_images(dir, mark, &files, &names, &planned.images) {
+        // The mark rename can land, or unlink can land without its directory
+        // sync. Either way the segment files have to stay.
+        return ForwardCommit::Keep(e);
+    }
     for (fi, file) in files.iter().enumerate() {
         file.adopt_durable_len(logical[fi]);
     }
-    Ok(())
+    ForwardCommit::Done
 }
 
 struct ForwardPages {
@@ -911,6 +935,15 @@ fn sync_fresh_spans(
     }
     for fi in &synced {
         files[*fi].sync_data_only()?;
+        // A roll creates the segment files just before this sync. The mark
+        // names those bytes, so the directory entry has to be durable first.
+        if let Some(parent) = files[*fi]
+            .path()
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+        }
     }
     Ok(())
 }
