@@ -3390,3 +3390,78 @@ MISSED   crates/rbitcoin-store/src/array_table.rs:734:9: replace ArrayTable::is_
 MISSED   crates/rbitcoin-store/src/array_table.rs:734:20: replace == with != in ArrayTable::is_empty in 3s build + 6s test
 MISSED   crates/rbitcoin-store/src/array_table.rs:1039:20: replace > with >= in ArrayTable::truncate in 3s build + 5s test
 MISSED   crates/rbitcoin-store/src/array_table.rs:1155:9: replace ArrayTable::flush_async -> Result<(), StoreError> with Ok(()) in 3s build + 5s test
+# 45971287718 1 ebc6e6787c9f790366d5d6e5a292ff718e6bbc8d
+MISSED   crates/rbitcoin-net/src/seeds.rs:354:51: replace > with >= in learned_addr_time in 82s build + 43s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:367:23: replace || with && in row_reply_time in 5s build + 43s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:367:47: replace > with == in row_reply_time in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:367:47: replace > with >= in row_reply_time in 5s build + 43s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:380:9: delete match arm (NetAddr::Onion{pk:x, ..}, NetAddr::Onion{pk:y, ..}) in same_host in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:381:9: delete match arm (NetAddr::I2p{dest:x, ..}, NetAddr::I2p{dest:y, ..}) in same_host in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:382:9: delete match arm (NetAddr::Cjdns{ip:x, ..}, NetAddr::Cjdns{ip:y, ..}) in same_host in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:383:9: delete match arm (NetAddr::Name{id:x, ..}, NetAddr::Name{id:y, ..}) in same_host in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:380:75: replace == with != in same_host in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:381:75: replace == with != in same_host in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:382:75: replace == with != in same_host in 9s build + 43s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:383:73: replace == with != in same_host in 8s build + 44s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:783:51: replace * with + in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:783:51: replace * with / in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:783:46: replace * with + in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:792:61: replace < with <= in AddrMan::refresh_seen in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:879:37: replace > with >= in AddrMan::merge_seen_from in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:1063:39: replace > with >= in AddrMan::note_disconnected_addr in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/seeds.rs:1080:62: replace > with >= in AddrMan::stamp_missing_seen_for in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/test_accept.rs:189:15: replace > with >= in package_precheck in 5s build + 44s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:216:5: replace lane_test_gate_enabled -> bool with true in 84s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:238:5: replace take_lane_exemption -> bool with false in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:261:54: replace == with != in take_lane_exemption in 8s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:270:18: delete ! in lane_send_guard in 8s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:283:5: replace lane_send_guard -> Option<std::sync::MutexGuard<'static, ()>> with Some(MutexGuard::new()) in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:283:5: replace lane_send_guard -> Option<std::sync::MutexGuard<'static, ()>> with Some(MutexGuard::from_iter([()])) in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:283:5: replace lane_send_guard -> Option<std::sync::MutexGuard<'static, ()>> with Some(MutexGuard::new(())) in 5s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:283:5: replace lane_send_guard -> Option<std::sync::MutexGuard<'static, ()>> with Some(MutexGuard::from(())) in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:315:5: replace lane_exclusive_notify -> &'static tokio::sync::Notify with Box::leak(Box::new(Default::default())) in 7s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:417:11: delete ! in hold_lane_mutex_for_tests in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:551:10: replace == with != in release_lane_hold in 6s build + 43s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:102:12: replace ^ with | in splitmix64 in 93s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:102:17: replace >> with << in splitmix64 in 9s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:103:12: replace ^ with | in splitmix64 in 9s build + 67s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:103:12: replace ^ with & in splitmix64 in 10s build + 67s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:104:7: replace ^ with | in splitmix64 in 9s build + 69s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:104:7: replace ^ with & in splitmix64 in 9s build + 67s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:104:12: replace >> with << in splitmix64 in 9s build + 67s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:110:12: replace >> with << in mix64 in 9s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:112:7: replace ^= with |= in mix64 in 9s build + 67s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:112:12: replace >> with << in mix64 in 9s build + 67s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:114:12: replace >> with << in mix64 in 8s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:127:15: replace == with != in hash3 in 10s build + 67s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:128:31: replace % with / in hash3 in 10s build + 67s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:128:26: replace + with * in hash3 in 10s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:130:25: replace || with && in hash3 in 10s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:130:15: replace == with != in hash3 in 9s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:130:35: replace == with != in hash3 in 10s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:131:31: replace % with / in hash3 in 9s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:131:26: replace + with * in hash3 in 10s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:132:29: replace || with && in hash3 in 10s build + 67s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:132:19: replace == with != in hash3 in 10s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:132:39: replace == with != in hash3 in 9s build + 67s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:133:35: replace % with / in hash3 in 10s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:133:30: replace + with * in hash3 in 9s build + 69s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:172:9: replace BdzMphf::g_bytes_resident -> usize with 0 in 10s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:173:39: replace * with + in BdzMphf::g_bytes_resident in 9s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:173:39: replace * with / in BdzMphf::g_bytes_resident in 8s build + 69s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:183:42: replace * with + in BdzMphf::occ_bytes_resident in 10s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:183:42: replace * with / in BdzMphf::occ_bytes_resident in 9s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:312:9: replace BdzMphf::one_key_index -> Result<u32, StoreError> with Ok(0) in 13s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:452:24: replace || with && in BdzMphf::read_packed_from in 13s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:452:34: replace > with == in BdzMphf::read_packed_from in 10s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:452:34: replace > with >= in BdzMphf::read_packed_from in 10s build + 68s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:602:47: replace + with - in BdzMphf::read_compact_from in 9s build + 67s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:646:79: delete - in pread_exact in 9s build + 69s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:751:30: replace < with <= in stream_g_pages in 2s build + 4s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:802:24: replace < with == in stream_g_pages in 2s build + 4s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:802:24: replace < with <= in stream_g_pages in 2s build + 4s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:805:59: delete - in stream_g_pages in 2s build + 4s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:809:22: replace < with == in stream_g_pages in 2s build + 4s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:809:22: replace < with > in stream_g_pages in 2s build + 4s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:809:22: replace < with <= in stream_g_pages in 2s build + 4s test
+MISSED   crates/rbitcoin-store/src/bdz.rs:925:61: replace / with * in extract_g_window in 2s build + 4s test
