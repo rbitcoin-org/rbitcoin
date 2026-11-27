@@ -5,5 +5,5 @@ mod lookup;
 mod phases;
 mod pin;
 mod spend_durable_tests;
-mod spent_ovf_guard;
+mod spent_ovf_crash;
 mod write_idempotent_tests;

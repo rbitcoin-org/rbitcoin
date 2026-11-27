@@ -105,7 +105,8 @@ absent, open restores only a tail that is still all zeros.
 `store/guard/class_c`. `header.body` uses `store/guard/header.body`.
 `header.head` uses `store/guard/header.head`. `header.head.mlt` is an append:
 rows, then length, each synced before the head mark arms.
-`spent.ovf` uses `store/guard/spent.ovf`. A scripthash commit, including an
+`spent.ovf` appends past its durable length and publishes the length only at
+a spend checkpoint or flush, after the nodes are synced. A scripthash commit, including an
 in-place slab and a head word, uses `store/guard/sh-*`. A `txstat` stamp
 needs no mark: each cell and block slot sits inside one sector, and the stamp
 is synced. Block-filter and silent-payment tweak puts are appends: bytes,
