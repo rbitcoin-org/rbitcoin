@@ -290,10 +290,12 @@ fn open_indexes_an_unnamed_row_below_a_named_one() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A batch past one chunk commits as several appends. Every row is named,
-/// across the chunk boundary and after reopen.
+/// A batch past one chunk commits as several appends, each named in the
+/// head before the next starts. A failure in the second chunk leaves the
+/// first chunk durable and named, so open's last-chunk scan misses no row.
+#[cfg(debug_assertions)]
 #[test]
-fn ensure_batch_past_one_chunk_names_every_row() {
+fn a_failure_past_the_first_chunk_keeps_that_chunk_named() {
     let dir = tmp();
     let t = HeaderTable::create_tiny(&dir).unwrap();
     let recs: Vec<HeaderRecord> = (0..2_001u32)
@@ -303,15 +305,44 @@ fn ensure_batch_past_one_chunk_names_every_row() {
             sample(h)
         })
         .collect();
-    let fks = t.ensure_batch(&recs).unwrap();
-    assert_eq!(fks.last(), Some(&Fk(2_001)));
+    // The first chunk's data sync passes; the second chunk's fails.
+    rbitcoin_store::io_handle::arm_fail_sync_after(t.body.io_handle(), 1, 1);
+    assert!(
+        t.ensure_batch(&recs).is_err(),
+        "the second chunk did not fail"
+    );
     drop(t);
     let t = HeaderTable::open_tiny(&dir).unwrap();
-    assert_eq!(t.count(), 2_001);
-    for i in [0usize, 1_999, 2_000] {
+    assert_eq!(t.count(), 2_000);
+    for i in [0usize, 1_999] {
         let found = t.get_by_hash(&recs[i].hash).unwrap().map(|(fk, _)| fk);
         assert_eq!(found, Some(Fk(i as u64 + 1)), "row {i}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A failed head insert leaves durable rows the head does not name. A retry
+/// of the same header must not append a second row: the table refuses puts
+/// until reopen, which indexes the row.
+#[test]
+fn a_failed_head_insert_refuses_header_puts_until_reopen() {
+    let dir = tmp();
+    let t = HeaderTable::create_tiny(&dir).unwrap();
+    t.ensure(&sample([0xB1; 32])).unwrap();
+    // A directory where the head mark goes: the head insert cannot arm.
+    let mark = dir.join(rbitcoin_store::page_guard::HEADER_HEAD_MARK);
+    std::fs::create_dir_all(mark.join("block")).unwrap();
+    let g = sample([0xB2; 32]);
+    assert!(t.ensure(&g).is_err(), "the head insert did not fail");
+    match t.ensure(&g) {
+        Err(StoreError::Rejected(m)) => assert!(m.contains("reopen"), "{m}"),
+        other => panic!("a retry after a failed head insert: {other:?}"),
+    }
+    drop(t);
+    std::fs::remove_dir_all(&mark).unwrap();
+    let t = HeaderTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.ensure(&g).unwrap(), Fk(2), "a second row for one hash");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
