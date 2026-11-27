@@ -2,7 +2,7 @@
 use rbitcoin_primitives::{SCHEMA_VERSION, STORE_MAGIC};
 use rbitcoin_store::page_guard::{
     append_past_end, arm_page_guard, arm_page_guard_group, clear_page_guard, restore_page_guard,
-    restore_page_guard_group,
+    restore_page_guard_group, restore_page_guard_group_fit,
 };
 use rbitcoin_store::testutil::TempDir;
 use rbitcoin_store::StoreError;
@@ -549,4 +549,34 @@ fn restore_store_file_syncs_the_directory_of_a_created_file() {
     }
     assert_eq!(read_bytes(&data, 0, PAGE), image);
     assert!(!mark.exists());
+}
+
+#[test]
+fn group_restore_accepts_a_two_component_name() {
+    let dir = TempDir::labeled("page-guard-rel").unwrap();
+    let live = dir.path().join("scripthash.body").join("00");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    let mark = dir.path().join("guard/sh-00");
+    write_bytes(&live, 0, &fill(0x11));
+    let next = fill(0xA1);
+    arm_page_guard_group(&mark, &[("scripthash.body/00", 0, next.as_slice())]).unwrap();
+    write_bytes(&live, 0, &fill(0x00));
+    assert!(restore_page_guard_group(&mark, dir.path()).unwrap());
+    assert_eq!(read_bytes(&live, 0, PAGE), next);
+}
+
+#[test]
+fn fit_restore_does_not_extend_a_short_file() {
+    let dir = TempDir::labeled("page-guard-fit").unwrap();
+    let live = dir.path().join("scripthash.head.val");
+    let mark = dir.path().join("guard/sh-00");
+    let mut image = fill(0x22);
+    image[8] = 0x33;
+    write_bytes(&live, 0, &image[..16]);
+    arm_page_guard_group(&mark, &[("scripthash.head.val", 0, image.as_slice())]).unwrap();
+    write_bytes(&live, 0, &[0xffu8; 16]);
+    assert_eq!(std::fs::metadata(&live).unwrap().len(), 16);
+    assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
+    assert_eq!(std::fs::metadata(&live).unwrap().len(), 16);
+    assert_eq!(read_bytes(&live, 0, 16), image[..16]);
 }
