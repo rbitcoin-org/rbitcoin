@@ -28,13 +28,13 @@ assert_ok "a matching count passes" \
   python3 "$PY" --root "$FIX/match"
 assert_fail "a new token in a known file fails" \
   python3 "$PY" --root "$FIX/new-token"
-assert_ok "write_at_pwrite is not also write_at" \
+assert_ok "a door call is not a raw page write" \
   python3 "$PY" --root "$FIX/alias"
 assert_ok "store write_all is not a raw page write" \
   python3 "$PY" --root "$FIX/store-write-all"
 assert_fail "mempool write_all fails an empty baseline" \
   python3 "$PY" --root "$FIX/mempool-write-all"
-assert_fail "pwrite_all fails an empty baseline" \
+assert_ok "pwrite_all is the checked door" \
   python3 "$PY" --root "$FIX/pwrite-all"
 assert_ok "handle_pwrite_all is not counted as pwrite_all" \
   python3 "$PY" --root "$FIX/match"
