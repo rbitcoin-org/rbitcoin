@@ -2406,6 +2406,7 @@ impl ScriptHashTable {
         key: &[u8; 32],
     ) -> Result<(), StoreError> {
         self.ensure_ingest()?;
+        // Flush writes the whole dirty chunk, not the one slot the key occupies.
         self.image_live_ingest(pages, std::slice::from_ref(key))
     }
 

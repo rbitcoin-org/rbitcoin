@@ -926,6 +926,16 @@ impl TableFile {
     /// Complete pwrite of all bytes or error (no partial success returned).
     #[doc(hidden)]
     pub fn pwrite_all(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        if !bytes.is_empty() {
+            // Committed end is the durable header, not a RAM high-water.
+            // A shared page has to be one this file's current arm names.
+            crate::page_guard::check_armed_write(
+                &self.path,
+                self.header_len_to_persist(),
+                offset,
+                bytes.len() as u64,
+            )?;
+        }
         handle_pwrite_all(&self.read_file, &self.path, offset, bytes)
     }
 
@@ -957,12 +967,19 @@ impl TableFile {
         self.pread_at(offset, buf)
     }
 
+    /// Publish bytes that share a 4 KiB block with a committed byte only when
+    /// those pages are the ones the current `page_guard` arm names. The
+    /// committed end is the durable header length, not a RAM high-water.
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         self.write_at_pwrite(offset, bytes)
     }
 
-    /// Payload past the published end. `published_len` stays put until the
-    /// caller commits, so a later failed write does not move readers.
+    /// Bytes strictly past the committed end, sharing no 4 KiB block with it.
+    ///
+    /// That is the append door. A range that still shares a committed page
+    /// has to be inside the current `page_guard` arm. `published_len` stays
+    /// put until the caller commits, so a later failed write does not move
+    /// readers.
     pub fn write_uncommitted(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         if bytes.is_empty() {
             return Ok(());
@@ -1323,10 +1340,19 @@ impl TableFile {
     }
 
     /// Punch a hole over `[offset, offset+len)`.
+    ///
+    /// A range that shares a committed 4 KiB block has to be one the current
+    /// `page_guard` arm names. The committed end is the durable header length.
     pub fn zero_range(&self, offset: u64, len: u64) -> Result<(), StoreError> {
         if len == 0 {
             return Ok(());
         }
+        crate::page_guard::check_armed_write(
+            &self.path,
+            self.header_len_to_persist(),
+            offset,
+            len,
+        )?;
         self.ensure_capacity(offset.saturating_add(len))?;
         let file = self.file.lock().unwrap();
         if try_punch_hole(&file, offset, len).is_ok() {
