@@ -575,9 +575,72 @@ fn a_failed_put_stays_out_of_reads_and_blocks_cuts() {
     assert_eq!(t.get_block(Height(0), 1).unwrap(), Some(vec![Some(tweak)]));
 }
 
+/// A crash can leave the body length durable and the idx length old. The
+/// last-record fit cuts the body back, and the next put lands after it.
+#[test]
+fn the_fit_cuts_a_body_length_published_before_its_idx() {
+    let dir = tmp_dir();
+    let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    let mut tweak = [0u8; 33];
+    tweak[0] = 0x02;
+    t.put_block(Height(0), &[Some(tweak)]).unwrap();
+    let idx_path = t
+        .inner
+        .lock()
+        .unwrap()
+        .segs
+        .last()
+        .unwrap()
+        .idx
+        .path()
+        .to_path_buf();
+    let mut old_header = [0u8; FILE_HEADER_LEN];
+    fs::File::open(&idx_path)
+        .unwrap()
+        .read_exact(&mut old_header)
+        .unwrap();
+    t.put_block(Height(1), &[Some(tweak)]).unwrap();
+    drop(t);
+    // The crash came after the body length and before the idx length.
+    let mut idx = fs::OpenOptions::new().write(true).open(&idx_path).unwrap();
+    idx.write_all(&old_header).unwrap();
+    drop(idx);
+    let t = SpTweaksTable::open(&dir).unwrap();
+    assert_eq!(t.next_height(), Height(1));
+    // Query open fits the last record to its block's `n_tx` before any use.
+    assert_eq!(t.trim_last_record(1).unwrap(), TrimLast::Cut);
+    assert_eq!(t.get_block(Height(0), 1).unwrap(), Some(vec![Some(tweak)]));
+    let mut other = tweak;
+    other[1] = 0x77;
+    t.put_block(Height(1), &[Some(other)]).unwrap();
+    drop(t);
+    let t = SpTweaksTable::open(&dir).unwrap();
+    assert_eq!(t.get_block(Height(1), 1).unwrap(), Some(vec![Some(other)]));
+    assert_eq!(t.get_block(Height(0), 1).unwrap(), Some(vec![Some(tweak)]));
+}
+
+/// A put that fails after its body length is published still leaves the old
+/// last record readable: its end is the body length.
+#[test]
+fn a_put_failing_after_the_body_length_keeps_the_old_tip_readable() {
+    let dir = tmp_dir();
+    let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    let mut tweak = [0u8; 33];
+    tweak[0] = 0x02;
+    t.put_block(Height(0), &[Some(tweak)]).unwrap();
+    {
+        let inner = t.inner.lock().unwrap();
+        let idx = &inner.segs.last().unwrap().idx;
+        rbitcoin_store::io_handle::arm_fail_flush(idx.io_handle(), 1);
+    }
+    assert!(t.put_block(Height(1), &[Some(tweak)]).is_err());
+    assert_eq!(t.next_height(), Height(1));
+    assert_eq!(t.get_block(Height(0), 1).unwrap(), Some(vec![Some(tweak)]));
+}
+
 /// A new table's `meta` and its two directories are durable before the
-/// first put can return. The first forward commit syncs only the segment
-/// files and their own directories.
+/// first put can return. A put syncs only the segment files and their own
+/// directories.
 #[cfg(all(unix, debug_assertions))]
 #[test]
 fn create_syncs_the_new_table_directories() {
