@@ -1498,7 +1498,7 @@ impl TableFile {
         self.read_file
             .durable_sync_data()
             .map_err(|e| StoreError::io(&self.path, e))?;
-        #[cfg(debug_assertions)]
+        #[cfg(all(unix, debug_assertions))]
         note_fsynced_dir(&self.path);
         #[cfg(feature = "write-probe")]
         crate::write_probe::synced(&self.path);
