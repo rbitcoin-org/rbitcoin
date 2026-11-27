@@ -1157,6 +1157,16 @@ impl From<LocatedHome> for KeyHome {
     }
 }
 
+/// `seal_ingest` moved every ingest row into a sealed file. Keys still
+/// tagged `Ingest` in the batch snapshot would also land in the new table.
+fn retarget_ingest_after_seal(heads: &mut HashMap<[u8; 32], (ShHeadValue, KeyHome)>) {
+    for (_, home) in heads.values_mut() {
+        if *home == KeyHome::Ingest {
+            *home = KeyHome::SealedOvf;
+        }
+    }
+}
+
 /// Remember the head file `apply_head_upserts` updates in place for `key`,
 /// once per main shard or for the sealed overflow files.
 fn note_moved_head(
@@ -1964,14 +1974,18 @@ impl ScriptHashTable {
         timing.sort_ns = t_sort.elapsed().as_nanos() as u64;
 
         let t_seed = std::time::Instant::now();
-        let heads = self.seed_batch_heads(recs, &order)?;
+        let mut heads = self.seed_batch_heads(recs, &order)?;
         timing.seed_ns = t_seed.elapsed().as_nanos() as u64;
 
         let mut written = 0usize;
         let mut i = 0usize;
         while i < order.len() {
             if self.ingest_room() == 0 {
+                let before = self.ovf_seal_stamp();
                 self.seal_ingest()?;
+                if self.ovf_seal_stamp() != before {
+                    retarget_ingest_after_seal(&mut heads);
+                }
                 continue;
             }
             let room = self.ingest_room();
@@ -2006,7 +2020,11 @@ impl ScriptHashTable {
             }
             let t_head = std::time::Instant::now();
             let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
+            let before = self.ovf_seal_stamp();
             self.commit_staged_batch(&batch, flush_each)?;
+            if self.ovf_seal_stamp() != before {
+                retarget_ingest_after_seal(&mut heads);
+            }
             timing.head_ns = timing
                 .head_ns
                 .saturating_add(t_head.elapsed().as_nanos() as u64);
@@ -2306,7 +2324,7 @@ impl ScriptHashTable {
                 crate::scripthash_layout::SH_HEAD_SLOT_SIZE as u64,
             )?;
         }
-        Ok(())
+        self.image_occ_sidecar(pages, &mark, &path)
     }
 
     /// A non-empty ingest probe-inserts the batch in hash-slot order. Image
@@ -2338,7 +2356,7 @@ impl ScriptHashTable {
         for (off, len) in spans {
             image_range(pages, &mark, &rel, &path, &file, off, len)?;
         }
-        Ok(())
+        self.image_occ_sidecar(pages, &mark, &path)
     }
 
     fn image_ingest_head(
@@ -2352,17 +2370,41 @@ impl ScriptHashTable {
             return Ok(());
         };
         let off = h.probe_slot_off(key)?;
-        let rel = page_guard::guard_rel_name(&self.store_dir, h.file.path())?;
+        let path = h.file.path().to_path_buf();
+        let rel = page_guard::guard_rel_name(&self.store_dir, &path)?;
         let mark = page_guard::sh_mark("ovf");
         image_range(
             pages,
             &mark,
             &rel,
-            h.file.path(),
+            &path,
             &h.file.read_file,
             off,
             crate::scripthash_layout::SH_HEAD_SLOT_SIZE as u64,
-        )
+        )?;
+        self.image_occ_sidecar(pages, &mark, &path)
+    }
+
+    /// Page 0 of `{head}.occ`. Restore writes only the bytes the sidecar has.
+    fn image_occ_sidecar(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        mark: &str,
+        head_path: &Path,
+    ) -> Result<(), StoreError> {
+        let occ = crate::scripthash_head::occ_sidecar_path(head_path);
+        let rel = page_guard::guard_rel_name(&self.store_dir, &occ)?;
+        let key = (mark.to_string(), rel, 0);
+        if pages.contains_key(&key) {
+            return Ok(());
+        }
+        let image = match std::fs::File::open(&occ) {
+            Ok(file) => page_guard::read_live_page(&occ, &file, 0)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => [0u8; PAGE as usize],
+            Err(e) => return Err(StoreError::io(&occ, e)),
+        };
+        pages.insert(key, image);
+        Ok(())
     }
 
     pub(super) fn arm_suffix_pages(
@@ -2677,6 +2719,13 @@ impl ScriptHashTable {
             return l1.head.update_value(&hk, val);
         }
         Ok(false)
+    }
+
+    fn ovf_seal_stamp(&self) -> (usize, bool) {
+        (
+            self.sealed_ovf.lock().unwrap().len(),
+            self.ovf_l1.lock().unwrap().is_some(),
+        )
     }
 
     fn ingest_room(&self) -> u64 {
