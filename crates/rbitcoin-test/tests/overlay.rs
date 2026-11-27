@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 
 fn tor_b(env: &OverlayEnv, datadir: &std::path::Path, rpc: SocketAddr) -> NodeConfig {
     write_rpc_token(datadir);
@@ -413,7 +413,7 @@ async fn cjdns_tun_two_node() {
     cfg_b.listen.discover = true;
     cfg_b.listen.only_net = vec![OnlyNet::Cjdns];
     cfg_b.rpc.listen = Some(b_rpc);
-    let b = spawn_node(cfg_b, b_rpc).await;
+    let b = spawn_node(cfg_b.clone(), b_rpc).await;
     generate_n(b_rpc, 3).await;
 
     write_rpc_token(a_dir.path());
@@ -465,6 +465,33 @@ async fn cjdns_tun_two_node() {
 
     a.stop().await;
     b.stop().await;
+
+    cfg_b.listen.only_net = vec![OnlyNet::Ipv4];
+    let b = spawn_node(cfg_b, b_rpc).await;
+    let inbound = tokio::spawn(async move {
+        let socket = TcpSocket::new_v6().unwrap();
+        socket.bind(SocketAddr::from((env.cjdns_a, 0))).unwrap();
+        let stream = tokio::time::timeout(Duration::from_secs(5), socket.connect(b_p2p))
+            .await
+            .expect("connect to restarted CJDNS listener")
+            .unwrap();
+        let source = stream.local_addr().unwrap().to_string();
+        let info = wait_jsonrpc(
+            b_rpc,
+            "getpeerinfo",
+            json!([]),
+            Duration::from_secs(5),
+            |info| info["result"][0]["addr"] == source,
+        )
+        .await;
+        info["result"][0].clone()
+    })
+    .await;
+    b.stop().await;
+    let row = inbound.expect("CJDNS inbound remains visible with --only-net=ipv4");
+    assert_eq!(row["inbound"], true, "{row}");
+    assert_eq!(row["version"], 0, "{row}");
+    assert_eq!(row["network"], "not_publicly_routable", "{row}");
 }
 
 #[test]

@@ -4031,9 +4031,14 @@ async fn check_native_tor_listener_permissions(
 
     let info = registered.expect("both inbound peers registered");
     let rows = info["result"].as_array().unwrap();
-    for (bind, permissions) in binds.iter().zip([ordinary_permissions, &[]]) {
+    for ((bind, permissions), network) in binds
+        .iter()
+        .zip([ordinary_permissions, &[]])
+        .zip(["not_publicly_routable", "onion"])
+    {
         let row = rows.iter().find(|row| row["addrbind"] == *bind).unwrap();
         assert_eq!(row["permissions"], json!(permissions), "{info}");
+        assert_eq!(row["network"], network, "{info}");
     }
 }
 
