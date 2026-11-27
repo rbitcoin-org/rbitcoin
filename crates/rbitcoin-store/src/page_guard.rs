@@ -466,7 +466,7 @@ pub fn drop_page_guard_names(mark: &Path, names: &HashSet<String>) -> Result<(),
 #[doc(hidden)]
 /// A renamed `guard/sh-*` mark. `sh-<shard>.tmp` is a rename leftover that
 /// may be partial; restore and drop skip it, and reset removes it.
-fn published_sh_mark(name: &str) -> bool {
+pub(crate) fn published_sh_mark(name: &str) -> bool {
     name.starts_with("sh-") && !name.ends_with(".tmp")
 }
 

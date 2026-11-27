@@ -630,3 +630,26 @@ fn displaced_pair(slots: u64) -> ([u8; 32], [u8; 32], u64) {
     }
     panic!("no two scripts collided onto a slot whose next page is unimaged");
 }
+
+/// A commit that fails before its clear leaves `guard/sh-*` armed with the
+/// body and ingest images. A seal then would drop the ingest image and keep
+/// the body image, so open could roll back a slab the sealed head names.
+#[test]
+fn seal_refuses_while_a_commit_guard_is_armed() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    put_create_batch(&t, [rec(script_hash(&[0xb1]), 1)]);
+    t.fail_next_sh_guard_clear();
+    assert!(t
+        .put_create_batch_append(&[rec(script_hash(&[0xb2]), 2)])
+        .is_err());
+    let marks = sh_marks(&dir);
+    assert!(!marks.is_empty(), "the failed clear leaves the mark");
+    let before: Vec<Vec<u8>> = marks.iter().map(|m| std::fs::read(m).unwrap()).collect();
+    assert!(t.seal_ingest().is_err(), "sealed over an armed guard");
+    let after: Vec<Vec<u8>> = sh_marks(&dir)
+        .iter()
+        .map(|m| std::fs::read(m).unwrap())
+        .collect();
+    assert_eq!(before, after, "the seal changed the armed mark");
+}
