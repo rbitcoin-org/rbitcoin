@@ -589,6 +589,10 @@ impl SpTweaksTable {
                 return Err(e);
             }
             page_guard::ForwardCommit::Keep(e) => {
+                // The mark may name these files, including a rolled pair, so
+                // they stay for reopen. Readers keep the old prefix: take the
+                // planned slots back out of the counts.
+                undo_slot_plan(&mut inner.segs, &plans);
                 self.blocked
                     .store(true, std::sync::atomic::Ordering::Release);
                 return Err(e);
@@ -660,6 +664,7 @@ impl SpTweaksTable {
     /// then checks the new last record.
     pub fn trim_last_record(&self, n_tx: u32) -> Result<TrimLast, StoreError> {
         let mut inner = self.lock();
+        self.refuse_pending_mark()?;
         let Some(seg) = inner.segs.iter_mut().rev().find(|s| s.n_slots > 0) else {
             return Ok(TrimLast::Clean);
         };
@@ -706,6 +711,9 @@ impl SpTweaksTable {
     #[doc(hidden)]
     pub fn truncate_keep_slots(&self, keep: u64) -> Result<(), StoreError> {
         let mut inner = self.lock();
+        // A failed put's mark can name the files a cut would change. Open
+        // would then put those bytes back.
+        self.refuse_pending_mark()?;
         let total: u64 = inner.segs.iter().map(|s| s.n_slots).sum();
         if keep >= total {
             return Ok(());
