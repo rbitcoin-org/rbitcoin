@@ -29,7 +29,7 @@ const GROUP_KIND: u16 = 1;
 
 /// Forward images for `confirmed[]`, `header_txs_*`, and `strong_tx`.
 pub const CLASS_C_MARK: &str = "guard/class_c";
-/// Forward images for `header.body`.
+/// Empty flag: the first `header.body` append may not be in `header.head`.
 pub const HEADER_BODY_MARK: &str = "guard/header.body";
 /// Forward images for one `header.head` generation.
 pub const HEADER_HEAD_MARK: &str = "guard/header.head";
@@ -186,10 +186,8 @@ pub fn restore_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreEr
     Ok(true)
 }
 
-/// [`restore_page_guard_group`] that leaves the mark in place.
-///
-/// The images are on the device when this returns. The caller removes the
-/// mark once the state the mark stands for is durable elsewhere.
+/// Copies the images and leaves the mark. They are on the device when this
+/// returns.
 fn replay_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreError> {
     mark_parent(mark)?;
     let raw = match std::fs::read(mark) {
@@ -372,9 +370,34 @@ pub fn restore_store_group(dir: &Path, mark: &str) -> Result<bool, StoreError> {
     restore_page_guard_group(&dir.join(mark), dir)
 }
 
-/// Copy `dir/<mark>` onto its files and keep the mark. Missing is `Ok(false)`.
-pub(crate) fn replay_store_group(dir: &Path, mark: &str) -> Result<bool, StoreError> {
-    replay_page_guard_group(&dir.join(mark), dir)
+/// Publish `dir/<mark>` as an empty flag after `meta` is 31.
+///
+/// A flag names no pages. Its presence alone tells open how to read the
+/// files, so a crash leaves it or not, and nothing is copied back.
+pub(crate) fn arm_store_flag(dir: &Path, mark: &str) -> Result<(), StoreError> {
+    promote_meta_31(dir)?;
+    let path = dir.join(mark);
+    ensure_mark_parent(&path)?;
+    crate::file::write_file_synced_tmp_rename(&path, &[])?;
+    sync_mark_dir(mark_parent(&path)?)?;
+    #[cfg(debug_assertions)]
+    ARM_TRACE.with(|trace| {
+        if let Some(marks) = trace.borrow_mut().as_mut() {
+            marks.push(mark.to_string());
+        }
+    });
+    Ok(())
+}
+
+/// Whether the flag `dir/<mark>` is published.
+pub(crate) fn store_flag_armed(dir: &Path, mark: &str) -> Result<bool, StoreError> {
+    let path = dir.join(mark);
+    path.try_exists().map_err(|e| StoreError::io(&path, e))
+}
+
+/// Remove the flag `dir/<mark>` and sync its directory. Missing is `Ok`.
+pub(crate) fn clear_store_flag(dir: &Path, mark: &str) -> Result<(), StoreError> {
+    remove_mark(&dir.join(mark), || {})
 }
 
 /// Promote `meta` to 31 when this directory is a datadir still on 30.

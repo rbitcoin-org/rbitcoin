@@ -175,20 +175,88 @@ fn ensure_batch_linked_headers_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The first append's data sync fails before any length moves. It leaves
+/// `guard/header.body` as an empty flag, not page images, and no row. Open
+/// finds no row, drops the flag, and takes that header again at fk 1.
 #[test]
-fn ensure_batch_syncs_the_body_before_the_head() {
+fn a_failed_first_append_leaves_an_empty_flag_and_no_row() {
     let dir = tmp();
     let t = HeaderTable::create_tiny(&dir).unwrap();
     rbitcoin_store::io_handle::arm_fail_sync(t.body.io_handle(), 1);
     let g = sample([0x91; 32]);
     let err = t.ensure_batch(std::slice::from_ref(&g)).unwrap_err();
     assert!(matches!(err, StoreError::Io { .. }), "{err}");
+    let flag = dir.join(rbitcoin_store::page_guard::HEADER_BODY_MARK);
+    assert_eq!(
+        std::fs::metadata(&flag).expect("no flag").len(),
+        0,
+        "the first append's flag holds page images"
+    );
     drop(t);
-    // The forward body mark finishes the append on open, and open indexes the
-    // row.
     let t = HeaderTable::open_tiny(&dir).expect("open after a failed body sync");
-    assert_eq!(t.get_by_hash(&g.hash).unwrap(), Some((Fk(1), g.clone())));
-    assert_eq!(t.get(Fk(1)).unwrap().hash, g.hash);
+    assert_eq!(t.count(), 0);
+    assert_eq!(t.get_by_hash(&g.hash).unwrap(), None);
+    assert!(!flag.exists(), "open left the flag");
+    assert_eq!(t.ensure(&g).unwrap(), Fk(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Only the first header append arms `guard/header.body`. A later append
+/// writes its rows past the end, syncs, then publishes the length, so it
+/// arms nothing.
+#[cfg(debug_assertions)]
+#[test]
+fn a_header_append_after_the_first_arms_no_mark() {
+    use rbitcoin_store::page_guard::{arm_store_mark_trace, take_armed_store_marks};
+    let mark = rbitcoin_store::page_guard::HEADER_BODY_MARK.to_string();
+    let dir = tmp();
+    let t = HeaderTable::create_tiny(&dir).unwrap();
+    arm_store_mark_trace();
+    t.ensure(&sample([0x92; 32])).unwrap();
+    let first = take_armed_store_marks();
+    assert!(
+        first.contains(&mark),
+        "the first append armed no flag: {first:?}"
+    );
+    arm_store_mark_trace();
+    t.ensure(&sample([0x93; 32])).unwrap();
+    let later = take_armed_store_marks();
+    assert!(!later.contains(&mark), "a later append armed {later:?}");
+    assert!(!dir.join(&mark).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A failed length flush may leave the new body length durable. The table
+/// refuses later header puts until reopen, so no retry rewrites rows below
+/// that length. Reopen indexes whatever the durable length names.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_length_flush_refuses_header_puts_until_reopen() {
+    let dir = tmp();
+    let t = HeaderTable::create_tiny(&dir).unwrap();
+    t.ensure(&sample([0x94; 32])).unwrap();
+    rbitcoin_store::io_handle::arm_fail_flush(t.body.io_handle(), 1);
+    let g = sample([0x95; 32]);
+    assert!(
+        t.ensure(&g).is_err(),
+        "the failed length flush was not reported"
+    );
+    let next = sample([0x96; 32]);
+    assert!(
+        t.ensure(&next).is_err(),
+        "a put after a failed length flush was accepted"
+    );
+    drop(t);
+    let t = HeaderTable::open_tiny(&dir).expect("open after a failed length flush");
+    let n = t.count();
+    assert!(n == 1 || n == 2, "{n}");
+    if n == 2 {
+        assert_eq!(
+            t.get_by_hash(&g.hash).unwrap().map(|(fk, _)| fk),
+            Some(Fk(2))
+        );
+    }
+    assert_eq!(t.ensure(&next).unwrap(), Fk(n + 1));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
