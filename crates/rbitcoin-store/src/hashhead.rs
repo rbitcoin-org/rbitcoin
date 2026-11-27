@@ -294,52 +294,29 @@ impl MultiList {
         Ok(self.collect(head)?.contains(&target))
     }
 
-    fn pending_pages(&self) -> Result<Vec<(u64, [u8; PAGE as usize])>, StoreError> {
-        let pending = self.pending.lock().unwrap();
-        if pending.is_empty() {
-            return Ok(Vec::new());
-        }
-        let old = self.file.logical_len();
-        let last_id = pending.last().map(|(id, _)| *id).unwrap_or(0);
-        let new_end = Self::offset(last_id).saturating_add(MULTI_REC_LEN as u64);
-        let mut pages = BTreeSet::new();
-        if new_end != old {
-            pages.insert(0u64);
-        }
-        for (id, _) in pending.iter() {
-            let off = Self::offset(*id);
-            pages.insert((off / PAGE) * PAGE);
-        }
-        let mut images = Vec::with_capacity(pages.len());
-        for page in pages {
-            let mut image = read_page(self.file.path(), &self.file, page)?;
-            if page == 0 {
-                image[..FILE_HEADER_LEN].copy_from_slice(&file::encode_leading_header(
-                    TableKind::ArrayLink,
-                    new_end.max(old),
-                ));
-            }
-            for (id, buf) in pending.iter() {
-                overlay_bytes(&mut image, page, Self::offset(*id), buf);
-            }
-            images.push((page, image));
-        }
-        Ok(images)
-    }
-
-    fn write_pending(&self) -> Result<(), StoreError> {
-        let pending = self.pending.lock().unwrap();
-        if pending.is_empty() {
+    /// Append the pending rows past the published end, then publish the length.
+    ///
+    /// Rows take consecutive ids, so they are one run. `commit_appends` makes
+    /// them durable before the length that names them, with no mark, so the
+    /// head mark armed after this never images `.mlt`.
+    fn commit_pending(&self) -> Result<(), StoreError> {
+        let mut pending = self.pending.lock().unwrap();
+        let Some(&(first, _)) = pending.first() else {
             return Ok(());
+        };
+        let mut bytes = Vec::with_capacity(pending.len() * MULTI_REC_LEN);
+        for (_, buf) in pending.iter() {
+            bytes.extend_from_slice(buf);
         }
-        for (id, buf) in pending.iter() {
-            self.file.write_at(Self::offset(*id), buf)?;
-        }
+        let at = Self::offset(first);
+        page_guard::commit_appends(&[page_guard::Append {
+            file: &self.file,
+            at,
+            bytes: &bytes,
+            new_logical: at + bytes.len() as u64,
+        }])?;
+        pending.clear();
         Ok(())
-    }
-
-    fn clear_pending(&self) {
-        self.pending.lock().unwrap().clear();
     }
 
     #[doc(hidden)]
@@ -400,8 +377,6 @@ pub fn install_grown_oa(from: &Path, to: &Path) -> Result<(), StoreError> {
 static FAIL_AHEAD: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 #[cfg(debug_assertions)]
 static FAIL_SECOND_WRITE: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
-#[cfg(debug_assertions)]
-static FAIL_BETWEEN_FILES: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 /// Leave the next group mark for `path` behind and fail before the pwrite.
 #[cfg(debug_assertions)]
@@ -423,16 +398,6 @@ pub fn fail_next_hash_head_flush_on_second_write(path: &Path) {
         .insert(path.to_path_buf());
 }
 
-/// Fail after the `.mlt` write and before the head write of the next flush.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn fail_next_header_head_flush_between_files(path: &Path) {
-    FAIL_BETWEEN_FILES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(path.to_path_buf());
-}
-
 #[cfg(debug_assertions)]
 fn take_fail_ahead(path: &Path) -> bool {
     FAIL_AHEAD
@@ -444,14 +409,6 @@ fn take_fail_ahead(path: &Path) -> bool {
 #[cfg(debug_assertions)]
 fn take_fail_second_write(path: &Path) -> bool {
     FAIL_SECOND_WRITE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(path)
-}
-
-#[cfg(debug_assertions)]
-fn take_fail_between_files(path: &Path) -> bool {
-    FAIL_BETWEEN_FILES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(path)
@@ -815,14 +772,11 @@ impl HashHead {
             overlay_bytes(&mut image, page, offset, bytes);
             images.push((page, image));
         }
-        let mlt_pages = self.multi.pending_pages()?;
+        self.multi.commit_pending()?;
         let _hold = page_guard::hold_marks();
-        self.arm_head_pages(&images, &mlt_pages)?;
-        self.multi.write_pending()?;
+        self.arm_head_pages(&images)?;
         self.file.write_at(offset, bytes)?;
-        self.clear_head_mark()?;
-        self.multi.clear_pending();
-        Ok(())
+        self.clear_head_mark()
     }
 
     /// Create a new OA file at `path`, reopening an existing `.mlt` if present.
@@ -915,24 +869,16 @@ impl HashHead {
         Self::open(&path)
     }
 
-    fn arm_head_pages(
-        &self,
-        head: &[(u64, [u8; PAGE as usize])],
-        mlt: &[(u64, [u8; PAGE as usize])],
-    ) -> Result<(), StoreError> {
-        if head.is_empty() && mlt.is_empty() {
+    fn arm_head_pages(&self, head: &[(u64, [u8; PAGE as usize])]) -> Result<(), StoreError> {
+        if head.is_empty() {
             return Ok(());
         }
         let dir = head_dir(self.file.path())?;
         let head_name = page_guard::guard_file_name(self.file.path())?;
-        let mlt_name = page_guard::guard_file_name(self.multi.file.path())?;
-        let mut refs: Vec<(&str, u64, &[u8])> = Vec::with_capacity(head.len() + mlt.len());
-        for (off, image) in head {
-            refs.push((head_name, *off, image.as_slice()));
-        }
-        for (off, image) in mlt {
-            refs.push((mlt_name, *off, image.as_slice()));
-        }
+        let refs: Vec<(&str, u64, &[u8])> = head
+            .iter()
+            .map(|(off, image)| (head_name, *off, image.as_slice()))
+            .collect();
         page_guard::arm_store_group(dir, page_guard::HEADER_HEAD_MARK, &refs)
     }
 
@@ -940,10 +886,7 @@ impl HashHead {
         let dir = head_dir(self.file.path())?;
         page_guard::clear_page_guard_files(
             &dir.join(page_guard::HEADER_HEAD_MARK),
-            &[
-                (&self.file.read_file, self.file.path()),
-                (&self.multi.file.read_file, self.multi.file.path()),
-            ],
+            &[(&self.file.read_file, self.file.path())],
         )
     }
 
@@ -1123,24 +1066,16 @@ impl<'a> SlotPageCache<'a> {
                 block += PAGE;
             }
         }
-        let mlt_pages = self.head.multi.pending_pages()?;
+        self.head.multi.commit_pending()?;
         let head_pages: Vec<(u64, [u8; PAGE as usize])> = blocks.into_iter().collect();
-        if !head_pages.is_empty() || !mlt_pages.is_empty() {
+        if !head_pages.is_empty() {
             let _hold = page_guard::hold_marks();
-            self.head.arm_head_pages(&head_pages, &mlt_pages)?;
+            self.head.arm_head_pages(&head_pages)?;
             #[cfg(debug_assertions)]
             if take_fail_ahead(self.head.file.path()) {
                 return Err(StoreError::io(
                     self.head.file.path(),
                     std::io::Error::other("injected hash head ahead failure"),
-                ));
-            }
-            self.head.multi.write_pending()?;
-            #[cfg(debug_assertions)]
-            if take_fail_between_files(self.head.file.path()) {
-                return Err(StoreError::io(
-                    self.head.file.path(),
-                    std::io::Error::other("injected hash head between-files failure"),
                 ));
             }
             let mut writes = 0u32;
@@ -1159,7 +1094,6 @@ impl<'a> SlotPageCache<'a> {
                 }
             }
             self.head.clear_head_mark()?;
-            self.head.multi.clear_pending();
         }
         self.chunks.clear();
         Ok(())
