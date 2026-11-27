@@ -102,8 +102,9 @@ absent, open restores only a tail that is still all zeros.
 `store/guard/class_c`. `header.body` uses `store/guard/header.body`.
 `header.head` and `header.head.mlt` share `store/guard/header.head`.
 `spent.ovf` uses `store/guard/spent.ovf`. A scripthash commit, including an
-in-place slab and a head word, uses `store/guard/sh-*`. `txstat` uses
-`store/guard/txstat`. Block filters use `store/guard/blockfilter`. Silent-payment
+in-place slab and a head word, uses `store/guard/sh-*`. A `txstat` stamp
+needs no mark: each cell and block slot sits inside one sector, and the stamp
+is synced. Block filters use `store/guard/blockfilter`. Silent-payment
 tweaks use `store/guard/sp_tweaks`. The mempool flush uses `mempool/guard/flush`.
 `tx.head` `*.mlt` is renamed into place, and the segment meta bit says the
 file must exist. A strong bit a fence run names is set again by

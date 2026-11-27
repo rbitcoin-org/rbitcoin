@@ -37,8 +37,6 @@ pub const HEADER_HEAD_MARK: &str = "guard/header.head";
 pub const SPENT_OVF_MARK: &str = "guard/spent.ovf";
 /// Prefix of one scripthash-commit mark (`guard/sh-00`, `guard/sh-ovf`).
 pub const SH_MARK_PREFIX: &str = "guard/sh-";
-/// Backward images of interior `txstat.body` and `txstat.blk` pages.
-pub const TXSTAT_MARK: &str = "guard/txstat";
 /// Forward images for one `blockfilter` put (body tail, idx tail, page 0).
 pub const BLOCKFILTER_MARK: &str = "guard/blockfilter";
 /// Forward images for one `sp_tweaks` put (body tail, idx tail, page 0).

@@ -36,10 +36,8 @@ fn page0_stamp_is_not_in_the_txstat_mark() {
         t.write_row(Fk(1), &stamped).unwrap();
         #[cfg(debug_assertions)]
         assert!(
-            !rbitcoin_store::page_guard::take_armed_store_marks()
-                .iter()
-                .any(|m| m == rbitcoin_store::page_guard::TXSTAT_MARK),
-            "a page-0 stamp armed guard/txstat"
+            rbitcoin_store::page_guard::take_armed_store_marks().is_empty(),
+            "a page-0 stamp armed a mark"
         );
         assert!(
             !dir.join("guard/txstat").exists(),
@@ -62,65 +60,6 @@ fn page0_stamp_is_not_in_the_txstat_mark() {
     let t = TxStat::open(&dir).unwrap();
     assert_eq!(t.get_cell(Fk(1)).unwrap(), [0xA5; 8]);
     assert_ne!(t.get_cell(Fk(1)).unwrap(), pack_cell(&stamped).unwrap().0);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn torn_interior_txstat_page_restores_the_pre_stamp_bytes() {
-    let dir = TempDir::labeled("txstat-interior").unwrap();
-    let path = dir.join("txstat.body");
-    let rows: Vec<TxStatRow> = (1..=1200u64).map(|i| tiny(i, 100, 10)).collect();
-    let old = pack_cell(&rows[599]).unwrap().0;
-    {
-        let t = TxStat::create(&dir).unwrap();
-        t.append_batch(0, &rows).unwrap();
-        assert!(!dir.join("guard/txstat").exists());
-        fail_next_txstat_guard_before_clear(&path);
-        assert!(
-            t.write_row(Fk(600), &tiny(9, 9, 9)).is_err(),
-            "the failpoint stops after the live pwrite, before the mark is cleared"
-        );
-        assert!(dir.join("guard/txstat").is_file());
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .unwrap();
-    use std::io::{Seek, SeekFrom, Write};
-    file.seek(SeekFrom::Start(4096)).unwrap();
-    file.write_all(&[0xA5; 4096]).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-    rbitcoin_store::store::restore_open_marks(&rbitcoin_store::StoreLayout::tiny(dir.path()))
-        .unwrap();
-    assert!(!dir.join("guard/txstat").exists());
-    let t = TxStat::open(&dir).unwrap();
-    assert_eq!(t.count(), 1200);
-    assert_eq!(t.get_cell(Fk(600)).unwrap(), old);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn a_later_stamp_repairs_the_page_a_failed_stamp_tore() {
-    let dir = TempDir::labeled("txstat-second-stamp").unwrap();
-    let path = dir.join("txstat.body");
-    let rows: Vec<TxStatRow> = (1..=1200u64).map(|i| tiny(i, 100, 10)).collect();
-    let old = pack_cell(&rows[599]).unwrap().0;
-    let later = tiny(7, 7, 7);
-    {
-        let t = TxStat::create(&dir).unwrap();
-        t.append_batch(0, &rows).unwrap();
-        fail_next_txstat_guard_before_clear(&path);
-        assert!(t.write_row(Fk(600), &tiny(9, 9, 9)).is_err());
-        assert!(dir.join("guard/txstat").is_file());
-        t.write_row(Fk(1100), &later).unwrap();
-        assert_eq!(t.get_cell(Fk(600)).unwrap(), old);
-        assert_eq!(t.get_cell(Fk(1100)).unwrap(), pack_cell(&later).unwrap().0);
-    }
-    assert!(!dir.join("guard/txstat").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -293,25 +232,14 @@ fn append_batch_relies_on_the_class_a_tail_guard() {
     t.append_batch(1, &rows).unwrap();
     #[cfg(debug_assertions)]
     assert!(
-        !rbitcoin_store::page_guard::take_armed_store_marks()
-            .iter()
-            .any(|m| m == rbitcoin_store::page_guard::TXSTAT_MARK),
-        "an append armed guard/txstat"
+        rbitcoin_store::page_guard::take_armed_store_marks().is_empty(),
+        "an append armed a mark"
     );
     assert!(!dir.join("txstat.body.ahead").exists());
     assert!(
         !dir.join("guard/txstat").exists(),
         "an append-only batch stays on the Class A tail guard"
     );
-    // An interior stamp does arm it, so the trace is live.
-    #[cfg(debug_assertions)]
-    {
-        rbitcoin_store::page_guard::arm_store_mark_trace();
-        t.write_row(Fk(600), &tiny(9, 9, 9)).unwrap();
-        assert!(rbitcoin_store::page_guard::take_armed_store_marks()
-            .iter()
-            .any(|m| m == rbitcoin_store::page_guard::TXSTAT_MARK));
-    }
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
@@ -333,4 +261,29 @@ fn header_blob_syncs_the_overflow_before_its_slot() {
     assert!(t.header_blob(Fk(1)).unwrap().is_empty());
     t.put_header_blob(Fk(1), &blob).unwrap();
     assert_eq!(t.header_blob(Fk(1)).unwrap(), blob);
+}
+
+/// A stamp writes 8-byte cells, each inside one sector, so a tear leaves
+/// each cell old or new. It arms no mark, and it is synced before it
+/// returns: a failed sync fails the stamp.
+#[cfg(debug_assertions)]
+#[test]
+fn an_interior_stamp_arms_no_mark_and_is_synced() {
+    let dir = TempDir::labeled("txstat-interior-stamp").unwrap();
+    let rows: Vec<TxStatRow> = (1..=1200u64).map(|i| tiny(i, 100, 10)).collect();
+    let t = TxStat::create(&dir).unwrap();
+    t.append_batch(0, &rows).unwrap();
+    rbitcoin_store::page_guard::arm_store_mark_trace();
+    t.write_row(Fk(600), &tiny(9, 9, 9)).unwrap();
+    assert!(
+        rbitcoin_store::page_guard::take_armed_store_marks().is_empty(),
+        "an interior stamp armed a mark"
+    );
+    assert_eq!(
+        t.get_cell(Fk(600)).unwrap(),
+        pack_cell(&tiny(9, 9, 9)).unwrap().0
+    );
+    rbitcoin_store::io_handle::arm_fail_sync(t.body.io_handle(), 1);
+    assert!(t.write_row(Fk(700), &tiny(8, 8, 8)).is_err());
+    let _ = std::fs::remove_dir_all(dir.path());
 }
