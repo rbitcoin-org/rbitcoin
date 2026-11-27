@@ -226,12 +226,16 @@ impl SpenderTable {
         let mark = dir.join(crate::page_guard::SPENT_OVF_MARK);
         if !mark.try_exists().map_err(|e| StoreError::io(&mark, e))? {
             // Unlink can land and the directory sync can fail. The checkpoint
-            // must not publish until that sync has been retried.
+            // must not publish until that sync has been retried. A directory
+            // that was never created never held a mark, so there is no
+            // barrier to finish.
             let parent = mark
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
                 .ok_or(StoreError::Corrupt("spent.ovf mark has no directory"))?;
-            fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+            if parent.try_exists().map_err(|e| StoreError::io(parent, e))? {
+                fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+            }
             return Ok(());
         }
         crate::page_guard::clear_page_guard(&mark, &self.body.read_file, self.body.path())
