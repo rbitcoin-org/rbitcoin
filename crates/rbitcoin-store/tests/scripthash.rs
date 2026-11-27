@@ -3112,6 +3112,27 @@ fn unlink_batch_publishes_both_heads() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A batch that names one scripthash twice removes every fk it names.
+#[test]
+fn unlink_batch_merges_a_repeated_scripthash() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let a = script_hash(&[0x65]);
+    for i in 1..=3u64 {
+        put_create(&t, rec(a, i, i as u32));
+    }
+    t.unlink_creates_batch(&[(a, vec![Fk(1)]), (a, vec![Fk(2)])])
+        .unwrap();
+    let fks =
+        |t: &ScriptHashTable| -> Vec<Fk> { t.entries(&a).unwrap().iter().map(|e| e.0).collect() };
+    assert_eq!(fks(&t), vec![Fk(3)]);
+    t.flush().unwrap();
+    drop(t);
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert_eq!(fks(&t), vec![Fk(3)]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Two frees on one body take one device barrier, then one alloc header.
 #[test]
 fn unlink_batch_syncs_one_body_once() {
