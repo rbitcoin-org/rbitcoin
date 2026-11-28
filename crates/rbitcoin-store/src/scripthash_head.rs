@@ -634,29 +634,6 @@ impl ScriptHashHead {
         Ok(())
     }
 
-    /// Byte spans [`Self::stage_rewrites`] will write for `keys`, in the same
-    /// hash-slot order. The cache is not flushed. A later key displaced by
-    /// an earlier one in this batch is included.
-    pub(crate) fn upsert_write_spans(
-        &self,
-        keys: &[[u8; 32]],
-    ) -> Result<Vec<(u64, u64)>, StoreError> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let slots_now = self.state.lock().unwrap().slots;
-        let val = ShHeadValue::inline_one(rbitcoin_primitives::Fk(1));
-        let enc = pack8_bytes(&val)?;
-        let mut order: Vec<&[u8; 32]> = keys.iter().collect();
-        order.sort_unstable_by_key(|full| Self::hash_slot(&Self::to_key(full), slots_now));
-        let mut cache = SlotPageCache::new(self, slots_now).preview();
-        for full in order {
-            let key = Self::to_key(full);
-            let _ = cache.try_insert(&key, &enc, true)?;
-        }
-        Ok(cache.dirty_spans())
-    }
-
     /// Sync the head, then drop its `*.ahead` image. No image means nothing to sync.
     #[doc(hidden)]
     pub fn sync_and_drop_ahead(&self) -> Result<(), StoreError> {
@@ -911,22 +888,6 @@ impl<'a> SlotPageCache<'a> {
     pub fn preview(mut self) -> Self {
         self.spill = ChunkSpill::Preview;
         self
-    }
-
-    fn dirty_spans(&self) -> Vec<(u64, u64)> {
-        let mut spans = Vec::new();
-        for chunk in self
-            .chunks
-            .values()
-            .chain(self.spilled.values())
-            .filter(|chunk| chunk.dirty)
-        {
-            spans.push((
-                ScriptHashHead::slot_file_off(chunk.base_slot),
-                chunk.data.len() as u64,
-            ));
-        }
-        spans
     }
 
     fn make_preview_room(&mut self) {

@@ -2803,7 +2803,7 @@ pub fn restore_open_marks(layout: &StoreLayout) -> Result<(), StoreError> {
 
 fn restore_hot_marks(path: &Path) -> Result<(), StoreError> {
     crate::page_guard::restore_store_group(path, crate::page_guard::CLASS_C_MARK)?;
-    restore_sh_marks_or_rebuild(path)?;
+    crate::scripthash::retire_leftover_sh_marks(path)?;
     Ok(())
 }
 
@@ -2815,23 +2815,6 @@ fn open_scripthash(path: &Path, scale: HeadScale) -> Result<ScriptHashTable, Sto
         ScriptHashTable::open_with_scale(path, scale)
     } else {
         ScriptHashTable::create_with_scale(path, scale)
-    }
-}
-
-/// A `guard/sh-*` mark that does not parse is scripthash damage, which
-/// rebuilds from Class A. Request that rebuild and drop the scripthash marks
-/// instead of stopping open. An OS error still stops open.
-fn restore_sh_marks_or_rebuild(path: &Path) -> Result<(), StoreError> {
-    match crate::page_guard::restore_sh_marks(path) {
-        Err(StoreError::Corrupt(why)) => {
-            rbitcoin_log::warn!(
-                "store: scripthash guard mark unreadable ({}); rebuilding the scripthash index",
-                why
-            );
-            crate::scripthash::mark_sh_rebuild(path)?;
-            crate::page_guard::clear_sh_marks(path)
-        }
-        other => other,
     }
 }
 

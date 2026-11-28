@@ -37,14 +37,6 @@ pub fn sidecar(base: &Path, ext: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn store_dir_holding_sh(path: &Path) -> Option<&Path> {
-    let parent = path.parent()?;
-    match parent.file_name().and_then(|n| n.to_str()) {
-        Some("scripthash.head" | "scripthash.ovf" | "scripthash.body") => parent.parent(),
-        _ => Some(parent),
-    }
-}
-
 pub fn mix_key16(key: &ShHeadKey) -> u64 {
     let lo = le_u64!(key, 0);
     let hi = le_u64!(key, 8);
@@ -127,13 +119,7 @@ impl MphfHead {
         }
         std::fs::rename(&staging, &mp).map_err(|e| StoreError::io(&mp, e))?;
         let vp = val_path(base);
-        crate::file::write_synced_tmp_rename_then(&vp, &val, || {
-            if let Some(dir) = store_dir_holding_sh(base) {
-                let rel = crate::page_guard::guard_rel_name(dir, &vp)?;
-                crate::page_guard::drop_sh_rel(dir, &rel)?;
-            }
-            Ok(())
-        })?;
+        crate::file::write_synced_tmp_rename(&vp, &val)?;
         Self::open(base)
     }
 
