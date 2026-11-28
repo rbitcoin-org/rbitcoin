@@ -1,0 +1,18 @@
+# The bitcoind the interop suite runs, fetched by
+# scripts/core-functional/fetch-bitcoind.sh with FETCH_BITCOIND_INVENTORY set
+# to this file. It is the Core release pin.env's BCS_CORE_VERSION names
+# (pin.test.sh checks), and moves with the spec pin, not with core-functional.
+pin = "v32.1"
+
+[release]
+base_url = "https://bitcoincore.org/bin/bitcoin-core-32.1"
+
+[[release.linux]]
+arch = "x86_64-linux-gnu"
+tarball = "bitcoin-32.1-x86_64-linux-gnu.tar.gz"
+sha256 = "61545c17c3120fb7412f896d248b11993af04ec8817aad3649c55b2afb044963"
+
+[[release.linux]]
+arch = "aarch64-linux-gnu"
+tarball = "bitcoin-32.1-aarch64-linux-gnu.tar.gz"
+sha256 = "7ed37c7373eb6aa3e3f72842596a1afeba1b223717033cade9842b25773e1922"

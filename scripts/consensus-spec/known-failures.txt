@@ -1,0 +1,55 @@
+# Checks rbitcoin is known to fail in bitcoin-consensus-spec's suites
+# (bcs-conformance --known-failures). One "<suite> <location>" per line, the
+# location as FAIL prints it, or its start up to a space. A failure not named
+# here fails the run. So does a line here that no longer fails: delete it in
+# the change that fixes it.
+
+# BIP340 over messages that are not 32 bytes. Consensus verifies only 32-byte
+# sighashes, and rbitcoin has no BIP340 path for another length.
+bip340 row 15
+bip340 row 16
+bip340 row 17
+bip340 row 18
+
+# Equal-work tie-break after invalidateblock. Core activates the candidate
+# whose data arrived first (nSequenceId); rbitcoin keeps the earlier held tip
+# (COMPAT.md, Equal-work fork choice). Both chains are valid.
+corpus feature_block.node0 check 88
+corpus feature_block.node0 check 89
+corpus feature_block.node0 check 90
+corpus feature_block_reorg.node0 check 88
+corpus feature_block_reorg.node0 check 89
+corpus feature_block_reorg.node0 check 90
+
+# A 1,088-block reorg onto a branch delivered before it became best: open
+# finding 088 F3 (docs/external_findings/088-tip-chain-selection.md), not a
+# harness effect. Tip-follow cannot assemble a branch that forks more than
+# HeldBodies::STALE_BELOW (288) blocks below the tip and does not hand off to
+# the IBD rewind, which refuses more than REWIND_MAX_DEPTH (1024). A peer
+# would not help. Interop and peer-sync sync this chain over P2P but never do
+# this reorg.
+corpus feature_block_reorg.node0 check 131
+corpus feature_block_reorg.node0 check 132
+
+# No regtest -test=bip94 (COMPAT.md, BIP94). BIP94 is enforced on testnet4
+# only, so these scenarios cannot be configured. Each file's errors are named
+# from the refused chain_reset, so an error before it is not covered.
+corpus feature_spec_pitfalls.node2 check 1
+corpus feature_spec_pitfalls.node2 check 2
+corpus feature_spec_pitfalls.node2 check 3
+corpus feature_spec_pitfalls.node2 check 4
+corpus feature_spec_pitfalls.node2 check 5
+corpus feature_spec_pitfalls.node2 check 6
+corpus feature_spec_pitfalls.node2 check 7
+corpus feature_spec_pitfalls.node2 errors from event 0
+corpus mining_basic.node0 check 265
+corpus mining_basic.node0 check 266
+corpus mining_basic.node0 check 267
+corpus mining_basic.node0 check 268
+corpus mining_basic.node0 check 269
+corpus mining_basic.node0 check 270
+corpus mining_basic.node0 check 271
+corpus mining_basic.node0 errors from event 642
+interop chain feature_spec_pitfalls.node2
+peer-sync feature_spec_pitfalls.node2 follow
+peer-sync feature_spec_pitfalls.node2 ibd

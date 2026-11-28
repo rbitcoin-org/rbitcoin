@@ -41,6 +41,12 @@ name = "journey-node"
 path = "src/bin/journey-node.rs"
 test = false
 
+# bitcoin-consensus-spec conformance harness (scripts/consensus-spec).
+[[bin]]
+name = "bcs-harness"
+path = "src/bin/bcs-harness.rs"
+test = false
+
 [[test]]
 name = "suite"
 path = "tests/suite.rs"

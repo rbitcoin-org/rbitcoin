@@ -113,6 +113,15 @@ required check. Do not label ordinary PRs.
 Label `nixos-module-runtime` when the NixOS module VM test should run (not
 eval). Poll with `--interest nixos-module-runtime`. It is not a required
 check.
+Label `consensus-spec` when the PR touches `scripts/consensus-spec/` or
+`bcs-harness`, or fixes a check `known-failures.txt` names: the fixed
+entry is then stale and fails the next weekly run and ship PR until its
+line is deleted
+([`docs/consensus-tests.md`](../../../docs/consensus-tests.md#bitcoin-consensus-spec)).
+Label it too when the PR changes block download or the initial-sync write
+path: peer-sync, about an hour, runs only under this label and weekly. A
+ship PR runs the other three suites without the label, in about 11
+minutes. It is not a required check.
 
 Bot fetch and push: [`rearden-vm-HOST.md`](../../../rearden-vm-HOST.md).
 
