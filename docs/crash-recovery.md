@@ -220,7 +220,8 @@ not image page 0, and a restore recreates a lost name from the images alone.
 `spent.ovf` appends past its durable length and publishes the length only at
 a spend checkpoint or flush, after the nodes are synced. A scripthash write, including an
 in-place slab and a head word, takes no mark: it runs under
-`scripthash.dirty`, and a crash inside it rebuilds the index. A `txstat` stamp
+`scripthash.dirty`, and after a crash inside it a start with the index on
+refuses until the index is rebuilt. A `txstat` stamp
 needs no mark: each cell and block slot sits inside one sector, and the stamp
 is synced. Block-filter and silent-payment tweak puts are appends: bytes,
 then lengths, body before idx, each synced, with no mark. A new segment
@@ -404,7 +405,9 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   The marker rescues faults that surface after open succeeded: a torn page, a failed write or unlink, a read of a
   torn key. A `guard/sh-*` mark left by an earlier development build writes `scripthash.rebuild` and is
   removed without being copied back, and the index open then discards the SH files before it decodes them,
-  so that start rebuilds from Class A. Without such a request, damage that makes the index open fail (a truncated
+  so that start rebuilds from Class A. The same request is written when `scripthash.dirty` is present and the
+  index does not decode: a crash cut a write, and the index is untrusted anyway. Without `scripthash.dirty`
+  or such a request, damage that makes the index open fail (a truncated
   `scripthash.head/NN.val`, a torn undo record, or an alloc header whose bump or free head is out of range)
   is decoded before the degraded marker is read, so such a store does not start, with or without
   `RBITCOIN_SH_AUTO_REBUILD` and `RBITCOIN_SH_FORCE_REBUILD`, and the fix is to stop the node, remove

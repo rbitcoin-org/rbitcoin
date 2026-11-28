@@ -57,7 +57,7 @@ segwit activation. Do not key the check on witness presence instead: storage
 tests store witness-carrying blocks that were never valid, and those must keep
 reconstructing.
 
-## A failed scripthash commit can leave a key served until restart
+## A failed scripthash commit can leave a key unreadable until restart
 
 A scripthash commit whose body sync fails holds `scripthash.dirty` until a
 wipe, and a start with the index on refuses while it is set. Until that
@@ -66,8 +66,8 @@ commit touched can read `Corrupt` (slab `used` disagrees with its decoded
 count) ([#2192](https://github.com/rbitcoin-org/rbitcoin/issues/2192)).
 
 This needs an I/O error inside a live commit. An unclean shutdown alone
-does not reach it: the crash leaves `scripthash.dirty`, and the index is
-rebuilt.
+does not reach it: the crash leaves `scripthash.dirty`, and a start with
+the index on refuses until it is rebuilt.
 
 A slab whose `used` disagrees with its count is refused, not served: the
 query layer rebuilds the index when a read hits `Corrupt`. An append that

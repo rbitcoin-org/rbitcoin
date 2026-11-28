@@ -136,10 +136,10 @@ pub fn sh_dirty_marked(store_dir: &Path) -> bool {
 }
 
 /// A `guard/sh-*` mark is left by an older build whose scripthash commit
-/// did not finish. That commit ran under [`SH_DIRTY_NAME`], so the index is
-/// rebuilt either way. Request the rebuild, which drops the index files
-/// before open decodes them, then drop the marks without copying their
-/// images back.
+/// did not finish. That commit ran under [`SH_DIRTY_NAME`], so the index
+/// was untrusted either way. Request the rebuild, which drops the index
+/// files before open decodes them, then drop the marks without copying
+/// their images back.
 pub(crate) fn retire_leftover_sh_marks(store_dir: &Path) -> Result<(), StoreError> {
     if !page_guard::sh_marks_present(store_dir)? {
         return Ok(());
@@ -1244,7 +1244,6 @@ impl ScriptHashTable {
     }
 
     pub fn open_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
-        retire_leftover_sh_marks(dir)?;
         let expected = sh_main_shard_count(scale);
         discard_incomplete_scripthash_head(dir, expected)?;
         discard_leftover_oa_overflow(dir)?;
@@ -1261,7 +1260,6 @@ impl ScriptHashTable {
         n_shards: usize,
         scale: HeadScale,
     ) -> Result<Self, StoreError> {
-        retire_leftover_sh_marks(dir)?;
         let n_shards = n_shards.max(1);
         let mut bodies = Vec::with_capacity(n_shards);
         let mut allocs = Vec::with_capacity(n_shards);
