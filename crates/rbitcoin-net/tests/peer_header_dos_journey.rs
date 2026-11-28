@@ -2235,6 +2235,7 @@ fn self_announce_stays_on_the_link_network() {
             peers.set_p2p_onion(onion.host_str(), onion.port());
         }
         if with_i2p {
+            peers.set_overlay_loopback_forward(true);
             peers.set_p2p_i2p(i2p);
         }
         peers
@@ -2242,6 +2243,17 @@ fn self_announce_stays_on_the_link_network() {
 
     let out = rbitcoin_net::peers::PeerConnType::OutboundFullRelay;
     let inbound = rbitcoin_net::peers::PeerConnType::Inbound;
+    let starting = hub_with(true, false);
+    starting.set_overlay_loopback_forward(true);
+    let starting_peer = overlay_peer(&starting, loopback_inbound, inbound);
+    assert!(
+        starting_peer.take_local_addr_due(1_000).is_none(),
+        "SAM ingress cannot announce a clearnet address while starting"
+    );
+    assert!(self_announce_nets(&starting_peer).is_empty());
+    starting.set_p2p_i2p(i2p);
+    assert_eq!(self_announce_nets(&starting_peer), ["i2p"]);
+
     let peers = hub_with(true, true);
     assert_eq!(
         self_announce_nets(&overlay_peer(&peers, clearnet_peer, out)),
@@ -2275,19 +2287,23 @@ fn self_announce_stays_on_the_link_network() {
         self_announce_nets(&overlay_peer(&peers, other_i2p, out)),
         ["i2p"]
     );
-    assert!(
-        self_announce_nets(&overlay_peer(&peers, loopback_inbound, inbound)).is_empty(),
-        "loopback inbound could be Tor or I2P, so it gets nothing"
+    assert_eq!(
+        self_announce_nets(&overlay_peer(&peers, loopback_inbound, inbound)),
+        ["i2p"]
     );
 
     let tor_only = hub_with(true, false);
+    tor_only.set_net_perms(rbitcoin_net::net_permissions::NetPermTable {
+        onion_bind: loopback_inbound.socket_addr(),
+        ..Default::default()
+    });
     let tor_inbound = overlay_peer(&tor_only, loopback_inbound, inbound);
     assert_eq!(
         self_announce_nets(&tor_inbound),
         ["onion"],
         "inbound on the onion listener gets the onion and not the clearnet IP"
     );
-    let v1_tor_inbound = live_peer(&tor_only, 51001, 41, true);
+    let v1_tor_inbound = live_peer(&tor_only, 51000, 41, true);
     assert!(
         v1_tor_inbound.take_self_announce_msg().is_none(),
         "v1 ADDR on the onion listener must not carry the clearnet IP"
@@ -2411,6 +2427,7 @@ fn external_onion_announcement_uses_the_configured_or_listen_port_on_tor() {
 
 #[test]
 fn external_onion_withholds_self_announcements_on_shared_loopback() {
+    use rbitcoin_net::net_permissions::{parse_whitelist, NetPermTable};
     use rbitcoin_net::peers::PeerConnType::Inbound;
 
     let peers = rbitcoin_net::PeerHub::new();
@@ -2427,6 +2444,18 @@ fn external_onion_withholds_self_announcements_on_shared_loopback() {
     assert!(inbound().take_local_addr_due(1_000).is_none());
     assert!(inbound().take_self_announce_msg().is_none());
 
+    peers.set_net_perms(NetPermTable {
+        onion_bind: Some("127.0.0.1:18446".parse().unwrap()),
+        onion_bind_is_implicit: true,
+        whitelist: vec![parse_whitelist("relay@127.0.0.1").unwrap()],
+        ..Default::default()
+    });
+    assert!(inbound().take_local_addr_due(1_000).is_none());
+    assert!(inbound().take_self_announce_msg().is_none());
+    let socket = loopback.socket_addr().unwrap();
+    assert!(peers.permission_strings(socket, true, socket).is_empty());
+
+    peers.set_overlay_loopback_forward(true);
     peers.set_p2p_i2p(rbitcoin_net::NetAddr::I2p {
         dest: [0x11; 32],
         port: 0,
@@ -2518,6 +2547,7 @@ fn marked_tor_listener_announces_the_public_onion() {
         dest: [0x11; 32],
         port: 0,
     };
+    peers.set_overlay_loopback_forward(true);
     peers.set_p2p_i2p(i2p);
     assert_eq!(announce(tor_bind), public.parse().unwrap());
     assert_eq!(announce(normal_bind), i2p);
@@ -2586,6 +2616,7 @@ fn a_down_onion_is_not_advertised_but_stays_our_own() {
     let external_onion = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion";
     let peers = rbitcoin_net::peers::PeerHub::new();
     peers.set_p2p_onion(onion.host_str(), onion.port());
+    peers.set_overlay_loopback_forward(true);
     peers.set_p2p_i2p(i2p);
     peers.set_tor_wallet_onion(tor_wallet.host_str(), tor_wallet.port());
     peers.set_listen_port(50002);
@@ -2612,9 +2643,10 @@ fn a_down_onion_is_not_advertised_but_stays_our_own() {
         peers.is_own_address(tor_wallet),
         "a down wallet onion is still filtered from address replies"
     );
-    assert!(
-        self_announce_nets(&overlay_peer(&peers, loopback_inbound, inbound)).is_empty(),
-        "a loopback inbound still cannot tell Tor from I2P, so it gets neither"
+    assert_eq!(
+        self_announce_nets(&overlay_peer(&peers, loopback_inbound, inbound)),
+        ["i2p"],
+        "the I2P announcement continues while native Tor is down"
     );
 
     peers.set_external_endpoints(vec![external_onion.parse().unwrap()]);

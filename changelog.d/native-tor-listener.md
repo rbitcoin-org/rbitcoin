@@ -1,0 +1,3 @@
+Fixed
+
+- **Native Tor inbound uses a dedicated listener.** With `--listen-onion`, rbitcoin opens a marked loopback listener if no explicit `=onion` bind is configured. With automatic P2P listening, startup fails if the network's default P2P port plus one is busy. Set an ordinary `--listen ADDR:PORT` to keep ordinary P2P and let the OS choose a free Tor port. The onion service's public P2P port stays the same. Source-IP grants skip the marked listener. Ordinary inbound loopback keeps those grants unless `--i2p-accept-incoming` is enabled or an external onion is configured without an explicit `=onion` bind.

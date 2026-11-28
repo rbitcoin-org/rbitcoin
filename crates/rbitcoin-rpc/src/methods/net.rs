@@ -111,7 +111,7 @@ pub fn peerinfo_json(chain: Option<&rbitcoin_net::ChainHub>, p: rbitcoin_net::Pe
         "connection_type": p.conn_type.as_str(),
         "relaytxes": p.relay && !matches!(p.conn_type, rbitcoin_net::PeerConnType::BlockRelay),
         "transport_protocol_type": p.transport.as_str(),
-        "network": p.net.network_label(),
+        "network": p.network,
         "synced_headers": synced_headers,
         "synced_blocks": synced_blocks,
         "timeoffset": p.time_offset_secs,

@@ -7322,6 +7322,80 @@ fn getpeerinfo_and_disconnectnode_support_onion_addr() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn getpeerinfo_uses_the_network_class_of_the_socket_address() {
+    use rbitcoin_net::{NetAddr, OnlyNet, PeerConnType, PeerHub};
+
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    let bind = "127.0.0.1:18445".parse().unwrap();
+    let not_public = "not_publicly_routable";
+    let cjdns = "[fc00::1]:18444";
+    let plain_cjdns = "[fc00::2]:18444";
+    let cases = [
+        ("127.0.0.1:18444", not_public),
+        ("192.168.1.5:18444", not_public),
+        ("[::1]:18444", not_public),
+        ("[fd42::1]:18444", not_public),
+        ("[fe80::1]:18444", not_public),
+        ("[::ffff:192.168.1.6]:18444", not_public),
+        ("255.255.255.255:18444", not_public),
+        ("[2001:db8::1]:18444", not_public),
+        ("[3fff::1]:18444", not_public),
+        ("[2001:10::1]:18444", not_public),
+        ("[2001:20::1]:18444", not_public),
+        ("1.2.3.4:18444", "ipv4"),
+        ("[2606:4700::1]:18444", "ipv6"),
+        ("224.0.0.1:18444", "ipv4"),
+        ("240.0.0.1:18444", "ipv4"),
+        ("[2001:2::1]:18444", "ipv6"),
+        ("[100::1]:18444", "ipv6"),
+        ("[64:ff9b::102:304]:18444", "ipv4"),
+        ("[64:ff9b::c0a8:106]:18444", "ipv4"),
+        ("[::ffff:0:102:304]:18444", "ipv4"),
+        ("[2002:102:304::1]:18444", "ipv4"),
+        ("[2001:0:1:2:3:4:fefd:fcfb]:18444", "ipv4"),
+        (cjdns, not_public),
+    ];
+    for (addr, _) in cases {
+        hub.register_connecting(addr.parse().unwrap(), bind, true, PeerConnType::Inbound);
+    }
+    let plain_socket = plain_cjdns.parse().unwrap();
+    hub.register_connecting_net(
+        plain_socket,
+        NetAddr::Ip(plain_socket),
+        bind,
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    ctx.peers = Some(Arc::clone(&hub));
+
+    let info = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+    let rows = info.as_array().unwrap();
+    assert_eq!(rows.len(), cases.len() + 1);
+    for (row, (addr, class)) in rows
+        .iter()
+        .zip(cases.into_iter().chain([(plain_cjdns, not_public)]))
+    {
+        assert_eq!(row["network"], class, "{addr}: {row}");
+    }
+
+    for (only_net, class) in [
+        (&[][..], "cjdns"),
+        (&[OnlyNet::Cjdns][..], "cjdns"),
+        (&[OnlyNet::Ipv4][..], not_public),
+    ] {
+        hub.set_cjdns_reporting(true, only_net);
+        let info = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+        let rows = info.as_array().unwrap();
+        for addr in [cjdns, plain_cjdns] {
+            let row = rows.iter().find(|row| row["addr"] == addr).unwrap();
+            assert_eq!(row["network"], class, "{addr}: {row}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A `--proxy` name session lists its name as `addr`, and `disconnectnode`
 /// takes that `addr` back, as Core matches the name a peer was added by.
 #[test]
@@ -7345,6 +7419,7 @@ fn disconnectnode_takes_the_addr_of_a_proxied_name() {
 
     let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
     assert_eq!(r[0]["addr"], json!("peer.example:8333"));
+    assert_eq!(r[0]["network"], "not_publicly_routable");
     dispatch(&ctx, "disconnectnode", vec![json!("peer.example:8333")]).unwrap();
     assert_eq!(dispatch(&ctx, "getpeerinfo", vec![]).unwrap(), json!([]));
     let _ = std::fs::remove_dir_all(&dir);

@@ -19,6 +19,9 @@ pub const I2P_B32_LEN: usize = 52;
 #[doc(hidden)]
 pub const I2P_SUFFIX: &str = ".b32.i2p";
 
+/// Network label for a peer without a known publicly routable address.
+pub const NOT_PUBLICLY_ROUTABLE: &str = "not_publicly_routable";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnlyNet {
     Ipv4,
@@ -41,6 +44,10 @@ impl OnlyNet {
     }
 
     pub const ALL: [Self; 5] = [Self::Ipv4, Self::Ipv6, Self::Onion, Self::I2p, Self::Cjdns];
+
+    pub(crate) fn allowed_by(self, only_net: &[Self]) -> bool {
+        only_net.is_empty() || only_net.contains(&self)
+    }
 
     pub fn of(addr: NetAddr) -> Self {
         match addr {
@@ -71,6 +78,10 @@ impl OnlyNet {
 /// `is_documentation` is still unstable.
 #[doc(hidden)]
 pub fn ipv6_special_unroutable(v: Ipv6Addr) -> bool {
+    ipv6_special_unroutable_for::<true>(v)
+}
+
+fn ipv6_special_unroutable_for<const GOSSIP: bool>(v: Ipv6Addr) -> bool {
     let o = v.octets();
     if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0x0d && o[3] == 0xb8 {
         return true;
@@ -85,6 +96,9 @@ pub fn ipv6_special_unroutable(v: Ipv6Addr) -> bool {
     if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0x00 && (o[3] & 0xf0) == 0x20 {
         return true;
     }
+    if !GOSSIP {
+        return false;
+    }
     // RFC 5180 benchmarking. The IPv4 twin is `198.18.0.0/15`. The last
     // 80 bits are free, so the whole prefix has to go.
     if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0x00 && o[3] == 0x02 && o[4] == 0x00 && o[5] == 0x00
@@ -92,6 +106,29 @@ pub fn ipv6_special_unroutable(v: Ipv6Addr) -> bool {
         return true;
     }
     o[0] == 0x01 && o[1] == 0x00 && o[2..8].iter().all(|&b| b == 0)
+}
+
+/// Core `GetLinkedIPv4`: the IPv4 an IPv4-mapped, NAT64 (RFC 6052), SIIT
+/// (RFC 6145), 6to4 (RFC 3964), or Teredo (RFC 4380) address carries.
+pub(crate) fn linked_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let o = v6.octets();
+    let last = Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+    // `::ffff:0:0/96`, `64:ff9b::/96`, and `::ffff:0:0:0/96`.
+    let mapped = o[..10].iter().all(|&b| b == 0) && o[10..12] == [u8::MAX, u8::MAX];
+    let nat64 = o[..4] == [0, 100, u8::MAX, 155] && o[4..12].iter().all(|&b| b == 0);
+    let siit = o[..8].iter().all(|&b| b == 0) && o[8..12] == [u8::MAX, u8::MAX, 0, 0];
+    if mapped || nat64 || siit {
+        return Some(last);
+    }
+    // 6to4 `2002::/16`: the IPv4 is bytes 2 to 5.
+    if o[..2] == [32, 2] {
+        return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    // Teredo `2001::/32`: the client IPv4 is the last four bytes, inverted.
+    if o[..4] == [32, 1, 0, 0] {
+        return Some(Ipv4Addr::from(!u32::from(last)));
+    }
+    None
 }
 
 /// Tunnel and translation prefixes.
@@ -168,17 +205,26 @@ pub fn ipv4_this_network(v: Ipv4Addr) -> bool {
 
 #[doc(hidden)]
 pub fn ipv4_unroutable(v: Ipv4Addr) -> bool {
-    v.is_unspecified()
-        || v.is_loopback()
+    ipv4_peer_unroutable(v) || v.is_multicast() || ipv4_reserved(v)
+}
+
+fn ipv4_peer_unroutable(v: Ipv4Addr) -> bool {
+    v.is_loopback()
         || v.is_private()
         || v.is_link_local()
-        // `is_broadcast` is only `255.255.255.255`, already in `240.0.0.0/4`.
-        || v.is_multicast()
+        || v.is_broadcast()
         || v.is_documentation()
         || ipv4_shared(v)
         || ipv4_benchmarking(v)
-        || ipv4_reserved(v)
         || ipv4_this_network(v)
+}
+
+fn ipv6_peer_unroutable(v: Ipv6Addr) -> bool {
+    v.is_unspecified()
+        || v.is_loopback()
+        || v.is_unique_local()
+        || v.segments()[..4] == [0xfe80, 0, 0, 0]
+        || ipv6_special_unroutable_for::<false>(v)
 }
 
 /// Clearnet bogon. CJDNS `fc00::/8` is an overlay, not a unique-local bogon.
@@ -499,6 +545,27 @@ impl NetAddr {
 
     pub fn network_label(self) -> &'static str {
         OnlyNet::of(self).label()
+    }
+
+    /// Core's IP network classes for connection reporting. The gossip filter
+    /// applies additional rules to addresses considered for the address book.
+    pub(crate) fn peer_network_label(self, cjdns_reportable: bool) -> &'static str {
+        let address = match self {
+            Self::Ip(socket) => Self::from_socket(socket),
+            address => address,
+        };
+        match address {
+            Self::Name { .. } => NOT_PUBLICLY_ROUTABLE,
+            Self::Cjdns { .. } if !cjdns_reportable => NOT_PUBLICLY_ROUTABLE,
+            Self::Ip(socket) => match socket.ip().to_canonical() {
+                IpAddr::V4(ip) if ipv4_peer_unroutable(ip) => NOT_PUBLICLY_ROUTABLE,
+                IpAddr::V4(_) => OnlyNet::Ipv4.label(),
+                IpAddr::V6(ip) if ipv6_peer_unroutable(ip) => NOT_PUBLICLY_ROUTABLE,
+                IpAddr::V6(ip) if linked_ipv4(ip).is_some() => OnlyNet::Ipv4.label(),
+                IpAddr::V6(_) => OnlyNet::Ipv6.label(),
+            },
+            _ => address.network_label(),
+        }
     }
 }
 

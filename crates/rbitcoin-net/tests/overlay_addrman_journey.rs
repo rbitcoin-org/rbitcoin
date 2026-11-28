@@ -85,10 +85,25 @@ fn advertise_then_self_announce(hub: &Arc<PeerHub>) {
     hub.set_listen_port(8333);
     hub.set_external_endpoints(vec![rbitcoin_net::netaddr::ExternalEndpoint::BareIp(IpAddr::V6(ip))]);
     assert!(hub.advertise_local_socket().is_none());
+    hub.set_cjdns_reporting(true, &[]);
+    let connecting = hub.register_connecting(
+        SocketAddr::from((ip, 18444)),
+        SocketAddr::from((ip, 8333)),
+        true,
+        PeerConnType::Inbound,
+    );
+    let rows = hub.snapshot();
+    let row = rows.iter().find(|row| row.id == connecting.id).unwrap();
+    assert_eq!(row.network, "cjdns");
+    assert!(!row.handshake_complete);
+    assert!(hub.advertise_local_socket().is_none());
+    hub.unregister(connecting.id);
     hub.set_cjdns_reachable(true);
     let sock = hub.advertise_local_socket().expect("cjdns listen");
     assert_eq!(sock.ip(), IpAddr::V6(ip));
     assert_eq!(sock.port(), 8333);
+    hub.set_cjdns_reporting(true, &[rbitcoin_net::OnlyNet::Ipv4]);
+    assert_eq!(hub.advertise_local_socket(), Some(sock));
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let ver = VersionMessage {

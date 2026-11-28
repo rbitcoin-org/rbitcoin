@@ -2,6 +2,7 @@
 //! asmap ASN, or IPv4 `/16` / IPv6 `/32` (Hurricane Electric `/36`).
 
 use crate::asmap::AsMap;
+use crate::netaddr::linked_ipv4;
 use crate::NetAddr;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -71,29 +72,6 @@ fn ipv4_group(v4: Ipv4Addr) -> u64 {
     let o = v4.octets();
     // The high byte sits above the low byte, so `|` and `^` are the same key.
     (u64::from(o[0]) << 8).wrapping_add(u64::from(o[1]))
-}
-
-/// Core `GetLinkedIPv4`: the IPv4 an IPv4-mapped, NAT64 (RFC 6052), SIIT
-/// (RFC 6145), 6to4 (RFC 3964), or Teredo (RFC 4380) address carries.
-fn linked_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
-    let o = v6.octets();
-    let last = Ipv4Addr::new(o[12], o[13], o[14], o[15]);
-    // `::ffff:0:0/96`, `64:ff9b::/96`, and `::ffff:0:0:0/96`.
-    let mapped = o[..10].iter().all(|&b| b == 0) && o[10..12] == [u8::MAX, u8::MAX];
-    let nat64 = o[..4] == [0, 100, u8::MAX, 155] && o[4..12].iter().all(|&b| b == 0);
-    let siit = o[..8].iter().all(|&b| b == 0) && o[8..12] == [u8::MAX, u8::MAX, 0, 0];
-    if mapped || nat64 || siit {
-        return Some(last);
-    }
-    // 6to4 `2002::/16`: the IPv4 is bytes 2 to 5.
-    if o[..2] == [32, 2] {
-        return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
-    }
-    // Teredo `2001::/32`: the client IPv4 is the last four bytes, inverted.
-    if o[..4] == [32, 1, 0, 0] {
-        return Some(Ipv4Addr::from(!u32::from(last)));
-    }
-    None
 }
 
 /// Core: Hurricane Electric `2001:470::/32` by `/36`, the rest by `/32`.

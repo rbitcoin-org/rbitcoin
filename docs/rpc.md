@@ -49,6 +49,26 @@ client refuses to start below a newer floor. Bark's captaind requires
 `310000` because Core 31 added the `getmempoolentry` chunk fields, which
 this node already returns.
 
+## `getpeerinfo.network`
+
+A connection accepted on an implicit native Tor listener or an explicit
+`=onion` listener reports `onion` as soon as it appears in `getpeerinfo`,
+including before VERSION.
+`addr` and `addrbind` still report the TCP source and listening endpoint.
+
+IP peers use Bitcoin Core's connection classes. Private and loopback IPs
+and SOCKS-resolved names with no known IP report `not_publicly_routable`.
+Address gossip filters additional ranges, such as `100::/64`, which reports
+`ipv6` in `getpeerinfo`.
+
+Inbound I2P peers forwarded by SAM appear as loopback TCP peers and report
+`not_publicly_routable`. Outbound I2P peers dialed by destination report `i2p`.
+
+A routable IPv6 address with a linked IPv4 address reports `ipv4` even if
+its embedded IPv4 is private. TCP peers from `fc00::/8` report `cjdns` if
+`--cjdns-reachable` enables it and `--only-net` allows it. Otherwise they
+report `not_publicly_routable`.
+
 ## Operator knobs
 
 | Knob | Default | Meaning |

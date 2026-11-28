@@ -149,6 +149,8 @@ fn clearnet_bogon_conjunctions_stay_tight() {
     for ip in [
         v6("2001:db8::1"),
         v6("3fff::1"),
+        v6("2001:2::1"),
+        v6("100::1"),
         v6("64:ff9b:1::"),
         v6("::ffff:0:0:0"),
         v6("::1"),
@@ -157,6 +159,7 @@ fn clearnet_bogon_conjunctions_stay_tight() {
         v6("ff02::1"),
         v4(255, 255, 255, 255),
         v4(224, 0, 0, 1),
+        v4(240, 0, 0, 1),
     ] {
         assert!(clearnet_unroutable(ip), "{ip} is a clearnet bogon");
     }

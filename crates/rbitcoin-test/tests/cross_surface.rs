@@ -357,7 +357,14 @@ async fn pin_metrics_equal_rpc(
         m["rbitcoin_tip_age_seconds"]
     );
     let peer_rows = peers.as_array().expect("getpeerinfo array");
-    for network in ["ipv4", "ipv6", "onion", "i2p", "cjdns"] {
+    for network in [
+        "ipv4",
+        "ipv6",
+        "onion",
+        "i2p",
+        "cjdns",
+        "not_publicly_routable",
+    ] {
         let want = peer_rows.iter().filter(|p| p["network"] == network).count() as f64;
         let series = format!("rbitcoin_peers{{network=\"{network}\"}}");
         assert_eq!(m.get(&series), Some(&want), "{series}: {m:?}");
@@ -3828,14 +3835,47 @@ async fn onion_listener_separates_source_ip_grants() {
     cfg.tor.control = Some(tor.addr);
     cfg.tor.password = Some(TOR_PASSWORD.into());
     cfg.rpc.listen = Some(rpc);
+    cfg.listen.health = Some("127.0.0.1:0".parse().unwrap());
+    cfg.metrics = true;
     cfg.max_run_secs = Some(60);
 
     let node = spawn_run_p2p(cfg);
     wait_listeners(&[rpc]).await;
+    let health = published_listener(&td.path(), "health").await;
+    let streams = [
+        TcpStream::connect(direct).await.unwrap(),
+        TcpStream::connect(onion).await.unwrap(),
+    ];
+    let sockets = streams
+        .each_ref()
+        .map(|stream| stream.local_addr().unwrap());
+    let wait_for_peers = |established| async move {
+        let sources = sockets.map(|socket| socket.to_string());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let info = jsonrpc(rpc, "getpeerinfo", json!([])).await;
+                if info["result"].as_array().is_some_and(|rows| {
+                    sources.iter().all(|source| {
+                        rows.iter().any(|row| {
+                            row["addr"] == source.as_str()
+                                && row["version"]
+                                    .as_u64()
+                                    .is_some_and(|version| (version > 0) == established)
+                        })
+                    })
+                }) {
+                    break info;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("both fixture peers with established={established}"))
+    };
+    let connecting = wait_for_peers(false).await;
+    let connecting_metrics = scrape_metrics(health).await;
     let mut connections = Vec::new();
-    for addr in [direct, onion] {
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let local = stream.local_addr().unwrap();
+    for ((stream, addr), local) in streams.into_iter().zip([direct, onion]).zip(sockets) {
         let handshake = connect_and_handshake(
             stream,
             bitcoin::p2p::Magic::REGTEST,
@@ -3853,8 +3893,37 @@ async fn onion_listener_separates_source_ip_grants() {
                 .unwrap(),
         );
     }
-    let info = jsonrpc(rpc, "getpeerinfo", json!([])).await;
+    let info = wait_for_peers(true).await;
+    let metrics = scrape_metrics(health).await;
     stop_run_p2p(rpc, node).await;
+    for (established, snapshot, samples) in [
+        (false, &connecting, connecting_metrics),
+        (true, &info, metrics),
+    ] {
+        let rows = snapshot["result"].as_array().unwrap();
+        for ((bind, socket), network) in [direct, onion]
+            .into_iter()
+            .zip(sockets)
+            .zip(["not_publicly_routable", "onion"])
+        {
+            let row = rows
+                .iter()
+                .find(|row| row["addrbind"] == bind.to_string())
+                .unwrap();
+            assert_eq!(row["addr"], socket.to_string(), "{snapshot}");
+            assert_eq!(
+                row["version"].as_u64().unwrap() > 0,
+                established,
+                "{snapshot}"
+            );
+            assert_eq!(row["network"], network, "{snapshot}");
+            assert_eq!(
+                samples[&format!("rbitcoin_peers{{network=\"{network}\"}}")],
+                1.0
+            );
+        }
+        assert_eq!(samples["rbitcoin_peers{network=\"ipv4\"}"], 0.0);
+    }
     let rows = info["result"].as_array().unwrap();
     for (bind, expected) in [(direct, json!(["relay"])), (onion, json!(["addr"]))] {
         let row = rows
@@ -3871,6 +3940,130 @@ async fn onion_listener_separates_source_ip_grants() {
                 && cmd.ends_with(&format!("Port=18444,{onion}"))),
         "{commands:?}"
     );
+}
+
+fn native_tor_port_mapping(line: &str, ordinary: SocketAddr) -> (&str, SocketAddr) {
+    let mapping = line.split_whitespace().last().unwrap();
+    let (public, target) = mapping.split_once(',').unwrap();
+    assert_eq!(
+        public,
+        format!("Port={}", Network::Regtest.default_p2p_port())
+    );
+    let target: SocketAddr = target.parse().unwrap();
+    assert_eq!(target.ip().to_string(), "127.0.0.1");
+    assert_ne!(target.port(), 0);
+    assert_ne!(target, ordinary, "Tor needs a dedicated listener");
+    (mapping, target)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_tor_with_an_external_onion_keeps_ordinary_loopback_unprivileged() {
+    check_native_tor_listener_permissions(
+        Some("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"),
+        &[],
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_tor_keeps_ordinary_loopback_grants_off_its_listener() {
+    check_native_tor_listener_permissions(None, &["relay"]).await;
+}
+
+async fn check_native_tor_listener_permissions(
+    external_onion: Option<&str>,
+    ordinary_permissions: &[&str],
+) {
+    use rbitcoin_net::peer::V2PlainSession;
+
+    let td = TestDatadir::new().unwrap();
+    rbitcoin_test::jsonrpc::write_rpc_token(&td.path());
+    let tor = FakeTor::start().await;
+    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
+    let rpc = ephemeral_addr();
+    let mut cfg = listen_and_exit_cfg(&td.path());
+    cfg.listen.listen_onion = true;
+    cfg.tor.control = Some(tor.addr);
+    cfg.tor.password = Some(TOR_PASSWORD.into());
+    cfg.rpc.listen = Some(rpc);
+    cfg.max_run_secs = Some(60);
+    if let Some(onion) = external_onion {
+        cfg.apply_kv("external_ip", onion).unwrap();
+    }
+    cfg.apply_kv("net_permission", "relay@127.0.0.1").unwrap();
+
+    let node = spawn_run_p2p(cfg);
+    wait_listeners(&[rpc]).await;
+    let ordinary = published_listener(&td.path(), "p2p").await;
+    let commands = starts_with_any(&tor.take_log(), "ADD_ONION ");
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    let (_, marked) = native_tor_port_mapping(&commands[0], ordinary);
+    let mut peers = Vec::new();
+    for addr in [ordinary, marked] {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        peers.push(
+            V2PlainSession::outbound_regtest(
+                stream,
+                "/native-tor-bind-test/",
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let binds = [ordinary.to_string(), marked.to_string()];
+    let registered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let info = jsonrpc(rpc, "getpeerinfo", json!([])).await;
+            let rows = info["result"].as_array().unwrap();
+            if binds.iter().all(|bind| {
+                rows.iter()
+                    .any(|row| row["inbound"] == true && row["addrbind"] == *bind)
+            }) {
+                return info;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    stop_run_p2p(rpc, node).await;
+    drop(peers);
+
+    let info = registered.expect("both inbound peers registered");
+    let rows = info["result"].as_array().unwrap();
+    for ((bind, permissions), network) in binds
+        .iter()
+        .zip([ordinary_permissions, &[]])
+        .zip(["not_publicly_routable", "onion"])
+    {
+        let row = rows.iter().find(|row| row["addrbind"] == *bind).unwrap();
+        assert_eq!(row["permissions"], json!(permissions), "{info}");
+        assert_eq!(row["network"], network, "{info}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_tor_and_sam_keep_separate_targets_without_an_ordinary_bind() {
+    let td = TestDatadir::new().unwrap();
+    let tor = FakeTor::start().await;
+    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
+    let sam = FakeSam::start().await;
+    let mut cfg = listen_and_exit_cfg(&td.path());
+    cfg.apply_kv("listen", "0").unwrap();
+    cfg.listen.listen_onion = true;
+    cfg.tor.control = Some(tor.addr);
+    cfg.tor.password = Some(TOR_PASSWORD.into());
+    cfg.listen.i2p_sam = Some(sam.addr);
+    cfg.listen.i2p_accept_incoming = true;
+    start_and_exit(cfg).await.unwrap();
+
+    let primary = published_listener(&td.path(), "p2p").await;
+    let forwards = starts_with_any(&sam.take_log(), "STREAM FORWARD");
+    assert_eq!(forwards.len(), 1, "{forwards:?}");
+    assert!(forwards[0].contains(&format!("PORT={} ", primary.port())));
+    let onions = starts_with_any(&tor.take_log(), "ADD_ONION ");
+    assert_eq!(onions.len(), 1, "{onions:?}");
+    native_tor_port_mapping(&onions[0], primary);
 }
 
 /// An operator publishes P2P, Electrum, and Esplora as onion and I2P
@@ -4112,12 +4305,12 @@ async fn tor_control_onion_lifecycle() {
     let first = tor.take_log();
     assert!(first.contains(&format!("AUTHENTICATE \"{TOR_PASSWORD}\"")));
     let onions = starts_with_any(&first, "ADD_ONION ");
+    assert_eq!(onions.len(), 3, "{onions:?}");
     let targets = [
-        format!("Port={regtest_port},127.0.0.1:{}", p2p.port()),
+        native_tor_port_mapping(&onions[0], p2p).0.to_owned(),
         format!("Port={0},127.0.0.1:{0}", electrum.port()),
         format!("Port={0},127.0.0.1:{0}", esplora.port()),
     ];
-    assert_eq!(onions.len(), 3, "{onions:?}");
     for (line, target) in onions.iter().zip(&targets) {
         assert_eq!(*line, format!("ADD_ONION NEW:ED25519-V3 {target}"));
     }
@@ -4160,7 +4353,15 @@ async fn tor_control_onion_lifecycle() {
     );
     let onions = starts_with_any(&second, "ADD_ONION ");
     assert_eq!(onions.len(), 3, "{onions:?}");
-    for (key, (line, target)) in private_keys.iter().zip(onions.iter().zip(&targets)) {
+    let restarted_targets = [
+        native_tor_port_mapping(&onions[0], p2p).0.to_owned(),
+        targets[1].clone(),
+        targets[2].clone(),
+    ];
+    for (key, (line, target)) in private_keys
+        .iter()
+        .zip(onions.iter().zip(&restarted_targets))
+    {
         assert_eq!(*line, format!("ADD_ONION {key} {target}"));
     }
     let creates = starts_with_any(&sam.take_log(), "SESSION CREATE");
@@ -4186,6 +4387,8 @@ async fn tor_control_onion_lifecycle() {
             .iter()
             .map(|l| l.rsplit(' ').next().unwrap())
             .collect();
+        let native = native_tor_port_mapping(&onion_lines[0], p2p).0.to_owned();
+        let targets = [native, targets[1].clone(), targets[2].clone()];
         let want: Vec<&str> = [true, electrum_on, esplora_on]
             .into_iter()
             .zip(&targets)

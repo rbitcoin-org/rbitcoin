@@ -14,7 +14,7 @@ crates/rbitcoin-ibd/src/ibd/state.rs	1
 crates/rbitcoin-mempool/src/packed.rs	1
 crates/rbitcoin-net/src/asmap.rs	192
 crates/rbitcoin-net/src/chain.rs	5
-crates/rbitcoin-net/src/netaddr.rs	47
+crates/rbitcoin-net/src/netaddr.rs	48
 crates/rbitcoin-net/src/peer.rs	3
 crates/rbitcoin-net/src/peers.rs	5
 crates/rbitcoin-net/src/socks.rs	4

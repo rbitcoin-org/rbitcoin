@@ -532,7 +532,7 @@ impl AddrMan {
     }
 
     pub fn reachable(&self, net: OnlyNet) -> bool {
-        if !self.only_net.is_empty() && !self.only_net.contains(&net) {
+        if !net.allowed_by(&self.only_net) {
             return false;
         }
         match net {
