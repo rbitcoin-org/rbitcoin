@@ -4039,7 +4039,8 @@ fn regtest_headers_after(parent: &bitcoin::block::Header, n: u32) -> Vec<bitcoin
 /// Duplicates of one tip, every hash on a chain, a disjoint chain, forks off
 /// a shared prefix, a re-sent chain, a body we already have, and a compact
 /// block under `-minimumchainwork` each cost items plus parked headers. A
-/// header that does not connect reads nothing from the header store.
+/// compact block for a body we already have costs none of them. A header that
+/// does not connect reads nothing from the header store.
 #[tokio::test]
 async fn parked_headers_are_walked_once_per_message() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-walk-once");
@@ -4049,7 +4050,7 @@ async fn parked_headers_are_walked_once_per_message() {
     let have = hub.query.reconstruct_block_at_height(Height(1)).unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer(&peers, 18621, 61, true);
-    let (out_tx, _rx) = peer_out_channel();
+    let (out_tx, mut rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let trunk = regtest_header_chain(BlockHash::from_byte_array([0xab; 32]), 150);
     let other = regtest_header_chain(BlockHash::from_byte_array([0xcd; 32]), 50);
@@ -4119,7 +4120,7 @@ async fn parked_headers_are_walked_once_per_message() {
         &out_tx,
         &mut follow,
         Some(peer.as_ref()),
-        NetworkMessage::Block(have),
+        NetworkMessage::Block(have.clone()),
     )
     .await;
     let steps = hub.take_path_work_steps();
@@ -4128,9 +4129,44 @@ async fn parked_headers_are_walked_once_per_message() {
         "a body we have scores every parked leaf once: {steps} steps"
     );
 
-    hub.set_minimum_chain_work(Some([0x7f; 32]));
     follow.send_cmpct = true;
     follow.cmpct_version = 2;
+    let have_hash = have.block_hash();
+    follow.requested_blocks.ask(&hub, have_hash);
+    let _ = take_msgs(&mut rx);
+    let stored = HeaderAndShortIds::from_block(&have, 1, 2, &[0]).unwrap();
+    let _ = hub.take_path_work_steps();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::CmpctBlock(CmpctBlock {
+            compact_block: stored,
+        }),
+    )
+    .await;
+    let steps = hub.take_path_work_steps();
+    assert!(
+        steps < parked,
+        "a compact block for a body we have scores no parked header: {steps} steps for {parked} parked"
+    );
+    assert_eq!(
+        follow.pending_headers.len() as u64,
+        parked,
+        "a body we have takes no parked slot"
+    );
+    assert!(
+        !follow.requested_blocks.contains(&have_hash),
+        "the ask for a body we have is settled"
+    );
+    assert_eq!(follow.ban_score, 0, "a compact block we have is not scored");
+    assert!(
+        take_msgs(&mut rx).is_empty(),
+        "a compact block we have asks for nothing"
+    );
+
+    hub.set_minimum_chain_work(Some([0x7f; 32]));
     let mut block = orphan_body(BlockHash::from_byte_array([0xef; 32]), 0);
     rbitcoin_consensus::grind_regtest_pow(&mut block.header);
     let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).unwrap();

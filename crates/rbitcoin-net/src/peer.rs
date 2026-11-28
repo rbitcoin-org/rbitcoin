@@ -7094,6 +7094,10 @@ pub async fn on_cmpctblock(
     if on_cmpctblock_reject_early(hub, follow, session, &hsi, hash)? {
         return Ok(());
     }
+    if hub.has_block(&hash) {
+        follow.requested_blocks.remove(&hash);
+        return Ok(());
+    }
     if hsi.header.prev_blockhash.to_byte_array() != [0u8; 32]
         && !hub.knows_header(&hsi.header.prev_blockhash)
     {
@@ -7160,10 +7164,6 @@ pub async fn on_cmpctblock(
         if let Some(s) = session {
             s.note_last_block_announcement();
         }
-    }
-    if hub.has_block(&hash) {
-        follow.requested_blocks.remove(&hash);
-        return Ok(());
     }
     if !follow.requested_blocks.contains(&hash)
         && !compact_unsolicited_reconstruct(hub, session, &hsi.header)
