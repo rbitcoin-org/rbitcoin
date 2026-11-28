@@ -248,14 +248,15 @@ Core `-txindex` (we always keep Class A + `tx.head` for by-txid lookup).
 | **on** (`--sh-index` / `sh_index=1`) | Direct IBD defers SH. Tip entry runs two Class A scans, then pack and seal; write-behind follows. Address/scripthash Electrum/Esplora methods work after that seal. |
 
 **A crash during an index write refuses the next start.** Some index writes
-land in place, so the node marks `store/scripthash.dirty` before it writes and
-removes the mark once those bytes are synced (about every second while the
-index catches up, and at a clean shutdown). If the process dies in between (a
-kill -9, an out-of-memory kill or a power cut), the next start with
-`--sh-index` exits with a "torn write" error, because the index can read as
-valid and be wrong. A mark left by an index write that failed (a full disk,
-say) is the exception to the sync: no sync removes it, so a clean shutdown
-keeps it and the next start refuses the same way. Start once with
+land in place, so a scripthash commit marks `store/scripthash.dirty` before
+it writes and removes the mark once that commit is synced. An unlink leaves
+the mark until the next index flush (about every second while the index
+catches up, and at a clean shutdown). If the process dies while the mark is
+present (a kill -9, an out-of-memory kill or a power cut), the next start
+with `--sh-index` exits with a "torn write" error, because the index can
+read as valid and be wrong. A mark left by an index write that failed (a
+full disk, say) is the exception to the sync: no sync removes it, so a clean
+shutdown keeps it and the next start refuses the same way. Start once with
 `RBITCOIN_SH_FORCE_REBUILD=1` to rebuild it from Class A. That takes hours on
 mainnet, but the chain is not touched.
 Under systemd, `Restart=always` repeats any failed start, so check the log

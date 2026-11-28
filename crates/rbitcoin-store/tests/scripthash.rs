@@ -4799,40 +4799,118 @@ fn collect_syncs_the_scanned_creates_first() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A write that may land in place over bytes a durable head still points at
-/// marks the index dirty first. Only a full `flush` clears the mark, so after
-/// an unclean stop the mark is still there and open can refuse to trust the
-/// index (#2074).
+/// A finished append has synced the bodies and heads it wrote, so the dirty
+/// mark is already gone. Reopen serves that commit, and the same foreign
+/// keys append nothing.
 #[test]
-fn writes_mark_the_index_dirty_until_a_full_flush() {
+fn a_published_append_drops_the_dirty_mark() {
+    let dir = tmp();
+    let sh = script_hash(&[0x5e]);
+    let marker = dir.join(SH_DIRTY_NAME);
+    {
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        let (n, _) = t
+            .put_create_batch_append(&[rec(sh, 1, 0), rec(sh, 2, 0)])
+            .unwrap();
+        assert_eq!(n, 2);
+        assert!(
+            !marker.exists(),
+            "a finished append still leaves scripthash.dirty"
+        );
+    }
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert_eq!(create_fks(&t, &sh), vec![1, 2]);
+    let (n, _) = t
+        .put_create_batch_append(&[rec(sh, 1, 0), rec(sh, 2, 0)])
+        .unwrap();
+    assert_eq!(n, 0, "replay of a published append wrote again");
+    assert!(!marker.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Sorting and seeding read the old index. A failed read writes nothing, so
+/// it must not leave a mark that would rebuild a commit that never started.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_seed_does_not_mark_the_index() {
+    use rbitcoin_store::scripthash_head::SLOTS_PER_CHUNK;
+    use rbitcoin_store::scripthash_layout::SH_HEAD_SLOT_SIZE;
+    let dir = tmp();
+    let sh = script_hash(&[0x5f]);
+    let marker = dir.join(SH_DIRTY_NAME);
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    t.put_create_batch_append(&[rec(sh, 1, 0)]).unwrap();
+    t.flush().unwrap();
+    assert!(!marker.exists());
+    let chunk = SLOTS_PER_CHUNK as usize * SH_HEAD_SLOT_SIZE;
+    rbitcoin_store::io_handle::arm_fail_pread_len(chunk, 1);
+    let err = t
+        .put_create_batch_append(&[rec(sh, 2, 0)])
+        .expect_err("the seed read was not failed");
+    rbitcoin_store::io_handle::disarm_fail_pread_len();
+    assert!(matches!(err, StoreError::Io { .. }), "{err}");
+    assert!(
+        !marker.exists(),
+        "a failed seed marked an index it did not write"
+    );
+    assert_eq!(create_fks(&t, &sh), vec![1]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The mark goes only after the index directories are synced, so a seal's
+/// new name is durable before a crash can miss the mark.
+#[cfg(all(debug_assertions, unix))]
+#[test]
+fn a_published_append_syncs_the_index_directories() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    t.put_create_batch_append(&[rec(script_hash(&[0x60]), 1, 0)])
+        .unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(!dir.join(SH_DIRTY_NAME).exists());
+    for sub in ["scripthash.body", "scripthash.ovf"] {
+        let d = dir.join(sub);
+        assert!(d.is_dir(), "{sub}");
+        assert!(
+            synced.contains(&d),
+            "{sub} not synced before the mark dropped: {synced:?}"
+        );
+    }
+    let head = dir.join("scripthash.head");
+    if head.is_dir() {
+        assert!(
+            synced.contains(&head),
+            "scripthash.head not synced before the mark dropped: {synced:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An unlink still leaves the mark until `flush`. A mark found at open stays
+/// until a wipe: a sync does not repair bytes a crash may have torn (#2074).
+#[test]
+fn an_unlink_keeps_the_dirty_mark_until_flush() {
     let dir = tmp();
     let sh = script_hash(&[0x5a]);
-    let marker = dir.join(rbitcoin_store::scripthash::SH_DIRTY_NAME);
+    let marker = dir.join(SH_DIRTY_NAME);
     {
         let t = ScriptHashTable::create_tiny(&dir).unwrap();
         assert!(!marker.exists(), "a new index is clean");
         t.put_create_batch_append(&[rec(sh, 1, 0), rec(sh, 2, 0)])
             .unwrap();
-        assert!(marker.exists(), "an append marks the index dirty");
+        assert!(!marker.exists(), "a finished append drops the mark");
+        t.unlink_creates_batch(&[(sh, vec![Fk(2)])]).unwrap();
+        assert!(marker.exists(), "an unlink marks the index dirty");
         t.flush().unwrap();
         assert!(!marker.exists(), "a full flush clears the mark");
         t.flush_async().unwrap();
         assert!(!marker.exists());
-
-        t.unlink_creates_batch(&[(sh, vec![Fk(2)])]).unwrap();
-        assert!(marker.exists(), "an unlink marks the index dirty");
-        t.flush().unwrap();
-        assert!(!marker.exists());
-
-        t.put_create_batch_append(&[rec(sh, 3, 0)]).unwrap();
-        t.flush_async().unwrap();
-        assert!(marker.exists(), "an unsynced flush keeps the mark");
     }
-    // Dropped without a full flush: the mark survives the reopen, and a sync
-    // in the new session does not repair the bytes, so only a wipe clears it.
+    std::fs::write(&marker, [1u8]).unwrap();
     let t = ScriptHashTable::open_tiny(&dir).unwrap();
     assert!(marker.exists(), "the mark outlives an unclean stop");
-    assert!(rbitcoin_store::scripthash::sh_dirty_marked(&dir));
+    assert!(sh_dirty_marked(&dir));
     t.flush().unwrap();
     t.flush_for_close().unwrap();
     assert!(marker.exists(), "a mark found at open is held until a wipe");
@@ -4899,9 +4977,11 @@ fn a_removed_mark_whose_dir_sync_failed_is_written_again() {
     let dir = tmp();
     let marker = dir.join(rbitcoin_store::scripthash::SH_DIRTY_NAME);
     let t = ScriptHashTable::create_tiny(&dir).unwrap();
-    t.put_create_batch_append(&[rec(script_hash(&[0x5d]), 1, 0)])
-        .unwrap();
-    assert!(marker.exists());
+    let sh = script_hash(&[0x5d]);
+    t.put_create_batch_append(&[rec(sh, 1, 0)]).unwrap();
+    assert!(!marker.exists(), "the append already published");
+    t.unlink_creates_batch(&[(sh, vec![Fk(1)])]).unwrap();
+    assert!(marker.exists(), "the unlink leaves the mark");
     // Write and search, no read: unlink works, opening the dir to sync fails.
     let set = |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode));
     set(0o300).unwrap();
@@ -4915,8 +4995,7 @@ fn a_removed_mark_whose_dir_sync_failed_is_written_again() {
     set(0o755).unwrap();
     assert!(flushed.is_err(), "the directory sync failed");
     assert!(!marker.exists(), "the unlink itself landed");
-    t.put_create_batch_append(&[rec(script_hash(&[0x5d]), 2, 0)])
-        .unwrap();
+    drop(t.begin_dirty_write().unwrap());
     assert!(marker.exists(), "the next write marks again");
     let _ = std::fs::remove_dir_all(&dir);
 }
