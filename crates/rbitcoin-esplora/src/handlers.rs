@@ -503,6 +503,24 @@ pub async fn tx_raw(State(st): State<AppState>, Path(txid_hex): Path<String>) ->
     .await
 }
 
+#[cfg(debug_assertions)]
+type MerkleblockHook = Box<dyn FnOnce()>;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static AFTER_MERKLEBLOCK_BLOCK_READ: std::cell::RefCell<Option<MerkleblockHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` once in the next merkleblock proof on this thread, after the
+/// proof has read which block is at the transaction's height and before it
+/// reads anything else.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn after_next_merkleblock_block_read(f: impl FnOnce() + 'static) {
+    AFTER_MERKLEBLOCK_BLOCK_READ.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+
 /// `GET /tx/:txid/merkleblock-proof` — BIP37 merkleblock as hex (Blockstream shape).
 pub async fn tx_merkleblock_proof(
     State(st): State<AppState>,
@@ -531,14 +549,23 @@ pub fn tx_merkleblock_proof_sync(st: AppState, txid_hex: String) -> Response {
         Ok(false) => return not_found(),
         Err(e) => return store_err(e),
     }
-    let ids = match st.query.block_txids(Height(height)) {
+    let (header_fk, rec) = match st.query.header_at_height(Height(height)) {
+        Ok(Some(block)) => block,
+        Ok(None) => return not_found(),
+        Err(e) => return store_err(e),
+    };
+    #[cfg(debug_assertions)]
+    if let Some(f) = AFTER_MERKLEBLOCK_BLOCK_READ.with(|h| h.borrow_mut().take()) {
+        f();
+    }
+    let ids = match st.query.header_txids(header_fk) {
         Ok(v) => v,
         Err(e) => return store_err(e),
     };
     if !ids.iter().any(|t| t == &txid) {
         return not_found();
     }
-    let header = match st.query.wire_header_at_height(Height(height)) {
+    let header = match st.query.wire_header_from_record(&rec) {
         Ok(h) => h,
         Err(e) => return store_err(e),
     };
