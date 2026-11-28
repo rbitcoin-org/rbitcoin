@@ -423,13 +423,16 @@ Trust-peer: --trust-peer ADDR (conf trustpeer=) dials only that address, the sam
   failed AUTH is a start error. Unset: no control connection.\n\
   --tor-control-cookie PATH (default /run/tor/control.authcookie). --tor-control-password PASS.\n\
   --i2p-sam [HOST:PORT] SAM v3 to system i2pd (default 127.0.0.1:7656). --only-net=i2p requires it.\n\
-  --i2p-accept-incoming persist {{datadir}}/i2p/p2p.priv and STREAM FORWARD to the P2P bind. Needs --listen. P2P only.\n\
+  --i2p-accept-incoming persist {{datadir}}/i2p/p2p.priv and STREAM FORWARD to the ordinary P2P listener. P2P only.\n\
+  With --no-listen and an implicit native Tor listener, SAM uses a separate loopback listener.\n\
   --listen ADDR:PORT=onion marks one Tor forwarding listener. Source-IP grants skip this listener.\n\
-  --listen-onion ADD_ONION to the marked listener, or the primary P2P bind (loopback with --no-listen). Needs --tor-control and --max-inbound > 0.\n\
+  --listen-onion ADD_ONION to the marked listener. Without an explicit =onion bind, opens a dedicated loopback listener.\n\
+  With automatic P2P listening, its port is the network P2P default plus one. Otherwise the OS picks a free port.\n\
+  Needs --tor-control and --max-inbound > 0.\n\
   --cjdns-reachable treat fc00::/8 as CJDNS (dial and advertise). --only-net=cjdns requires it.\n\
   --external-ip ENDPOINT takes an IP or Tor v3 onion with an optional port (IPv6 uses [HOST]:PORT).\n\
   Without an explicit port, it uses the P2P listen port (network default for Tor-only listening).\n\
-  With an external onion and no marked listener, inbound loopback skips source-IP grants and self-announcements.\n\
+  With an external onion and no explicit =onion bind, ordinary inbound loopback skips source-IP grants and self-announcements.\n\
   --discover-from-peers (default off) announce the IP outbound clearnet peers report reaching us at; needs a non-loopback --listen.\n\
   A clearnet --external-ip wins. Never sent over Tor, I2P or CJDNS. --no-discover turns it off.\n\
   --trusted / --always-relay / --relay are inbound permission knobs.\n\

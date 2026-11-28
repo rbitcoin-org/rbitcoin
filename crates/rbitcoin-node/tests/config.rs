@@ -1034,24 +1034,3 @@ fn v1_bind_needs_its_listener_and_inbound_slots() {
     let err = c.validate().unwrap_err().to_string();
     assert!(err.contains("--max-inbound greater than 0"), "{err}");
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn native_overlays_count_as_loopback_forward() {
-        let listen = ListenOpts::default();
-        assert!(!listen.overlay_loopback_forward());
-        let onion = ListenOpts {
-            listen_onion: true,
-            ..ListenOpts::default()
-        };
-        assert!(onion.overlay_loopback_forward());
-        let i2p = ListenOpts {
-            i2p_accept_incoming: true,
-            ..ListenOpts::default()
-        };
-        assert!(i2p.overlay_loopback_forward());
-    }
-}

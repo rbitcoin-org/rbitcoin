@@ -78,6 +78,8 @@ Timeout **45 minutes** (i2pd tunnel build on a tiny net is the long pole).
 7. **i2pd restart** — B `--i2p-accept-incoming` on SAM B; restart that i2pd router under B. B lists the same `.b32.i2p` again, a SAM stream reaches it, and A then syncs from it.
 8. **cjdroute restart** — B listens on its `fc00::/8` address; restart B's cjdroute. A then connects to B over cjdns and syncs. The listener is kept across the restart.
 
+9. **Occupied automatic Tor port** — Hold the regtest default P2P port plus one on loopback. Starting with automatic P2P listening and `--listen-onion` must fail and name the ordinary bind in the recovery message. Apply that bind while the Tor port is still held and complete V2 handshakes over direct TCP and private Tor. Run this journey with regtest ports 18444 and 18445 available.
+
 Out of this harness: seqsigwit prune; public overlays; replacing NixOS
 module dummy `tor`/`i2pd` units ([`nixos-module-runtime`](../nix/tests/nixos-module-runtime.nix)
 stays argv / `After=` only).

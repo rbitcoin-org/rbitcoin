@@ -122,7 +122,7 @@ pub struct ListenOpts {
     pub i2p_sam: Option<SocketAddr>,
     /// Persistent SAM destination + STREAM FORWARD to the P2P bind (`--i2p-accept-incoming`).
     pub i2p_accept_incoming: bool,
-    /// Tor `ADD_ONION` to the marked P2P bind, with a loopback fallback (`--listen-onion`).
+    /// Tor `ADD_ONION` to an explicit or implicit marked P2P bind (`--listen-onion`).
     pub listen_onion: bool,
     /// `--listen` or `--no-listen` was set. Default auto-listen is not explicit.
     pub p2p_explicit: bool,
@@ -168,11 +168,6 @@ impl ListenOpts {
         !self.connect.is_empty() || !self.connect_dns.is_empty()
     }
 
-    /// Forwarding through a P2P listener shared with ordinary peers.
-    pub fn overlay_loopback_forward(&self) -> bool {
-        (self.listen_onion && self.onion_bind.is_none()) || self.i2p_accept_incoming
-    }
-
     pub(crate) fn reset_p2p_listeners(&mut self, p2p: P2pListen) {
         self.p2p = p2p;
         self.p2p_extra.clear();
@@ -212,10 +207,21 @@ impl ListenOpts {
 
     /// Primary P2P bind, with a Tor-only listener as fallback.
     pub fn start_p2p_bind(&self, network: Network) -> Option<SocketAddr> {
-        self.p2p_bind_addr(network).or(self.onion_bind).or_else(|| {
-            self.listen_onion
-                .then_some(SocketAddr::from(([127, 0, 0, 1], 0)))
-        })
+        self.p2p_bind_addr(network)
+            .or(self.onion_bind)
+            .or_else(|| self.implicit_onion_bind(network))
+    }
+
+    #[doc(hidden)]
+    pub fn implicit_onion_bind(&self, network: Network) -> Option<SocketAddr> {
+        if !self.listen_onion || self.onion_bind.is_some() {
+            return None;
+        }
+        let port = match self.p2p {
+            P2pListen::Auto => network.default_p2p_port() + 1,
+            P2pListen::Socket(_) | P2pListen::Off => 0,
+        };
+        Some(SocketAddr::from(([127, 0, 0, 1], port)))
     }
 }
 
@@ -974,6 +980,12 @@ impl NodeConfig {
         let forwarded = [
             ("--listen", self.listen.p2p_bind_addr(self.network)),
             ("--listen=onion", self.listen.onion_bind),
+            (
+                "--listen-onion",
+                self.listen
+                    .implicit_onion_bind(self.network)
+                    .filter(|a| a.port() != 0),
+            ),
             ("--electrum-listen", self.listen.electrum),
             ("--esplora-listen", esplora),
         ];

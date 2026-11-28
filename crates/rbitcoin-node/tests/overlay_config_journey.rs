@@ -9,6 +9,30 @@ fn assert_overlay_help() {
     assert!(h.contains("--i2p-accept-incoming") && !h.contains("--i2pacceptincoming"));
 }
 
+#[test]
+fn native_tor_listener_port_follows_the_p2p_listen_mode() {
+    let mut cfg = NodeConfig::default().with_network(Network::Regtest);
+    assert_eq!(cfg.listen.implicit_onion_bind(cfg.network), None);
+    cfg.apply_kv("listen_onion", "1").unwrap();
+    assert_eq!(
+        cfg.listen.implicit_onion_bind(cfg.network),
+        Some("127.0.0.1:18445".parse().unwrap())
+    );
+
+    for listen in ["127.0.0.1:18444", "0"] {
+        let mut cfg = cfg.clone();
+        cfg.apply_kv("listen", listen).unwrap();
+        assert_eq!(
+            cfg.listen.implicit_onion_bind(cfg.network),
+            Some("127.0.0.1:0".parse().unwrap()),
+            "listen={listen}"
+        );
+    }
+
+    cfg.apply_kv("listen", "127.0.0.1:18446=onion").unwrap();
+    assert_eq!(cfg.listen.implicit_onion_bind(cfg.network), None);
+}
+
 fn proxy_onion_and_connects(c: &mut NodeConfig) {
     assert_eq!(c.listen.dialer(), rbitcoin_net::Dialer::Direct);
     assert!(c.listen.proxy_randomize);

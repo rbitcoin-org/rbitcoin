@@ -651,25 +651,37 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     publish_listener_addr(config.datadir.path(), "p2p", node.local_addr);
     let spend_sync = SpendSync::spawn(std::sync::Arc::clone(&node.hub.query));
     status.attach_p2p(&node.hub, &node.peers);
-    let mut onion_bind = config
-        .listen
-        .onion_bind
-        .filter(|_| !clearnet_listen)
+    let implicit_onion_bind = config.listen.implicit_onion_bind(config.network);
+    let requested_onion_bind = config.listen.onion_bind.or(implicit_onion_bind);
+    // With --no-listen and SAM enabled, the primary loopback socket is SAM's.
+    let onion_is_primary = !clearnet_listen && !config.listen.i2p_accept_incoming;
+    let mut onion_bind = requested_onion_bind
+        .filter(|_| onion_is_primary)
         .map(|_| node.local_addr);
-    let extra_onion_bind = config.listen.onion_bind.iter().filter(|_| clearnet_listen);
-    for extra in config.listen.p2p_extra.iter().chain(extra_onion_bind) {
+    for extra in &config.listen.p2p_extra {
         let bound = node
             .add_listen(*extra)
             .await
             .map_err(|e| p2p_start_err(&format!("p2p extra listen {extra}"), e))?;
-        if config.listen.onion_bind == Some(*extra) {
-            onion_bind = Some(bound);
-        }
         info!(
             "rbitcoin-node listening on {} ({})",
             bound,
             config.network.as_str()
         );
+    }
+    if let Some(addr) = requested_onion_bind.filter(|_| !onion_is_primary) {
+        let bound = node.add_listen(addr).await.map_err(|e| {
+            if implicit_onion_bind.is_some() {
+                NodeError::Init(format!(
+                    "Unable to open implicit Tor listener {addr}: {e}. Set --listen {} to keep ordinary P2P listening there and let the OS pick a free Tor port. To choose the Tor port as well, add --listen ADDR:PORT=onion.",
+                    node.local_addr,
+                ))
+            } else {
+                p2p_start_err("p2p onion listen", e)
+            }
+        })?;
+        onion_bind = Some(bound);
+        info!("rbitcoin-node Tor P2P listener on {bound}");
     }
     node.hub.set_minimum_chain_work(config.minimum_chain_work);
     node.hub.set_blocks_only(config.mempool.blocksonly);
@@ -721,6 +733,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let expiry_hours = config.mempool.expiry_hours;
     let mut table = config.finalized_net_perms();
     table.onion_bind = onion_bind;
+    table.onion_bind_is_implicit = implicit_onion_bind.is_some();
     let immediate_relay = config.trusted;
     let hub = Arc::clone(&node.hub);
     let enforce_bip54 = hub.params.enforce_bip54;
@@ -764,7 +777,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         mempool.set_isolated_broadcast(true);
     }
     node.peers
-        .set_overlay_loopback_forward(config.listen.overlay_loopback_forward());
+        .set_overlay_loopback_forward(config.listen.i2p_accept_incoming);
     if let Some(secs) = config.listen.peer_timeout_secs {
         node.peers.set_peer_timeout_secs(secs);
     }
@@ -867,8 +880,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let ctl = tor_ctl
             .as_ref()
             .expect("validate requires --tor-control with --listen-onion");
-        let target = onion_bind
-            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], node.local_addr.port())));
+        let target = onion_bind.expect("native Tor requires a marked P2P listener");
         shutdown
             .run_until_cancelled(ctl.add_p2p_onion(
                 config.datadir.path(),

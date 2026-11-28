@@ -4,9 +4,13 @@
 //! `./scripts/overlay-functional/run.sh`.
 
 use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::p2p::message::NetworkMessage;
+use bitcoin::p2p::Magic;
 use bitcoin::Amount;
+use rbitcoin_net::{peer::V2PlainSession, socks::socks5_connect_domain, v2::read_v2_frame};
 use rbitcoin_net::{NetAddr, OnlyNet};
-use rbitcoin_node::{NodeConfig, P2pListen};
+use rbitcoin_node::{NodeConfig, NodeError, P2pListen};
+use rbitcoin_primitives::Network;
 use rbitcoin_test::jsonrpc::write_rpc_token;
 use rbitcoin_test::mine::spend_anyone_can_spend;
 use rbitcoin_test::overlay::{
@@ -21,6 +25,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 fn tor_b(env: &OverlayEnv, datadir: &std::path::Path, rpc: SocketAddr) -> NodeConfig {
     write_rpc_token(datadir);
@@ -55,6 +60,112 @@ async fn generate_n(rpc: SocketAddr, n: u32) {
     assert!(r["error"].is_null(), "generate: {r}");
 }
 
+async fn read_self_announcement(stream: TcpStream) -> (V2PlainSession, Vec<NetAddr>) {
+    let mut peer =
+        V2PlainSession::outbound_regtest(stream, "/overlay-bind-test/", Duration::from_secs(5))
+            .await
+            .unwrap();
+    let addresses = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = read_v2_frame(&mut peer.reader, Magic::REGTEST)
+                .await
+                .unwrap();
+            if let NetworkMessage::AddrV2(rows) = frame.decode().into_payload() {
+                return rows
+                    .iter()
+                    .map(|row| NetAddr::from_addrv2(row).unwrap())
+                    .collect();
+            }
+        }
+    })
+    .await
+    .expect("P2P self-announcement");
+    (peer, addresses)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tor_automatic_listener_reports_an_occupied_backend() {
+    let env = require_env();
+    let dir = TempDir::new().unwrap();
+    let rpc = ephemeral_addr();
+    let ordinary_port = Network::Regtest.default_p2p_port();
+    let ordinary = SocketAddr::from(([127, 0, 0, 1], ordinary_port));
+    let backend = SocketAddr::from(([127, 0, 0, 1], ordinary_port + 1));
+    let _occupied = tokio::net::TcpListener::bind(backend)
+        .await
+        .expect("reserve the regtest Tor backend");
+    let mut cfg = tor_b(&env, dir.path(), rpc);
+    cfg.listen.p2p = P2pListen::Auto;
+
+    let Err(NodeError::Init(message)) =
+        tokio::time::timeout(Duration::from_secs(30), rbitcoin_node::run_p2p(cfg.clone()))
+            .await
+            .expect("node startup deadline")
+    else {
+        panic!("startup must fail on the occupied implicit Tor listener");
+    };
+    assert!(
+        message.contains(&format!("Unable to open implicit Tor listener {backend}")),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("--listen {ordinary}"))
+            && message.contains("--listen ADDR:PORT=onion"),
+        "{message}"
+    );
+
+    cfg.apply_kv("listen", &ordinary.to_string()).unwrap();
+    let node = spawn_node(cfg, rpc).await;
+    let checks = tokio::spawn(async move {
+        let direct = TcpStream::connect(ordinary).await.unwrap();
+        let _direct =
+            V2PlainSession::outbound_regtest(direct, "/tor-port-recovery/", Duration::from_secs(5))
+                .await
+                .expect("ordinary P2P after recovery");
+        let (onion, port) = wait_p2p_onion(rpc, Duration::from_secs(90)).await;
+        assert_eq!(port, ordinary_port);
+        wait_socks_onion(env.tor_socks, &onion, port, Duration::from_secs(90)).await;
+        let forwarded = tokio::time::timeout(
+            Duration::from_secs(15),
+            socks5_connect_domain(env.tor_socks, &onion, port, None),
+        )
+        .await
+        .expect("Tor SOCKS deadline")
+        .unwrap();
+        let _forwarded = V2PlainSession::outbound_regtest(
+            forwarded,
+            "/tor-port-recovery/",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Tor P2P while the default backend is still occupied");
+        wait_jsonrpc(
+            rpc,
+            "getpeerinfo",
+            json!([]),
+            Duration::from_secs(5),
+            |reply| {
+                let Some(rows) = reply["result"].as_array() else {
+                    return false;
+                };
+                let binds: Vec<_> = rows
+                    .iter()
+                    .filter(|row| row["inbound"] == true)
+                    .filter_map(|row| row["addrbind"].as_str()?.parse::<SocketAddr>().ok())
+                    .collect();
+                binds.contains(&ordinary)
+                    && binds
+                        .iter()
+                        .any(|addr| *addr != ordinary && *addr != backend)
+            },
+        )
+        .await;
+    })
+    .await;
+    node.stop().await;
+    checks.expect("ordinary and Tor P2P recovery");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tor_onion_two_node_v2() {
     let env = require_env();
@@ -63,39 +174,76 @@ async fn tor_onion_two_node_v2() {
     let b_rpc = ephemeral_addr();
     let a_rpc = ephemeral_addr();
 
-    let b = spawn_node(tor_b(&env, b_dir.path(), b_rpc), b_rpc).await;
+    let direct = ephemeral_addr();
+    let mut cfg = tor_b(&env, b_dir.path(), b_rpc);
+    cfg.listen.p2p = P2pListen::Socket(direct);
+    cfg.listen.discover = true;
+    let public_ip = "93.184.216.34:18444";
+    cfg.apply_kv("external_ip", public_ip).unwrap();
+    cfg.apply_kv("net_permission", "relay@127.0.0.1").unwrap();
+    let b = spawn_node(cfg, b_rpc).await;
     generate_n(b_rpc, 3).await;
     let (onion, port) = wait_p2p_onion(b_rpc, Duration::from_secs(90)).await;
     wait_socks_onion(env.tor_socks, &onion, port, Duration::from_secs(90)).await;
 
     let a = spawn_node(tor_a(&env, a_dir.path(), a_rpc, &onion, port), a_rpc).await;
-    wait_jsonrpc(
-        a_rpc,
-        "getblockcount",
-        json!([]),
-        Duration::from_secs(90),
-        |v| v["result"] == 3,
-    )
+    // Keep both nodes outside the task so an assertion cannot skip shutdown.
+    let checks = tokio::spawn(async move {
+        wait_jsonrpc(
+            a_rpc,
+            "getblockcount",
+            json!([]),
+            Duration::from_secs(90),
+            |v| v["result"] == 3,
+        )
+        .await;
+        let peers = wait_peer_network(a_rpc, "onion", false, Duration::from_secs(30)).await;
+        let row = &peers["result"].as_array().unwrap()[0];
+        assert_eq!(row["network"], "onion", "{peers}");
+        assert_eq!(row["inbound"], false, "{peers}");
+        assert_eq!(row["transport_protocol_type"], "v2", "{peers}");
+        assert!(row["addr"].as_str().unwrap().contains(".onion"), "{peers}");
+        assert_ne!(row["addr"], "0.0.0.0", "{peers}");
+
+        let bin = wait_peer_network(b_rpc, "ipv4", true, Duration::from_secs(30)).await;
+        let brow = bin["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["inbound"] == true)
+            .expect("B inbound");
+        assert_eq!(brow["transport_protocol_type"], "v2", "{bin}");
+        let tor_bind: SocketAddr = brow["addrbind"].as_str().unwrap().parse().unwrap();
+        assert!(tor_bind.ip().is_loopback() && tor_bind.is_ipv4());
+        assert_ne!(tor_bind, direct, "{bin}");
+        assert_eq!(brow["permissions"], json!([]), "{bin}");
+
+        let tor_stream = socks5_connect_domain(env.tor_socks, &onion, port, None)
+            .await
+            .unwrap();
+        let (_tor_peer, tor_announce) = read_self_announcement(tor_stream).await;
+        assert_eq!(
+            tor_announce,
+            [format!("{onion}:{port}").parse::<NetAddr>().unwrap()]
+        );
+        let direct_stream = TcpStream::connect(direct).await.unwrap();
+        let (_direct_peer, direct_announce) = read_self_announcement(direct_stream).await;
+        assert_eq!(direct_announce, [public_ip.parse::<NetAddr>().unwrap()]);
+        let live = jsonrpc(b_rpc, "getpeerinfo", json!([])).await;
+        let direct_peer = live["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["addrbind"] == direct.to_string())
+            .expect("ordinary inbound peer");
+        assert_eq!(direct_peer["permissions"], json!(["relay"]), "{live}");
+    })
     .await;
-    let peers = wait_peer_network(a_rpc, "onion", false, Duration::from_secs(30)).await;
-    let row = &peers["result"].as_array().unwrap()[0];
-    assert_eq!(row["network"], "onion", "{peers}");
-    assert_eq!(row["inbound"], false, "{peers}");
-    assert_eq!(row["transport_protocol_type"], "v2", "{peers}");
-    assert!(row["addr"].as_str().unwrap().contains(".onion"), "{peers}");
-    assert_ne!(row["addr"], "0.0.0.0", "{peers}");
 
-    let bin = wait_peer_network(b_rpc, "ipv4", true, Duration::from_secs(30)).await;
-    let brow = bin["result"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["inbound"] == true)
-        .expect("B inbound");
-    assert_eq!(brow["transport_protocol_type"], "v2", "{bin}");
-
-    a.stop().await;
-    b.stop().await;
+    let (a_stopped, b_stopped) = tokio::join!(tokio::spawn(a.stop()), tokio::spawn(b.stop()));
+    checks.expect("Tor and direct P2P checks");
+    a_stopped.expect("stop node A");
+    b_stopped.expect("stop node B");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

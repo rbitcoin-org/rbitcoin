@@ -890,9 +890,6 @@ impl LivePeer {
             return None;
         }
         let sock = SelfAnnounceLink::Clearnet.local_socket(&hub, self.reported_local_ip)?;
-        if self.withhold_self_announcement(&hub, SelfAnnounceLink::Clearnet) {
-            return None;
-        }
         let prev = self.next_local_addr_send.load(Ordering::Relaxed);
         if prev != 0 && now < prev {
             return None;
@@ -933,9 +930,6 @@ impl LivePeer {
             .filter(|_| link == SelfAnnounceLink::I2p);
         let sock = link.local_socket(&hub, self.reported_local_ip);
         if onion.is_none() && i2p.is_none() && sock.is_none() {
-            return None;
-        }
-        if self.withhold_self_announcement(&hub, link) {
             return None;
         }
         const DAY: u64 = 24 * 60 * 60;
@@ -1016,31 +1010,19 @@ impl LivePeer {
         }
     }
 
-    // Startup can publish the listener designation during address selection.
-    fn withhold_self_announcement(&self, hub: &PeerHub, link: SelfAnnounceLink) -> bool {
-        if !self.inbound {
-            return false;
-        }
-        let Some(source) = self.net.socket_addr() else {
-            return false;
-        };
-        match hub.onion_bind() {
-            Some(bind) => bind == self.addrbind && link != SelfAnnounceLink::Tor,
-            None => source.ip().is_loopback() && hub.external_onion().is_some(),
-        }
-    }
-
-    /// Choose the network for self-announcements. The local bind identifies
-    /// the marked Tor listener. When Tor and I2P share a loopback listener,
-    /// the source address is ambiguous and neither address is announced.
+    /// Choose the network for self-announcements. An external onion that may
+    /// share ordinary loopback makes the network of those peers ambiguous.
     fn self_announce_link(&self, hub: &PeerHub) -> SelfAnnounceLink {
-        let onion_bind = if self.inbound && self.net.socket_addr().is_some() {
-            hub.onion_bind()
-        } else {
-            None
-        };
-        if onion_bind == Some(self.addrbind) {
-            return SelfAnnounceLink::Tor;
+        if self.inbound {
+            if let Some(source) = self.net.socket_addr() {
+                let table = hub.net_perms.lock().unwrap_or_else(|e| e.into_inner());
+                if table.onion_bind == Some(self.addrbind) {
+                    return SelfAnnounceLink::Tor;
+                }
+                if source.ip().is_loopback() && hub.external_onion_may_share_loopback(&table) {
+                    return SelfAnnounceLink::Unknown;
+                }
+            }
         }
         let sock = match self.net {
             crate::NetAddr::Onion { .. } => return SelfAnnounceLink::Tor,
@@ -1071,15 +1053,10 @@ impl LivePeer {
                 SelfAnnounceLink::Clearnet
             };
         }
-        if !sock.ip().is_loopback() {
-            return SelfAnnounceLink::Clearnet;
-        }
-        let tor_on_shared_bind = onion_bind.is_none() && hub.p2p_onion().is_some();
-        match (tor_on_shared_bind, hub.p2p_i2p().is_some()) {
-            (false, false) => SelfAnnounceLink::Clearnet,
-            (true, false) => SelfAnnounceLink::Tor,
-            (false, true) => SelfAnnounceLink::I2p,
-            (true, true) => SelfAnnounceLink::Unknown,
+        if sock.ip().is_loopback() && hub.overlay_loopback_forward.load(Ordering::Relaxed) {
+            SelfAnnounceLink::I2p
+        } else {
+            SelfAnnounceLink::Clearnet
         }
     }
 
@@ -2562,13 +2539,19 @@ impl PeerHub {
         })
     }
 
-    /// Loopback inbound may be a forwarded overlay peer: `--i2p-accept-incoming`,
-    /// an unmarked `--listen-onion`, or an operator's hidden service named
-    /// only by `--external-ip`.
+    fn external_onion_may_share_loopback(
+        &self,
+        table: &crate::net_permissions::NetPermTable,
+    ) -> bool {
+        (table.onion_bind.is_none() || table.onion_bind_is_implicit)
+            && self.external_onion().is_some()
+    }
+
+    /// Ordinary loopback may carry forwarded I2P or external Tor peers.
     fn loopback_forwarded(&self, table: &crate::net_permissions::NetPermTable, ip: IpAddr) -> bool {
         ip.is_loopback()
             && (self.overlay_loopback_forward.load(Ordering::Relaxed)
-                || (table.onion_bind.is_none() && self.external_onion().is_some()))
+                || self.external_onion_may_share_loopback(table))
     }
 
     /// An inbound `--net-permission` grant covers loopback while loopback
@@ -2645,7 +2628,7 @@ impl PeerHub {
         let _ = open.wait_for(|o| *o).await;
     }
 
-    /// Treat inbound loopback as potentially forwarded.
+    /// Treat ordinary inbound loopback as possible SAM ingress, even before the destination is ready.
     pub fn set_overlay_loopback_forward(&self, on: bool) {
         self.overlay_loopback_forward.store(on, Ordering::Relaxed);
     }
