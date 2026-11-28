@@ -666,6 +666,55 @@ async fn merkleblock_proof_keeps_a_stored_root_that_does_not_match() {
     assert!(mb.extract_matches(&mut matches, &mut indexes).is_err());
 }
 
+/// A reorg that replaces the block while its proof is built does not pair
+/// the new block's header with the old block's txids.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn merkleblock_proof_header_and_txids_are_one_block_across_a_reorg() {
+    use bitcoin::consensus::encode::deserialize;
+    use bitcoin::hashes::Hash;
+    use bitcoin::MerkleBlock;
+
+    let (_dir, q) = temp_query("mb-reorg");
+    let (genesis, genesis_cb) = coinbase(0, Fk::NULL, None);
+    let genesis_fk = q.connect_block(Height(0), &genesis, &[genesis_cb]).unwrap();
+    let (old, old_cb) = coinbase(1, genesis_fk, Some(genesis.hash));
+    let txid = old_cb.tx.txid;
+    q.connect_block(Height(1), &old, &[old_cb]).unwrap();
+    let (new, new_cb) = coinbase(2, genesis_fk, Some(genesis.hash));
+    let new_hash = new.hash;
+    let q = Arc::new(q);
+    let st = join_only_state(
+        Arc::clone(&q),
+        Arc::new(Mutex::new(rbitcoin_esplora::server::JoinCache::default())),
+    );
+    let reorg = Arc::clone(&q);
+    handlers::after_next_merkleblock_block_read(move || {
+        reorg.disconnect_tip().unwrap();
+        reorg.connect_block(Height(1), &new, &[new_cb]).unwrap();
+    });
+
+    let resp = handlers::tx_merkleblock_proof_sync(st, block_hash_hex(&txid));
+    assert_eq!(
+        q.header_at_height(Height(1)).unwrap().unwrap().1.hash,
+        new_hash,
+        "the reorg landed inside the proof"
+    );
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    let mb: MerkleBlock =
+        deserialize(&rbitcoin_primitives::hex_decode(body.trim()).unwrap()).unwrap();
+    assert_eq!(mb.header.block_hash().to_byte_array(), old.hash);
+    let mut matches = Vec::new();
+    let mut indexes = Vec::new();
+    mb.extract_matches(&mut matches, &mut indexes)
+        .expect("the header root is the root of the proof's txids");
+    assert_eq!(matches, vec![bitcoin::Txid::from_byte_array(txid)]);
+}
+
 fn header_value(text: &str, name: &str) -> Option<String> {
     let want = name.to_ascii_lowercase();
     text.split("\r\n\r\n")
