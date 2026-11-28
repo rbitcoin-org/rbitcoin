@@ -545,6 +545,11 @@ pub fn spawn_inbound_accept(
                         drop(stream);
                         continue;
                     }
+                    if peers.ip_banned(peer_addr.ip()) {
+                        rbitcoin_log::info!("p2p: reject banned inbound {peer_addr}");
+                        drop(stream);
+                        continue;
+                    }
                     if !crate::listen::listener_fd_room() {
                         rbitcoin_log::warn_repeated(
                             rbitcoin_log::RepeatedInfo::DescriptorReserve,
@@ -744,6 +749,9 @@ pub async fn prepare_outbound_session(
     if peers.net_discouraged(peer_net) {
         return Err(NetError::Protocol("discouraged"));
     }
+    if peers.net_banned(peer_net) {
+        return Err(NetError::Protocol("banned"));
+    }
     let connect = async {
         match &peer {
             DialTarget::Socket(_) => dialer.connect_net(peer_net).await,
@@ -756,12 +764,29 @@ pub async fn prepare_outbound_session(
     )
     .await
     .map_err(|_| NetError::Timeout)??;
+    // A hostname dial keys the session on its name, which no IP ban
+    // matches. When the node resolved the name itself (a direct dial),
+    // the connected address is the endpoint: a manual ban on it refuses
+    // the dial here, before any handshake traffic, and the address is
+    // carried into the session so a later ban matches it too. Through
+    // a proxy the name is resolved there and the stream's address is
+    // the proxy's, so nothing is carried or checked.
+    let resolved = match (&peer, &dialer) {
+        (DialTarget::Domain { .. }, crate::socks::Dialer::Direct) => stream.peer_addr().ok(),
+        _ => None,
+    };
+    if let Some(addr) = resolved {
+        if peers.ip_banned(addr.ip()) {
+            return Err(NetError::Protocol("banned"));
+        }
+    }
     let peer_hint = peer.version_socket();
     let bind = stream.local_addr().unwrap_or(local);
     let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
     // Core adds CNode before VERSION. Provisional row so getpeerinfo is non-empty
     // during handshake (p2p_handshake self-connect wait_until + assert_debug_log).
-    let provisional = peers.register_connecting_net(peer_hint, peer_net, bind, false, typ);
+    let provisional =
+        peers.register_connecting_net(resolved.unwrap_or(peer_hint), peer_net, bind, false, typ);
     let provisional_id = provisional.id;
     let handshake = connect_and_handshake_timed(
         HANDSHAKE_TIMEOUT,
@@ -787,17 +812,23 @@ pub async fn prepare_outbound_session(
             return Err(e);
         }
     };
-    let sess = peers.register_handshaken_net(
+    // A ban added while this dial was connecting or handshaking must not
+    // leave a live session behind: publication checks the ban list
+    // under the ban lock and refuses a banned endpoint.
+    let Some(sess) = peers.register_handshaken_net(
         &provisional,
         crate::peers::PeerEndpoint {
-            addr: peer_hint,
+            addr: resolved.unwrap_or(peer_hint),
             net: peer_net,
             addrbind: bind,
         },
         &ver,
         typ,
         wire,
-    );
+    ) else {
+        peers.unregister(provisional_id);
+        return Err(NetError::Protocol("banned"));
+    };
     sess.attach_tcp_shutdown(tcp_shutdown);
     if let Some(mp) = hub.mempool() {
         sess.set_inv_gen_floor(mp.next_accept_gen());
@@ -862,6 +893,9 @@ pub async fn run_outbound_session(
         let peer_net = crate::NetAddr::Ip(peer_addr);
         if peers.net_discouraged(peer_net) {
             return Err(NetError::Protocol("discouraged"));
+        }
+        if peers.net_banned(peer_net) {
+            return Err(NetError::Protocol("banned"));
         }
         let stream = dialer.connect_net(peer_net).await?;
         let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
