@@ -234,6 +234,138 @@ pub fn disconnectnode(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
     Err(rpc_error(ERR_INVALID_PARAMS, "address or nodeid required"))
 }
 
+/// Expiry for a `setban add`, Core's rules: an omitted `bantime` is 0.
+/// Relative, 0 and negative both mean the 24-hour default (`Ban` treats
+/// an offset `<= 0` as the default). Absolute, the value is a unix time
+/// and one before `now` is refused; one equal to `now` is stored.
+fn ban_until(now: u64, bantime: Option<i64>, absolute: bool) -> Result<u64, Value> {
+    let t = bantime.unwrap_or(0);
+    if absolute {
+        if t < 0 || (t as u64) < now {
+            return Err(rpc_error(
+                ERR_INVALID_PARAMETER,
+                "Error: Absolute timestamp is in the past",
+            ));
+        }
+        return Ok(t as u64);
+    }
+    if t <= 0 {
+        return Ok(now.saturating_add(rbitcoin_net::ban::DEFAULT_BAN_SECS));
+    }
+    Ok(now.saturating_add(t as u64))
+}
+
+/// Map a ban-list update failure to its RPC error: a duplicate `add` is
+/// Core's -23; a ban file write failure is a plain misc error, and the
+/// in-memory list is unchanged so the caller can retry.
+fn ban_update_error(e: rbitcoin_net::ban::BanUpdateError) -> Value {
+    match e {
+        rbitcoin_net::ban::BanUpdateError::AlreadyBanned(_) => {
+            rpc_error(ERR_ALREADY_BANNED, "Error: IP/Subnet already banned")
+        }
+        rbitcoin_net::ban::BanUpdateError::Persist(e) => {
+            rpc_error(ERR_MISC, format!("Error: Failed to write ban list: {e}"))
+        }
+    }
+}
+
+pub fn setban(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["subnet", "command", "bantime", "absolute"])?;
+    let hub = require_peers(ctx)?;
+    let subnet = params.req_str(0, "subnet")?;
+    let command = params.req_str(1, "command")?;
+    let target = rbitcoin_net::parse_ban_target(subnet).map_err(|e| match e {
+        rbitcoin_net::BanParseError::TooBroad => rpc_error(
+            ERR_INVALID_PARAMETER,
+            format!("Subnet is too broad: {subnet}"),
+        ),
+        rbitcoin_net::BanParseError::Invalid => {
+            rpc_error(ERR_INVALID_IP_OR_SUBNET, "Error: Invalid IP/Subnet")
+        }
+    })?;
+    match command {
+        "add" => {
+            // Core checks the ban list before the bantime: an exact
+            // entry, or — for a bare host with no `/` — any subnet
+            // covering it (`IsBanned(CNetAddr)`), is already banned. A
+            // slashed target is an exact-key add even under a covering
+            // subnet. Only a row still in force counts: a row expiring
+            // exactly now is listed but no longer banned, and the add
+            // below replaces it. `ban_add` re-checks coverage under the
+            // ban lock, so these reads only keep Core's error order.
+            let bare_host = !subnet.contains('/');
+            let covered = bare_host
+                && match &target {
+                    rbitcoin_net::BanTarget::V4 { addr, .. } => {
+                        hub.ip_banned(std::net::IpAddr::V4(*addr))
+                    }
+                    rbitcoin_net::BanTarget::V6 { addr, .. } => {
+                        hub.ip_banned(std::net::IpAddr::V6(*addr))
+                    }
+                    _ => false,
+                };
+            let now = hub.now_secs();
+            if covered
+                || hub
+                    .ban_list()
+                    .iter()
+                    .any(|e| e.target == target && e.banned_until > now)
+            {
+                return Err(rpc_error(
+                    ERR_ALREADY_BANNED,
+                    "Error: IP/Subnet already banned",
+                ));
+            }
+            let bantime = params.opt_i64(2, "bantime")?;
+            let absolute = params.opt_bool(3, "absolute")?.unwrap_or(false);
+            let until = ban_until(hub.now_secs(), bantime, absolute)?;
+            hub.ban_add(target, until, bare_host)
+                .map_err(ban_update_error)?;
+            Ok(Value::Null)
+        }
+        "remove" => {
+            hub.ban_remove(target)
+                .map_err(ban_update_error)?
+                .ok_or_else(|| {
+                    rpc_error(
+                        ERR_INVALID_IP_OR_SUBNET,
+                        "Error: Unban failed. Requested address/subnet was not previously manually banned.",
+                    )
+                })?;
+            Ok(Value::Null)
+        }
+        _ => Err(rpc_error(ERR_MISC, method_help("setban"))),
+    }
+}
+
+pub fn listbanned(ctx: &RpcContext) -> Value {
+    let Some(hub) = ctx.peers.as_ref() else {
+        return json!([]);
+    };
+    let now = hub.now_secs();
+    let rows: Vec<Value> = hub
+        .ban_list()
+        .into_iter()
+        .map(|e| {
+            json!({
+                "address": e.target.to_string(),
+                "ban_created": e.created,
+                "banned_until": e.banned_until,
+                "ban_duration": e.banned_until.saturating_sub(e.created),
+                "time_remaining": e.banned_until.saturating_sub(now),
+                "ban_reason": "manually added",
+            })
+        })
+        .collect();
+    json!(rows)
+}
+
+pub fn clearbanned(ctx: &RpcContext) -> Result<Value, Value> {
+    let hub = require_peers(ctx)?;
+    hub.ban_clear().map_err(ban_update_error)?;
+    Ok(Value::Null)
+}
+
 pub fn addconnection(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["address", "connection_type", "v2transport"])?;
     let hub = require_peers(ctx)?;
