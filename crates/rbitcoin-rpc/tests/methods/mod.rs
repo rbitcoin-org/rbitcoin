@@ -5546,7 +5546,7 @@ fn mempool_under_pressure() {
     use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
 
     let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
-    pressure_same_rate_evicts_the_lighter_chunk(&ctx);
+    pressure_same_rate_evicts_the_tail_chunk(&ctx);
     let spk = ScriptBuf::from_bytes(vec![0x51]);
     let (parent_hex, parent) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk.clone());
     let child = child_of(&parent, 1_000);
@@ -5673,10 +5673,13 @@ fn mempool_under_pressure() {
 }
 
 /// Fee 501 at vsize 5000 and 5001 both floor to 100 sat/kvB and both clear
-/// min relay. The lighter txid is linearized first, so the two children stay
-/// two chunks. A weight cap that fits the parent and the heavier child drops
-/// the lighter one. `<=` in the worst-chunk walk would drop the heavier one.
-fn pressure_same_rate_evicts_the_lighter_chunk(ctx: &RpcContext) {
+/// min relay. The lighter child has the higher exact feerate, so it is
+/// linearized first and the heavier child is the cluster's last chunk. A
+/// weight cap that fits the parent and the lighter child drops the heavier
+/// one, as Core does: its worst chunk is the last one, whatever the txids
+/// (#1923). The lighter txid is picked to sort first, so a txid tie-break
+/// cannot be what keeps it.
+fn pressure_same_rate_evicts_the_tail_chunk(ctx: &RpcContext) {
     chain_ops_mine_pool_empty(ctx);
     let tip = dispatch(ctx, "getblockcount", vec![])
         .unwrap()
@@ -5729,7 +5732,7 @@ fn pressure_same_rate_evicts_the_lighter_chunk(ctx: &RpcContext) {
     dispatch(ctx, "sendrawtransaction", vec![json!(tx_hex(&heavy))]).unwrap();
     let probe_cb = generated_coinbase_value(ctx, 5);
     let (probe_hex, probe) = spend_generated_coinbase(ctx, 5, probe_cb - 20_000, true_spk());
-    mp.set_max_weight(parent.weight().to_wu() + heavy.weight().to_wu() + probe.weight().to_wu());
+    mp.set_max_weight(parent.weight().to_wu() + light.weight().to_wu() + probe.weight().to_wu());
     dispatch(ctx, "sendrawtransaction", vec![json!(probe_hex)]).unwrap();
     let raw = dispatch(ctx, "getrawmempool", vec![]).unwrap();
     let listed = |tx: &Transaction| {
@@ -5740,10 +5743,10 @@ fn pressure_same_rate_evicts_the_lighter_chunk(ctx: &RpcContext) {
             .any(|id| id.as_str() == Some(want.as_str()))
     };
     assert!(listed(&parent), "parent stays");
-    assert!(listed(&heavy), "heavier sibling stays");
+    assert!(listed(&light), "lighter sibling stays");
     assert!(
-        !listed(&light),
-        "the earlier equal-rate chunk is the one evicted"
+        !listed(&heavy),
+        "the last chunk, at the lower exact feerate, is the one evicted"
     );
     assert!(listed(&probe), "the arriving tx stays");
     chain_ops_mine_pool_empty(ctx);

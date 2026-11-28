@@ -2846,6 +2846,39 @@ fn recent_invalid_keeps_the_oldest() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Issue #1923: a parent and child at the same feerate are two chunks, as in
+/// Core. With room for one of them, only the tail chunk (the child) is evicted.
+#[test]
+fn equal_feerate_chain_evicts_only_the_tail_chunk() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(&[100_000]);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let parent = spend_tx(ops[0], 95_000);
+    let child = spend_tx(out_of(&parent, 0), 90_000);
+    assert_eq!(parent.weight(), child.weight(), "same fee and weight");
+    mp.accept_tx(&parent, &utxos, TIP_OK).unwrap();
+    mp.accept_tx(&child, &utxos, TIP_OK).unwrap();
+    let (p, c) = (parent.compute_txid(), child.compute_txid());
+
+    let chunks: Vec<Vec<Txid>> = mp
+        .graph
+        .cluster_of(&p)
+        .unwrap()
+        .chunks
+        .iter()
+        .map(|ch| ch.txids.clone())
+        .collect();
+    assert_eq!(chunks, vec![vec![p], vec![c]]);
+    assert_eq!(mp.graph.worst_chunk().unwrap().1.txids, vec![c]);
+
+    mp.max_weight = parent.weight().to_wu();
+    let gone = mp.evict_to_budget(None).unwrap();
+    assert_eq!(gone, vec![c]);
+    assert!(mp.graph.contains(&p));
+    assert!(!mp.graph.contains(&c));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Free-slot eviction. A session reaches it only when the slot table is
 /// at `MAX_SLOT_CAP` (1_048_576) and every row is live. The pin pretends
 /// the table is already there. Weight-budget eviction is the full-pool

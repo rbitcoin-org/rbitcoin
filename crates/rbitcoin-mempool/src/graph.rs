@@ -369,12 +369,16 @@ impl TxGraph {
             return;
         };
         self.drop_cluster_index(rep);
+        // Chunk feerates never rise along the linearization, so on a tie the
+        // later chunk is the worse one (Core evicts a cluster's last chunk).
+        // Picking the first would evict an equal-feerate parent and, through
+        // `unlink_tree`, every chunk after it.
         let mut best: Option<(u64, Chunk)> = None;
         for ch in c.chunks {
             let rate = ch.fee_rate_sat_per_kvb();
             let take = match &best {
                 None => true,
-                Some((br, _)) => rate < *br,
+                Some((br, _)) => rate <= *br,
             };
             if take {
                 best = Some((rate, ch));
