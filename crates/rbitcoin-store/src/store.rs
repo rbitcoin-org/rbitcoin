@@ -2808,18 +2808,21 @@ fn restore_hot_marks(path: &Path) -> Result<(), StoreError> {
 }
 
 /// Open the scripthash table, or create it. A rebuild a restore asked for
-/// discards the index first. A dirty index that does not decode is a write
-/// a crash cut: it is untrusted anyway, so request the rebuild and start
-/// empty instead of failing the store open.
+/// discards the index first. A dirty index that does not decode (`Corrupt`,
+/// or `BadMagic` from a torn first sector) is a write a crash cut: it is
+/// untrusted anyway, so request the rebuild and start empty instead of
+/// failing the store open. An I/O error still stops open.
 fn open_scripthash(path: &Path, scale: HeadScale) -> Result<ScriptHashTable, StoreError> {
     crate::scripthash::discard_index_for_rebuild(path)?;
     if !path.join("scripthash.body").exists() {
         return ScriptHashTable::create_with_scale(path, scale);
     }
     match ScriptHashTable::open_with_scale(path, scale) {
-        Err(StoreError::Corrupt(why)) if crate::scripthash::sh_dirty_marked(path) => {
+        Err(e @ (StoreError::Corrupt(_) | StoreError::BadMagic))
+            if crate::scripthash::sh_dirty_marked(path) =>
+        {
             rbitcoin_log::warn!(
-                "store: dirty scripthash index does not decode ({why}); rebuilding it"
+                "store: dirty scripthash index does not decode ({e}); rebuilding it"
             );
             crate::scripthash::mark_sh_rebuild(path)?;
             crate::scripthash::discard_index_for_rebuild(path)?;

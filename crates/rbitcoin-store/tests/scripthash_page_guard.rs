@@ -34,16 +34,19 @@ fn scripthash_writes_arm_no_mark() {
 }
 
 /// A `guard/sh-*` mark left by an older build is a scripthash commit that
-/// did not finish. Open requests a rebuild and drops the mark without
-/// copying its image back.
+/// did not finish. Open drops the mark without copying its image back and
+/// makes sure `scripthash.dirty` is on disk: the index may read as valid
+/// and be wrong, so a start with the index on refuses and the operator
+/// chooses the rebuild. An index that still decodes is not wiped.
 #[test]
-fn open_rebuilds_scripthash_for_a_leftover_sh_mark() {
+fn open_marks_a_leftover_sh_mark_dirty_without_copying_it() {
     let dir = tmp();
     {
         let s = Store::create_tiny(&dir).unwrap();
         s.flush().unwrap();
     }
     let body = sh_ovf_body_path(&dir);
+    let before = std::fs::read(&body).unwrap();
     let rel = body
         .strip_prefix(&*dir)
         .unwrap()
@@ -58,10 +61,38 @@ fn open_rebuilds_scripthash_for_a_leftover_sh_mark() {
     .unwrap();
     let s = Store::open_tiny(&dir).expect("a leftover sh mark stopped open");
     drop(s);
-    assert!(dir.join(SH_REBUILD_NAME).is_file(), "no rebuild requested");
     assert!(!dir.join("guard/sh-ovf").exists(), "the mark stayed");
-    let page0 = std::fs::read(&body)
-        .map(|b| b[..16].to_vec())
-        .unwrap_or_default();
-    assert_ne!(page0, vec![0xAAu8; 16], "open copied the image back");
+    assert!(sh_dirty_marked(&dir), "scripthash.dirty was not written");
+    assert!(
+        !dir.join(SH_REBUILD_NAME).exists(),
+        "a decodable index was wiped"
+    );
+    let after = std::fs::read(&body).unwrap();
+    assert_eq!(
+        after[..PAGE as usize],
+        before[..PAGE as usize],
+        "open copied the image back"
+    );
+}
+
+/// A `guard/sh-*.tmp` is an arm the old build never renamed into place, not
+/// a mark. Open neither marks the index dirty nor rebuilds it for that.
+#[test]
+fn a_leftover_sh_tmp_is_not_a_mark() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::create_dir_all(dir.join("guard")).unwrap();
+    std::fs::write(dir.join("guard/sh-ovf.tmp"), b"partial").unwrap();
+    drop(Store::open_tiny(&dir).unwrap());
+    assert!(
+        !sh_dirty_marked(&dir),
+        "an unpublished arm marked the index dirty"
+    );
+    assert!(
+        !dir.join(SH_REBUILD_NAME).exists(),
+        "an unpublished arm wiped the index"
+    );
 }

@@ -136,16 +136,19 @@ pub fn sh_dirty_marked(store_dir: &Path) -> bool {
 }
 
 /// A `guard/sh-*` mark is left by an older build whose scripthash commit
-/// did not finish. That commit ran under [`SH_DIRTY_NAME`], so the index
-/// was untrusted either way. Request the rebuild, which drops the index
-/// files before open decodes them, then drop the marks without copying
-/// their images back.
+/// did not finish. That commit ran under [`SH_DIRTY_NAME`], so the index may
+/// read as valid and be wrong. Make sure the dirty mark is on disk, then
+/// drop the guard marks without copying their images back: a start with the
+/// index on refuses, and the operator chooses the rebuild. An index that no
+/// longer decodes is rebuilt by the store open instead.
 pub(crate) fn retire_leftover_sh_marks(store_dir: &Path) -> Result<(), StoreError> {
     if !page_guard::sh_marks_present(store_dir)? {
         return Ok(());
     }
-    rbitcoin_log::warn!("store: leftover scripthash guard mark; rebuilding the scripthash index");
-    mark_sh_rebuild(store_dir)?;
+    rbitcoin_log::warn!(
+        "store: leftover scripthash guard mark; marking the scripthash index dirty"
+    );
+    crate::file::write_synced_tmp_rename(&store_dir.join(SH_DIRTY_NAME), &[1])?;
     page_guard::clear_sh_marks(store_dir)
 }
 

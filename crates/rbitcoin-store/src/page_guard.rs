@@ -463,8 +463,9 @@ pub fn take_armed_store_marks() -> Vec<String> {
     ARM_TRACE.with(|trace| trace.borrow_mut().take().unwrap_or_default())
 }
 
-/// Whether `guard/` under `dir` holds any `sh-*` entry. Builds before
-/// #2207 armed one per scripthash commit; this build writes none.
+/// Whether `guard/` under `dir` holds a published `sh-*` mark. Builds before
+/// #2207 armed one per scripthash commit; this build writes none. A
+/// `sh-*.tmp` is an arm that was never renamed into place, not a mark.
 pub(crate) fn sh_marks_present(dir: &Path) -> Result<bool, StoreError> {
     let guard = dir.join(GUARD_DIR);
     let rd = match std::fs::read_dir(&guard) {
@@ -477,7 +478,7 @@ pub(crate) fn sh_marks_present(dir: &Path) -> Result<bool, StoreError> {
         if ent
             .file_name()
             .to_str()
-            .is_some_and(|n| n.starts_with("sh-"))
+            .is_some_and(|n| n.starts_with("sh-") && !n.ends_with(".tmp"))
         {
             return Ok(true);
         }

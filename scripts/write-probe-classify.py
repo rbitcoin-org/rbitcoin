@@ -54,7 +54,7 @@ RULES = [
     # inside dirty_write: scripthash.dirty is synced before the first byte,
     # and after a crash a --sh-index start refuses until the index is
     # rebuilt. Only on that stack.
-    (r"MULTI_SECTOR", r"scripthash", r"ScriptHashTable::dirty_write",
+    (r"MULTI_SECTOR", r"scripthash", r"ScriptHashTable::dirty_(write|publish)",
      "scripthash write under scripthash.dirty: a crash refuses the index until it is rebuilt"),
     (r"MULTI_SECTOR", r"scripthash", r"unlink::restore_page|unlink::arm_undo|recover_unlink_undos",
      "legacy unlink undo replay at open, or its test hook"),

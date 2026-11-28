@@ -403,10 +403,11 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   `scripthash.runs` and `scripthash.unsorted` together. The wipe also clears an unlink undo record left armed by
   a failed unlink, so the next open does not reject it.
   The marker rescues faults that surface after open succeeded: a torn page, a failed write or unlink, a read of a
-  torn key. A `guard/sh-*` mark left by an earlier development build writes `scripthash.rebuild` and is
-  removed without being copied back, and the index open then discards the SH files before it decodes them,
-  so that start rebuilds from Class A. The same request is written when `scripthash.dirty` is present and the
-  index does not decode: a crash cut a write, and the index is untrusted anyway. Without `scripthash.dirty`
+  torn key. A published `guard/sh-*` mark left by an earlier development build is removed without being copied
+  back and writes `scripthash.dirty`, so a start with the index on refuses and the operator chooses the rebuild. When
+  `scripthash.dirty` is present and the index open fails with `Corrupt` or a bad magic, a crash cut a write and the
+  index is untrusted anyway: open writes `scripthash.rebuild`, and the index open then discards the SH files before
+  it decodes them, so that start rebuilds from Class A. Without `scripthash.dirty`
   or such a request, damage that makes the index open fail (a truncated
   `scripthash.head/NN.val`, a torn undo record, or an alloc header whose bump or free head is out of range)
   is decoded before the degraded marker is read, so such a store does not start, with or without

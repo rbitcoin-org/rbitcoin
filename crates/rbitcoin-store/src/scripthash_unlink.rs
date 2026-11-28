@@ -131,13 +131,15 @@ impl ScriptHashTable {
                 "scripthash unlink while an empty head is still queued",
             ));
         }
-        let mut batch = UnlinkBatch::default();
-        let changed = self.unlink_one(scripthash, create_tx_fks, &mut batch)?;
-        self.finish_unlink_batch(batch)?;
-        // The queue was empty on entry, so this publishes only a full drop
-        // this call just deferred.
-        self.commit_deferred_for(scripthash)?;
-        Ok(changed)
+        self.dirty_write(|| {
+            let mut batch = UnlinkBatch::default();
+            let changed = self.unlink_one(scripthash, create_tx_fks, &mut batch)?;
+            self.finish_unlink_batch(batch)?;
+            // The queue was empty on entry, so this publishes only a full drop
+            // this call just deferred.
+            self.commit_deferred_for(scripthash)?;
+            Ok(changed)
+        })
     }
 
     /// Unlink every group, then sync the new chains and heads once before any

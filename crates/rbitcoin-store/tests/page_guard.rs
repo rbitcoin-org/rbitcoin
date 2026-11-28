@@ -947,7 +947,11 @@ fn a_rewritten_mark_blocks_dropped_pages_when_the_dir_sync_fails() {
         "page 1 is committed and not armed"
     );
     rbitcoin_store::page_guard::fail_next_mark_dir_sync(&dir.path().join("guard"));
-    let file = std::fs::File::open(&live).unwrap();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&live)
+        .unwrap();
     assert!(clear_page_guard_rel(&mark, dir.path(), &[(&file, live.as_path())]).is_err());
     assert!(mark.exists(), "the mark still names `other`");
     match check(0) {

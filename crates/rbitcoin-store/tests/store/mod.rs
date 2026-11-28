@@ -894,10 +894,10 @@ fn assert_first_header_row_indexed(s: &Store, first: &HeaderRecord) {
 }
 
 /// A `guard/sh-*` mark that does not parse is scripthash damage, not
-/// Class A damage. Open requests a scripthash rebuild, drops the scripthash
-/// marks, and opens.
+/// Class A damage. Open marks the index dirty, drops the scripthash marks,
+/// and opens; the decodable index stays for the operator to rebuild.
 #[test]
-fn open_rebuilds_scripthash_on_a_corrupt_sh_mark() {
+fn open_marks_scripthash_dirty_on_a_corrupt_sh_mark() {
     let dir = tmp();
     {
         let s = Store::create_tiny(&dir).unwrap();
@@ -907,9 +907,10 @@ fn open_rebuilds_scripthash_on_a_corrupt_sh_mark() {
     std::fs::write(dir.join("guard/sh-ovf"), b"not a guard file").unwrap();
     let s = Store::open_tiny(&dir).expect("a corrupt sh mark stopped open");
     drop(s);
-    assert!(dir
+    assert!(rbitcoin_store::scripthash::sh_dirty_marked(&dir));
+    assert!(!dir
         .join(rbitcoin_store::scripthash::SH_REBUILD_NAME)
-        .is_file());
+        .exists());
     assert!(!dir.join("guard/sh-ovf").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -936,6 +937,31 @@ fn open_rebuilds_a_dirty_scripthash_index_it_cannot_decode() {
     f.write_all(&[0xff; 4]).unwrap();
     drop(f);
     let s = Store::open_tiny(&dir).expect("a torn dirty scripthash index stopped open");
+    drop(s);
+    assert!(dir
+        .join(rbitcoin_store::scripthash::SH_REBUILD_NAME)
+        .is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A torn first sector fails the scripthash open with `BadMagic`, not
+/// `Corrupt`. Under `scripthash.dirty` that is the same cut write, so open
+/// rebuilds the same way.
+#[test]
+fn open_rebuilds_a_dirty_scripthash_index_with_torn_magic() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::write(dir.join(rbitcoin_store::scripthash::SH_DIRTY_NAME), [1u8]).unwrap();
+    let body = rbitcoin_store::scripthash::sh_ovf_body_path(&dir);
+    let mut f = std::fs::OpenOptions::new().write(true).open(&body).unwrap();
+    f.seek(SeekFrom::Start(0)).unwrap();
+    f.write_all(&[0u8; 4]).unwrap();
+    drop(f);
+    let s = Store::open_tiny(&dir).expect("a torn-magic dirty scripthash index stopped open");
     drop(s);
     assert!(dir
         .join(rbitcoin_store::scripthash::SH_REBUILD_NAME)
