@@ -137,15 +137,19 @@ async fn addrv2_gossip_drops_unroutable_clearnet() {
     );
 }
 
-/// Core `ProcessAddrs` rewrites an insane address time before
-/// `RelayAddress`, so a neighbor never receives a future or 1970 time.
+/// Core `ProcessAddrs` rewrites an insane address time to five days ago for
+/// `AddrMan` and skips relay when the sanitized time is not within 10 minutes,
+/// so a neighbor never receives a future or 1970 time.
 #[tokio::test]
 async fn addrv2_relay_sanitizes_an_insane_time() {
     use bitcoin::p2p::message::NetworkMessage;
     use std::sync::{Arc, Mutex};
 
+    let now = 1_700_000_000u64;
     let peers = rbitcoin_net::peers::PeerHub::new();
-    peers.set_addrman(Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new())));
+    let book = Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new()));
+    peers.set_addrman(Arc::clone(&book));
+    peers.set_mock_now(now - 20);
     let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
     let ver = hostile_ver(src_addr);
     let src = peers.register(
@@ -166,7 +170,6 @@ async fn addrv2_relay_sanitizes_an_insane_time() {
     );
     dst.set_wants_addrv2();
     let (_, mut dst_rx) = dst.open_out();
-    let now = 1_700_000_000u64;
     peers.set_mock_now(now);
     while dst_rx.try_recv().is_ok() {}
 
@@ -182,11 +185,31 @@ async fn addrv2_relay_sanitizes_an_insane_time() {
         }],
     )
     .unwrap();
-    let got = dst_rx.try_recv().expect("relayed").expect_msg();
+    assert!(
+        dst_rx.try_recv().is_err(),
+        "an insane future time backdates past 10 minutes and is not relayed"
+    );
+    let stored = book
+        .lock()
+        .unwrap()
+        .last_seen_of(&"9.9.9.9:8333".parse().unwrap());
+    assert!(
+        stored > 0 && stored <= now as u32 - 5 * 24 * 60 * 60,
+        "stored={stored}"
+    );
+
+    let fresh = AddrV2Message {
+        time: now as u32 - 60,
+        services: ServiceFlags::NETWORK,
+        addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 10)),
+        port: 8333,
+    };
+    on_addrv2(&mut follow, Some(src.as_ref()), std::slice::from_ref(&fresh)).unwrap();
+    let got = dst_rx.try_recv().expect("fresh row relays").expect_msg();
     let NetworkMessage::AddrV2(rows) = got else {
         panic!("expected addrv2, got {got:?}");
     };
-    assert_eq!(rows[0].time, now as u32 - 5 * 24 * 60 * 60);
+    assert_eq!(rows, vec![fresh]);
 }
 
 /// A peer that announces its own listen address from a different TCP source
@@ -496,9 +519,9 @@ async fn addrv2_relay_drops_own_addresses() {
     );
 }
 
-fn hostile_addr(port: u16) -> AddrV2Message {
+fn hostile_addr(port: u16, time: u32) -> AddrV2Message {
     AddrV2Message {
-        time: 1_700_000_000,
+        time,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
         port,
@@ -867,11 +890,13 @@ async fn hostile_addr_relay(
             "refill stops at the cap"
         );
         // A quiet peer refills its bucket: let 10_000 s of node time pass.
-        peers.set_mock_now(peer.connected_at_secs() + 10_000);
+        let now = peer.connected_at_secs() + 10_000;
+        peers.set_mock_now(now);
+        let addr_time = (now - 60) as u32;
 
         let list: Vec<AddrV2Message> = (1..=3u8)
             .map(|i| AddrV2Message {
-                time: 1_700_000_000,
+                time: addr_time,
                 services: ServiceFlags::NETWORK,
                 addr: AddrV2::Ipv4(Ipv4Addr::new(123, 123, 123, i)),
                 port: 8333,
@@ -918,7 +943,7 @@ async fn hostile_addr_relay(
         let mut odd_port = None;
         let mut wrap_port = None;
         for port in 1..20_000u16 {
-            let key = addr_key_oracle(&hostile_addr(port));
+            let key = addr_key_oracle(&hostile_addr(port, addr_time));
             if (key as usize) < n * n {
                 continue;
             }
@@ -940,7 +965,7 @@ async fn hostile_addr_relay(
             wrap_port.expect("an odd relay key whose next neighbor wraps"),
         ];
         for port in ports {
-            let msg = hostile_addr(port);
+            let msg = hostile_addr(port, addr_time);
             on_addrv2(follow, Some(peer.as_ref()), std::slice::from_ref(&msg)).unwrap();
             let key = addr_key_oracle(&msg);
             let n_dest = if key & 1 == 0 { 1 } else { 2 };
@@ -975,7 +1000,7 @@ async fn hostile_addr_relay(
             );
         }
 
-        on_addrv2(follow, Some(peer.as_ref()), &[hostile_addr(8333)]).unwrap();
+        on_addrv2(follow, Some(peer.as_ref()), &[hostile_addr(8333, addr_time)]).unwrap();
         let mut reached = 0usize;
         for (_, rx) in &mut neigh {
             if rx.try_recv().is_ok() {
@@ -986,12 +1011,14 @@ async fn hostile_addr_relay(
             (1..=2).contains(&reached),
             "one address reached {reached} neighbors"
         );
-        let burst: Vec<_> = (1..1000u16).map(hostile_addr).collect();
+        let burst: Vec<_> = (1..1000u16)
+            .map(|port| hostile_addr(port, addr_time))
+            .collect();
         on_addrv2(follow, Some(peer.as_ref()), &burst).unwrap();
         for (_, rx) in &mut neigh {
             while rx.try_recv().is_ok() {}
         }
-        on_addrv2(follow, Some(peer.as_ref()), &[hostile_addr(9_000)]).unwrap();
+        on_addrv2(follow, Some(peer.as_ref()), &[hostile_addr(9_000, addr_time)]).unwrap();
         let mut extra_relay = 0usize;
         for (_, rx) in &mut neigh {
             if rx.try_recv().is_ok() {
@@ -1910,4 +1937,187 @@ fn empty_headers_takes_no_header_permit() {
         });
     assert!(!peer.is_awaiting_headers());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Core `ProcessAddrs` relays an `addrv2` only when the incoming message
+/// carries at most 10 addresses, even when rate limiting leaves <= 10 rows;
+/// larger messages still feed `AddrMan` up to the token budget.
+#[test]
+fn addrv2_relay_respects_the_ten_address_message_cap() {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use rbitcoin_net::peer::on_addrv2;
+    use rbitcoin_net::peers::PeerConnType;
+    use rbitcoin_net::send_queue::PeerOutRx;
+    use rbitcoin_net::NetAddr;
+
+    let t0 = 1_700_000_000u64;
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_mock_now(t0);
+    let book = Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new()));
+    peers.set_addrman(Arc::clone(&book));
+
+    let reg = |octet: u8| {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, octet)), 8333);
+        let peer = peers.register(addr, addr, &hostile_ver(addr), true, PeerConnType::Inbound);
+        peer.set_wants_addrv2();
+        peer
+    };
+    let src = reg(1);
+    let n1 = reg(2);
+    let n2 = reg(3);
+    let (_n1_tx, mut rx1) = n1.open_out();
+    let (_n2_tx, mut rx2) = n2.open_out();
+    while rx1.try_recv().is_ok() {}
+    while rx2.try_recv().is_ok() {}
+
+    // Refill `src` well past 11 tokens so rate limiting does not trim the list.
+    let now = t0 + 500;
+    peers.set_mock_now(now);
+    let row = |b: u8, c: u8, time: u64| AddrV2Message {
+        time: time as u32,
+        services: ServiceFlags::NETWORK,
+        addr: AddrV2::Ipv4(Ipv4Addr::new(b, 2, 3, c)),
+        port: 8333,
+    };
+    let drain_relayed = |a: &mut PeerOutRx, b: &mut PeerOutRx| {
+        let mut got = HashSet::new();
+        for rx in [a, b] {
+            while let Ok(out) = rx.try_recv() {
+                if let NetworkMessage::AddrV2(rows) = out.expect_msg() {
+                    for r in rows {
+                        if let Some(net) = NetAddr::from_addrv2(&r) {
+                            got.insert(net);
+                        }
+                    }
+                }
+            }
+        }
+        got
+    };
+    let mut follow = PeerFollowState::new();
+
+    let eleven: Vec<_> = (1..=11).map(|c| row(1, c, now - 60)).collect();
+    on_addrv2(&mut follow, Some(src.as_ref()), &eleven).unwrap();
+    assert!(
+        drain_relayed(&mut rx1, &mut rx2).is_empty(),
+        "an 11-address message must not relay"
+    );
+    for c in 1..=11 {
+        let net: NetAddr = format!("1.2.3.{c}:8333").parse().unwrap();
+        assert!(
+            book.lock().unwrap().last_seen_of(&net) > 0,
+            "oversized-for-relay {net} must still enter AddrMan"
+        );
+    }
+
+    let ten: Vec<_> = (1..=10).map(|c| row(2, c, now - 60)).collect();
+    on_addrv2(&mut follow, Some(src.as_ref()), &ten).unwrap();
+    let relayed_ten = drain_relayed(&mut rx1, &mut rx2);
+    assert_eq!(relayed_ten.len(), 10, "a 10-address message relays all 10: {relayed_ten:?}");
+
+    // A fresh peer starts with 1 token; sending 11 addresses processes 1 row,
+    // which still must not relay because `list.len() > 10`.
+    let limited = reg(4);
+    let mut follow_limited = PeerFollowState::new();
+    let limited_eleven: Vec<_> = (1..=11).map(|c| row(3, c, now - 60)).collect();
+    on_addrv2(&mut follow_limited, Some(limited.as_ref()), &limited_eleven).unwrap();
+    assert!(
+        drain_relayed(&mut rx1, &mut rx2).is_empty(),
+        "rate limiting 11 rows down to 1 must still suppress relay"
+    );
+    let first_limited: NetAddr = "3.2.3.1:8333".parse().unwrap();
+    assert!(
+        book.lock().unwrap().last_seen_of(&first_limited) > 0,
+        "token-admitted row from 11-entry message still enters AddrMan"
+    );
+}
+
+/// Core `ProcessAddrs` relays a row only when `addr.time > now - 600`; rows
+/// at or before `now - 600` (including sanitized insane times) still enter
+/// `AddrMan` but are not relayed.
+#[test]
+fn addrv2_relay_requires_timestamp_strictly_within_ten_minutes() {
+    use std::sync::Mutex;
+
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use rbitcoin_net::peer::on_addrv2;
+    use rbitcoin_net::peers::PeerConnType;
+    use rbitcoin_net::send_queue::PeerOutRx;
+    use rbitcoin_net::NetAddr;
+
+    let t0 = 1_700_000_000u64;
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_mock_now(t0);
+    let book = Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new()));
+    peers.set_addrman(Arc::clone(&book));
+
+    let reg = |octet: u8| {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 1, octet)), 8333);
+        let peer = peers.register(addr, addr, &hostile_ver(addr), true, PeerConnType::Inbound);
+        peer.set_wants_addrv2();
+        peer
+    };
+    let src = reg(1);
+    let dst = reg(2);
+    let (_dst_tx, mut dst_rx) = dst.open_out();
+    while dst_rx.try_recv().is_ok() {}
+
+    let now = t0 + 1_000;
+    peers.set_mock_now(now);
+    let row = |c: u8, time: u64| AddrV2Message {
+        time: time as u32,
+        services: ServiceFlags::NETWORK,
+        addr: AddrV2::Ipv4(Ipv4Addr::new(4, 2, 3, c)),
+        port: 8333,
+    };
+    let drain = |rx: &mut PeerOutRx| {
+        let mut rows = Vec::new();
+        while let Ok(out) = rx.try_recv() {
+            if let NetworkMessage::AddrV2(batch) = out.expect_msg() {
+                rows.extend(batch);
+            }
+        }
+        rows
+    };
+    let mut follow = PeerFollowState::new();
+
+    for (c, time, label) in [
+        (1u8, now - 600, "exact 10-minute boundary"),
+        (2, now - 3_600, "one hour old"),
+        (3, 100_000_000, "floor timestamp backdated to 5 days ago"),
+    ] {
+        on_addrv2(&mut follow, Some(src.as_ref()), &[row(c, time)]).unwrap();
+        let relayed = drain(&mut dst_rx);
+        assert!(
+            relayed.is_empty(),
+            "{label} (time={time}, now={now}) must not relay: {relayed:?}"
+        );
+        let net: NetAddr = format!("4.2.3.{c}:8333").parse().unwrap();
+        assert!(
+            book.lock().unwrap().last_seen_of(&net) > 0,
+            "{label} must still enter AddrMan"
+        );
+    }
+
+    on_addrv2(&mut follow, Some(src.as_ref()), &[row(4, now - 599)]).unwrap();
+    let relayed = drain(&mut dst_rx);
+    assert_eq!(relayed.len(), 1, "now - 599 must relay: {relayed:?}");
+    assert_eq!(relayed[0].time, (now - 599) as u32);
+
+    // Mixed small message relays only rows strictly within 10 minutes.
+    let mixed = [row(5, now - 601), row(6, now - 300), row(7, now + 3_600)];
+    on_addrv2(&mut follow, Some(src.as_ref()), &mixed).unwrap();
+    let relayed = drain(&mut dst_rx);
+    assert_eq!(relayed.len(), 1, "only fresh row relays from mixed list: {relayed:?}");
+    assert_eq!(
+        NetAddr::from_addrv2(&relayed[0]),
+        Some("4.2.3.6:8333".parse().unwrap())
+    );
 }

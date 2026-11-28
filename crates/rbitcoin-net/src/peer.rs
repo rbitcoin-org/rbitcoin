@@ -1064,6 +1064,10 @@ pub fn addr_relay_key(msg: &bitcoin::p2p::address::AddrV2Message) -> u64 {
 /// Interop size — do not change without a named reason to diverge
 /// (see COMPAT.md).
 pub const MAX_PCT_ADDR_TO_SEND: usize = 23;
+/// Core `ProcessAddrs`: relay at most this many addresses per incoming message.
+const MAX_ADDR_RELAY_SIZE: usize = 10;
+/// Core `ProcessAddrs`: relay only rows strictly newer than `now - 10min`.
+const ADDR_RELAY_MAX_AGE_SECS: u64 = 600;
 
 pub fn sendaddrv2_after_verack_log(peer: u64) -> String {
     format!("sendaddrv2 received after verack, disconnecting peer={peer}")
@@ -4685,77 +4689,91 @@ pub fn on_addrv2(
         learn_addrfetch_reply(s, list, n);
         return Ok(());
     }
-    if let Some(s) = session {
-        if let Some(ph) = s.peer_hub() {
-            // Node time, as the bucket's start (`connected_at`) is.
-            let now = s.clock_now();
-            let allow = s.take_addr_tokens(list.len(), now.saturating_mul(1000));
-            // One sanitized copy for the book and the relay, as Core
-            // `ProcessAddrs` rewrites an insane time before `RelayAddress`.
-            let rows: Vec<bitcoin::p2p::address::AddrV2Message> = list[..allow]
-                .iter()
-                .map(|a| {
-                    let mut a = a.clone();
-                    a.time = crate::seeds::learned_addr_time(a.time, now);
-                    a
-                })
-                .collect();
-            ph.learn_addrv2(s.net, &rows, now);
-            let mut neighbors: Vec<_> = ph
-                .live_peers()
-                .into_iter()
-                .filter(|other| {
-                    other.id != s.id && other.wants_addrv2() && other.writer().is_some()
-                })
-                .collect();
-            neighbors.sort_by_key(|other| other.id);
-            let own = ph.own_addrs();
-            let mut batches: Vec<Vec<bitcoin::p2p::address::AddrV2Message>> =
-                vec![Vec::new(); neighbors.len()];
-            for addr in &rows {
-                if crate::netaddr::addrv2_skip_relay(addr) {
-                    continue;
+    let Some(s) = session else {
+        return Ok(());
+    };
+    let Some(ph) = s.peer_hub() else {
+        return Ok(());
+    };
+    // Node time, as the bucket's start (`connected_at`) is.
+    let now = s.clock_now();
+    let allow = s.take_addr_tokens(n, now.saturating_mul(1000));
+    // One sanitized copy for the book and the relay, as Core
+    // `ProcessAddrs` rewrites an insane time before `RelayAddress`.
+    let rows: Vec<bitcoin::p2p::address::AddrV2Message> = list[..allow]
+        .iter()
+        .map(|a| {
+            let mut a = a.clone();
+            a.time = crate::seeds::learned_addr_time(a.time, now);
+            a
+        })
+        .collect();
+    ph.learn_addrv2(s.net, &rows, now);
+    if n > MAX_ADDR_RELAY_SIZE || rows.is_empty() {
+        return Ok(());
+    }
+    relay_addrv2(s.id, &ph, &rows, now)
+}
+
+fn relay_addrv2(
+    source_id: u64,
+    ph: &crate::peers::PeerHub,
+    rows: &[bitcoin::p2p::address::AddrV2Message],
+    now: u64,
+) -> Result<(), NetError> {
+    let mut neighbors: Vec<_> = ph
+        .live_peers()
+        .into_iter()
+        .filter(|other| other.id != source_id && other.wants_addrv2() && other.writer().is_some())
+        .collect();
+    if neighbors.is_empty() {
+        return Ok(());
+    }
+    neighbors.sort_by_key(|other| other.id);
+    let own = ph.own_addrs();
+    let min_relay_time = now.saturating_sub(ADDR_RELAY_MAX_AGE_SECS);
+    let mut batches: Vec<Vec<bitcoin::p2p::address::AddrV2Message>> =
+        vec![Vec::new(); neighbors.len()];
+    for addr in rows {
+        if u64::from(addr.time) <= min_relay_time {
+            continue;
+        }
+        if crate::netaddr::addrv2_skip_relay(addr) {
+            continue;
+        }
+        if crate::NetAddr::from_addrv2(addr).is_some_and(|a| own.contains(a)) {
+            continue;
+        }
+        let key = addr_relay_key(addr);
+        let n_dest = if neighbors.len() == 1 || key & 1 == 0 {
+            1
+        } else {
+            2
+        };
+        let start = (key as usize) % neighbors.len();
+        for step in 0..n_dest {
+            let idx = match step {
+                0 => start,
+                _ => {
+                    if start + 1 == neighbors.len() {
+                        0
+                    } else {
+                        start + 1
+                    }
                 }
-                if crate::NetAddr::from_addrv2(addr).is_some_and(|a| own.contains(a)) {
-                    continue;
-                }
-                let key = addr_relay_key(addr);
-                let n_dest = if neighbors.len() <= 1 {
-                    neighbors.len()
-                } else if key & 1 == 0 {
-                    1
-                } else {
-                    2
-                };
-                if n_dest == 0 {
-                    continue;
-                }
-                let start = (key as usize) % neighbors.len();
-                for step in 0..n_dest {
-                    let idx = match step {
-                        0 => start,
-                        _ => {
-                            if start + 1 == neighbors.len() {
-                                0
-                            } else {
-                                start + 1
-                            }
-                        }
-                    };
-                    batches[idx].push(addr.clone());
-                }
-            }
-            for (other, batch) in neighbors.iter().zip(batches) {
-                if batch.is_empty() {
-                    continue;
-                }
-                if let Some(tx) = other.writer() {
-                    let msg = NetworkMessage::AddrV2(batch);
-                    let sent = bitcoin::consensus::encode::serialize(&msg).len();
-                    rbitcoin_log::debug!(P2p, "{}", sending_addrv2_log(sent, other.id));
-                    tx.send(msg)?;
-                }
-            }
+            };
+            batches[idx].push(addr.clone());
+        }
+    }
+    for (other, batch) in neighbors.iter().zip(batches) {
+        if batch.is_empty() {
+            continue;
+        }
+        if let Some(tx) = other.writer() {
+            let msg = NetworkMessage::AddrV2(batch);
+            let sent = bitcoin::consensus::encode::serialize(&msg).len();
+            rbitcoin_log::debug!(P2p, "{}", sending_addrv2_log(sent, other.id));
+            tx.send(msg)?;
         }
     }
     Ok(())
