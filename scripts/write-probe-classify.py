@@ -50,6 +50,12 @@ RULES = [
     # before anything can name it. No byte below that length was durable.
     (r"MULTI_SECTOR", r"header\.head", r"HashHead::create_with_slots",
      "new head generation: slot table zeroed before its first sync"),
+    # Every scripthash commit, unlink and deferred empty-head commit runs
+    # inside dirty_write: scripthash.dirty is synced before the first byte,
+    # and after a crash a --sh-index start refuses until the index is
+    # rebuilt. Only on that stack.
+    (r"MULTI_SECTOR", r"scripthash", r"ScriptHashTable::dirty_write",
+     "scripthash write under scripthash.dirty: a crash refuses the index until it is rebuilt"),
     (r"MULTI_SECTOR", r"scripthash", r"unlink::restore_page|unlink::arm_undo|recover_unlink_undos",
      "legacy unlink undo replay at open, or its test hook"),
     (r"MULTI_SECTOR", r"blockfilter\.body", r"repair_body|repaired_filter_body",

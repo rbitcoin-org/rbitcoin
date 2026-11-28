@@ -914,6 +914,35 @@ fn open_rebuilds_scripthash_on_a_corrupt_sh_mark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A crash inside a scripthash write can leave bytes the index open cannot
+/// decode. With `scripthash.dirty` present the index is untrusted anyway, so
+/// open requests a rebuild and starts from an empty index instead of
+/// failing before the rebuild could run.
+#[test]
+fn open_rebuilds_a_dirty_scripthash_index_it_cannot_decode() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::write(dir.join(rbitcoin_store::scripthash::SH_DIRTY_NAME), [1u8]).unwrap();
+    let body = rbitcoin_store::scripthash::sh_ovf_body_path(&dir);
+    let mut f = std::fs::OpenOptions::new().write(true).open(&body).unwrap();
+    f.seek(SeekFrom::Start(
+        rbitcoin_store::file::FILE_HEADER_LEN as u64,
+    ))
+    .unwrap();
+    f.write_all(&[0xff; 4]).unwrap();
+    drop(f);
+    let s = Store::open_tiny(&dir).expect("a torn dirty scripthash index stopped open");
+    drop(s);
+    assert!(dir
+        .join(rbitcoin_store::scripthash::SH_REBUILD_NAME)
+        .is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A corrupt sh mark beside a torn scripthash alloc header still opens. The
 /// rebuild request comes before any scripthash file is decoded.
 #[test]

@@ -10,7 +10,6 @@ use super::{
     sh_page_pack_extent_last_fks, sh_page_pack_fks, write_alloc_header, AllocState, LocatedHome,
     ScriptHashTable, StagedSlabs, StoreError, TableFile, SH_PAGE_SIZE, SH_PAGE_SLAB_CLASS,
 };
-use crate::page_guard;
 use crate::scripthash_layout::ShHeadValue;
 use crate::scripthash_pages::{
     sh_page_entries_into, sh_page_extent_creates, sh_page_set_extent_creates,
@@ -93,9 +92,6 @@ pub(super) struct PendingEmpty {
     pages_left: Option<Vec<(u8, u64)>>,
     /// `live_count` already dropped `removed`. A header retry must not do it again.
     live_applied: bool,
-    /// The earlier attempt's arm. A retry keeps the pre-images its mark still
-    /// holds, re-images only pages a later clear dropped, and clears both sets.
-    armed: Option<super::ArmedSh>,
 }
 
 pub enum SuffixPlan {
@@ -311,10 +307,7 @@ impl ScriptHashTable {
         if batch.rewrites.is_empty() {
             return Ok(());
         }
-        let _hold = page_guard::hold_marks();
-        let armed = self.arm_unlink_rewrites(&batch)?;
-        self.land_unlink_rewrites(&batch)?;
-        self.clear_armed_sh(&armed)
+        self.land_unlink_rewrites(&batch)
     }
 
     fn land_unlink_rewrites(&self, batch: &UnlinkBatch) -> Result<(), StoreError> {
@@ -494,7 +487,6 @@ impl ScriptHashTable {
             job.old = old;
             job.removed = removed;
             job.pages_left = None;
-            job.armed = None;
             return;
         }
         q.push(PendingEmpty {
@@ -505,7 +497,6 @@ impl ScriptHashTable {
             head_synced: false,
             pages_left: None,
             live_applied: false,
-            armed: None,
         });
     }
 
@@ -604,32 +595,11 @@ impl ScriptHashTable {
         }
     }
 
-    /// One backward mark covers the head word (until it is synced), page 0,
-    /// and each freed page's link. A crash before the clear restores the
-    /// head and the chain together.
     fn commit_one_empty(&self, job: &mut PendingEmpty) -> Result<(), StoreError> {
-        let _hold = page_guard::hold_marks();
         if job.pages_left.is_none() {
             job.pages_left = Some(self.deferred_page_list(job)?);
         }
-        let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
-        let mut offs = vec![0u64];
-        offs.extend(job.pages_left.iter().flatten().map(|&(_, off)| off));
-        let armed = self.arm_suffix_pages(
-            body,
-            &job.scripthash,
-            job.home,
-            &offs,
-            !job.head_synced,
-            job.armed.as_ref(),
-        )?;
-        job.armed = None;
-        let landed = self.land_one_empty(job);
-        let cleared = landed.and_then(|()| self.clear_armed_sh(&armed));
-        if cleared.is_err() {
-            job.armed = Some(armed);
-        }
-        cleared
+        self.land_one_empty(job)
     }
 
     fn land_one_empty(&self, job: &mut PendingEmpty) -> Result<(), StoreError> {
@@ -720,7 +690,6 @@ impl ScriptHashTable {
                 creates,
                 removed,
             } => {
-                let _hold = page_guard::hold_marks();
                 let body = self.body_for(scripthash, super::KeyHome::from(home));
                 let alloc_mu = self.alloc_for(scripthash, super::KeyHome::from(home));
                 let mut alloc = alloc_mu.lock().unwrap();
@@ -743,23 +712,6 @@ impl ScriptHashTable {
                 } else {
                     Some(ShHeadValue::extent(prepared.new_last))
                 };
-                let mut dirty = vec![0u64, prepared.at];
-                if boundary != old_last {
-                    dirty.push(old_last);
-                }
-                if let Some((off, _)) = prepared.extra {
-                    dirty.push(off);
-                }
-                dirty.extend_from_slice(&drop_pages);
-                dirty.extend(gaps.iter().map(|&(_, off)| off));
-                let armed = self.arm_suffix_pages(
-                    body,
-                    scripthash,
-                    home,
-                    &dirty,
-                    new_head.is_some(),
-                    None,
-                )?;
                 super::publish_bump(body, &alloc)?;
                 if boundary != old_last {
                     self.retire_head_page(body, &mut alloc, scripthash, home, old_last, &pack)?;
@@ -790,7 +742,6 @@ impl ScriptHashTable {
                 body.sync_data_only()?;
                 write_alloc_header(body, &alloc)?;
                 drop(alloc);
-                self.clear_armed_sh(&armed)?;
                 Ok(true)
             }
             SuffixPlan::Absent | SuffixPlan::NotSuffix => Ok(false),
@@ -1363,11 +1314,6 @@ pub fn clear_undo_keep_image(body: &TableFile, alloc: &AllocState) -> Result<(),
     persist_undo(body, alloc, None)?;
     body.sync_data_only()?;
     Ok(())
-}
-
-#[doc(hidden)]
-pub fn frees_old_pages(old: &ShHeadValue) -> bool {
-    matches!(old, ShHeadValue::Extent { .. } | ShHeadValue::Slab { .. })
 }
 
 #[doc(hidden)]
