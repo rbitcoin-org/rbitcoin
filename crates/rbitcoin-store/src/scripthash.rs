@@ -124,11 +124,14 @@ pub fn clear_sh_rebuild(store_dir: &Path) -> Result<(), StoreError> {
     }
 }
 
-/// Present while the index may hold a write that is not yet synced. Some of
-/// those writes land in place over bytes a durable head still points at (a
-/// same-class slab rewritten in place, a freed slab's free-list link, the
-/// alloc header), so after an unclean stop the index can read as valid and
-/// be wrong. The node refuses to start while it is present (#2074).
+/// Present while a scripthash commit, seal, or unlink may have bytes that
+/// are not yet the durable index. Some of those writes land in place over
+/// bytes a durable head still points at (a same-class slab rewritten in
+/// place, a freed slab's free-list link, the alloc header), so after an
+/// unclean stop the index can read as valid and be wrong. A finished append
+/// or seal removes the file once that commit is synced. An unlink leaves it
+/// until [`ScriptHashTable::flush`]. The node refuses to start while it is
+/// present (#2074).
 pub const SH_DIRTY_NAME: &str = "scripthash.dirty";
 
 pub fn sh_dirty_marked(store_dir: &Path) -> bool {
@@ -165,6 +168,31 @@ fn fsync_sh_dirs(store_dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+// How many `dirty_publish` calls are on this thread. A seal inside one
+// does not open a second mark.
+thread_local! {
+    static PUBLISH_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct PublishDepth;
+
+impl PublishDepth {
+    fn enter() -> Self {
+        PUBLISH_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self
+    }
+
+    fn current() -> u32 {
+        PUBLISH_DEPTH.with(|depth| depth.get())
+    }
+}
+
+impl Drop for PublishDepth {
+    fn drop(&mut self) {
+        PUBLISH_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 /// [`SH_DIRTY_NAME`] for one open table. A writer marks before it writes
 /// and holds `scope` for the write. [`ScriptHashTable::flush`] clears the
 /// mark only if no write started since its sync began (`gen` unchanged), and
@@ -199,15 +227,19 @@ impl ShDirty {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).held = true;
     }
 
-    fn begin(&self, store_dir: &Path) -> Result<std::sync::RwLockReadGuard<'_, ()>, StoreError> {
+    fn begin(
+        &self,
+        store_dir: &Path,
+    ) -> Result<(std::sync::RwLockReadGuard<'_, ()>, u64), StoreError> {
         let scope = self.scope.read().unwrap_or_else(|e| e.into_inner());
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.gen = s.gen.wrapping_add(1);
+        let gen = s.gen;
         if !s.marked {
             crate::file::write_synced_tmp_rename(&store_dir.join(SH_DIRTY_NAME), &[1])?;
             s.marked = true;
         }
-        Ok(scope)
+        Ok((scope, gen))
     }
 
     /// The write count with no write in progress.
@@ -383,17 +415,7 @@ struct BodyStage<'a> {
 struct IngestBatch<'a> {
     head_final: Vec<([u8; 32], ShHeadValue, KeyHome)>,
     stages: BTreeMap<usize, BodyStage<'a>>,
-    moved_heads: Vec<MovedHead>,
     written: usize,
-}
-
-/// A head file whose bare in-place update must be synced before a slab its
-/// key replaced is freed. An ingest head needs none: `insert_many` syncs it,
-/// and a seal writes a synced sorted file.
-#[derive(PartialEq)]
-enum MovedHead {
-    MainShard(usize),
-    SealedOvf,
 }
 
 /// Body slab allocator state (persisted in alloc header).
@@ -1168,22 +1190,6 @@ fn retarget_ingest_after_seal(heads: &mut HashMap<[u8; 32], (ShHeadValue, KeyHom
 
 /// Remember the head file `apply_head_upserts` updates in place for `key`,
 /// once per main shard or for the sealed overflow files.
-fn note_moved_head(
-    table: &ScriptHashTable,
-    heads: &mut Vec<MovedHead>,
-    key: &[u8; 32],
-    kh: KeyHome,
-) {
-    let head = match kh {
-        KeyHome::Main => MovedHead::MainShard(table.shard_index(key)),
-        KeyHome::SealedOvf => MovedHead::SealedOvf,
-        KeyHome::Ingest | KeyHome::Absent => return,
-    };
-    if !heads.contains(&head) {
-        heads.push(head);
-    }
-}
-
 impl ScriptHashTable {
     pub fn create(dir: &std::path::Path) -> Result<Self, StoreError> {
         Self::create_with_scale(dir, HeadScale::Mainnet)
@@ -1956,10 +1962,12 @@ impl ScriptHashTable {
         if recs.is_empty() {
             return Ok((0, AppendTiming::default()));
         }
-        self.dirty_write(|| self.put_create_batch_append_marked(recs))
+        // Sort, seed, and stage only read. The commit marks, publishes, and
+        // drops the mark. A failed read here leaves the previous index.
+        self.append_staged_creates(recs)
     }
 
-    fn put_create_batch_append_marked(
+    fn append_staged_creates(
         &self,
         recs: &[ScriptHashRecord],
     ) -> Result<(usize, AppendTiming), StoreError> {
@@ -2091,15 +2099,11 @@ impl ScriptHashTable {
                 slabs: StagedSlabs::default(),
                 popped: false,
             });
-        let frees_before = stage.slabs.frees.len();
         let mut alloc = alloc_mu.lock().unwrap();
         let free_before = alloc.free_head;
         let new_val = self.append_sorted_creates(body, &mut alloc, cur, &add, &mut stage.slabs)?;
         stage.popped |= alloc.free_head != free_before;
         drop(alloc);
-        if stage.slabs.frees.len() > frees_before {
-            note_moved_head(self, &mut batch.moved_heads, &key, kh);
-        }
         batch.head_final.push((key, new_val, kh));
         Ok(())
     }
@@ -2114,8 +2118,10 @@ impl ScriptHashTable {
         batch: &IngestBatch<'_>,
         flush_each: bool,
     ) -> Result<(), StoreError> {
-        self.land_staged_batch(batch, flush_each)?;
-        self.maybe_seal_ingest()
+        self.dirty_publish(|| {
+            self.land_staged_batch(batch, flush_each)?;
+            self.maybe_seal_ingest()
+        })
     }
 
     fn land_staged_batch(
@@ -2137,33 +2143,61 @@ impl ScriptHashTable {
             stage.body.sync_data_only()?;
         }
         self.apply_head_upserts(&batch.head_final, flush_each)?;
-        self.free_replaced_slabs(&batch.stages, &batch.moved_heads)
+        self.sync_upserted_heads(&batch.head_final)?;
+        self.free_replaced_slabs(&batch.stages)
     }
 
-    /// Link the slabs a class change replaced once the heads that named them
-    /// are durable: the links, a body barrier, then the header that names them.
-    fn free_replaced_slabs(
+    /// Sync main and sealed heads this commit updated in place. Ingest heads
+    /// are already synced by `insert_many`. A same-class word is one sector,
+    /// and it has to be durable before the mark drops: until then the payload
+    /// `used` is new and the head `used` is old, which reads as `Corrupt`.
+    /// The free below runs only after this, so a live slab is not linked
+    /// while a durable head still names it.
+    fn sync_upserted_heads(
         &self,
-        stages: &BTreeMap<usize, BodyStage<'_>>,
-        moved_heads: &[MovedHead],
+        upserts: &[([u8; 32], ShHeadValue, KeyHome)],
     ) -> Result<(), StoreError> {
-        for head in moved_heads {
-            match head {
-                MovedHead::MainShard(si) => {
-                    if let Some(h) = self.sorted_main[*si].read().unwrap().as_ref() {
-                        h.flush()?;
+        let mut shards = Vec::new();
+        let mut sealed = false;
+        for (key, _, home) in upserts {
+            match home {
+                KeyHome::Main => {
+                    let si = self.shard_index(key);
+                    if !shards.contains(&si) {
+                        shards.push(si);
                     }
                 }
-                MovedHead::SealedOvf => {
-                    for h in self.sealed_ovf.lock().unwrap().iter() {
-                        h.flush()?;
-                    }
-                    if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
-                        l1.head.flush()?;
-                    }
+                KeyHome::SealedOvf => sealed = true,
+                KeyHome::Ingest | KeyHome::Absent => {}
+            }
+        }
+        for si in shards {
+            if let Some(slot) = self.sorted_main.get(si) {
+                if let Some(h) = slot.read().unwrap().as_ref() {
+                    h.flush()?;
                 }
             }
         }
+        if sealed {
+            for h in self.sealed_ovf.lock().unwrap().iter() {
+                h.flush()?;
+            }
+            if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+                l1.head.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Link the slabs a class change replaced once the heads that named them
+    /// are durable: the links, a body barrier, then the header that names
+    /// them, then one more barrier so that header is durable before the mark
+    /// drops. The header is one sector. A crash while it is written leaves
+    /// the previous header (the slab leaks) or the new one.
+    fn free_replaced_slabs(
+        &self,
+        stages: &BTreeMap<usize, BodyStage<'_>>,
+    ) -> Result<(), StoreError> {
         for stage in stages
             .values()
             .filter(|s| !s.slabs.frees.is_empty() || !s.slabs.gaps.is_empty())
@@ -2174,6 +2208,7 @@ impl ScriptHashTable {
             }
             stage.body.sync_data_only()?;
             write_alloc_header(stage.body, &alloc)?;
+            stage.body.sync_data_only()?;
         }
         Ok(())
     }
@@ -2374,6 +2409,19 @@ impl ScriptHashTable {
 
     #[doc(hidden)]
     pub fn seal_ingest(&self) -> Result<(), StoreError> {
+        if self.ingest.lock().unwrap().is_none() {
+            return Ok(());
+        }
+        // A seal from inside a commit is already under that commit's mark.
+        // Marking again would bump the generation and the outer clear would
+        // leave the file in place.
+        if PublishDepth::current() > 0 {
+            return self.seal_ingest_inner();
+        }
+        self.dirty_publish(|| self.seal_ingest_inner())
+    }
+
+    fn seal_ingest_inner(&self) -> Result<(), StoreError> {
         let mut recs = {
             let g = self.ingest.lock().unwrap();
             let Some(g) = g.as_ref() else {
@@ -3038,13 +3086,42 @@ impl ScriptHashTable {
     pub fn hold_dirty(&self) -> Result<(), StoreError> {
         // Hold the write scope until `held` is set: a flush that samples
         // the generation in between would otherwise clear the new mark.
-        let _scope = self.dirty.begin(&self.store_dir)?;
+        let (_scope, _) = self.dirty.begin(&self.store_dir)?;
         self.dirty.hold();
         Ok(())
     }
 
+    /// Mark, run `write`, and drop the mark when `write` returns `Ok`.
+    ///
+    /// The mark stays through the write, including a seal this commit
+    /// started. The clear syncs `scripthash.body`, `scripthash.head`, and
+    /// `scripthash.ovf` before it unlinks the file. An error holds the mark
+    /// until a wipe, and a later quiet commit does not clear a held mark.
+    fn dirty_publish<T>(
+        &self,
+        write: impl FnOnce() -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let (scope, gen) = self.dirty.begin(&self.store_dir)?;
+        let out = {
+            let _depth = PublishDepth::enter();
+            write()
+        };
+        drop(scope);
+        match out {
+            Ok(value) => {
+                self.dirty.clear_if_unchanged(&self.store_dir, gen)?;
+                Ok(value)
+            }
+            Err(err) => {
+                self.dirty.hold();
+                Err(err)
+            }
+        }
+    }
+
     /// Run a write that can land in place with [`SH_DIRTY_NAME`] set for its
-    /// whole span. An error keeps the mark until a wipe.
+    /// whole span. An error keeps the mark until a wipe. The mark stays
+    /// until [`Self::flush`].
     pub(crate) fn dirty_write<T>(
         &self,
         write: impl FnOnce() -> Result<T, StoreError>,
@@ -3061,7 +3138,7 @@ impl ScriptHashTable {
     /// guard until the write returns.
     #[doc(hidden)]
     pub fn begin_dirty_write(&self) -> Result<std::sync::RwLockReadGuard<'_, ()>, StoreError> {
-        self.dirty.begin(&self.store_dir)
+        Ok(self.dirty.begin(&self.store_dir)?.0)
     }
 
     fn flush_synced(&self) -> Result<(), StoreError> {

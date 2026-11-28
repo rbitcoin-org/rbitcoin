@@ -234,15 +234,21 @@ appends its body the same way, then uses `mempool/guard/flush` for slots and
 file must exist. A strong bit a fence run names is set again by
 `restore_strong_from_fence`.
 
-The scripthash index is still gated: an append, an unlink, or a deferred
-empty-head commit writes `scripthash.dirty` before it writes. A full synced
-`ScriptHashTable::flush` (file data, then the `scripthash.body`,
-`scripthash.head`, and `scripthash.ovf` directories) removes the mark only
-when no write started since its sync began, and never a mark that was present
-at open or that a failed write left. A clean shutdown of a dirty index runs
-that flush. The cold build and pack paths do not mark: an unsealed shard is
-untrusted until its pack mark, and its keys stay in ingest or overflow until
-then. The seal syncs the shard body (data, length, and alloc header) before it
+The scripthash index is still gated. An append marks only for its commit
+and its seal, then removes `scripthash.dirty` once that commit is synced:
+payloads, every head word the commit wrote, the free-list links, and the
+alloc header that names those frees. The clear syncs `scripthash.body`,
+`scripthash.head`, and `scripthash.ovf` before it unlinks the mark. Sorting,
+seeding, and staging do not mark. An unlink or a deferred empty-head commit
+still leaves the mark until a full synced `ScriptHashTable::flush`. That
+flush removes the mark only when no write started since its sync began, and
+never a mark that was present at open or that a failed write left. A clean
+shutdown of a dirty index runs that flush. `scripthash.include_hwm` still
+advances only after the flush, so a lagging watermark replays a published
+append as a no-op. The cold build and pack paths do not mark: an unsealed
+shard is untrusted until its pack mark, and its keys stay in ingest or
+overflow until then. The seal syncs the shard body (data, length, and alloc
+header) before it
 writes the mark, so a marked shard never names chains the device lacks. A start with `--sh-index` that finds the file refuses and names the fix:
 `RBITCOIN_SH_FORCE_REBUILD=1` (or the `scripthash.rebuild` and degraded
 markers) wipes the index at open and removes the file, or start without
@@ -365,16 +371,19 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   append skips each `fk ≤` the last fk its head or last page already holds.
   Hot path only appends + maintains heads in RAM.
 - Creates for unstrong / above-tip txs are **invisible** via `is_confirmed_strong`.
-- Append: one batch packs every key before it writes a slab. A batch that
-  reuses a free offset syncs an alloc header that no longer names it before
-  it writes that slab, so no durable header names a written slab as free.
-  Otherwise the payloads are synced before the header. The heads move
-  last. A slab a class change replaced joins the free list only after the
-  head that stopped naming it is durable: a main shard or sealed overflow
-  head, updated in place, is synced first; an ingest head was already
-  synced by its insert, or by the seal that moved it to a sealed file. The
-  link is synced before the header names it. Only a body that reused an
-  offset takes the extra barrier.
+- Append: one batch packs every key before it writes a slab. Packing does
+  not mark. The commit marks, then writes. A batch that reuses a free
+  offset syncs an alloc header that no longer names it before it writes
+  that slab, so no durable header names a written slab as free. Otherwise
+  the payloads are synced before the header. The heads move last, and every
+  head word this commit wrote is synced before the mark drops, including a
+  same-class update of a main shard or a sealed overflow. A slab a class
+  change replaced joins the free list only after the head that stopped
+  naming it is durable. The link is synced, then the header that names it,
+  then that header is synced. The header is one sector. A seal this commit
+  started returns before the mark drops, and the clear syncs the index
+  directories first. A crash before the mark drops still rebuilds. A crash
+  after it is this commit, and a lagging `include_hwm` replays as a no-op.
 - Disconnect tip: **one unlink per scripthash**. A megakey drops that block's
   creates from the tail pages. The page the head names is updated before
   any earlier page is rewritten, then the head moves. Old pages are freed
